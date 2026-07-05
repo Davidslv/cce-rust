@@ -85,6 +85,15 @@ scores are compared, sorted, or emitted.
   addendum (v1.1); wins over `SPEC.md` for the metrics feature only.
 - [`SPEC-V2.md`](SPEC-V2.md) — the v2.0 language-packs evolution (packs, registry,
   validators, `kind`, conformance shape); wins over `SPEC.md` for chunking/packs.
+- [`SPEC-V2.1.md`](SPEC-V2.1.md) · [`SPEC-V2.2.md`](SPEC-V2.2.md) ·
+  [`SPEC-SYNC.md`](SPEC-SYNC.md) · [`SPEC-MCP.md`](SPEC-MCP.md) — the secret-protection
+  (v2.1), workspace (v2.2), CCE Sync (v2.3), and CCE MCP (v2.4) evolution specs; each
+  wins over `SPEC.md` for its feature. `cce mcp`/`cce init` and the three MCP tools
+  (`context_search`, `index_status`, `record_feedback`) live in `src/mcp/`; their
+  names/schemas/output are a **cross-language contract** with the Ruby engine — do not
+  drift them.
+- [`docs/mcp.md`](docs/mcp.md) · [`docs/sync.md`](docs/sync.md) — the MCP and Sync
+  user docs; [`docs/VERIFIED.md`](docs/VERIFIED.md) is the cold-start transcript.
 - [`docs/adding-a-language.md`](docs/adding-a-language.md) — how to add a pack.
 - [`docs/architecture.md`](docs/architecture.md) — module map, pipeline, design
   rationale, and where the design strains.

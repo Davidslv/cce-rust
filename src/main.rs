@@ -13,17 +13,13 @@
 //! - Own argument parsing, store-path resolution, and output formatting.
 //! - It does NOT implement chunking, embedding, or retrieval — it calls `lib`.
 
-use cce::chunker::token_count;
-use cce::config::{
-    EmbedderKind, DEFAULT_DASHBOARD_PORT, DEFAULT_INPUT_PRICE_PER_MILLION,
-    LOW_CONFIDENCE_THRESHOLD, METRICS_FILE,
-};
+use cce::config::{EmbedderKind, DEFAULT_DASHBOARD_PORT, DEFAULT_INPUT_PRICE_PER_MILLION, METRICS_FILE};
 use cce::embedder::{format6, Embedder, HashEmbedder, OllamaEmbedder};
 use cce::federation::{
     federated_search, load_member_stores, member_metrics, workspace_stats, FedResult,
 };
-use cce::metrics::{HexIdSource, IdSource, IndexRecord, MetricsWriter, SearchRecord, SystemClock};
-use cce::retriever::{search, SearchResult};
+use cce::metrics::{HexIdSource, IdSource, IndexRecord, MetricsWriter, SystemClock};
+use cce::retriever::{build_search_record, search, SearchResult};
 use cce::store::{default_store_path, Index};
 use cce::sync::commands as sync_cmd;
 use cce::workspace::{build_graph, build_manifest, Manifest, WorkspaceGraph};
@@ -166,6 +162,32 @@ enum Command {
         /// Language to benchmark: ruby, rust, typescript, c (or python default).
         #[arg(long, default_value = "python")]
         lang: String,
+    },
+    /// Serve CCE as an MCP server over stdio for an agent (SPEC-MCP).
+    Mcp {
+        /// Project directory to serve (single-repo store resolution).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Explicit store path (overrides `--dir`/cwd resolution).
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// Federate over the workspace at `--dir`/cwd (SPEC-V2.2).
+        #[arg(long)]
+        workspace: bool,
+    },
+    /// Wire up an editor (Claude Code) to use CCE via MCP, plug-and-play (SPEC-MCP).
+    Init {
+        /// Project directory to initialise (default: current directory).
+        dir: Option<PathBuf>,
+        /// Target agent. v1 supports `claude`.
+        #[arg(long, default_value = "claude")]
+        agent: String,
+        /// Pull the CI-built index from this sync remote instead of indexing locally.
+        #[arg(long)]
+        remote: Option<String>,
+        /// Force the index refresh (a `--force` sync pull past a sha mismatch).
+        #[arg(long)]
+        force: bool,
     },
     /// Emit conformance.json for a fixture directory (SPEC-V2 §7).
     Conformance {
@@ -324,6 +346,8 @@ fn main() -> ExitCode {
         Command::Bench { repo_dir, queries, store, commit, name, lang } => {
             cmd_bench(&repo_dir, queries, store, commit, &name, &lang)
         }
+        Command::Mcp { dir, store, workspace } => cmd_mcp(dir, store, workspace),
+        Command::Init { dir, agent, remote, force } => cmd_init_mcp(dir, agent, remote, force),
         Command::Conformance { fixture_dir, output } => cmd_conformance(&fixture_dir, &output),
         Command::Packs { validate } => cmd_packs(validate),
     };
@@ -494,50 +518,6 @@ fn cmd_search(
         }
     }
     Ok(())
-}
-
-/// Assemble a search metrics record from the results (DASHBOARD-SPEC §2.1, §3).
-fn build_search_record(
-    index: &Index,
-    results: &[SearchResult],
-    query: &str,
-    top_k: usize,
-    graph_enabled: bool,
-    latency_ms: f64,
-) -> SearchRecord {
-    let result_count = results.len();
-    let baseline_tokens = index.baseline_tokens(results.iter().map(|r| r.file_path.as_str()));
-    let served_tokens: u64 = results.iter().map(|r| token_count(&r.content) as u64).sum();
-    let tokens_saved = baseline_tokens.saturating_sub(served_tokens);
-    let savings_ratio = if baseline_tokens == 0 {
-        0.0
-    } else {
-        tokens_saved as f64 / baseline_tokens as f64
-    };
-    let top_score = results.first().map(|r| r.score).unwrap_or(0.0);
-    let mean_score = if results.is_empty() {
-        0.0
-    } else {
-        results.iter().map(|r| r.score).sum::<f64>() / results.len() as f64
-    };
-    let empty = result_count == 0;
-    let low_confidence = !empty && top_score < LOW_CONFIDENCE_THRESHOLD;
-    SearchRecord {
-        query: query.to_string(),
-        top_k,
-        graph_enabled,
-        embedder: index.embedder_name.clone(),
-        result_count,
-        baseline_tokens,
-        served_tokens,
-        tokens_saved,
-        savings_ratio,
-        top_score,
-        mean_score,
-        empty,
-        low_confidence,
-        latency_ms,
-    }
 }
 
 fn results_json(results: &[SearchResult], query_id: Option<&str>) -> String {
@@ -1088,6 +1068,32 @@ fn detect_commit(repo_dir: &Path) -> String {
         .filter(|o| o.status.success())
         .map(|o| String::from_utf8_lossy(&o.stdout).trim().to_string())
         .unwrap_or_else(|| "unknown".to_string())
+}
+
+/// `cce mcp` (SPEC-MCP): serve the MCP protocol over stdio for an agent. The
+/// server warms the index via CCE Sync (best-effort) then serves until stdin EOF.
+fn cmd_mcp(dir: Option<PathBuf>, store: Option<PathBuf>, workspace: bool) -> Result<(), String> {
+    let server = cce::mcp::McpServer::new(dir, store, workspace);
+    server.serve().map_err(|e| format!("mcp server error: {e}"))
+}
+
+/// `cce init` (SPEC-MCP): ensure an index and wire the editor up (`.mcp.json` +
+/// `CLAUDE.md`). Idempotent; prints next steps.
+fn cmd_init_mcp(
+    dir: Option<PathBuf>,
+    agent: String,
+    remote: Option<String>,
+    force: bool,
+) -> Result<(), String> {
+    let opts = cce::mcp::InitOptions {
+        dir: dir.unwrap_or_else(|| PathBuf::from(".")),
+        agent,
+        remote,
+        force,
+    };
+    let report = cce::mcp::init::run(&opts)?;
+    print!("{report}");
+    Ok(())
 }
 
 fn cmd_conformance(fixture_dir: &Path, output: &Path) -> Result<(), String> {

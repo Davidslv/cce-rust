@@ -98,7 +98,7 @@ cargo test                # confirm a green build
 
 ```bash
 cargo install --path .    # installs `cce` into ~/.cargo/bin
-cce --version             # cce 2.3.0
+cce --version             # cce 2.4.0
 ```
 
 ### Optional: the semantic embedder (Ollama)
@@ -501,6 +501,64 @@ cross-language), the content-address scheme, permissions guidance, and
 troubleshooting; and [`docs/VERIFIED.md`](docs/VERIFIED.md) for the full cold-start
 transcript.
 
+## Use it with Claude Code (MCP) — v2.4
+
+The whole point of indexing your code is for an **agent** to use it. `cce mcp` is a
+[Model Context Protocol](https://modelcontextprotocol.io) server so Claude Code (or
+any MCP client) calls CCE as a **first-class tool it auto-invokes** — instead of
+reading and grepping whole files, the agent runs `context_search` and pays tokens
+only for the handful of relevant chunks. `cce init` wires the editor up so it is
+plug-and-play, and every search is logged to `.cce/metrics.jsonl`, so
+`cce dashboard` proves the agent used it (and what it saved).
+
+```bash
+# 1. In your project: build the index, write .mcp.json + a CLAUDE.md block.
+cce init .
+#   CCE is wired up for Claude Code.
+#     index     : built N chunk(s) from M file(s)
+#     .mcp.json : ./.mcp.json (server "cce")
+#     CLAUDE.md : ./CLAUDE.md (context_search guidance)
+
+# 2. Restart your editor so it loads .mcp.json, then just ask a question:
+#      "where is the password hashed?"
+#    Claude Code calls the `context_search` tool and answers from the chunks it
+#    returns — no whole-file reads.
+
+# 3. Confirm it was used — the search shows up on the dashboard:
+cce dashboard
+```
+
+`cce init` writes a minimal, idempotent [`.mcp.json`](https://modelcontextprotocol.io):
+
+```json
+{ "mcpServers": { "cce": { "command": "cce", "args": ["mcp", "--dir", "."] } } }
+```
+
+and a marker-bounded block in `CLAUDE.md` telling the agent to **prefer
+`context_search` over Read/Grep**. Re-running `cce init` is safe — it merges, never
+duplicating a server entry or the block.
+
+**Three tools** (identical names, schemas, and output in the Ruby and Rust engines):
+
+| Tool | What it does |
+|---|---|
+| `context_search` | Ranked code chunks (`file:line + kind`) for a natural-language query, over the same hybrid vector + BM25 index as `cce search`. Logs a `search` metrics event and returns a `query_id`. Args: `query` (required), `top_k` (8), `package`, `no_graph`, `max_tokens`. |
+| `index_status` | Whether the project is indexed, per-language/per-kind counts, and — if CCE Sync is configured — the source (local vs pulled), sha, and whether it is behind the remote. |
+| `record_feedback` | Rate a prior result (`query_id`, `helpful`, optional `note`); appends a `feedback` event so the dashboard's quality signal reflects agent use. |
+
+**How to confirm the agent used it.** Two independent signals: the tool call is
+visible in Claude Code's tool-call log, and every `context_search` is a `search`
+event on `cce dashboard` (queries, counts, tokens saved). That is proof of *use*
+and of *value*.
+
+**Fresh, team-shared context via CCE Sync (optional).** `cce init --remote <cache>`
+pulls the CI-built index (seconds, not a full local re-index) instead of indexing
+locally, and if `sync.auto_pull` is on, `cce mcp` best-effort refreshes to the
+canonical `main@sha` on startup. This is a **soft dependency** — with no remote
+configured, MCP works fully on the local index, offline. See
+[`docs/mcp.md`](docs/mcp.md) for the tool schemas, the workspace (`--workspace`)
+flow, and the sync-freshness details.
+
 ## Supported languages
 
 Language support is a set of pluggable **language packs** (SPEC-V2). The core
@@ -543,13 +601,13 @@ node type in a `kind` field alongside the coarse `chunk_type`
 ## Tests & coverage
 
 ```bash
-cargo test                                                  # 183 tests
+cargo test                                                  # 298 tests
 cargo clippy --all-targets --all-features -- -D warnings    # lint gate
 cargo fmt --check                                           # format gate
 ```
 
-The suite is **183 passing tests** (+1 `#[ignore]` Ollama integration test) and
-measures **92.4% line coverage** via `cargo llvm-cov`. The default suite is
+The suite is **298 passing tests** (+1 `#[ignore]` Ollama integration test) and
+measures **93.8% line coverage** via `cargo llvm-cov`. The default suite is
 fully deterministic and makes no network calls — including the metrics subsystem,
 whose clock and id source are injected and whose dashboard tests bind an
 ephemeral loopback port. A CI test gate runs the three-layer validators over every
@@ -565,8 +623,10 @@ language pack, and a guard test asserts the core chunker names no language.
 | [`SPEC-V2.1.md`](SPEC-V2.1.md) | The secret-protection evolution spec (v2.1) |
 | [`SPEC-V2.2.md`](SPEC-V2.2.md) | The workspace-mode evolution spec (v2.2) |
 | [`SPEC-SYNC.md`](SPEC-SYNC.md) | The CCE Sync design spec (v2.3) |
+| [`SPEC-MCP.md`](SPEC-MCP.md) | The CCE MCP design spec (v2.4) |
 | [`docs/sync.md`](docs/sync.md) | CCE Sync: model, artifact format, content address, permissions, troubleshooting |
-| [`docs/VERIFIED.md`](docs/VERIFIED.md) | CCE Sync cold-start verification transcript |
+| [`docs/mcp.md`](docs/mcp.md) | CCE MCP: the server, the three tools, `cce init`, sync freshness, and how to confirm agent use |
+| [`docs/VERIFIED.md`](docs/VERIFIED.md) | CCE Sync + CCE MCP cold-start verification transcripts |
 | [`docs/ci/cce-sync.yml`](docs/ci/cce-sync.yml) | Ready-to-copy GitHub Actions cache-push workflow |
 | [`docs/getting-started.md`](docs/getting-started.md) | Install → first index + search |
 | [`docs/adding-a-language.md`](docs/adding-a-language.md) | Step-by-step guide to adding a language pack |
