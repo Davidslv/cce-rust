@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.2] - 2026-07-05
+
+### Added
+- **Memory recall (L5)** — a local-only, secret-scrubbed `.cce/memory.jsonl` of *validated* decisions,
+  with two MCP tools: `record_decision(text, tags?, area?)` (deduped by a content-hash id; redacted
+  before write) and `session_recall(query, top_k?)` (hybrid search over the memory corpus,
+  precision-filtered — score ≥ 0.30 and a shared query token — to avoid context pollution). Reuses the
+  retrieval engine; workspace-aware (root + members); **never pushed by Sync** (non-reproducible /
+  local). `tools/list` is now eight tools. Additive; `conformance.json` and the Sync artifact unchanged.
+
 ## [2.5.1] - 2026-07-05
 
 ### Added

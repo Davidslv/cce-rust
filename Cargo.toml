@@ -1,6 +1,6 @@
 [package]
 name = "cce"
-version = "2.5.1"
+version = "2.5.2"
 edition = "2021"
 description = "Code Context Engine — Rust implementation (SPEC v1.0 + Dashboard v1.1 + Language Packs v2.0 + Secret Protection v2.1 + Workspace Mode v2.2 + CCE Sync v2.3 + CCE MCP v2.4 + Dashboard refresh & docs sweep v2.4.1 + Savings Layers v2.5.0: chunk compression, progressive disclosure, savings ledger)"
 license = "MIT"
