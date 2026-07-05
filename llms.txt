@@ -3,33 +3,39 @@
 > A local CLI (`cce`) that indexes a code repository — AST-chunking files with
 > tree-sitter, embedding chunks, and storing a vector + keyword index on disk as
 > JSON — and answers queries with hybrid vector + BM25 retrieval. It is a
-> clean-room, test-first Rust implementation of SPEC v1.0; a sibling Ruby
-> implementation was built from the identical spec. MIT licensed, © 2026 David
-> Silva. No network calls by default (the semantic embedder over localhost is
-> opt-in).
+> clean-room, test-first Rust implementation of SPEC v1.0 plus a Dashboard &
+> observability addendum (SPEC v1.1); a sibling Ruby implementation was built from
+> the identical specs. MIT licensed, © 2026 David Silva. No network calls by
+> default: the semantic embedder over localhost is opt-in, and `cce dashboard` is
+> a loopback-only, read-only, self-contained local web UI.
 
 ## Documentation
 
 - [README](README.md): What it is, install/setup for macOS and Ubuntu, worked usage examples, tests/coverage.
-- [SPEC.md](SPEC.md): The normative specification (v1.0) — the single source of truth for all behaviour.
+- [SPEC.md](SPEC.md): The normative specification (v1.0) — the single source of truth for the base engine.
+- [DASHBOARD-SPEC.md](DASHBOARD-SPEC.md): The dashboard & observability addendum (v1.1) — metrics log, aggregator, dashboard.
 - [Getting started](docs/getting-started.md): Newcomer path from install to first successful index + search.
-- [How-to recipes](docs/how-to.md): Task recipes for index, search, stats, bench, conformance, and Ollama.
+- [How-to recipes](docs/how-to.md): Task recipes for index, search, feedback, dashboard, stats, bench, conformance, and Ollama.
 - [Architecture](docs/architecture.md): Design goals, module map, pipeline, design rationale, and where the design strains.
+- [Dashboard](docs/dashboard.md): The metrics pipeline (log → aggregator → API → page), event schema, and aggregation formulas.
 - [Decisions](docs/DECISIONS.md): How each ambiguity in the spec was resolved, with rationale.
-- [TDD log](docs/TDD.md): The red → green build order and coverage (84 tests, 95.33% line coverage).
+- [TDD log](docs/TDD.md): The red → green build order and coverage (113 tests, 95.44% line coverage).
 - [Benchmarks](docs/BENCHMARKS.md): Measured index/latency/recall numbers on a real corpus.
 
 ## Source (key files)
 
 - [src/lib.rs](src/lib.rs): Crate root; module tree and public surface.
-- [src/main.rs](src/main.rs): CLI (clap) — index, search, stats, bench, conformance.
-- [src/config.rs](src/config.rs): Normative constants (SPEC §3) and runtime config.
+- [src/main.rs](src/main.rs): CLI (clap) — index, search, feedback, dashboard, stats, bench, conformance.
+- [src/config.rs](src/config.rs): Normative constants (SPEC §3, DASHBOARD-SPEC §1) and runtime config.
 - [src/tokenizer.rs](src/tokenizer.rs): The shared byte-exact tokenizer (SPEC §4.1).
 - [src/chunker.rs](src/chunker.rs): tree-sitter chunking, chunk IDs, imports (SPEC §4.2–4.4).
 - [src/embedder.rs](src/embedder.rs): Hashing embedder, cosine, rounding, optional Ollama (SPEC §5, §11).
 - [src/retriever.rs](src/retriever.rs): The hybrid retrieval pipeline (SPEC §6).
-- [src/store.rs](src/store.rs): Index assembly and JSON persistence (SPEC §7).
+- [src/store.rs](src/store.rs): Index assembly, JSON persistence, whole-file token counts (SPEC §7, DASHBOARD-SPEC §3).
 - [src/conformance.rs](src/conformance.rs): The byte-stable conformance.json emitter (SPEC §8).
+- [src/metrics.rs](src/metrics.rs): The persisted metrics event log — injected clock/id source (the one place wall-clock time is allowed), best-effort append, robust reader (DASHBOARD-SPEC §2).
+- [src/aggregator.rs](src/aggregator.rs): The pure aggregator — totals, north-stars, daily series, deltas (DASHBOARD-SPEC §4).
+- [src/dashboard.rs](src/dashboard.rs): The loopback-only, read-only, self-contained dashboard web server (DASHBOARD-SPEC §6).
 
 ## Project
 

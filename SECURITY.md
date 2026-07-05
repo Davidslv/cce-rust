@@ -3,12 +3,12 @@
 ## Supported versions
 
 cce-rust follows [Semantic Versioning](https://semver.org). Security fixes are
-provided for the current `1.0.x` line only.
+provided for the current `1.1.x` line only.
 
 | Version | Supported |
 |---|---|
-| 1.0.x | ✅ |
-| < 1.0 | ❌ |
+| 1.1.x | ✅ |
+| < 1.1 | ❌ |
 
 ## Threat model
 
@@ -32,12 +32,26 @@ not — do makes the real attack surface clear.
   record a commit for its report; that is the only external process it invokes.
 - **Output is data on disk.** The store is plain JSON written under a directory
   you control. Treat a store as containing verbatim snippets of whatever you
-  indexed — do not share a store built from a private repository.
+  indexed — do not share a store built from a private repository. The metrics log
+  (`<store-dir>/metrics.jsonl`, since v1.1) sits beside it and likewise contains
+  verbatim query strings and derived counts — treat it as equally sensitive.
+- **The dashboard server (v1.1) is loopback-only, read-only, and
+  self-contained.** `cce dashboard` binds **`127.0.0.1` only**, so it is not
+  reachable from other hosts. Every endpoint is **read-only** — nothing it serves
+  mutates the index, the metrics log, or any file. The page is **fully
+  self-contained**: it inlines all CSS/JS and draws its own SVG charts, making
+  **no external network, CDN, font, or script requests**, consistent with CCE's
+  offline/local posture. It reads only the metrics log you point it at and, like
+  the rest of the tool, does not execute indexed content. Because binding is
+  loopback-only, no authentication is required or offered; **if a future version
+  ever allowed binding a non-loopback address, it must require a token** before
+  doing so. There is no browser auto-open (the command only prints the URL).
 
-Because there is no server, no daemon, no authentication, and no
-attacker-reachable network surface by default, the practical risk is limited to
-parser/robustness bugs on untrusted input and to whatever trust you place in a
-local Ollama server you opt into.
+Because there is no attacker-reachable network surface by default — the only
+server is loopback-only and read-only, and the only outbound path is the opt-in
+localhost Ollama embedder — the practical risk is limited to parser/robustness
+bugs on untrusted input, to whatever trust you place in a local Ollama server you
+opt into, and to the sensitivity of the store/metrics files you keep on disk.
 
 ## Reporting a vulnerability
 

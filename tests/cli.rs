@@ -50,12 +50,17 @@ fn index_then_search_in_fresh_process() {
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
-    let arr = v.as_array().unwrap();
+    // DASHBOARD-SPEC §5: --json is now an object with a top-level `query_id`
+    // field wrapping the `results` array.
+    let arr = v["results"].as_array().unwrap();
     assert!(!arr.is_empty());
     assert_eq!(arr[0]["file_path"], "auth.py");
     // score is a fixed 6-decimal string
     let score = arr[0]["score"].as_str().unwrap();
     assert_eq!(score.split('.').nth(1).unwrap().len(), 6);
+    // A query-id was assigned (metrics enabled by default) and is 12 hex chars.
+    let qid = v["query_id"].as_str().unwrap();
+    assert_eq!(qid.len(), 12);
 }
 
 #[test]

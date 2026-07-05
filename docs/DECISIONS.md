@@ -112,3 +112,49 @@ formatting gate cannot pass as delivered.
 then ran `cargo fmt`. This makes `cargo fmt --check` genuinely clean while
 preserving the compact style and module ordering rather than blowing them away to
 stock defaults. Formatting-only; no logic or spec behavior changed.
+
+## D15 — Dashboard & observability (SPEC v1.1)
+
+The following ambiguities in `DASHBOARD-SPEC.md` were resolved to the simplest
+reasonable reading and are recorded here.
+
+**HTTP server = hand-rolled on `std::net::TcpListener`.** The spec offers a
+choice between a minimal crate (e.g. `tiny_http`) and raw `std::net`. Raw std is
+the smallest thing that works, adds no dependency (nothing new to pin or let
+Dependabot chase), and the server surface is tiny (one request line, four routes,
+`Connection: close`). Charts are hand-drawn inline SVG as required.
+
+**`.jsonl` files are excluded from indexing.** The spec says to ship
+`test/fixture/metrics_sample.jsonl`, but the conformance harness indexes
+`test/fixture/` and must keep producing exactly 7 chunks with a byte-identical
+`conformance.json`. A `.jsonl` file is runtime log data, never source to be
+chunked, so the walker now skips `.jsonl` (like it skips `.cce/`). This reconciles
+both requirements: the fixture ships at the spec'd path and `conformance.json` is
+unchanged. Verified byte-identical before and after.
+
+**`--json` search output becomes an object.** DASHBOARD-SPEC §5 says to add a
+top-level `query_id` field to `--json`. A "top-level field" implies an object, so
+`cce search --json` now emits `{"query_id": "...", "results": [ ... ]}` instead of
+a bare array. This is the documented v1.1 shape; `query_id` is `null` when metrics
+are disabled.
+
+**Feedback for an unknown id warns but still records (exit 0).** The spec allows
+either behaviour. Recording anyway is the more forgiving choice — feedback is
+cheap, ids are opaque, and a later re-index or log inspection can still make use
+of it. A warning is printed to stderr.
+
+**Metrics location derives from the store.** The log lives beside the index at
+`<store-dir>/metrics.jsonl`. `--store PATH` points at the index file, so the log
+is `PATH`'s parent directory plus `metrics.jsonl`; `--dir D` uses `D/.cce/`; and
+`--metrics PATH` overrides both (dashboard/feedback only).
+
+**`metrics.enabled` config key vs `--no-metrics`.** The base engine (SPEC v1.0)
+ships no config-file loader — all configuration is compile-time constants — so
+the runtime switch is the `--no-metrics` flag on `index`/`search`. A config-file
+`metrics.enabled=false` is honoured in spirit by that flag; wiring an actual
+config file is out of scope for v1.1 and would be a separate change.
+
+**Delta direction uses the rounded window means.** `delta_ratio` /
+`delta_top_score` are computed from the 6-decimal-rounded current/prior means, so
+both language implementations reach an identical value and direction from the same
+inputs (no last-ULP divergence). This matches the §4.1 anchor exactly.

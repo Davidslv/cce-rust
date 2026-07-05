@@ -8,11 +8,20 @@ summary.
 
 `cce` is a local CLI that indexes a code repository (tree-sitter AST chunking →
 embedding → JSON vector + BM25 index) and answers queries with hybrid retrieval.
-It is a **clean-room, test-first implementation of [`SPEC.md`](SPEC.md) v1.0**.
-`SPEC.md` is the single source of truth for behaviour — treat it as the
-constitution. A sibling Ruby implementation
-([davidslv/cce-ruby](https://github.com/davidslv/cce-ruby)) is built from the
-identical spec, and the two must stay conformance-compatible.
+It is a **clean-room, test-first implementation of [`SPEC.md`](SPEC.md) v1.0**
+plus the **Dashboard & observability addendum
+[`DASHBOARD-SPEC.md`](DASHBOARD-SPEC.md) (v1.1)**. Both specs are the single
+source of truth for behaviour — treat them as the constitution. A sibling Ruby
+implementation ([davidslv/cce-ruby](https://github.com/davidslv/cce-ruby)) is
+built from the identical specs, and the two must stay conformance-compatible —
+including the dashboard aggregator's §4.1 anchor, which is the cross-language
+equivalence gate for the metrics feature.
+
+**The metrics/dashboard subsystem is the one place wall-clock time and unique
+IDs are allowed** (`src/metrics.rs`, `src/aggregator.rs`, `src/dashboard.rs`).
+Everywhere else stays deterministic. In metrics, the clock and id source are
+**injected** so tests pin them; the aggregator is a **pure function** of
+`(events, now, price)` with no ambient time. Keep it that way.
 
 ## The gates that must stay green
 
@@ -41,7 +50,9 @@ This codebase is built test-first (see [`docs/TDD.md`](docs/TDD.md)):
 
 Tests must be **deterministic and hermetic** — no network, no wall-clock, no
 ambient filesystem state. The only network-touching test (Ollama) is `#[ignore]`.
-Keep coverage at or above the baseline (**84 tests, 95.33% line coverage** via
+The metrics tests inject a fixed clock/id source, and the dashboard's socket test
+binds an **ephemeral loopback port** and serves a bounded number of connections.
+Keep coverage at or above the baseline (**113 tests, 95.44% line coverage** via
 `cargo llvm-cov`); a change that lowers coverage should add tests.
 
 ## Spec conformance must not drift
@@ -57,9 +68,13 @@ scores are compared, sorted, or emitted.
 
 ## Where things live (docs map)
 
-- [`SPEC.md`](SPEC.md) — normative behaviour reference (authoritative).
+- [`SPEC.md`](SPEC.md) — normative base-engine behaviour reference (authoritative).
+- [`DASHBOARD-SPEC.md`](DASHBOARD-SPEC.md) — normative dashboard/observability
+  addendum (v1.1); wins over `SPEC.md` for the metrics feature only.
 - [`docs/architecture.md`](docs/architecture.md) — module map, pipeline, design
   rationale, and where the design strains.
+- [`docs/dashboard.md`](docs/dashboard.md) — metrics pipeline, event schema, and
+  the aggregation formulas.
 - [`docs/DECISIONS.md`](docs/DECISIONS.md) — how each spec ambiguity was resolved.
 - [`docs/getting-started.md`](docs/getting-started.md) · [`docs/how-to.md`](docs/how-to.md) — user paths.
 - [`docs/TDD.md`](docs/TDD.md) — red → green log and coverage.

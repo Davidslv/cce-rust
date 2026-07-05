@@ -14,7 +14,7 @@
 //! - Recompute BM25 and the graph on load (they are derived, not persisted).
 //! - It does NOT run retrieval; it hands its data to `retriever`.
 
-use crate::chunker::{Chunk, Chunker};
+use crate::chunker::{token_count, Chunk, Chunker};
 use crate::config::SPEC_VERSION;
 use crate::embedder::Embedder;
 use crate::graph_store::Graph;
@@ -32,6 +32,10 @@ struct IndexData {
     embedder: String,
     chunks: Vec<Chunk>,
     file_imports: BTreeMap<String, Vec<String>>,
+    /// Whole-file token count per indexed file (DASHBOARD-SPEC §3). Optional so
+    /// stores written before v1.1 still load (defaults to empty).
+    #[serde(default)]
+    file_tokens: BTreeMap<String, usize>,
 }
 
 fn default_embedder_name() -> String {
@@ -42,6 +46,9 @@ fn default_embedder_name() -> String {
 pub struct Index {
     pub chunks: Vec<Chunk>,
     pub file_imports: BTreeMap<String, Vec<String>>,
+    /// Whole-file token count per indexed file (DASHBOARD-SPEC §3), used to
+    /// compute a search's `baseline_tokens` counterfactual.
+    pub file_tokens: BTreeMap<String, usize>,
     pub embedder_name: String,
     pub bm25: Bm25Index,
     pub graph: Graph,
@@ -60,6 +67,7 @@ impl Index {
     fn assemble(
         chunks: Vec<Chunk>,
         file_imports: BTreeMap<String, Vec<String>>,
+        file_tokens: BTreeMap<String, usize>,
         embedder_name: String,
     ) -> Index {
         let files: Vec<String> = {
@@ -71,7 +79,21 @@ impl Index {
         };
         let bm25 = Bm25Index::build(&chunks);
         let graph = Graph::build(&file_imports, &files);
-        Index { chunks, file_imports, embedder_name, bm25, graph }
+        Index { chunks, file_imports, file_tokens, embedder_name, bm25, graph }
+    }
+
+    /// Sum the whole-file token counts of a set of files (DASHBOARD-SPEC §3).
+    /// Callers pass the DISTINCT file paths of a search's returned results; a
+    /// file with no recorded count contributes 0.
+    pub fn baseline_tokens<'a>(&self, files: impl Iterator<Item = &'a str>) -> u64 {
+        let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
+        let mut total = 0u64;
+        for f in files {
+            if seen.insert(f) {
+                total += self.file_tokens.get(f).copied().unwrap_or(0) as u64;
+            }
+        }
+        total
     }
 
     /// Build an index by walking `root` and embedding with `embedder`.
@@ -95,8 +117,12 @@ impl Index {
         let mut chunker = Chunker::new();
         let mut chunks: Vec<Chunk> = Vec::new();
         let mut file_imports: BTreeMap<String, Vec<String>> = BTreeMap::new();
+        let mut file_tokens: BTreeMap<String, usize> = BTreeMap::new();
 
         for (rel_path, content) in kept_files {
+            // Persist the whole-file token count for the baseline counterfactual
+            // (DASHBOARD-SPEC §3), independent of how the file chunks.
+            file_tokens.insert(rel_path.clone(), token_count(content));
             let fc = chunker.chunk_file(rel_path, content);
             if !fc.imports.is_empty() {
                 file_imports.insert(rel_path.clone(), fc.imports);
@@ -108,7 +134,7 @@ impl Index {
         }
 
         let total_chunks = chunks.len();
-        let index = Index::assemble(chunks, file_imports, embedder.name().to_string());
+        let index = Index::assemble(chunks, file_imports, file_tokens, embedder.name().to_string());
         (index, BuildStats { files_indexed, files_skipped, total_chunks })
     }
 
@@ -122,6 +148,7 @@ impl Index {
             embedder: self.embedder_name.clone(),
             chunks: self.chunks.clone(),
             file_imports: self.file_imports.clone(),
+            file_tokens: self.file_tokens.clone(),
         };
         let json = serde_json::to_string(&data).map_err(io::Error::other)?;
         std::fs::write(path, json)
@@ -132,7 +159,7 @@ impl Index {
         let json = std::fs::read_to_string(path)?;
         let data: IndexData = serde_json::from_str(&json)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
-        Ok(Index::assemble(data.chunks, data.file_imports, data.embedder))
+        Ok(Index::assemble(data.chunks, data.file_imports, data.file_tokens, data.embedder))
     }
 
     /// Distinct file paths in the corpus.
@@ -148,6 +175,12 @@ impl Index {
 /// Default store path for an indexed root: `<root>/.cce/index.json`.
 pub fn default_store_path(root: &Path) -> PathBuf {
     root.join(".cce").join("index.json")
+}
+
+/// Default metrics-log path for an indexed root: `<root>/.cce/metrics.jsonl`
+/// (DASHBOARD-SPEC §2). The metrics log lives beside the index in the store dir.
+pub fn default_metrics_path(root: &Path) -> PathBuf {
+    root.join(".cce").join(crate::config::METRICS_FILE)
 }
 
 #[cfg(test)]
@@ -167,6 +200,34 @@ mod tests {
         assert_eq!(idx.chunks.len(), 7);
         // payments.py -> auth edge present
         assert_eq!(idx.file_imports.get("payments.py"), Some(&vec!["auth".to_string()]));
+    }
+
+    #[test]
+    fn persists_whole_file_token_counts_and_baseline_sums() {
+        // DASHBOARD-SPEC §3: index persists each file's whole-file token_count so
+        // baseline_tokens (the "read the whole file" counterfactual) is accurate.
+        use crate::chunker::token_count;
+        let e = HashEmbedder;
+        let (idx, _) = Index::build_from_dir(&fixture_dir(), &e);
+
+        // Every source file has a whole-file token count equal to token_count of
+        // the file's full contents.
+        for name in ["auth.py", "payments.py", "README.md"] {
+            let src = std::fs::read_to_string(fixture_dir().join(name)).unwrap();
+            assert_eq!(idx.file_tokens.get(name).copied(), Some(token_count(&src)), "{name}");
+        }
+
+        // The baseline over a set of DISTINCT result files sums their whole-file
+        // counts; a missing file contributes 0.
+        let baseline = idx.baseline_tokens(["auth.py", "auth.py", "nope.py"].iter().copied());
+        assert_eq!(baseline, idx.file_tokens["auth.py"] as u64);
+
+        // Survives a save/load round-trip.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("index.json");
+        idx.save(&path).unwrap();
+        let loaded = Index::load(&path).unwrap();
+        assert_eq!(loaded.file_tokens, idx.file_tokens);
     }
 
     #[test]

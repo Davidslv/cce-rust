@@ -36,10 +36,19 @@ responsibilities header.
 | `src/graph_store.rs` | Import graph + neighbor lookup (SPEC §6.7) | `Graph` |
 | `src/retriever.rs` | The hybrid pipeline (SPEC §6) | `search`, `is_code_lookup`, `SearchResult` |
 | `src/walker.rs` | Filesystem walk + ignore rules (SPEC §7.1) | `walk` |
-| `src/store.rs` | Index assembly + JSON persistence (SPEC §7) | `Index`, `build_from_dir`, `save`, `load` |
+| `src/store.rs` | Index assembly + JSON persistence, whole-file token counts (SPEC §7, DASH §3) | `Index`, `build_from_dir`, `save`, `load`, `baseline_tokens` |
 | `src/conformance.rs` | `conformance.json` emitter (SPEC §8) | `generate` |
 | `src/bench.rs` | Benchmark runner (SPEC §10) | `run`, `BenchReport` |
-| `src/main.rs` | CLI (SPEC §9) | clap command tree |
+| `src/metrics.rs` | Persisted metrics event log; injected clock/id source (DASH §2) | `MetricsWriter`, `read_log`, `parse_log`, `Clock`, `IdSource`, `parse_iso` |
+| `src/aggregator.rs` | Pure aggregate: totals, north-stars, series, deltas (DASH §4) | `aggregate`, `Aggregate`, `direction` |
+| `src/dashboard.rs` | Loopback-only, read-only, self-contained web server (DASH §6) | `run`, `serve`, `route` |
+| `src/main.rs` | CLI (SPEC §9, DASH §5) | clap command tree |
+
+The metrics/dashboard modules (`DASH` = [`DASHBOARD-SPEC.md`](../DASHBOARD-SPEC.md),
+v1.1) are the one part of the system that uses real wall-clock time; the clock and
+id source are injected, and the aggregator is a pure function of `(events, now,
+price)`. The full metrics pipeline — log → aggregator → API → page — its event
+schema, and the aggregation formulas live in [`dashboard.md`](dashboard.md).
 
 ## Data flow
 
