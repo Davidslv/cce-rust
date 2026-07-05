@@ -15,9 +15,13 @@
 
 pub mod config;
 pub mod tokenizer;
+pub mod pricing;
+pub mod savings;
+pub mod eval;
 pub mod embedder;
 pub mod packs;
 pub mod chunker;
+pub mod compress;
 pub mod sensitive;
 pub mod redactor;
 pub mod vector_store;

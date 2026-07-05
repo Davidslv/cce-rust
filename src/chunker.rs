@@ -61,8 +61,14 @@ pub struct FileChunks {
 }
 
 /// token_count(content) = max(1, floor(byte_length / CHARS_PER_TOKEN)).
+///
+/// Delegates to `tokenizer::estimate_tokens` — the ONE canonical `cce.tokens/v1`
+/// estimator (SPEC-V2.5 §4) — so the chunk-size heuristic, `conformance.json`, the
+/// Sync artifact, and the savings ledger all share a single byte-pinned rule.
+/// `CHARS_PER_TOKEN` remains this rule's documented divisor.
 pub fn token_count(content: &str) -> usize {
-    (content.len() / CHARS_PER_TOKEN).max(1)
+    debug_assert_eq!(CHARS_PER_TOKEN, 4);
+    crate::tokenizer::estimate_tokens(content) as usize
 }
 
 /// Compute the exact, cross-language chunk id (base SPEC §4.3). Unchanged in v2:

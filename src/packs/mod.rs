@@ -70,6 +70,54 @@ pub trait LanguagePack {
     /// so the grammar-binding lint (Layer 2) can verify they are real node kinds.
     fn import_node_types(&self) -> &'static [&'static str];
 
+    /// AST node-type strings that are the *body* of a definition — the block or
+    /// member list a declaration's header stops before. L2 chunk compression
+    /// (SPEC-V2.5 §2) forms the signature view by keeping the bytes from a
+    /// definition node's start up to its first body child, and eliding the rest.
+    /// e.g. Rust `block`/`declaration_list`, Python `block`, Ruby `body_statement`.
+    /// Declared here (not hard-coded in the compressor) so the grammar-binding lint
+    /// verifies they are real node kinds. Default: none (chunk compression then
+    /// falls back to the language-neutral first-line rule — see `crate::compress`).
+    fn body_node_types(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// AST node-type strings that count as a *leading doc* when one is the first
+    /// named element inside a definition body — the docstring / doc-comment L2
+    /// keeps in the compact view (SPEC-V2.5 §2). A docstring wrapped in an
+    /// `expression_statement` (Python) is unwrapped one level before matching, so a
+    /// pack declares the inner kind (`string`). e.g. Ruby/JS/TS/C `comment`, Rust
+    /// `line_comment`/`block_comment`, Python `string`. Default: none.
+    fn doc_node_types(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// AST node-type strings that, as a **direct child** of a container's body, are
+    /// kept as member declaration lines in the STRUCTURAL `compact` view of a
+    /// container chunk (SPEC-V2.5-TUNING §A). Methods are already kept via
+    /// `function_types` and need NOT be repeated here; this set declares the
+    /// NON-method members a language wants in the skeleton — e.g. Rust
+    /// `field_declaration`/`enum_variant`/`const_item`, TS `public_field_definition`/
+    /// `method_signature`/`property_signature`/`enum_assignment`, JS `field_definition`,
+    /// C `field_declaration`/`enumerator`. Declared here (not hard-coded in the
+    /// compressor) so the grammar-binding lint (Layer 2) verifies they are real node
+    /// kinds. Default: none (a container's skeleton then lists only its methods).
+    fn member_node_types(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Leading-token line prefixes that mark a direct-child statement as a kept
+    /// member in the STRUCTURAL `compact` view, for members that are ordinary calls
+    /// with no distinguishing node kind — chiefly the **Ruby model DSL**
+    /// (`has_many`, `belongs_to`, `validates`, `scope`, `enum`, `delegate`, …). A
+    /// direct child whose trimmed first line's leading identifier equals one of these
+    /// is kept (SPEC-V2.5-TUNING §A, "the lines a 'what are its associations'
+    /// question needs"). These are source tokens, NOT node kinds, so the Layer-2
+    /// grammar-binding lint does not check them. Default: none.
+    fn member_line_prefixes(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Ordered, de-duplicated module/include names imported by `source`.
     /// Must never panic; on any trouble it returns what it has so far.
     fn extract_imports(&self, root: Node, source: &[u8]) -> Vec<String>;

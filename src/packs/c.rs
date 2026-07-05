@@ -57,6 +57,24 @@ impl LanguagePack for CPack {
         &["preproc_include"]
     }
 
+    fn body_node_types(&self) -> &'static [&'static str] {
+        // `function_definition` → `compound_statement`; `struct_specifier`/
+        // `union_specifier` → `field_declaration_list`; `enum_specifier` →
+        // `enumerator_list`.
+        &["compound_statement", "field_declaration_list", "enumerator_list"]
+    }
+
+    fn doc_node_types(&self) -> &'static [&'static str] {
+        &["comment"]
+    }
+
+    fn member_node_types(&self) -> &'static [&'static str] {
+        // Struct/union fields (`field_declaration_list` → `field_declaration`) and
+        // enum constants (`enumerator_list` → `enumerator`). C has no methods inside
+        // these aggregates (SPEC-V2.5-TUNING §A).
+        &["field_declaration", "enumerator"]
+    }
+
     fn extract_imports(&self, root: Node, src: &[u8]) -> Vec<String> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();

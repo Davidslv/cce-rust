@@ -47,6 +47,26 @@ impl LanguagePack for TypeScriptPack {
         &["import_statement"]
     }
 
+    fn body_node_types(&self) -> &'static [&'static str] {
+        // Functions/methods/arrows → `statement_block`; `class_declaration` →
+        // `class_body`; `interface_declaration` → `interface_body`;
+        // `enum_declaration` → `enum_body`.
+        &["statement_block", "class_body", "interface_body", "enum_body"]
+    }
+
+    fn doc_node_types(&self) -> &'static [&'static str] {
+        // A `/** … */` JSDoc leading the body (conventionally above the def).
+        &["comment"]
+    }
+
+    fn member_node_types(&self) -> &'static [&'static str] {
+        // Class fields (`class_body` → `public_field_definition`), interface members
+        // (`interface_body` → `property_signature`/`method_signature`), and enum
+        // members (`enum_body` → `enum_assignment`). Class methods
+        // (`method_definition`) are kept via `function_types` (SPEC-V2.5-TUNING §A).
+        &["public_field_definition", "property_signature", "method_signature", "enum_assignment"]
+    }
+
     fn extract_imports(&self, root: Node, src: &[u8]) -> Vec<String> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();

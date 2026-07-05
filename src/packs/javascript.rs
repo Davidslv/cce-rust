@@ -46,6 +46,22 @@ impl LanguagePack for JavaScriptPack {
         &["import_statement"]
     }
 
+    fn body_node_types(&self) -> &'static [&'static str] {
+        // Functions/methods/arrows → `statement_block`; `class_declaration` →
+        // `class_body`.
+        &["statement_block", "class_body"]
+    }
+
+    fn doc_node_types(&self) -> &'static [&'static str] {
+        &["comment"]
+    }
+
+    fn member_node_types(&self) -> &'static [&'static str] {
+        // Class fields (`class_body` → `field_definition`). Methods
+        // (`method_definition`) are kept via `function_types` (SPEC-V2.5-TUNING §A).
+        &["field_definition"]
+    }
+
     fn extract_imports(&self, root: Node, src: &[u8]) -> Vec<String> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();

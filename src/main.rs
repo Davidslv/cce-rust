@@ -201,6 +201,36 @@ enum Command {
         #[arg(long)]
         validate: bool,
     },
+    /// Print the seven-bucket savings ledger + totals + a $ estimate (SPEC-V2.5 §3).
+    ///
+    /// The figures are "vs full-file baseline — not your real end-to-end agent
+    /// cost". For the real delta, run `cce eval` (SPEC-V2.5 §7).
+    Savings {
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        #[arg(long)]
+        store: Option<PathBuf>,
+        #[arg(long)]
+        metrics: Option<PathBuf>,
+        /// Emit the ledger as JSON (the same shape as `/api/metrics.savings_by_layer`).
+        #[arg(long)]
+        json: bool,
+    },
+    /// Run the real-world A/B eval harness over recorded runs (SPEC-V2.5 §7).
+    ///
+    /// Correctness-gated (punts excluded) and cost-primary (cost includes
+    /// sub-agents). Does not call a model; it aggregates run outputs recorded by
+    /// `eval/run.sh` (see `eval/README.md`).
+    Eval {
+        /// Recorded run outputs (JSONL). Required.
+        runs: PathBuf,
+        /// The pinned question set with ground truth (JSONL).
+        #[arg(long, default_value = "eval/questions.jsonl")]
+        questions: PathBuf,
+        /// Emit the full report as JSON.
+        #[arg(long)]
+        json: bool,
+    },
 }
 
 /// Subcommands of `cce sync` (SPEC-SYNC §5). All are workspace-aware and
@@ -350,6 +380,8 @@ fn main() -> ExitCode {
         Command::Init { dir, agent, remote, force } => cmd_init_mcp(dir, agent, remote, force),
         Command::Conformance { fixture_dir, output } => cmd_conformance(&fixture_dir, &output),
         Command::Packs { validate } => cmd_packs(validate),
+        Command::Savings { dir, store, metrics, json } => cmd_savings(dir, store, metrics, json),
+        Command::Eval { runs, questions, json } => cmd_eval(&runs, &questions, json),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -504,9 +536,19 @@ fn cmd_search(
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     // Best-effort metrics: a search event (DASHBOARD-SPEC §2.1). The write is
-    // fail-open, so it never affects the result or the exit code.
-    let record =
-        build_search_record(&index, &results, query, top_k, graph_enabled, latency_ms, "cli");
+    // fail-open, so it never affects the result or the exit code. `cce search`
+    // serves whole chunk bodies (detail:full), so the L2 chunk_compression bucket
+    // is zero here — compression is the agent-facing `context_search` path.
+    let record = build_search_record(
+        &index,
+        &results,
+        query,
+        top_k,
+        graph_enabled,
+        latency_ms,
+        "cli",
+        cce::compress::DetailLevel::Full,
+    );
     let clock = SystemClock;
     let ids = HexIdSource::default();
     let writer =
@@ -659,6 +701,93 @@ fn cmd_stats(store: Option<PathBuf>, dir: Option<PathBuf>) -> Result<(), String>
     for (kind, n) in &per_kind {
         println!("    {kind:<20}: {n}");
     }
+    Ok(())
+}
+
+/// `cce savings` (SPEC-V2.5 §3): print the seven-bucket ledger, totals, and an
+/// offline $ estimate. Purely log-derived, no network. Every surface is labelled
+/// with the honesty note.
+fn cmd_savings(
+    dir: Option<PathBuf>,
+    store: Option<PathBuf>,
+    metrics: Option<PathBuf>,
+    json: bool,
+) -> Result<(), String> {
+    use cce::metrics::Event;
+    let metrics_path = resolve_metrics_path(metrics, store, dir);
+    let log = cce::metrics::read_log(&metrics_path);
+    let buckets = log.events.iter().filter_map(|e| match e {
+        Event::Search(s) => Some(&s.savings),
+        _ => None,
+    });
+    let ledger = cce::savings::sum_by_layer(buckets);
+    let table = cce::pricing::PriceTable::builtin();
+    let dollars = table.dollars_saved(ledger.total.saved_tokens);
+
+    if json {
+        let body = serde_json::json!({
+            "savings_by_layer": ledger,
+            "pricing_id": table.id,
+            "estimated_dollars_saved": format!("{dollars:.2}"),
+            "source": metrics_path.display().to_string(),
+        });
+        println!("{}", serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string()));
+        return Ok(());
+    }
+
+    println!("CCE savings ledger  ({})", cce::savings::SAVINGS_NOTE);
+    println!("  source : {}", metrics_path.display());
+    println!("  pricing: {}  (offline, embedded; edit src/pricing.json to change)", table.id);
+    println!();
+    println!("  {:<26}{:>14}{:>18}", "layer", "saved_tokens", "baseline_tokens");
+    for (name, b) in ledger.ordered() {
+        println!("  {:<26}{:>14}{:>18}", name, b.saved_tokens, b.baseline_tokens);
+    }
+    println!("  {}", "-".repeat(56));
+    println!(
+        "  {:<26}{:>14}{:>18}",
+        "total", ledger.total.saved_tokens, ledger.total.baseline_tokens
+    );
+    println!();
+    println!("  estimated $ saved: ${dollars:.2}  (default-model input rate)");
+    println!();
+    println!("  This is the internal \"vs full-file\" figure, NOT your real agent cost.");
+    println!("  For the real end-to-end delta, run the A/B eval harness: see eval/README.md.");
+    Ok(())
+}
+
+/// `cce eval` (SPEC-V2.5 §7): aggregate recorded A/B runs into the correctness-
+/// gated, cost-primary report. No model call — it reads run outputs from disk.
+fn cmd_eval(runs: &Path, questions: &Path, json: bool) -> Result<(), String> {
+    let qtext = std::fs::read_to_string(questions)
+        .map_err(|e| format!("could not read questions {}: {e}", questions.display()))?;
+    let rtext = std::fs::read_to_string(runs)
+        .map_err(|e| format!("could not read runs {}: {e}", runs.display()))?;
+    let report = cce::eval::evaluate_files(&qtext, &rtext);
+
+    if json {
+        println!("{}", serde_json::to_string_pretty(&report).unwrap_or_else(|_| "{}".to_string()));
+        return Ok(());
+    }
+
+    println!("CCE eval — {}", report.note);
+    println!("  questions: {}   skipped runs: {}", report.questions, report.skipped_runs);
+    let arm = |name: &str, a: &cce::eval::ArmSummary| {
+        println!(
+            "  {name:<4}: correct {}/{} runs · punts {} · incorrect {} · correct_cost ${:.2} · mean ${:.2}",
+            a.correct, a.runs, a.punts, a.incorrect, a.correct_cost_usd, a.mean_correct_cost_usd
+        );
+    };
+    arm("off", &report.off);
+    arm("on", &report.on);
+    println!("  paired-correct (both arms): {}", report.paired_correct);
+    println!(
+        "  paired cost: off ${:.2} · on ${:.2} · saved ${:.2}  ({:.1}%)",
+        report.paired_off_cost_usd,
+        report.paired_on_cost_usd,
+        report.cost_delta_usd,
+        report.cost_saved_ratio * 100.0
+    );
     Ok(())
 }
 

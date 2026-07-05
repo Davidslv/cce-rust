@@ -1,0 +1,10 @@
+{
+  "id": "cce.pricing/builtin-v1",
+  "note": "Embedded, OFFLINE, updatable price table. Never fetched at runtime. Prices are USD per 1,000,000 tokens and are ESTIMATES for the $-saved figure only; edit this file to match your provider's current rates.",
+  "default_model": "generic-frontier",
+  "models": {
+    "generic-frontier": { "input_per_million_usd": 3.0, "output_per_million_usd": 15.0 },
+    "generic-mid": { "input_per_million_usd": 1.0, "output_per_million_usd": 5.0 },
+    "generic-small": { "input_per_million_usd": 0.25, "output_per_million_usd": 1.25 }
+  }
+}

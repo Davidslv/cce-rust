@@ -26,6 +26,33 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_cce")
 }
 
+// Byte-pinned copies of the three expand-first tool descriptions (SPEC-V2.5 §6 +
+// SPEC-V2.5-TUNING §B). These mirror the private consts in `src/mcp/tools.rs`
+// verbatim; `tools/list` must serve exactly these bytes, and cce-ruby reconciles to
+// them. A drift here means the schema changed and both engines must be re-synced.
+const CONTEXT_SEARCH_DESC: &str = "Search THIS project's code by meaning, across files. Use it \
+FIRST for any cross-file question — \"where is X\", \"how does Y work\", \"what calls Z\" — or \
+whenever you cannot already name the exact file to open. Returns the most relevant code chunks \
+(file:line + kind) from a hybrid vector + BM25 index, so you don't pay tokens for whole files. \
+Skip it only when you already know the single file you need — reading that path directly is fine; \
+cce does not win there. Results are COMPACT and each carries a `chunk_id`; to read a full body \
+call `expand_chunk(chunk_id)` — do NOT re-issue `context_search` for a target you already found. \
+Widen to import-graph neighbours with `related_context(chunk_id)`.";
+
+const EXPAND_CHUNK_DESC: &str = "Read the FULL detail of a chunk `context_search` already \
+returned, by its `chunk_id`. `context_search` serves COMPACT chunks (a header + members, or a \
+signature + first line); when you need the real body, call this — do NOT re-run `context_search` \
+for a chunk you already have. scope=body recovers the exact full body; scope=file returns every \
+chunk in the same file; scope=neighbors returns chunks from import-graph-related files. A stale \
+or unknown `chunk_id` returns a short, actionable error you can retry from, never a crash.";
+
+const RELATED_CONTEXT_DESC: &str = "Given a `chunk_id` from `context_search`, return the chunks \
+connected to it through the import graph — both what it imports AND its consumers (reverse edges) \
+— as compact entries. Use it to widen context on demand — trace how a symbol is used or what it \
+depends on across files — instead of pre-loading whole neighbourhoods; expand any result with \
+`expand_chunk(chunk_id)`. Pairs with `context_search` (find first) and `expand_chunk` (read the \
+full body).";
+
 /// Write a tiny self-contained Python repo into `dir`.
 fn write_tiny_repo(dir: &Path) {
     std::fs::write(dir.join("auth.py"), "def hash_password(pw):\n    return pw + 'salt'\n")
@@ -93,14 +120,39 @@ fn handshake_list_and_search_over_a_fixture_index_logs_metrics() {
     assert_eq!(init["result"]["serverInfo"]["name"], "cce");
     assert!(init["result"]["capabilities"]["tools"].is_object());
 
-    // tools/list — exactly the three tools, in order, with the schemas.
+    // tools/list — exactly the five tools, in fixed order, with the schemas.
     let list = by_id(&resps, 2);
     let tools = list["result"]["tools"].as_array().unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, vec!["context_search", "index_status", "record_feedback"]);
+    assert_eq!(
+        names,
+        vec![
+            "context_search",
+            "index_status",
+            "record_feedback",
+            "expand_chunk",
+            "related_context"
+        ]
+    );
     assert_eq!(tools[0]["inputSchema"]["required"], serde_json::json!(["query"]));
     assert_eq!(tools[0]["inputSchema"]["properties"]["top_k"]["default"], 8);
-    assert!(tools[0]["description"].as_str().unwrap().contains("PREFERRED"));
+    assert_eq!(
+        tools[0]["inputSchema"]["properties"]["detail"]["enum"],
+        serde_json::json!(["signature", "compact", "full"])
+    );
+    // Tool descriptions are byte-pinned (part of the schema, SPEC-V2.5 §6): the
+    // expand-first rewrite (SPEC-V2.5-TUNING §B) must match to the byte, because the
+    // Ruby engine reconciles to these exact strings.
+    assert_eq!(tools[0]["description"].as_str().unwrap(), CONTEXT_SEARCH_DESC);
+    assert_eq!(tools[3]["description"].as_str().unwrap(), EXPAND_CHUNK_DESC);
+    assert_eq!(tools[4]["description"].as_str().unwrap(), RELATED_CONTEXT_DESC);
+    // The expand-first rule is present and steers away from the re-search reflex.
+    assert!(CONTEXT_SEARCH_DESC
+        .contains("do NOT re-issue `context_search` for a target you already found"));
+    assert!(EXPAND_CHUNK_DESC.contains("do NOT re-run `context_search`"));
+    // The Layer-7 tools carry their pinned schemas.
+    assert_eq!(tools[3]["inputSchema"]["properties"]["scope"]["default"], "body");
+    assert_eq!(tools[4]["inputSchema"]["required"], serde_json::json!(["chunk_id"]));
 
     // context_search
     let search = by_id(&resps, 3);
@@ -115,6 +167,99 @@ fn handshake_list_and_search_over_a_fixture_index_logs_metrics() {
     // A `search` event was logged for the dashboard.
     let log = std::fs::read_to_string(tmp.path().join(".cce").join("metrics.jsonl")).unwrap();
     assert!(log.contains("\"event\":\"search\""), "no search event logged: {log}");
+}
+
+/// The 16-hex `#chunk_id` on the first result header line mentioning `file_hint`.
+fn chunk_id_for(text: &str, file_hint: &str) -> String {
+    for line in text.lines() {
+        if line.contains(file_hint) {
+            if let Some(pos) = line.rfind('#') {
+                let id: String =
+                    line[pos + 1..].chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+                if id.len() == 16 {
+                    return id;
+                }
+            }
+        }
+    }
+    panic!("no chunk_id for {file_hint} in:\n{text}");
+}
+
+#[test]
+fn context_search_compact_then_expand_chunk_round_trips_to_full() {
+    // SPEC-V2.5 §2/§7: context_search serves compact + a chunk_id; expand_chunk
+    // (scope=body) recovers the EXACT full body the store holds.
+    let tmp = tempfile::tempdir().unwrap();
+    write_tiny_repo(tmp.path());
+    index_dir(tmp.path());
+    let dir = tmp.path().to_string_lossy().to_string();
+
+    // Compact search: the body is reduced but the chunk_id is present for expansion.
+    let input = "{\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"context_search\",\"arguments\":{\"query\":\"process payment amount\",\"no_graph\":true,\"detail\":\"compact\"}}}\n";
+    let out = drive(&["mcp", "--dir", &dir], input, &[]);
+    let resps = responses(&out);
+    let text = by_id(&resps, 1)["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("payments.py"), "got: {text}");
+    assert!(text.contains("def process_payment(amount):"), "compact signature missing: {text}");
+    // The compact footer advertises expansion.
+    assert!(text.contains("expand_chunk(chunk_id"), "no expansion hint: {text}");
+
+    let id = chunk_id_for(text, "payments.py");
+
+    // expand_chunk(body) returns the exact stored full body — byte-for-byte.
+    let einput = format!(
+        "{{\"id\":2,\"method\":\"tools/call\",\"params\":{{\"name\":\"expand_chunk\",\"arguments\":{{\"chunk_id\":\"{id}\",\"scope\":\"body\"}}}}}}\n"
+    );
+    let eout = drive(&["mcp", "--dir", &dir], &einput, &[]);
+    let eresps = responses(&eout);
+    let body = by_id(&eresps, 2)["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(body, "def process_payment(amount):\n    return amount");
+    assert_eq!(by_id(&eresps, 2)["result"]["isError"], false);
+}
+
+#[test]
+fn related_context_returns_import_graph_neighbours() {
+    // payments.py imports auth.py; related_context on a payments chunk surfaces the
+    // auth.py neighbour (SPEC-V2.5 §7), deterministically.
+    let tmp = tempfile::tempdir().unwrap();
+    write_tiny_repo(tmp.path());
+    index_dir(tmp.path());
+    let dir = tmp.path().to_string_lossy().to_string();
+
+    let input = "{\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"context_search\",\"arguments\":{\"query\":\"process payment amount\",\"no_graph\":true}}}\n";
+    let out = drive(&["mcp", "--dir", &dir], input, &[]);
+    let text =
+        by_id(&responses(&out), 1)["result"]["content"][0]["text"].as_str().unwrap().to_string();
+    let id = chunk_id_for(&text, "payments.py");
+
+    let rinput = format!(
+        "{{\"id\":2,\"method\":\"tools/call\",\"params\":{{\"name\":\"related_context\",\"arguments\":{{\"chunk_id\":\"{id}\"}}}}}}\n"
+    );
+    let rout = drive(&["mcp", "--dir", &dir], &rinput, &[]);
+    let rresps = responses(&rout);
+    let rtext = by_id(&rresps, 2)["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(rtext.contains("related to payments.py via import graph"), "got: {rtext}");
+    assert!(rtext.contains("auth.py"), "neighbour auth.py missing: {rtext}");
+    assert!(rtext.contains("hash_password"), "neighbour body missing: {rtext}");
+
+    // Deterministic across runs.
+    let rout2 = drive(&["mcp", "--dir", &dir], &rinput, &[]);
+    let rresps2 = responses(&rout2);
+    let rtext2 = by_id(&rresps2, 2)["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(rtext, rtext2);
+}
+
+#[test]
+fn expand_chunk_unknown_id_is_friendly_not_a_crash() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_tiny_repo(tmp.path());
+    index_dir(tmp.path());
+    let input = "{\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"expand_chunk\",\"arguments\":{\"chunk_id\":\"deadbeefdeadbeef\"}}}\n";
+    let out = drive(&["mcp", "--dir", &tmp.path().to_string_lossy()], input, &[]);
+    let resps = responses(&out);
+    let text = by_id(&resps, 1)["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("no chunk with id deadbeefdeadbeef"), "got: {text}");
+    assert_eq!(by_id(&resps, 1)["result"]["isError"], false);
 }
 
 #[test]

@@ -1,0 +1,6 @@
+{"id": "q1-hash-password", "question": "Where is the password hashing function defined, and what is it called?", "must_include": ["auth.py", "hash_password"]}
+{"id": "q2-process-payment", "question": "Which file and function handles processing a payment amount?", "must_include": ["payments.py", "process_payment"]}
+{"id": "q3-token-estimator", "question": "Which function estimates the token count used for the savings ledger, and in which module?", "must_include": ["estimate_tokens", "tokenizer"]}
+{"id": "q4-savings-buckets", "question": "How many savings buckets does the ledger track, and name the retrieval one?", "must_include": ["seven", "retrieval"]}
+{"id": "q5-metrics-schema", "question": "What is the schema tag stamped on every metrics event?", "must_include": ["cce.metrics/v1"]}
+{"id": "q6-dashboard-loopback", "question": "What address does the dashboard bind to, and is it loopback-only?", "must_include": ["127.0.0.1", "loopback"]}

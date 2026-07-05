@@ -55,6 +55,27 @@ impl LanguagePack for RustPack {
         &["use_declaration"]
     }
 
+    fn body_node_types(&self) -> &'static [&'static str] {
+        // `function_item` → `block`; `impl_item`/`trait_item` → `declaration_list`;
+        // `struct_item`/`union_item` → `field_declaration_list`; `enum_item` →
+        // `enum_variant_list`. The signature is the header before any of these.
+        &["block", "declaration_list", "field_declaration_list", "enum_variant_list"]
+    }
+
+    fn doc_node_types(&self) -> &'static [&'static str] {
+        // A `///`/`/** */` doc comment leading the body (outer docs sit above the
+        // item, outside the chunk span; inner `//!` docs can lead a body).
+        &["line_comment", "block_comment"]
+    }
+
+    fn member_node_types(&self) -> &'static [&'static str] {
+        // Struct/union fields (`field_declaration_list` → `field_declaration`),
+        // enum variants (`enum_variant_list` → `enum_variant`), and impl/trait
+        // constants (`declaration_list` → `const_item`). Methods (`function_item`)
+        // are kept via `function_types` (SPEC-V2.5-TUNING §A).
+        &["field_declaration", "enum_variant", "const_item"]
+    }
+
     fn extract_imports(&self, root: Node, src: &[u8]) -> Vec<String> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();

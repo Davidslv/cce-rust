@@ -14,7 +14,7 @@
 //! - Recompute BM25 and the graph on load (they are derived, not persisted).
 //! - It does NOT run retrieval; it hands its data to `retriever`.
 
-use crate::chunker::{token_count, Chunk, Chunker};
+use crate::chunker::{Chunk, Chunker};
 use crate::config::SPEC_VERSION;
 use crate::embedder::Embedder;
 use crate::graph_store::Graph;
@@ -161,8 +161,11 @@ impl Index {
                 raw.clone()
             };
             // Persist the whole-file token count for the baseline counterfactual
-            // (DASHBOARD-SPEC §3), independent of how the file chunks.
-            file_tokens.insert(rel_path.clone(), token_count(&content));
+            // (DASHBOARD-SPEC §3 / SPEC-V2.5 §2), independent of how the file chunks.
+            // Counted with the ONE savings estimator (`cce.tokens/v1`, SPEC-V2.5 §4)
+            // so the retrieval baseline is coherent with `served_tokens`.
+            file_tokens
+                .insert(rel_path.clone(), crate::tokenizer::estimate_tokens(&content) as usize);
             let fc = chunker.chunk_file(rel_path, &content);
             if !fc.imports.is_empty() {
                 file_imports.insert(rel_path.clone(), fc.imports);
@@ -244,17 +247,23 @@ mod tests {
 
     #[test]
     fn persists_whole_file_token_counts_and_baseline_sums() {
-        // DASHBOARD-SPEC §3: index persists each file's whole-file token_count so
-        // baseline_tokens (the "read the whole file" counterfactual) is accurate.
-        use crate::chunker::token_count;
+        // DASHBOARD-SPEC §3 / SPEC-V2.5 §2+§4: the index persists each file's
+        // whole-file token estimate (the "read the whole file" counterfactual) with
+        // the ONE savings estimator, so baseline_tokens is accurate and coherent
+        // with served_tokens.
+        use crate::tokenizer::estimate_tokens;
         let e = HashEmbedder;
         let (idx, _) = Index::build_from_dir(&fixture_dir(), &e);
 
-        // Every source file has a whole-file token count equal to token_count of
+        // Every source file has a whole-file token count equal to the estimator over
         // the file's full contents.
         for name in ["auth.py", "payments.py", "README.md"] {
             let src = std::fs::read_to_string(fixture_dir().join(name)).unwrap();
-            assert_eq!(idx.file_tokens.get(name).copied(), Some(token_count(&src)), "{name}");
+            assert_eq!(
+                idx.file_tokens.get(name).copied(),
+                Some(estimate_tokens(&src) as usize),
+                "{name}"
+            );
         }
 
         // The baseline over a set of DISTINCT result files sums their whole-file
