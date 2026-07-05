@@ -50,6 +50,17 @@ not — do makes the real attack surface clear.
   opt-out flag **`--allow-secrets`** disables **both** layers for a run (sensitive
   files are indexed and secrets stored verbatim); `cce` prints a warning when it
   is set, and you own the resulting store's sensitivity.
+- **Workspace metadata is non-secret; per-member scrubbing still applies (since
+  v2.2).** A workspace adds only two metadata files at the root —
+  `.cce/workspace.yml` (the detected member list) and `.cce/workspace-graph.json`
+  (cross-member dependency edges) — both derived from directory structure and
+  declared manifest dependency *names*; they contain **no source content and no
+  secrets**. Every member is still indexed into its own store with the **same
+  secret-safe-by-default** Layer 1 + Layer 2 protection described above (a
+  member's store is byte-identical to indexing it standalone), and a federated
+  search/dashboard only ever reads those per-member stores and logs. `cce
+  dashboard --workspace` keeps the loopback-only, read-only, self-contained
+  posture and simply federates each member's metrics log.
 - **The dashboard server (v1.1) is loopback-only, read-only, and
   self-contained.** `cce dashboard` binds **`127.0.0.1` only**, so it is not
   reachable from other hosts. Every endpoint is **read-only** — nothing it serves

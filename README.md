@@ -10,7 +10,9 @@ Fusion.
 Since **v2.0** language support is a set of pluggable **language packs**: the
 core engine holds zero language-specific knowledge, and six packs ship in the box
 — **Python, JavaScript, Ruby, Rust, TypeScript, and C** (see
-[Supported languages](#supported-languages)).
+[Supported languages](#supported-languages)). Since **v2.2** it can also treat a
+directory of related codebases as one searchable **workspace** while each member
+stays isolated (see [Workspaces / ecosystems](#workspaces--ecosystems)).
 
 ```
 index a directory → walk → AST-chunk → embed → store (vectors + BM25 + import graph)
@@ -346,6 +348,75 @@ per 1M input tokens for the $-saved estimate, default 3.00), `--no-open`.
 See [`docs/dashboard.md`](docs/dashboard.md) for the pipeline, event schema, and
 the exact aggregation formulas.
 
+## Workspaces / ecosystems
+
+CCE can treat a directory of related codebases — a Rails app, its engines, and a
+frontend under one root — as a single searchable **ecosystem**, while **each
+member stays isolated in its own store** (SPEC-V2.2). Three ideas: members are
+auto-detected into a reviewable `.cce/workspace.yml`; every member is indexed into
+its own `<member>/.cce/index.json` (byte-identical to indexing it standalone); and
+a federated search runs the standard hybrid retrieval over the **union** of the
+members' chunks, tagging each result with its package and adding **cross-member
+dependency edges** read from manifests.
+
+Worked example — a generic ecosystem laid out as:
+
+```
+shop/
+  app/                     Gemfile (gem "billing"), config/application.rb, app/models/charge.rb
+  engines/
+    billing/               billing.gemspec (name = "billing"), lib/billing.rb, lib/billing/engine.rb
+  web/                     package.json (name = "web"), tsconfig.json, src/index.ts
+```
+
+```bash
+# 1. Detect members → write shop/.cce/workspace.yml (reviewable, hand-editable).
+cce workspace init shop
+#   app      rails-app    app             · package app
+#   billing  ruby-engine  engines/billing · package billing
+#   web      typescript   web             · package web
+
+# 2. Members + the detected cross-member edges.
+cce workspace list shop
+#   app -> billing  (via gemfile)
+
+# 3. Index every member into its own store, then build the workspace graph.
+cce index --workspace shop
+
+# 4. Federated search over the union, scoped and labelled by package.
+cce search "charge the customer" shop --workspace --package app,billing --json
+#   → results carry {package, file_path (member-relative), …}; a top hit in `app`
+#     expands into `billing` via the app→billing dependency edge.
+
+# 5. Per-member stats and a federated dashboard (roll-up + by_package breakdown).
+cce stats     --workspace shop
+cce dashboard --workspace shop
+```
+
+`workspace.yml` (deterministic, members sorted by path):
+
+```yaml
+version: 1
+name: shop
+members:
+  - name: app
+    path: app
+    type: rails-app
+    package: app
+  - name: billing
+    path: engines/billing
+    type: ruby-engine
+    package: billing
+  - name: web
+    path: web
+    type: typescript
+    package: web
+```
+
+Absent `--workspace`, every command behaves exactly as before. See
+[`docs/workspace.md`](docs/workspace.md) for the model, manifest format, detection
+rules, federation semantics, and where the approach strains.
+
 ## Supported languages
 
 Language support is a set of pluggable **language packs** (SPEC-V2). The core
@@ -388,13 +459,13 @@ node type in a `kind` field alongside the coarse `chunk_type`
 ## Tests & coverage
 
 ```bash
-cargo test                                                  # 154 tests
+cargo test                                                  # 183 tests
 cargo clippy --all-targets --all-features -- -D warnings    # lint gate
 cargo fmt --check                                           # format gate
 ```
 
-The suite is **154 passing tests** (+1 `#[ignore]` Ollama integration test) and
-measures **95.08% line coverage** via `cargo llvm-cov`. The default suite is
+The suite is **183 passing tests** (+1 `#[ignore]` Ollama integration test) and
+measures **92.4% line coverage** via `cargo llvm-cov`. The default suite is
 fully deterministic and makes no network calls — including the metrics subsystem,
 whose clock and id source are injected and whose dashboard tests bind an
 ephemeral loopback port. A CI test gate runs the three-layer validators over every
@@ -407,9 +478,12 @@ language pack, and a guard test asserts the core chunker names no language.
 | [`SPEC.md`](SPEC.md) | The normative base specification (v1.0) |
 | [`DASHBOARD-SPEC.md`](DASHBOARD-SPEC.md) | The dashboard & observability addendum (v1.1) |
 | [`SPEC-V2.md`](SPEC-V2.md) | The language-packs evolution spec (v2.0) |
+| [`SPEC-V2.1.md`](SPEC-V2.1.md) | The secret-protection evolution spec (v2.1) |
+| [`SPEC-V2.2.md`](SPEC-V2.2.md) | The workspace-mode evolution spec (v2.2) |
 | [`docs/getting-started.md`](docs/getting-started.md) | Install → first index + search |
 | [`docs/adding-a-language.md`](docs/adding-a-language.md) | Step-by-step guide to adding a language pack |
 | [`docs/architecture.md`](docs/architecture.md) | Design goals, pipeline, language packs, and where it strains |
+| [`docs/workspace.md`](docs/workspace.md) | Workspace model, manifest, detection, federation semantics |
 | [`docs/dashboard.md`](docs/dashboard.md) | Metrics pipeline, event schema, aggregation formulas |
 | [`docs/how-to.md`](docs/how-to.md) | Task recipes: index, search, feedback, dashboard, bench, conformance |
 | [`docs/DECISIONS.md`](docs/DECISIONS.md) | How each spec ambiguity was resolved |

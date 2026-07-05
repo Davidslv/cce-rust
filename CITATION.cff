@@ -6,10 +6,11 @@ abstract: >-
   files with tree-sitter through pluggable language packs (Python, JavaScript,
   Ruby, Rust, TypeScript, C), embedding chunks, and storing a vector + keyword
   index on disk as JSON, then answers queries with hybrid vector + BM25 retrieval.
-  Built test-first from SPEC v1.0, the Dashboard addendum (v1.1), and the v2.0
-  language-packs evolution.
+  Built test-first from SPEC v1.0, the Dashboard addendum (v1.1), the v2.0
+  language-packs evolution, v2.1 secret protection, and v2.2 workspace mode
+  (federating a multi-codebase ecosystem while each member stays isolated).
 type: software
-version: 2.1.0
+version: 2.2.0
 date-released: "2026-07-05"
 license: MIT
 repository-code: "https://github.com/davidslv/cce-rust"
@@ -27,3 +28,5 @@ keywords:
   - rust
   - clean-room
   - language-packs
+  - workspaces
+  - monorepo

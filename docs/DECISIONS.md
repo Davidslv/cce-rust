@@ -255,3 +255,51 @@ secrets, so they need no opt-out and keep protection on. Adding the flag solely 
 for the private-key block, a closure over the generic match). `regex = "=1.12.4"`
 was already resolved transitively, so promoting it to a direct, `=`-pinned
 dependency adds no new code to the tree.
+
+## v2.2 — workspace mode (SPEC-V2.2)
+
+The following `SPEC-V2.2.md` ambiguities were resolved to the simplest reasonable
+reading.
+
+**Federation is realised as a union corpus with member-namespaced paths.** The
+spec defines a workspace search as *exactly* the §6 retrieval over the union of
+members' chunks, with a `(member, file_path)` diversity key. Rather than fork the
+retriever, `retriever::search` is split into `rank_core` (the §6 pipeline without
+graph expansion) and a thin `search` wrapper; federation builds a combined `Index`
+whose chunk paths are namespaced `<member>/<rel>` and calls the *same* `rank_core`.
+Namespacing makes the diversity key naturally `(member, file_path)` and lets BM25
+statistics span the union — so the "single index over A+B" equivalence holds by
+construction, and the namespace is stripped for output.
+
+**The combined graph is the union of per-member graphs, not a rebuild over the
+union.** Building one import graph over all namespaced files could resolve a module
+name in member A to a same-stemmed file in member B, inventing a cross-member file
+edge the spec does not want. Instead each member's own intra-store graph is unioned
+(namespaced) via `Graph::{out_pairs,from_pairs}`; the *only* cross-member links are
+the declared dependency edges, applied by a separate member-level expansion step.
+
+**The §8 fixture carries the engine/tsconfig markers the assertions require.** The
+§8 sketch lists `billing` as a `ruby-engine` and `web` as `typescript`, but the §3
+detection rules only yield those types given a `lib/**/engine.rb` (engine) and a
+`tsconfig.json` (typescript). The shipped fixture therefore includes
+`engines/billing/lib/billing/engine.rb` and `web/tsconfig.json` — the minimal
+markers that make the normative detection produce the types §8 asserts.
+
+**Workspace `[<dir>]` is an optional positional for `search`/`stats`/`dashboard`.**
+`index --workspace [<dir>]` already had a positional dir; to match the spec's
+`[<dir>]` notation on the other workspace commands (whose single-repo forms use
+`--dir`/`--store`), an optional positional `DIR` was added, preferred over `--dir`
+in workspace mode. Single-repo behaviour is untouched.
+
+**Workspace search is read-only over member stores (no metrics write).** A
+federated search reads the members' stores and logs but does not append its own
+`search` event to any member's `metrics.jsonl` (which member would own it?). The
+`--json` output still carries a top-level `query_id` for shape compatibility; it is
+generated, not persisted. The federated dashboard aggregates each member's existing
+per-member events.
+
+**`serde_yaml` for reading, a hand-rolled writer for byte-determinism.** The
+manifest is emitted by a small canonical writer so the exact bytes are under our
+control (and match across languages); `serde_yaml = "=0.9.34"` parses hand-written
+manifests back. Emitting via `serde_yaml` was avoided because its formatting is not
+guaranteed stable across versions or identical to another language's YAML library.
