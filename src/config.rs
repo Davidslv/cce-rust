@@ -54,6 +54,25 @@ pub const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024;
 /// Spec version emitted in `conformance.json`.
 pub const SPEC_VERSION: &str = "1.0";
 
+// --- Dashboard & observability (DASHBOARD-SPEC v1.1 §1) ---
+
+/// Schema tag stamped on every metrics event and on the aggregate API body.
+pub const METRICS_SCHEMA: &str = "cce.metrics/v1";
+/// Default metrics log filename, written inside the store directory.
+pub const METRICS_FILE: &str = "metrics.jsonl";
+/// A non-empty search whose top score is below this is "low confidence".
+pub const LOW_CONFIDENCE_THRESHOLD: f64 = 0.30;
+/// Current-vs-prior comparison window length, in days.
+pub const TREND_WINDOW_DAYS: i64 = 7;
+/// Default loopback port for `cce dashboard`.
+pub const DEFAULT_DASHBOARD_PORT: u16 = 8787;
+/// Default USD price per 1M input tokens, used for the $-saved estimate.
+pub const DEFAULT_INPUT_PRICE_PER_MILLION: f64 = 3.00;
+/// How many recent searches the aggregate/API returns.
+pub const RECENT_SEARCHES_LIMIT: usize = 20;
+/// Delta magnitude at or below this is treated as "flat" (no direction).
+pub const DIRECTION_EPSILON: f64 = 1e-9;
+
 /// Selects the embedding backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbedderKind {

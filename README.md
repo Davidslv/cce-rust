@@ -74,7 +74,7 @@ cargo test                # confirm a green build
 
 ```bash
 cargo install --path .    # installs `cce` into ~/.cargo/bin
-cce --version             # cce 1.0.0
+cce --version             # cce 1.1.0
 ```
 
 ### Optional: the semantic embedder (Ollama)
@@ -135,22 +135,30 @@ Add `--json` for machine-readable output:
 
 ```bash
 $ cce search "cosine similarity ranking" --dir ./src --top-k 3 --no-graph --json
-[
-  {
-    "chunk_id": "2d5d9159a130943e",
-    "chunk_type": "module",
-    "end_line": 75,
-    "file_path": "vector_store.rs",
-    "rank": 1,
-    "score": "0.852287",
-    "start_line": 1
-  },
-  ...
-]
+{
+  "query_id": "3f9a1c0b7e21",
+  "results": [
+    {
+      "chunk_id": "2d5d9159a130943e",
+      "chunk_type": "module",
+      "end_line": 75,
+      "file_path": "vector_store.rs",
+      "rank": 1,
+      "score": "0.852287",
+      "start_line": 1
+    }
+  ]
+}
 ```
 
+Since v1.1 the `--json` body is an **object** with a top-level `query_id` (the id
+of the recorded search event — see [Dashboard & observability](#dashboard--observability))
+wrapping the `results` array. Human output prints the same id on a final
+`query-id:` line. Pass `--no-metrics` to skip recording (then `query_id` is null).
+
 Search flags: `--dir <dir>` (resolves `<dir>/.cce`) or `--store <path>`,
-`--top-k N` (default 5), `--no-graph` (skip import-graph expansion), `--json`.
+`--top-k N` (default 5), `--no-graph` (skip import-graph expansion), `--json`,
+`--no-metrics`.
 
 ### A worked example (AST chunking)
 
@@ -213,6 +221,45 @@ $ cce conformance test/fixture -o conformance.json
 wrote conformance.json
 ```
 
+## Dashboard & observability
+
+Since v1.1, CCE keeps a small **persisted metrics log** so you can see whether
+using it is *improving or degrading your experience over time*, from real data.
+Every `cce search` and `cce index` appends one JSON line to
+`<store-dir>/metrics.jsonl` (best-effort — a metrics failure never affects the
+command), and `cce feedback` lets you rate a past result. A local, read-only web
+dashboard visualizes two north-stars — **token/cost savings** and **retrieval
+quality** — each trended current-vs-prior with an ↑ improving / ↓ degrading / →
+flat indicator, plus a recent-searches table. (The base engine and
+`conformance.json` are untouched by any of this.)
+
+```bash
+# 1. Index and search as usual — events are recorded automatically.
+$ cce index ./src
+$ cce search "how does confidence scoring work" --dir ./src
+ 1. [0.83xxxx] retriever.rs:1-423 (module)
+    //! # retriever — the hybrid retrieval pipeline
+query-id: 3f9a1c0b7e21  ·  rate with: cce feedback 3f9a1c0b7e21 --helpful|--not-helpful
+
+# 2. Rate that result (optional but powers the "quality" north-star).
+$ cce feedback 3f9a1c0b7e21 --helpful --dir ./src
+recorded feedback (helpful) for 3f9a1c0b7e21  [event a1b2c3d4e5f6]
+
+# 3. Open the dashboard (loopback only, read-only, fully self-contained).
+$ cce dashboard --dir ./src
+cce dashboard: serving http://127.0.0.1:8787/  (loopback only, read-only)
+```
+
+The server binds `127.0.0.1` only, mutates nothing, and inlines all CSS/JS and
+draws its own SVG charts — **no external network, CDN, or fonts**. It exposes
+`GET /` (the page), `GET /api/metrics` (the aggregate JSON, recomputed per
+request), and `GET /api/health`. Flags: `--dir DIR` / `--store PATH` /
+`--metrics PATH` to locate the log, `--port N` (default 8787), `--price N` (USD
+per 1M input tokens for the $-saved estimate, default 3.00), `--no-open`.
+
+See [`docs/dashboard.md`](docs/dashboard.md) for the pipeline, event schema, and
+the exact aggregation formulas.
+
 ## What's inside
 
 - **AST-aware chunking** via tree-sitter for Python and JavaScript; a whole-file
@@ -230,23 +277,27 @@ wrote conformance.json
 ## Tests & coverage
 
 ```bash
-cargo test                                                  # 84 tests
+cargo test                                                  # 113 tests
 cargo clippy --all-targets --all-features -- -D warnings    # lint gate
 cargo fmt --check                                           # format gate
 ```
 
-The suite is **84 tests** (83 hermetic + 1 `#[ignore]` Ollama integration test)
-and measures **95.33% line coverage** via `cargo llvm-cov`. The default suite is
-fully deterministic and makes no network calls.
+The suite is **113 tests** (112 hermetic + 1 `#[ignore]` Ollama integration test)
+and measures **95.44% line coverage** via `cargo llvm-cov`. The default suite is
+fully deterministic and makes no network calls — including the metrics subsystem,
+whose clock and id source are injected and whose dashboard tests bind an
+ephemeral loopback port.
 
 ## Documentation
 
 | Doc | What it covers |
 |---|---|
 | [`SPEC.md`](SPEC.md) | The normative specification (v1.0) — the single source of truth |
+| [`DASHBOARD-SPEC.md`](DASHBOARD-SPEC.md) | The dashboard & observability addendum (v1.1) |
 | [`docs/getting-started.md`](docs/getting-started.md) | Install → first index + search |
 | [`docs/architecture.md`](docs/architecture.md) | Design goals, pipeline, rationale, and where it strains |
-| [`docs/how-to.md`](docs/how-to.md) | Task recipes: index, search, bench, conformance, Ollama |
+| [`docs/dashboard.md`](docs/dashboard.md) | Metrics pipeline, event schema, aggregation formulas |
+| [`docs/how-to.md`](docs/how-to.md) | Task recipes: index, search, feedback, dashboard, bench, conformance |
 | [`docs/DECISIONS.md`](docs/DECISIONS.md) | How each spec ambiguity was resolved |
 | [`docs/TDD.md`](docs/TDD.md) | The red → green log and coverage |
 | [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | Measured numbers on a real corpus |

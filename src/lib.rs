@@ -25,6 +25,9 @@ pub mod walker;
 pub mod retriever;
 pub mod bench;
 pub mod conformance;
+pub mod metrics;
+pub mod aggregator;
+pub mod dashboard;
 
 pub use chunker::Chunk;
 pub use retriever::SearchResult;

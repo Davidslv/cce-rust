@@ -38,14 +38,14 @@ sudo apt-get update && sudo apt-get install -y build-essential
 git clone https://github.com/davidslv/cce-rust
 cd cce-rust
 cargo build --release     # binary at target/release/cce
-cargo test                # 84 tests — confirms a green build
+cargo test                # 113 tests — confirms a green build
 ```
 
 Optionally put the binary on your PATH:
 
 ```bash
 cargo install --path .    # installs `cce` into ~/.cargo/bin
-cce --version             # cce 1.0.0
+cce --version             # cce 1.1.0
 ```
 
 The rest of this guide writes `cce`; if you did not install it, use

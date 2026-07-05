@@ -14,6 +14,12 @@
 //! - Own the ignore policy and the read/UTF-8/size checks.
 //! - Report how many files were skipped.
 //! - It does NOT chunk or embed.
+//!
+//! Note (dashboard, SPEC v1.1): files with a `.jsonl` extension are skipped.
+//! `.jsonl` is a runtime data/log format (the metrics event log lives in
+//! `metrics.jsonl`), never source to be chunked. Skipping it keeps the metrics
+//! sample fixture (`test/fixture/metrics_sample.jsonl`) out of the conformance
+//! corpus, so `conformance.json` stays byte-identical. See docs/DECISIONS.md.
 
 use crate::config::MAX_FILE_SIZE;
 use std::path::Path;
@@ -56,6 +62,12 @@ pub fn walk(root: &Path) -> WalkResult {
             continue;
         }
         let path = entry.path();
+        // Skip runtime data logs (`.jsonl`); they are never source. Keeps the
+        // metrics sample fixture out of the conformance corpus (SPEC v1.1).
+        if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
+            skipped += 1;
+            continue;
+        }
         // Size check.
         let meta = match entry.metadata() {
             Ok(m) => m,
@@ -124,5 +136,21 @@ mod tests {
         assert_eq!(paths, vec!["keep.py"]);
         // big.py + bin.dat skipped
         assert!(res.skipped >= 2);
+    }
+
+    #[test]
+    fn jsonl_logs_are_skipped() {
+        // The metrics event log format (`.jsonl`) is runtime data, not source,
+        // and must never be chunked — this keeps the metrics fixture out of the
+        // conformance corpus (SPEC v1.1).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("keep.py"), "def f():\n    pass\n").unwrap();
+        fs::write(root.join("metrics_sample.jsonl"), "{\"event\":\"search\"}\n").unwrap();
+
+        let res = walk(root);
+        let paths: Vec<&str> = res.files.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(paths, vec!["keep.py"]);
+        assert!(res.skipped >= 1);
     }
 }
