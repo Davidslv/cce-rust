@@ -112,9 +112,11 @@ cce packs --validate    # run the three validator layers; non-zero exit on failu
 cce bench /path/to/sinatra --lang ruby --name "sinatra/sinatra@v4.1.1"
 ```
 
-- Runs the pipeline over a checked-out repo **for one language** (`--lang ruby |
-  rust | typescript | c`, default `python`) and writes
-  [`BENCHMARKS.md`](BENCHMARKS.md). Only that language's sources are indexed.
+- Indexes a checked-out repo **whole** (exactly as `cce index`) and runs one
+  language's labeled query set (`--lang ruby | rust | typescript | c`, default
+  `python`), writing [`BENCHMARKS.md`](BENCHMARKS.md). `--lang` selects only the
+  query set and label — the file set is the whole repo either way, so recall and
+  token-savings match the Ruby sibling exactly.
 - Records the corpus commit; by default it reads git `HEAD` of the repo, or pass
   `--commit <sha>`.
 - Uses the deterministic hash embedder, so recall and token-savings numbers are

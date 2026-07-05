@@ -241,21 +241,23 @@ core edits. See [`docs/adding-a-language.md`](docs/adding-a-language.md).
 
 ### Benchmark
 
-Runs the pipeline over a checked-out repository for one language and writes
-[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md):
+Indexes a checked-out repository **whole** (exactly as `cce index`) and runs one
+language's labeled query set, writing [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md):
 
 ```bash
 $ cce bench /path/to/sinatra --lang ruby --name "sinatra/sinatra@v4.1.1"
 Benchmark complete (sinatra/sinatra@v4.1.1, ruby, commit 7b50a1b...):
-  files/chunks : 147/1197
-  index        : 0.159s (7528.1 chunks/s)
-  latency      : p50 0.381ms  p95 0.476ms
+  files/chunks : 287/1337
+  index        : 0.167s (7990.0 chunks/s)
+  latency      : p50 0.429ms  p95 0.549ms
   recall@5/@10 : 90.0% / 90.0%
-  token savings: 83.8%
+  token savings: 72.6%
 ```
 
-The four active languages benchmarked are Ruby (sinatra), Rust (hyperfine),
-TypeScript (zustand), and C (jq) — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+`--lang` selects only the query set and label — the whole repo is indexed either
+way, so recall and token-savings match the Ruby sibling exactly. The four active
+languages benchmarked are Ruby (sinatra), Rust (hyperfine), TypeScript (zustand),
+and C (jq) — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
 ### Conformance
 

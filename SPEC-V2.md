@@ -332,6 +332,18 @@ clone shallowly at the pinned tag, record the exact commit in the report, index,
 and measure the base metrics (index files/chunks/sec; query p50/p95;
 Recall@5/@10; mean token savings) using the default hashing embedder.
 
+**Indexing methodology (normative, pins cross-language equivalence):** `cce bench`
+indexes the **whole repository exactly as `cce index` does** — the normal walker
+(base SPEC §7.1 ignore rules: skip `.git/`, `.cce/`, `node_modules/`,
+`.venv`/`venv/`, `__pycache__/`, `dist/`, `build/`, and any dotdir; skip files
+> 2 MB and non-UTF-8), then pack-matched files are AST-chunked and **every other
+text file becomes a fallback `module` chunk**. There is **no extension pre-filter
+and no other custom exclude** — the `language` argument selects only the labeled
+query set and the report label, not the file set. Both implementations therefore
+index the identical file set, so Recall@5/@10 and token-savings must be **byte-for-
+byte identical** across cce-ruby and cce-rust on the same pinned corpus; only
+index/query latency differs.
+
 | Lang | Repo (pin a recent stable tag; record the commit) | Suggested labeled queries → expected path substring |
 |---|---|---|
 | Ruby | `sinatra/sinatra` | "route matching and dispatch"→base · "render erb/haml template"→base · "session and cookies"→base · "mime type helpers"→base · "middleware stack"→base · "delegator methods"→base · "handle errors and show exceptions"→show_exceptions · "streaming responses"→base · "rack response building"→base · "url helpers"→base |
