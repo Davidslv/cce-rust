@@ -1,0 +1,11 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Questions & discussion
+    url: https://github.com/davidslv/cce-rust/discussions
+    about: Ask a question, share an idea, or discuss usage before filing an issue.
+  - name: Security report (private)
+    url: https://github.com/davidslv/cce-rust/security/advisories/new
+    about: Report a vulnerability privately. Do not open a public issue for security.
+  - name: Ruby sibling implementation
+    url: https://github.com/davidslv/cce-ruby
+    about: The parallel clean-room implementation built from the same SPEC.

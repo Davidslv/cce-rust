@@ -1,0 +1,26 @@
+cff-version: 1.2.0
+message: "If you use this software, please cite it using these metadata."
+title: "cce-rust: Code Context Engine (clean-room Rust implementation)"
+abstract: >-
+  A local command-line tool that indexes a source-code repository by AST-chunking
+  files with tree-sitter, embedding chunks, and storing a vector + keyword index
+  on disk as JSON, then answers queries with hybrid vector + BM25 retrieval. Built
+  test-first as a clean-room implementation of SPEC v1.0.
+type: software
+version: 1.0.0
+date-released: "2026-07-05"
+license: MIT
+repository-code: "https://github.com/davidslv/cce-rust"
+url: "https://github.com/davidslv/cce-rust"
+authors:
+  - family-names: Silva
+    given-names: David
+    website: "https://davidslv.uk"
+keywords:
+  - code-search
+  - retrieval
+  - tree-sitter
+  - bm25
+  - embeddings
+  - rust
+  - clean-room

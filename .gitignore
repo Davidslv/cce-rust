@@ -1,0 +1,24 @@
+# Rust build output
+/target
+
+# Coverage output (cargo llvm-cov)
+/lcov.info
+/coverage/
+*.profraw
+*.profdata
+
+# Generated on-disk stores
+.cce/
+**/.cce/
+
+# Temp files
+*.tmp
+/tmp/
+
+# OS / editor cruft
+.DS_Store
+Thumbs.db
+*.swp
+*~
+.idea/
+.vscode/

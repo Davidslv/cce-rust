@@ -1,0 +1,45 @@
+# cce-rust
+
+> A local CLI (`cce`) that indexes a code repository — AST-chunking files with
+> tree-sitter, embedding chunks, and storing a vector + keyword index on disk as
+> JSON — and answers queries with hybrid vector + BM25 retrieval. It is a
+> clean-room, test-first Rust implementation of SPEC v1.0; a sibling Ruby
+> implementation was built from the identical spec. MIT licensed, © 2026 David
+> Silva. No network calls by default (the semantic embedder over localhost is
+> opt-in).
+
+## Documentation
+
+- [README](README.md): What it is, install/setup for macOS and Ubuntu, worked usage examples, tests/coverage.
+- [SPEC.md](SPEC.md): The normative specification (v1.0) — the single source of truth for all behaviour.
+- [Getting started](docs/getting-started.md): Newcomer path from install to first successful index + search.
+- [How-to recipes](docs/how-to.md): Task recipes for index, search, stats, bench, conformance, and Ollama.
+- [Architecture](docs/architecture.md): Design goals, module map, pipeline, design rationale, and where the design strains.
+- [Decisions](docs/DECISIONS.md): How each ambiguity in the spec was resolved, with rationale.
+- [TDD log](docs/TDD.md): The red → green build order and coverage (84 tests, 95.33% line coverage).
+- [Benchmarks](docs/BENCHMARKS.md): Measured index/latency/recall numbers on a real corpus.
+
+## Source (key files)
+
+- [src/lib.rs](src/lib.rs): Crate root; module tree and public surface.
+- [src/main.rs](src/main.rs): CLI (clap) — index, search, stats, bench, conformance.
+- [src/config.rs](src/config.rs): Normative constants (SPEC §3) and runtime config.
+- [src/tokenizer.rs](src/tokenizer.rs): The shared byte-exact tokenizer (SPEC §4.1).
+- [src/chunker.rs](src/chunker.rs): tree-sitter chunking, chunk IDs, imports (SPEC §4.2–4.4).
+- [src/embedder.rs](src/embedder.rs): Hashing embedder, cosine, rounding, optional Ollama (SPEC §5, §11).
+- [src/retriever.rs](src/retriever.rs): The hybrid retrieval pipeline (SPEC §6).
+- [src/store.rs](src/store.rs): Index assembly and JSON persistence (SPEC §7).
+- [src/conformance.rs](src/conformance.rs): The byte-stable conformance.json emitter (SPEC §8).
+
+## Project
+
+- [Contributing](CONTRIBUTING.md): Dev setup, the three quality gates, TDD discipline, conformance rules.
+- [Security](SECURITY.md): Threat model (local filesystem trust boundary, no network by default) and private reporting.
+- [Governance](GOVERNANCE.md): Single-maintainer/BDFL model with the spec as constitution.
+- [Changelog](CHANGELOG.md): Keep a Changelog / SemVer history.
+- [AGENTS.md](AGENTS.md): Instructions for AI agents working in this repo.
+
+## Optional
+
+- [Ruby sibling](https://github.com/davidslv/cce-ruby): The parallel clean-room implementation from the same spec.
+- [Blog: "The spec was the program"](https://davidslv.uk/2026/07/05/the-spec-was-the-program.html): The write-up of the experiment.

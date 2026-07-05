@@ -1,0 +1,4 @@
+reorder_imports = false
+reorder_modules = false
+use_small_heuristics = "Max"
+single_line_if_else_max_width = 60

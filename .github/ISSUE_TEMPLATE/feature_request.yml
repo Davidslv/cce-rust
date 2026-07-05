@@ -1,0 +1,61 @@
+name: Feature request
+description: Suggest an enhancement for cce
+title: "[feature]: "
+labels: ["enhancement"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for the idea. cce is a spec-driven, clean-room implementation, so
+        please note how the change relates to [`SPEC.md`](https://github.com/davidslv/cce-rust/blob/main/SPEC.md)
+        and whether it would affect cross-implementation conformance with the
+        [Ruby sibling](https://github.com/davidslv/cce-ruby). For larger changes,
+        opening this issue first (before a PR) is the right move.
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem / motivation
+      description: What are you trying to do that cce does not support today?
+    validations:
+      required: true
+  - type: textarea
+    id: proposal
+    attributes:
+      label: Proposed solution
+      description: What should cce do? Sketch the command, flags, or output shape.
+    validations:
+      required: true
+  - type: dropdown
+    id: area
+    attributes:
+      label: Area
+      options:
+        - chunking (tree-sitter / languages)
+        - embedding (hash / ollama)
+        - retrieval (vector / BM25 / RRF / graph)
+        - storage (JSON index)
+        - CLI / output
+        - benchmarking
+        - conformance
+        - docs
+        - other
+    validations:
+      required: true
+  - type: dropdown
+    id: conformance-impact
+    attributes:
+      label: Conformance impact
+      description: Would this change `cce conformance test/fixture` output?
+      options:
+        - "No — behaviour is unchanged"
+        - "Yes — it would change conformance (needs a spec discussion)"
+        - "Not sure"
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives considered
+      description: Other approaches you weighed, and why this one.
+    validations:
+      required: false

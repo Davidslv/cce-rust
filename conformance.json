@@ -1,0 +1,175 @@
+{
+  "spec_version": "1.0",
+  "impl_language": "rust",
+  "chunks": [
+    {
+      "file_path": "README.md",
+      "start_line": 1,
+      "end_line": 2,
+      "chunk_type": "module",
+      "chunk_id": "00166d3be9bb5925",
+      "token_count": 11
+    },
+    {
+      "file_path": "auth.py",
+      "start_line": 3,
+      "end_line": 4,
+      "chunk_type": "function",
+      "chunk_id": "e3539a6cc87df405",
+      "token_count": 21
+    },
+    {
+      "file_path": "auth.py",
+      "start_line": 6,
+      "end_line": 7,
+      "chunk_type": "function",
+      "chunk_id": "1eb146037ad13f91",
+      "token_count": 20
+    },
+    {
+      "file_path": "auth.py",
+      "start_line": 9,
+      "end_line": 11,
+      "chunk_type": "class",
+      "chunk_id": "fcc7617773d8f44d",
+      "token_count": 23
+    },
+    {
+      "file_path": "auth.py",
+      "start_line": 10,
+      "end_line": 11,
+      "chunk_type": "function",
+      "chunk_id": "1f7fa885bdd90499",
+      "token_count": 16
+    },
+    {
+      "file_path": "payments.py",
+      "start_line": 3,
+      "end_line": 4,
+      "chunk_type": "function",
+      "chunk_id": "eb1b9a4f766376e6",
+      "token_count": 26
+    },
+    {
+      "file_path": "payments.py",
+      "start_line": 6,
+      "end_line": 7,
+      "chunk_type": "function",
+      "chunk_id": "0246f0f6eead83ee",
+      "token_count": 22
+    }
+  ],
+  "queries": [
+    {
+      "query": "hash password",
+      "top_k": 5,
+      "graph_enabled": false,
+      "results": [
+        {
+          "rank": 1,
+          "chunk_id": "e3539a6cc87df405",
+          "file_path": "auth.py",
+          "score": "0.878300"
+        },
+        {
+          "rank": 2,
+          "chunk_id": "1eb146037ad13f91",
+          "file_path": "auth.py",
+          "score": "0.876031"
+        },
+        {
+          "rank": 3,
+          "chunk_id": "00166d3be9bb5925",
+          "file_path": "README.md",
+          "score": "0.488935"
+        },
+        {
+          "rank": 4,
+          "chunk_id": "0246f0f6eead83ee",
+          "file_path": "payments.py",
+          "score": "0.485063"
+        },
+        {
+          "rank": 5,
+          "chunk_id": "1f7fa885bdd90499",
+          "file_path": "auth.py",
+          "score": "0.481312"
+        }
+      ]
+    },
+    {
+      "query": "process payment amount",
+      "top_k": 5,
+      "graph_enabled": false,
+      "results": [
+        {
+          "rank": 1,
+          "chunk_id": "eb1b9a4f766376e6",
+          "file_path": "payments.py",
+          "score": "0.870145"
+        },
+        {
+          "rank": 2,
+          "chunk_id": "00166d3be9bb5925",
+          "file_path": "README.md",
+          "score": "0.849078"
+        },
+        {
+          "rank": 3,
+          "chunk_id": "0246f0f6eead83ee",
+          "file_path": "payments.py",
+          "score": "0.566935"
+        },
+        {
+          "rank": 4,
+          "chunk_id": "1eb146037ad13f91",
+          "file_path": "auth.py",
+          "score": "0.483095"
+        },
+        {
+          "rank": 5,
+          "chunk_id": "1f7fa885bdd90499",
+          "file_path": "auth.py",
+          "score": "0.479375"
+        }
+      ]
+    },
+    {
+      "query": "create session user",
+      "top_k": 5,
+      "graph_enabled": false,
+      "results": [
+        {
+          "rank": 1,
+          "chunk_id": "1f7fa885bdd90499",
+          "file_path": "auth.py",
+          "score": "0.849056"
+        },
+        {
+          "rank": 2,
+          "chunk_id": "fcc7617773d8f44d",
+          "file_path": "auth.py",
+          "score": "0.838629"
+        },
+        {
+          "rank": 3,
+          "chunk_id": "1eb146037ad13f91",
+          "file_path": "auth.py",
+          "score": "0.538733"
+        },
+        {
+          "rank": 4,
+          "chunk_id": "00166d3be9bb5925",
+          "file_path": "README.md",
+          "score": "0.485063"
+        },
+        {
+          "rank": 5,
+          "chunk_id": "0246f0f6eead83ee",
+          "file_path": "payments.py",
+          "score": "0.481312"
+        }
+      ]
+    }
+  ]
+}

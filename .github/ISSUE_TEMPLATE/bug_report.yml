@@ -1,0 +1,86 @@
+name: Bug report
+description: Report a defect where cce deviates from SPEC.md or its documented behaviour
+title: "[bug]: "
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Thanks for reporting a bug. Please give exact commands and output so it
+        can be reproduced. For security issues, do **not** file here — see
+        [SECURITY.md](https://github.com/davidslv/cce-rust/blob/main/SECURITY.md).
+  - type: textarea
+    id: what-happened
+    attributes:
+      label: What happened?
+      description: Describe the bug and how it differs from the expected behaviour.
+      placeholder: "`cce search ...` returned ... but I expected ..."
+    validations:
+      required: true
+  - type: textarea
+    id: repro
+    attributes:
+      label: Steps to reproduce
+      description: The exact commands you ran, in order (index, then search, etc.).
+      placeholder: |
+        1. cce index ./my-project
+        2. cce search "..." --dir ./my-project --top-k 5
+        3. ...
+      render: shell
+    validations:
+      required: true
+  - type: textarea
+    id: expected
+    attributes:
+      label: Expected behaviour
+      description: What did you expect, and which part of SPEC.md / the docs backs it up?
+    validations:
+      required: true
+  - type: textarea
+    id: actual
+    attributes:
+      label: Actual output
+      description: Paste the actual output (add `--json` for search if relevant).
+      render: shell
+    validations:
+      required: true
+  - type: dropdown
+    id: command
+    attributes:
+      label: Which command?
+      options:
+        - index
+        - search
+        - stats
+        - bench
+        - conformance
+        - build / install
+        - other
+    validations:
+      required: true
+  - type: dropdown
+    id: embedder
+    attributes:
+      label: Embedder in use
+      options:
+        - hash (default)
+        - ollama
+        - not applicable
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: cce version
+      description: Output of `cce --version`.
+      placeholder: "cce 1.0.0"
+    validations:
+      required: true
+  - type: input
+    id: environment
+    attributes:
+      label: OS and Rust toolchain
+      description: Output of `rustc --version` and your OS/arch.
+      placeholder: "macOS 15 (aarch64), rustc 1.91.1"
+    validations:
+      required: true
