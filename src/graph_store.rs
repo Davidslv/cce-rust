@@ -67,6 +67,33 @@ impl Graph {
         self.out_edges.get(from).map(|s| s.contains(to)).unwrap_or(false)
     }
 
+    /// Every directed edge `from -> to` as a pair, sorted. Lets a caller union
+    /// several graphs (SPEC-V2.2 §6 builds the combined graph as the union of each
+    /// member's intra-store import graph over member-namespaced paths).
+    pub fn out_pairs(&self) -> Vec<(String, String)> {
+        let mut pairs: Vec<(String, String)> = Vec::new();
+        for (from, tos) in &self.out_edges {
+            for to in tos {
+                pairs.push((from.clone(), to.clone()));
+            }
+        }
+        pairs
+    }
+
+    /// Build a graph directly from directed `from -> to` pairs (both directions
+    /// recorded for neighbor lookup).
+    pub fn from_pairs(pairs: &[(String, String)]) -> Graph {
+        let mut g = Graph::default();
+        for (from, to) in pairs {
+            if from == to {
+                continue;
+            }
+            g.out_edges.entry(from.clone()).or_default().insert(to.clone());
+            g.in_edges.entry(to.clone()).or_default().insert(from.clone());
+        }
+        g
+    }
+
     /// Neighbors of `file` in either direction (successors + predecessors),
     /// returned sorted and deduplicated.
     pub fn neighbors(&self, file: &str) -> Vec<String> {

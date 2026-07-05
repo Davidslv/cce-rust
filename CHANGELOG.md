@@ -7,6 +7,63 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.2.0] - 2026-07-05
+
+**Workspace mode** — CCE now understands an *ecosystem* of related codebases (e.g.
+a Rails app + engines + a frontend under one root) as a single searchable whole,
+while **each member stays isolated in its own store**. Built test-first from
+[`SPEC-V2.2.md`](SPEC-V2.2.md). This is an **additive minor release**: absent
+`--workspace`, every command behaves exactly as before and single-repo
+`conformance.json` remains byte-identical.
+
+### Added
+
+- **Auto-detection + manifest** (`src/workspace.rs`). `cce workspace init [<dir>]
+  [--force]` walks the root under the standard ignore rules and detects members by
+  §3 markers — `*.gemspec` ⇒ Ruby (`ruby-engine` when an `app/`, `config/routes.rb`
+  or `lib/**/engine.rb` marker is present, else `ruby-gem`); `Gemfile` +
+  `config/application.rb` ⇒ `rails-app`; `package.json` ⇒ `typescript` (with
+  `tsconfig.json`) or `javascript`. Members do **not** nest. Writes a deterministic
+  `<dir>/.cce/workspace.yml` (members sorted by path, names collision-suffixed).
+  Hand-written manifests are honoured. `cce workspace list` prints members + edges.
+- **Federated indexing** — `cce index --workspace [<dir>]` indexes each member into
+  its **own** `<member>/.cce/index.json` via the normal pipeline (language packs +
+  secret scrubbing inherited). A member's store is **byte-identical to indexing that
+  member standalone** (asserted). Then builds `<dir>/.cce/workspace-graph.json`.
+- **Cross-member dependency edges (Level 1)** (SPEC-V2.2 §5). Declared deps are
+  extracted from `*.gemspec` (`add_dependency`/`add_runtime_dependency`/
+  `add_development_dependency`), `Gemfile` (`gem "name"`), and `package.json`
+  (`dependencies`/`devDependencies`/`peerDependencies`); an edge `A → B` is recorded
+  (with its `via`) when a dep `A` declares matches member `B`'s `package` or `name`.
+  Deterministic: edges sorted by `(from, to, via)`.
+- **Federated search** — `cce search "q" --workspace [<dir>] [--package a,b]
+  [--top-k N] [--no-graph] [--json]`. Defined to equal the standard §6 retrieval run
+  over the **union** of in-scope members' chunks (BM25 stats over the union;
+  diversity key `(member, file_path)`). Each result is tagged with its `package` and
+  member-relative `file_path`. Graph expansion adds the union of members' intra-store
+  import graphs **plus** cross-member edges (a top result in `A` expands into a
+  dependency target `B`). `--package` scopes to named members (errors on an unknown
+  name).
+- **Workspace stats & dashboard** — `cce stats --workspace` (per-member + totals +
+  edges) and `cce dashboard --workspace` (a roll-up over every member's
+  `metrics.jsonl` plus a `by_package` breakdown; loopback-only, read-only,
+  self-contained, unchanged posture).
+- Fixture ecosystem `test/fixture/workspace/` (`app` / `billing` / `web`) plus 10
+  end-to-end CLI tests and unit tests covering detection, each dependency extractor,
+  per-member byte-identical isolation, federation-equals-union, `--package` scoping
+  (+ unknown-name error), the cross-member graph hop, stats and dashboard roll-up,
+  and a re-assert that single-repo `conformance.json` is byte-identical.
+
+### Changed
+
+- `retriever` is refactored to expose `rank_core` (the §6 ranking without graph
+  expansion) so federated search runs the **identical** pipeline over the union
+  corpus. `store::Index::from_parts` and `graph_store::Graph::{out_pairs,from_pairs}`
+  support building the combined corpus. Single-repo behaviour is unchanged.
+- New pinned dependency `serde_yaml = "=0.9.34"` (parsing hand-written manifests;
+  the manifest is emitted by a byte-deterministic hand-rolled writer).
+- Version bumped to **2.2.0** (`Cargo.toml`, `CITATION.cff`).
+
 ## [2.1.0] - 2026-07-05
 
 **Secret & sensitive-file protection**, built test-first from

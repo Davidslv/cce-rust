@@ -38,8 +38,10 @@ responsibilities header.
 | `src/packs/validators.rs` | Three-layer pack validators (SPEC-V2 §5) | `validate_pack`, `validate_all`, `startup_check` |
 | `src/vector_store.rs` | Exact brute-force cosine ranking (SPEC §6.2) | `rank_by_cosine` |
 | `src/keyword_store.rs` | Lucene-form BM25 (SPEC §6.3) | `Bm25Index` |
-| `src/graph_store.rs` | Import graph + neighbor lookup (SPEC §6.7) | `Graph` |
-| `src/retriever.rs` | The hybrid pipeline (SPEC §6) | `search`, `is_code_lookup`, `SearchResult` |
+| `src/graph_store.rs` | Import graph + neighbor lookup (SPEC §6.7) | `Graph`, `out_pairs`, `from_pairs` |
+| `src/retriever.rs` | The hybrid pipeline (SPEC §6) | `search`, `rank_core`, `expand_graph`, `is_code_lookup`, `SearchResult` |
+| `src/workspace.rs` | Member detection, manifest, cross-member edges (SPEC-V2.2 §2–5) | `Manifest`, `Member`, `detect_members`, `build_graph`, `deps_from_*`, `WorkspaceGraph` |
+| `src/federation.rs` | Federated indexing/search/stats/dashboard over members (SPEC-V2.2 §4–7) | `federated_search`, `combined_index`, `load_member_stores`, `workspace_stats`, `federated_metrics_json` |
 | `src/walker.rs` | Filesystem walk + ignore rules + Layer-1 sensitive-file skip (SPEC §7.1, SPEC-V2.1 §2) | `walk` |
 | `src/sensitive.rs` | Layer-1 sensitive-file policy: is a basename secret material? (SPEC-V2.1 §1) | `is_sensitive` |
 | `src/redactor.rs` | Layer-2 secret redaction over indexed content (SPEC-V2.1 §1) | `redact` |
@@ -48,8 +50,8 @@ responsibilities header.
 | `src/bench.rs` | Per-language benchmark runner (SPEC-V2 §8) | `run`, `BenchReport` |
 | `src/metrics.rs` | Persisted metrics event log; injected clock/id source (DASH §2) | `MetricsWriter`, `read_log`, `parse_log`, `Clock`, `IdSource`, `parse_iso` |
 | `src/aggregator.rs` | Pure aggregate: totals, north-stars, series, deltas (DASH §4) | `aggregate`, `Aggregate`, `direction` |
-| `src/dashboard.rs` | Loopback-only, read-only, self-contained web server (DASH §6) | `run`, `serve`, `route` |
-| `src/main.rs` | CLI (SPEC §9, DASH §5) | clap command tree |
+| `src/dashboard.rs` | Loopback-only, read-only, self-contained web server (DASH §6, SPEC-V2.2 §7) | `run`, `serve`, `route`, `run_workspace`, `route_workspace` |
+| `src/main.rs` | CLI (SPEC §9, DASH §5, SPEC-V2.2 §9) | clap command tree |
 
 The metrics/dashboard modules (`DASH` = [`DASHBOARD-SPEC.md`](../DASHBOARD-SPEC.md),
 v1.1) are the one part of the system that uses real wall-clock time; the clock and
@@ -228,3 +230,11 @@ Being honest about the edges of the design:
   floating-point or ordering difference in either implementation would surface as
   a conformance mismatch — which is precisely why `conformance.json` is a gate,
   not an afterthought.
+- **Workspaces reload every member per query (v2.2).** A federated search loads
+  and unions all in-scope members' stores on each invocation; for a large
+  ecosystem that is a lot of JSON per query — the reload-and-union model favours
+  simplicity and the union-equals-single-index correctness anchor over scale. And
+  cross-member edges are **declared, not behavioural**: they come only from
+  manifest dependencies (`Gemfile`/`*.gemspec`/`package.json`), so runtime coupling
+  such as Rails route mounting produces no edge yet. See
+  [`workspace.md`](workspace.md).

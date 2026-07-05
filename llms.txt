@@ -4,9 +4,11 @@
 > tree-sitter through pluggable language packs, embedding chunks, and storing a
 > vector + keyword index on disk as JSON — and answers queries with hybrid vector
 > + BM25 retrieval. It is a test-first Rust implementation of SPEC v1.0, a
-> Dashboard addendum (v1.1), and the v2.0 language-packs evolution (SPEC-V2);
-> six packs ship (Python, JavaScript, Ruby, Rust, TypeScript, C) and every chunk
-> records the exact tree-sitter node type in a `kind` field. A sibling Ruby
+> Dashboard addendum (v1.1), the v2.0 language-packs evolution (SPEC-V2), v2.1
+> secret protection (SPEC-V2.1), and v2.2 workspace mode (SPEC-V2.2 — federating a
+> multi-codebase ecosystem while each member stays isolated); six packs ship
+> (Python, JavaScript, Ruby, Rust, TypeScript, C) and every chunk records the
+> exact tree-sitter node type in a `kind` field. A sibling Ruby
 > implementation was built from the identical specs. MIT licensed, © 2026 David
 > Silva. No network calls by default: the semantic embedder over localhost is
 > opt-in, and `cce dashboard` is a loopback-only, read-only, self-contained UI.
@@ -17,6 +19,9 @@
 - [SPEC.md](SPEC.md): The normative base-engine specification (v1.0).
 - [DASHBOARD-SPEC.md](DASHBOARD-SPEC.md): The dashboard & observability addendum (v1.1) — metrics log, aggregator, dashboard.
 - [SPEC-V2.md](SPEC-V2.md): The language-packs evolution spec (v2.0) — pack interface, registry, validators, `kind`, conformance shape.
+- [SPEC-V2.1.md](SPEC-V2.1.md): The secret-protection evolution spec (v2.1) — sensitive-file skip + secret redaction.
+- [SPEC-V2.2.md](SPEC-V2.2.md): The workspace-mode evolution spec (v2.2) — detection, manifest, federation, cross-member edges.
+- [Workspace](docs/workspace.md): Workspace model, `workspace.yml`, detection rules, federation semantics, where it strains.
 - [Getting started](docs/getting-started.md): Newcomer path from install to first successful index + search.
 - [Adding a language](docs/adding-a-language.md): Step-by-step guide to adding a language pack, with a worked example.
 - [How-to recipes](docs/how-to.md): Task recipes for index, search, packs, feedback, dashboard, stats, bench, conformance, and Ollama.

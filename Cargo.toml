@@ -1,8 +1,8 @@
 [package]
 name = "cce"
-version = "2.1.0"
+version = "2.2.0"
 edition = "2021"
-description = "Code Context Engine — Rust implementation (SPEC v1.0 + Dashboard v1.1 + Language Packs v2.0 + Secret Protection v2.1)"
+description = "Code Context Engine — Rust implementation (SPEC v1.0 + Dashboard v1.1 + Language Packs v2.0 + Secret Protection v2.1 + Workspace Mode v2.2)"
 license = "MIT"
 
 [[bin]]
@@ -32,6 +32,9 @@ serde = { version = "=1.0.228", features = ["derive"] }
 serde_json = "=1.0.150"
 # High-confidence secret redaction patterns (SPEC-V2.1 §1, Layer 2), pinned.
 regex = "=1.12.4"
+# YAML parsing for the workspace manifest (SPEC-V2.2 §2), pinned. Reading only —
+# the manifest is emitted by a hand-rolled canonical writer for byte-determinism.
+serde_yaml = "=0.9.34"
 
 [profile.release]
 opt-level = 3
