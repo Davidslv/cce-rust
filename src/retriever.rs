@@ -108,6 +108,10 @@ fn file_hints(query: &str) -> Vec<String> {
 /// (compressed) tokens are compared against the full chunk bodies with the same
 /// `cce.tokens/v1` counter, so `chunk_compression.saved = full_tokens −
 /// served_tokens`. At `Full`, nothing is compressed, so the bucket is zeroed.
+///
+/// It also fills the L3 `grammar` bucket (SPEC-V2.5 §2 Layer 3): the compact result
+/// grammar vs a pinned verbose baseline rendering of the same result set (framing
+/// only, so it never double-counts the L2 bucket). See `crate::grammar`.
 #[allow(clippy::too_many_arguments)]
 pub fn build_search_record(
     index: &Index,
@@ -161,6 +165,12 @@ pub fn build_search_record(
         (base, saved)
     };
 
+    // SPEC-V2.5 §2 (Layer 3): the `grammar` bucket. The compact result grammar this
+    // engine serves is measured against a pinned verbose baseline rendering of the same
+    // result set (framing only — chunk bodies belong to the L2 bucket), with the same
+    // `cce.tokens/v1` estimator. Self-measurable: our format vs a pinned alternative.
+    let grammar = crate::grammar::grammar_savings_for_results(results);
+
     SearchRecord {
         query: query.to_string(),
         top_k,
@@ -173,6 +183,8 @@ pub fn build_search_record(
         savings_ratio,
         chunk_baseline_tokens,
         chunk_saved_tokens,
+        grammar_baseline_tokens: grammar.baseline_tokens,
+        grammar_saved_tokens: grammar.saved_tokens,
         top_score,
         mean_score,
         empty,

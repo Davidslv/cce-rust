@@ -538,7 +538,8 @@ fn cmd_search(
     // Best-effort metrics: a search event (DASHBOARD-SPEC §2.1). The write is
     // fail-open, so it never affects the result or the exit code. `cce search`
     // serves whole chunk bodies (detail:full), so the L2 chunk_compression bucket
-    // is zero here — compression is the agent-facing `context_search` path.
+    // is zero here — compression is the agent-facing `context_search` path. The L3
+    // `grammar` bucket is still populated (grammar density is independent of detail).
     let record = build_search_record(
         &index,
         &results,

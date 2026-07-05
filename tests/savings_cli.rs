@@ -77,6 +77,44 @@ fn savings_on_empty_log_is_a_clean_zero_ledger() {
 }
 
 #[test]
+fn savings_reports_a_real_grammar_bucket_from_a_live_search() {
+    // SPEC-V2.5 §2 Layer 3 / §3: a real `cce search` writes a `search` event carrying
+    // the `grammar` bucket; `cce savings --json` then sums it into a NON-ZERO
+    // `savings_by_layer.grammar` — the L3 layer's self-measured saving (compact result
+    // grammar vs the pinned verbose baseline).
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path();
+    std::fs::write(dir.join("auth.py"), "def hash_password(pw):\n    return pw + 'salt'\n")
+        .unwrap();
+    std::fs::write(
+        dir.join("payments.py"),
+        "import auth\n\ndef process_payment(amount):\n    return amount\n",
+    )
+    .unwrap();
+
+    let idx = Command::new(bin()).args(["index"]).arg(dir).output().unwrap();
+    assert!(idx.status.success(), "index: {}", String::from_utf8_lossy(&idx.stderr));
+    let sr = Command::new(bin())
+        .args(["search", "hash password"])
+        .arg("--dir")
+        .arg(dir)
+        .output()
+        .unwrap();
+    assert!(sr.status.success(), "search: {}", String::from_utf8_lossy(&sr.stderr));
+
+    let out = Command::new(bin()).args(["savings", "--json", "--dir"]).arg(dir).output().unwrap();
+    assert!(out.status.success(), "savings: {}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_slice(&out.stdout).unwrap();
+    let g = &v["savings_by_layer"]["grammar"];
+    let saved = g["saved_tokens"].as_u64().unwrap();
+    let baseline = g["baseline_tokens"].as_u64().unwrap();
+    assert!(saved > 0, "grammar bucket should be non-zero, got {saved}");
+    assert!(saved <= baseline, "saved {saved} must be ≤ baseline {baseline}");
+    // The grammar saving flows into the grand total alongside retrieval.
+    assert!(v["savings_by_layer"]["total"]["saved_tokens"].as_u64().unwrap() >= saved);
+}
+
+#[test]
 fn eval_grades_canned_runs_and_reports_paired_delta() {
     let questions = manifest_path("eval/questions.jsonl");
     let runs = manifest_path("eval/runs.example.jsonl");

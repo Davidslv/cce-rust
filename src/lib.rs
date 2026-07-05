@@ -32,6 +32,7 @@ pub mod memory;
 pub mod session;
 pub mod walker;
 pub mod retriever;
+pub mod grammar;
 pub mod bench;
 pub mod conformance;
 pub mod metrics;

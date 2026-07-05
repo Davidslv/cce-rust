@@ -100,6 +100,13 @@ pub struct SearchRecord {
     /// when the results were served at `detail:full`.
     pub chunk_baseline_tokens: u64,
     pub chunk_saved_tokens: u64,
+    /// L3 grammar-compression accounting (SPEC-V2.5 §2 Layer 3). `grammar_baseline_tokens`
+    /// is a pinned verbose rendering of this result set's grammar; `grammar_saved_tokens`
+    /// is what the compact result grammar removes vs that baseline. Both feed the
+    /// `grammar` ledger bucket. Framing only (not chunk bodies) — independent of the L2
+    /// bucket. Zero for an empty result set.
+    pub grammar_baseline_tokens: u64,
+    pub grammar_saved_tokens: u64,
     pub top_score: f64,
     pub mean_score: f64,
     pub empty: bool,
@@ -156,16 +163,18 @@ impl<'a> MetricsWriter<'a> {
             return None;
         }
         let id = self.ids.next_id();
-        // SPEC-V2.5 §3: the seven-bucket ledger, additive. Stage ② populates
-        // `retrieval` (Layer 1) AND `chunk_compression` (Layer 2); the other five
-        // ship present-and-zero, ready for later stages. The legacy top-level
+        // SPEC-V2.5 §3: the seven-bucket ledger, additive. Stage ③ populates
+        // `retrieval` (Layer 1), `chunk_compression` (Layer 2) AND `grammar` (Layer 3);
+        // the other four ship present-and-zero, ready for later stages. The legacy top-level
         // `baseline_tokens`/`served_tokens`/`tokens_saved`/`savings_ratio` fields
         // stay for backward compatibility with the v2.4 dashboard aggregator.
-        let savings = SavingsBuckets::layers_1_2(
+        let savings = SavingsBuckets::layers_1_2_3(
             rec.tokens_saved,
             rec.baseline_tokens,
             rec.chunk_saved_tokens,
             rec.chunk_baseline_tokens,
+            rec.grammar_saved_tokens,
+            rec.grammar_baseline_tokens,
         );
         let obj = serde_json::json!({
             "schema": METRICS_SCHEMA,
@@ -588,6 +597,8 @@ mod tests {
                 savings_ratio: 0.8,
                 chunk_baseline_tokens: 8000,
                 chunk_saved_tokens: 6000,
+                grammar_baseline_tokens: 260,
+                grammar_saved_tokens: 150,
                 top_score: 0.9,
                 mean_score: 0.7,
                 empty: false,
@@ -609,6 +620,13 @@ mod tests {
                 assert_eq!(s.secs, parse_iso("2026-07-05T13:04:11Z").unwrap());
                 assert_eq!(s.tokens_saved, 32000);
                 assert_eq!(s.savings_ratio, 0.8);
+                // The seven-bucket ledger round-trips L1/L2/L3 through the event.
+                assert_eq!(s.savings.retrieval.saved_tokens, 32000);
+                assert_eq!(s.savings.chunk_compression.saved_tokens, 6000);
+                assert_eq!(
+                    s.savings.grammar,
+                    crate::savings::Bucket { saved_tokens: 150, baseline_tokens: 260 }
+                );
                 assert_eq!(s.source, "cli");
                 assert!(!s.empty);
             }
@@ -669,6 +687,8 @@ mod tests {
             savings_ratio: 0.0,
             chunk_baseline_tokens: 0,
             chunk_saved_tokens: 0,
+            grammar_baseline_tokens: 0,
+            grammar_saved_tokens: 0,
             top_score: 0.0,
             mean_score: 0.0,
             empty: true,
