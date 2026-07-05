@@ -36,6 +36,13 @@ The write-up of the experiment:
 - Ruby sibling: <https://github.com/davidslv/cce-ruby>
 - Author / sole maintainer: **David Silva** ([@davidslv](https://github.com/davidslv), <https://davidslv.uk>)
 
+## Walkthrough
+
+![CCE walkthrough — language packs, index, validate, search, stats](docs/walkthrough.gif)
+
+▶ **Interactive version:** open [`docs/presentation/index.html`](docs/presentation/index.html)
+in a browser — a self-contained, autoplaying terminal cast (no dependencies, no network).
+
 ## Installation & environment setup
 
 `cce` is a single Rust binary. The tree-sitter crates compile their C grammars
@@ -281,6 +288,8 @@ dashboard visualizes two north-stars — **token/cost savings** and **retrieval
 quality** — each trended current-vs-prior with an ↑ improving / ↓ degrading / →
 flat indicator, plus a recent-searches table. (The base engine and
 `conformance.json` are untouched by any of this.)
+
+![CCE dashboard — token/cost savings and retrieval quality, trended](docs/dashboard.png)
 
 ```bash
 # 1. Index and search as usual — events are recorded automatically.
