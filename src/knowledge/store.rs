@@ -20,6 +20,7 @@
 //! - It does NOT parse the contract (that is `contract`) nor retrieve (that is M4).
 
 use crate::config::DEFAULT_MARKDOWN_MAX_SECTION_TOKENS;
+use crate::embedder::{Embedder, HashEmbedder};
 use crate::knowledge::contract::{render_document, KnowledgeRecord, KNOWLEDGE_SCHEMA_ID};
 use crate::markdown::chunk_markdown;
 use serde::{Deserialize, Serialize};
@@ -29,7 +30,7 @@ use std::path::{Path, PathBuf};
 
 /// One indexed knowledge chunk: a markdown heading section plus the source record's
 /// metadata as facets (SPEC-V2.6 §4). Field order is the persisted, byte-pinned order.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KnowledgeChunk {
     /// `SHA-256(record_id:start:end:prefix)`, the shared content-addressed scheme.
     pub chunk_id: String,
@@ -55,10 +56,24 @@ pub struct KnowledgeChunk {
     pub updated_at: Option<String>,
     pub group: Option<String>,
     pub labels: Vec<String>,
+    // --- M4 retrieval facets (SPEC-V2.6 §5) ---
+    /// The source record's title, carried on every chunk so a knowledge hit can render
+    /// its byte-pinned provenance line without re-reading the record.
+    #[serde(default)]
+    pub title: String,
+    /// The record's related links (a merged-PR reference is the "decided + implemented"
+    /// staleness signal, SPEC-V2.6 §5). Empty for older Phase-A snapshots.
+    #[serde(default)]
+    pub links: Vec<String>,
+    /// The deterministic hash embedding of `content`, persisted at index time so
+    /// knowledge search uses the SAME hybrid retrieval as code (SPEC-V2.6 §5). Older
+    /// Phase-A snapshots omit it (serde default `[]`); retrieval recomputes then.
+    #[serde(default)]
+    pub embedding: Vec<f64>,
 }
 
 /// A persisted knowledge store for one extraction snapshot (SPEC-V2.6 §4).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
 pub struct KnowledgeStore {
     /// The pinned contract schema id (`cce.knowledge/v1`).
     pub schema: String,
@@ -99,6 +114,10 @@ pub fn ingest(
     input_bytes: &[u8],
     max_section_tokens: usize,
 ) -> KnowledgeStore {
+    // The deterministic hash embedder (SPEC §5.1) — the SAME backend the code index
+    // uses — so a knowledge chunk's persisted embedding is byte-reproducible and its
+    // retrieval ranking is identical to code's (no network, no wall-clock).
+    let embedder = HashEmbedder;
     let mut chunks: Vec<KnowledgeChunk> = Vec::new();
     for rec in records {
         // Render, then redact the WHOLE document BEFORE chunking (SPEC-V2.6 §4 /
@@ -108,6 +127,7 @@ pub fn ingest(
         let redacted = crate::redactor::redact(&doc);
         let md_chunks = chunk_markdown(&rec.id, &redacted, max_section_tokens);
         for mc in md_chunks {
+            let embedding = embedder.embed(&mc.content);
             chunks.push(KnowledgeChunk {
                 chunk_id: mc.chunk_id,
                 record_id: rec.id.clone(),
@@ -124,6 +144,9 @@ pub fn ingest(
                 updated_at: rec.updated_at.clone(),
                 group: rec.group.clone(),
                 labels: rec.labels.clone(),
+                title: rec.title.trim().to_string(),
+                links: rec.links.clone(),
+                embedding,
             });
         }
     }

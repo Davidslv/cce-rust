@@ -400,27 +400,52 @@ impl MarkdownConfig {
 /// is ON by default. Absent config / absent block / absent key all resolve to this.
 pub const DEFAULT_KNOWLEDGE_ENABLED: bool = true;
 
-/// The `knowledge.*` runtime configuration (SPEC-V2.6 §8). Only `enabled` is defined
-/// in Phase A (the `source`/`min_score` retrieval keys arrive with M4). Absent block
-/// / absent key / bad YAML all fall back to the default (enabled).
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+/// The default `knowledge.min_score` (SPEC-V2.6 §8): the recall precision floor,
+/// shared with L5 memory recall (`MEMORY_RECALL_MIN_SCORE`). A knowledge hit below
+/// this hybrid score is dropped so a loosely-related/stale record never surfaces.
+pub const DEFAULT_KNOWLEDGE_MIN_SCORE: f64 = 0.30;
+
+/// The default `knowledge.default_source` (SPEC-V2.6 §5/§8): when the caller omits
+/// `source` AND a knowledge store exists, retrieval blends `both`. (When no store
+/// exists, retrieval always resolves to `code`, preserving today's behaviour.)
+pub const DEFAULT_KNOWLEDGE_SOURCE: &str = "both";
+
+/// The deterministic "decided + implemented" boost (SPEC-V2.6 §5): a knowledge
+/// record whose `links` include a merged-PR reference is intent AND implementation,
+/// so its base hybrid score is scaled by this pinned factor before the final sort.
+pub const KNOWLEDGE_MERGED_PR_BOOST: f64 = 1.10;
+
+/// The `knowledge.*` runtime configuration (SPEC-V2.6 §8): `enabled` (Phase A) plus
+/// the M4 retrieval keys `min_score` (the recall precision floor) and `default_source`
+/// (`code` | `knowledge` | `both`, used only when the caller omits `source`). Absent
+/// block / absent key / bad YAML all fall back to the defaults.
+#[derive(Debug, Clone, PartialEq)]
 pub struct KnowledgeConfig {
     pub enabled: bool,
+    pub min_score: f64,
+    pub default_source: String,
 }
 
 impl Default for KnowledgeConfig {
     fn default() -> Self {
-        KnowledgeConfig { enabled: DEFAULT_KNOWLEDGE_ENABLED }
+        KnowledgeConfig {
+            enabled: DEFAULT_KNOWLEDGE_ENABLED,
+            min_score: DEFAULT_KNOWLEDGE_MIN_SCORE,
+            default_source: DEFAULT_KNOWLEDGE_SOURCE.to_string(),
+        }
     }
 }
 
 impl KnowledgeConfig {
     /// Parse from the `.cce/config` YAML text. Tolerant: no `knowledge:` block, an
-    /// absent `enabled`, or bad YAML all fall back to the default (enabled).
+    /// absent key, or bad YAML all fall back to the defaults. A `default_source` that
+    /// is not one of `code`/`knowledge`/`both` is ignored (falls back to the default).
     pub fn from_yaml(text: &str) -> KnowledgeConfig {
         #[derive(serde::Deserialize)]
         struct RawKnowledge {
             enabled: Option<bool>,
+            min_score: Option<f64>,
+            default_source: Option<String>,
         }
         #[derive(serde::Deserialize)]
         struct RawRoot {
@@ -428,8 +453,20 @@ impl KnowledgeConfig {
         }
         let mut cfg = KnowledgeConfig::default();
         if let Ok(raw) = serde_yaml::from_str::<RawRoot>(text) {
-            if let Some(e) = raw.knowledge.and_then(|k| k.enabled) {
-                cfg.enabled = e;
+            if let Some(k) = raw.knowledge {
+                if let Some(e) = k.enabled {
+                    cfg.enabled = e;
+                }
+                if let Some(s) = k.min_score {
+                    if s.is_finite() {
+                        cfg.min_score = s;
+                    }
+                }
+                if let Some(src) = k.default_source {
+                    if matches!(src.as_str(), "code" | "knowledge" | "both") {
+                        cfg.default_source = src;
+                    }
+                }
             }
         }
         cfg
@@ -694,6 +731,10 @@ mod tests {
     fn knowledge_default_is_enabled() {
         assert!(KnowledgeConfig::default().enabled);
         assert_eq!(KnowledgeConfig::default().enabled, DEFAULT_KNOWLEDGE_ENABLED);
+        // M4 retrieval defaults (SPEC-V2.6 §8): the recall floor and the blend source.
+        assert_eq!(KnowledgeConfig::default().min_score, DEFAULT_KNOWLEDGE_MIN_SCORE);
+        assert_eq!(KnowledgeConfig::default().min_score, 0.30);
+        assert_eq!(KnowledgeConfig::default().default_source, "both");
     }
 
     #[test]
@@ -704,6 +745,28 @@ mod tests {
         assert!(KnowledgeConfig::from_yaml("sync:\n  lfs: true\n").enabled);
         assert!(KnowledgeConfig::from_yaml("knowledge: {}\n").enabled);
         assert!(KnowledgeConfig::from_yaml("not: yaml: [").enabled);
+    }
+
+    #[test]
+    fn knowledge_config_reads_min_score_and_default_source() {
+        let cfg = KnowledgeConfig::from_yaml(
+            "knowledge:\n  min_score: 0.5\n  default_source: knowledge\n",
+        );
+        assert_eq!(cfg.min_score, 0.5);
+        assert_eq!(cfg.default_source, "knowledge");
+        // `code` and `both` are the other accepted sources.
+        assert_eq!(
+            KnowledgeConfig::from_yaml("knowledge:\n  default_source: code\n").default_source,
+            "code"
+        );
+        // An unknown source is ignored (falls back to the default `both`).
+        assert_eq!(
+            KnowledgeConfig::from_yaml("knowledge:\n  default_source: nonsense\n").default_source,
+            "both"
+        );
+        // Absent keys fall back to the defaults.
+        assert_eq!(KnowledgeConfig::from_yaml("knowledge: {}\n").min_score, 0.30);
+        assert_eq!(KnowledgeConfig::from_yaml("knowledge: {}\n").default_source, "both");
     }
 
     #[test]

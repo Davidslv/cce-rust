@@ -36,9 +36,10 @@
 
 use crate::chunker::{token_count, Chunk};
 use crate::compress::{compress, DetailLevel};
-use crate::config::{MemoryConfig, OutputLevel, RetrievalConfig, CHARS_PER_TOKEN};
-use crate::embedder::{format6, Embedder, HashEmbedder, OllamaEmbedder};
+use crate::config::{KnowledgeConfig, MemoryConfig, OutputLevel, RetrievalConfig, CHARS_PER_TOKEN};
+use crate::embedder::{format6, score_key, Embedder, HashEmbedder, OllamaEmbedder};
 use crate::federation::{combined_index, federated_search, load_member_stores, workspace_stats};
+use crate::knowledge::{search_knowledge, same_document_sections, KnowledgeHit, KnowledgeStore};
 use crate::mcp::server::McpServer;
 use crate::mcp::MCP_DEFAULT_TOP_K;
 use crate::memory::{self, RecallHit};
@@ -178,7 +179,8 @@ pub fn tool_definitions() -> Vec<Value> {
                     "package":    { "type": "string", "description": "scope to one workspace member (optional)" },
                     "no_graph":   { "type": "boolean", "default": false },
                     "max_tokens": { "type": "integer", "description": "cap the returned context (optional)" },
-                    "detail":     { "type": "string", "enum": ["signature", "compact", "full"], "description": "chunk compression level (optional; default from config, usually compact)" }
+                    "detail":     { "type": "string", "enum": ["signature", "compact", "full"], "description": "chunk compression level (optional; default from config, usually compact)" },
+                    "source":     { "type": "string", "enum": ["code", "knowledge", "both"], "description": "which pools to search (optional; default `both` when a knowledge store exists, else `code`)" }
                 },
                 "required": ["query"]
             }
@@ -276,12 +278,58 @@ pub fn tool_definitions() -> Vec<Value> {
 
 // --- context_search ---
 
-/// `context_search` (SPEC-MCP §1): ranked chunks for a natural-language query.
+/// Which pool(s) `context_search` searches (SPEC-V2.6 §5).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum SourceSel {
+    Code,
+    Knowledge,
+    Both,
+}
+
+/// Resolve the effective `source` (SPEC-V2.6 §5). An explicit, valid `source` arg wins.
+/// Absent (or an unknown value) ⇒ the default: when a `.cce/knowledge/current` store
+/// exists AND knowledge is enabled, the config `knowledge.default_source` (itself
+/// `both` by default); otherwise `code` — so today's code-only behaviour is preserved
+/// exactly whenever there is no knowledge store.
+fn resolve_source(server: &McpServer, args: &Value) -> SourceSel {
+    if let Some(s) = args.get("source").and_then(Value::as_str) {
+        match s.trim() {
+            "code" => return SourceSel::Code,
+            "knowledge" => return SourceSel::Knowledge,
+            "both" => return SourceSel::Both,
+            _ => {} // unknown ⇒ fall through to the default
+        }
+    }
+    let root = server.root();
+    let cfg = KnowledgeConfig::load(&root);
+    if cfg.enabled && KnowledgeStore::load_current(&root).is_ok() {
+        match cfg.default_source.as_str() {
+            "code" => SourceSel::Code,
+            "knowledge" => SourceSel::Knowledge,
+            _ => SourceSel::Both,
+        }
+    } else {
+        SourceSel::Code
+    }
+}
+
+/// `context_search` (SPEC-MCP §1 + SPEC-V2.6 §5): ranked context for a query, over the
+/// code index, the knowledge store, or both (blended by the one shared ranking).
 pub fn context_search(server: &McpServer, args: &Value) -> ToolOutput {
     let query = args.get("query").and_then(Value::as_str).unwrap_or("").trim().to_string();
     if query.is_empty() {
         return ToolOutput::err("context_search requires a non-empty `query`.");
     }
+    match resolve_source(server, args) {
+        // Code-only is the UNCHANGED v2.5 path — byte-identical to today.
+        SourceSel::Code => context_search_code(server, args, &query),
+        SourceSel::Knowledge => context_search_knowledge(server, args, &query),
+        SourceSel::Both => context_search_both(server, args, &query),
+    }
+}
+
+/// The code-only path (SPEC-MCP §1): the exact v2.5 behaviour, preserved byte-for-byte.
+fn context_search_code(server: &McpServer, args: &Value, query: &str) -> ToolOutput {
     let top_k = args
         .get("top_k")
         .and_then(Value::as_u64)
@@ -300,9 +348,9 @@ pub fn context_search(server: &McpServer, args: &Value) -> ToolOutput {
         .unwrap_or_else(|| RetrievalConfig::load(&server.root()).detail);
 
     if server.is_workspace() {
-        context_search_workspace(server, &query, top_k, no_graph, max_tokens, package, detail)
+        context_search_workspace(server, query, top_k, no_graph, max_tokens, package, detail)
     } else {
-        context_search_single(server, &query, top_k, no_graph, max_tokens, detail)
+        context_search_single(server, query, top_k, no_graph, max_tokens, detail)
     }
 }
 
@@ -423,6 +471,380 @@ fn context_search_workspace(
     let total_chunks: usize = members.iter().map(|m| m.index.chunks.len()).sum();
     let rows: Vec<Row> = results.iter().map(Row::from_fed).collect();
     ToolOutput::ok(format_rows(&rows, query_id.as_deref(), max_tokens, total_chunks, detail))
+}
+
+// --- knowledge + blend (SPEC-V2.6 §5) ---
+
+/// The shared query params for a `context_search` call (parsed once, used by the
+/// knowledge and blend paths — the code path parses its own so it stays byte-identical).
+struct SearchParams {
+    top_k: usize,
+    no_graph: bool,
+    max_tokens: Option<usize>,
+    package: Option<String>,
+    detail: DetailLevel,
+}
+
+fn parse_params(server: &McpServer, args: &Value) -> SearchParams {
+    SearchParams {
+        top_k: args
+            .get("top_k")
+            .and_then(Value::as_u64)
+            .map(|n| n as usize)
+            .filter(|n| *n > 0)
+            .unwrap_or(MCP_DEFAULT_TOP_K),
+        no_graph: args.get("no_graph").and_then(Value::as_bool).unwrap_or(false),
+        max_tokens: args.get("max_tokens").and_then(Value::as_u64).map(|n| n as usize),
+        package: args.get("package").and_then(Value::as_str).map(|s| s.to_string()),
+        detail: args
+            .get("detail")
+            .and_then(Value::as_str)
+            .and_then(DetailLevel::parse)
+            .unwrap_or_else(|| RetrievalConfig::load(&server.root()).detail),
+    }
+}
+
+/// Load the ranked knowledge hits for a query (SPEC-V2.6 §5), honouring
+/// `knowledge.enabled` and `knowledge.min_score`. No store (or disabled) ⇒ empty.
+fn load_knowledge_hits(server: &McpServer, query: &str, top_k: usize) -> Vec<KnowledgeHit> {
+    let root = server.root();
+    let cfg = KnowledgeConfig::load(&root);
+    if !cfg.enabled {
+        return Vec::new();
+    }
+    match KnowledgeStore::load_current(&root) {
+        Ok(store) => search_knowledge(&store, query, top_k, cfg.min_score),
+        Err(_) => Vec::new(),
+    }
+}
+
+/// One code hit as an owned row (so it can be interleaved with knowledge without
+/// borrowing the transient `SearchResult`/`FedResult`). Fields mirror what the pinned
+/// result-header grammar (`crate::grammar::compact_line`) needs, so a code row renders
+/// byte-identically whether it is served alone or blended.
+struct CodeRow {
+    score: f64,
+    package: Option<String>,
+    chunk_id: String,
+    file_path: String,
+    start: usize,
+    end: usize,
+    chunk_type: String,
+    kind: String,
+    content: String,
+}
+
+/// A blended candidate: a code row or a knowledge hit, ranked by one shared score.
+enum BlendItem {
+    Code(CodeRow),
+    Knowledge(KnowledgeHit),
+}
+
+impl BlendItem {
+    fn score(&self) -> f64 {
+        match self {
+            BlendItem::Code(c) => c.score,
+            BlendItem::Knowledge(k) => k.score,
+        }
+    }
+    fn chunk_id(&self) -> &str {
+        match self {
+            BlendItem::Code(c) => &c.chunk_id,
+            BlendItem::Knowledge(k) => &k.chunk_id,
+        }
+    }
+    /// Sort priority when scores tie: code before knowledge (a stable, pinned order).
+    fn source_rank(&self) -> u8 {
+        match self {
+            BlendItem::Code(_) => 0,
+            BlendItem::Knowledge(_) => 1,
+        }
+    }
+}
+
+/// Run code retrieval and return owned code rows plus the logged `query_id` and the
+/// code chunk count — reusing the SAME §6 pipeline, metrics event, and session-ledger
+/// recording as the code-only path (so the dashboard and digest are unchanged), but
+/// deferring rendering so the rows can be blended with knowledge.
+fn gather_code_hits(
+    server: &McpServer,
+    query: &str,
+    p: &SearchParams,
+) -> (Vec<CodeRow>, Option<String>, usize) {
+    if server.is_workspace() {
+        gather_code_hits_workspace(server, query, p)
+    } else {
+        gather_code_hits_single(server, query, p)
+    }
+}
+
+fn gather_code_hits_single(
+    server: &McpServer,
+    query: &str,
+    p: &SearchParams,
+) -> (Vec<CodeRow>, Option<String>, usize) {
+    let store = server.store_path();
+    let index = match Index::load(&store) {
+        Ok(i) => i,
+        Err(_) => return (Vec::new(), None, 0),
+    };
+    let emb = pick_embedder(&index);
+    let start = Instant::now();
+    let results = search(&index, emb.as_ref(), query, p.top_k, !p.no_graph);
+    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let record = build_search_record(
+        &index,
+        &results,
+        query,
+        p.top_k,
+        !p.no_graph,
+        latency_ms,
+        "mcp",
+        p.detail,
+    );
+    let query_id = write_search_event(&server.metrics_path(), &record);
+    let chunk_ids: Vec<String> = results.iter().map(|r| r.chunk_id.clone()).collect();
+    let file_paths: Vec<String> = results.iter().map(|r| r.file_path.clone()).collect();
+    server.record_search(query, &chunk_ids, &file_paths);
+    let rows = results
+        .into_iter()
+        .map(|r| CodeRow {
+            score: r.score,
+            package: None,
+            chunk_id: r.chunk_id,
+            file_path: r.file_path,
+            start: r.start_line,
+            end: r.end_line,
+            chunk_type: r.chunk_type,
+            kind: r.kind,
+            content: r.content,
+        })
+        .collect();
+    (rows, query_id, index.chunks.len())
+}
+
+fn gather_code_hits_workspace(
+    server: &McpServer,
+    query: &str,
+    p: &SearchParams,
+) -> (Vec<CodeRow>, Option<String>, usize) {
+    let root = server.root();
+    let manifest = match Manifest::load(&root) {
+        Ok(m) => m,
+        Err(_) => return (Vec::new(), None, 0),
+    };
+    let scope = p.package.as_ref().map(|p| {
+        p.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>()
+    });
+    let members = match load_member_stores(&root, &manifest, scope.as_deref()) {
+        Ok(m) => m,
+        Err(_) => return (Vec::new(), None, 0),
+    };
+    let graph = WorkspaceGraph::load_or_empty(&root, &manifest);
+    let uses_ollama = members.iter().any(|m| m.index.embedder_name == "ollama");
+    let emb: Box<dyn Embedder> = if uses_ollama {
+        let oll = OllamaEmbedder::default();
+        if oll.healthy() {
+            Box::new(oll)
+        } else {
+            Box::new(HashEmbedder)
+        }
+    } else {
+        Box::new(HashEmbedder)
+    };
+    let start = Instant::now();
+    let results = federated_search(&members, &graph, emb.as_ref(), query, p.top_k, !p.no_graph);
+    let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
+    let combined = combined_index(&members);
+    let namespaced: Vec<SearchResult> = results
+        .iter()
+        .map(|r| SearchResult {
+            rank: r.rank,
+            chunk_id: r.chunk_id.clone(),
+            file_path: format!("{}/{}", r.member, r.file_path),
+            start_line: r.start_line,
+            end_line: r.end_line,
+            chunk_type: r.chunk_type.clone(),
+            kind: r.kind.clone(),
+            score: r.score,
+            content: r.content.clone(),
+        })
+        .collect();
+    let record = build_search_record(
+        &combined,
+        &namespaced,
+        query,
+        p.top_k,
+        !p.no_graph,
+        latency_ms,
+        "mcp",
+        p.detail,
+    );
+    let query_id = write_search_event(&server.metrics_path(), &record);
+    let chunk_ids: Vec<String> = results.iter().map(|r| r.chunk_id.clone()).collect();
+    let file_paths: Vec<String> =
+        results.iter().map(|r| format!("{}/{}", r.member, r.file_path)).collect();
+    server.record_search(query, &chunk_ids, &file_paths);
+    let total_chunks: usize = members.iter().map(|m| m.index.chunks.len()).sum();
+    let rows = results
+        .into_iter()
+        .map(|r| CodeRow {
+            score: r.score,
+            package: Some(r.package),
+            chunk_id: r.chunk_id,
+            file_path: r.file_path,
+            start: r.start_line,
+            end: r.end_line,
+            chunk_type: r.chunk_type,
+            kind: r.kind,
+            content: r.content,
+        })
+        .collect();
+    (rows, query_id, total_chunks)
+}
+
+/// The knowledge-only path (SPEC-V2.6 §5, `source:"knowledge"`).
+fn context_search_knowledge(server: &McpServer, args: &Value, query: &str) -> ToolOutput {
+    let p = parse_params(server, args);
+    let hits = load_knowledge_hits(server, query, p.top_k);
+    // Record the knowledge search in the session ledger (its query + returned ids/docs).
+    let chunk_ids: Vec<String> = hits.iter().map(|h| h.chunk_id.clone()).collect();
+    let record_ids: Vec<String> = hits.iter().map(|h| h.record_id.clone()).collect();
+    server.record_search(query, &chunk_ids, &record_ids);
+    let items: Vec<BlendItem> = hits.into_iter().map(BlendItem::Knowledge).collect();
+    ToolOutput::ok(render_blend(items, None, &p, knowledge_total_chunks(server)))
+}
+
+/// The blended path (SPEC-V2.6 §5, `source:"both"`): code + knowledge candidates merged
+/// through the one shared ranking into a single top-K.
+fn context_search_both(server: &McpServer, args: &Value, query: &str) -> ToolOutput {
+    let p = parse_params(server, args);
+    let (code_rows, query_id, code_chunks) = gather_code_hits(server, query, &p);
+    let khits = load_knowledge_hits(server, query, p.top_k);
+    let mut items: Vec<BlendItem> = Vec::with_capacity(code_rows.len() + khits.len());
+    items.extend(code_rows.into_iter().map(BlendItem::Code));
+    items.extend(khits.into_iter().map(BlendItem::Knowledge));
+    let total = code_chunks + knowledge_total_chunks(server);
+    ToolOutput::ok(render_blend(items, query_id.as_deref(), &p, total))
+}
+
+/// The knowledge store's chunk count (for the "no matches" hint), 0 if none/disabled.
+fn knowledge_total_chunks(server: &McpServer) -> usize {
+    let root = server.root();
+    if !KnowledgeConfig::load(&root).enabled {
+        return 0;
+    }
+    KnowledgeStore::load_current(&root).map(|s| s.chunks.len()).unwrap_or(0)
+}
+
+/// The byte-pinned compact header for ONE knowledge hit (SPEC-V2.6 §5), mirroring the
+/// code grammar's shape but carrying the provenance in place of `file:line (type/kind)`:
+/// `«rank». [«score»] [knowledge] «title» — «state» · «updated_at» · «url» #«chunk_id»`
+/// (missing facets omitted cleanly). No trailing newline — the caller adds it.
+fn knowledge_compact_line(rank: usize, score6: &str, hit: &KnowledgeHit) -> String {
+    format!("{:>2}. [{}] {} #{}", rank, score6, hit.provenance(), hit.chunk_id)
+}
+
+/// Render a blended list (SPEC-V2.6 §5): sort code + knowledge candidates by the one
+/// shared score (desc), tie-break code-before-knowledge then `chunk_id` asc, truncate to
+/// `top_k`, and render each — code rows via the UNCHANGED pinned grammar, knowledge rows
+/// with the provenance header — with the same body-serving, `max_tokens`, hint, and
+/// `query_id` footer as the code path.
+fn render_blend(
+    mut items: Vec<BlendItem>,
+    query_id: Option<&str>,
+    p: &SearchParams,
+    total_chunks: usize,
+) -> String {
+    items.sort_by(|a, b| {
+        score_key(b.score())
+            .cmp(&score_key(a.score()))
+            .then_with(|| a.source_rank().cmp(&b.source_rank()))
+            .then_with(|| a.chunk_id().cmp(b.chunk_id()))
+    });
+    items.truncate(p.top_k);
+
+    if items.is_empty() {
+        let mut s = format!(
+            "No matching context found. The index has {total_chunks} chunk(s) — try broader or \
+             different terms."
+        );
+        if let Some(id) = query_id {
+            s.push_str(&format!("\n\nquery_id: {id}\n"));
+        }
+        return s;
+    }
+
+    let registry = Registry::default();
+    let mut out = String::new();
+    let mut used = 0usize;
+    let mut truncated = false;
+    for (i, item) in items.iter().enumerate() {
+        let rank = i + 1;
+        let (header, served) = match item {
+            BlendItem::Code(c) => {
+                // The UNCHANGED pinned result grammar (Layer 3) — code rows stay
+                // byte-for-byte identical to the code-only path (aside from their rank,
+                // which reflects the blended position).
+                let header = crate::grammar::compact_line(&crate::grammar::GrammarRow {
+                    rank,
+                    score6: format6(c.score),
+                    package: c.package.clone(),
+                    file_path: c.file_path.clone(),
+                    start: c.start,
+                    end: c.end,
+                    chunk_type: c.chunk_type.clone(),
+                    kind: c.kind.clone(),
+                    chunk_id: c.chunk_id.clone(),
+                });
+                let served = compress(&registry, &c.file_path, &c.content, p.detail);
+                (header, served)
+            }
+            BlendItem::Knowledge(k) => {
+                // Knowledge bodies are already heading-sized markdown sections; serve
+                // them whole (redacted at index time). Provenance rides the header.
+                (knowledge_compact_line(rank, &format6(k.score), k), k.content.clone())
+            }
+        };
+        out.push_str(&header);
+        out.push('\n');
+        let body = match p.max_tokens {
+            Some(max) => {
+                let (b, cut) = trim_to_tokens(&served, max.saturating_sub(used));
+                truncated |= cut;
+                b
+            }
+            None => served,
+        };
+        out.push_str(&body);
+        if !body.ends_with('\n') {
+            out.push('\n');
+        }
+        out.push('\n');
+        used += token_count(&body);
+        if let Some(max) = p.max_tokens {
+            if used >= max && i + 1 < items.len() {
+                truncated = true;
+                break;
+            }
+        }
+    }
+    if truncated {
+        out.push_str("… (context truncated to max_tokens)\n\n");
+    }
+    if p.detail != DetailLevel::Full {
+        out.push_str(
+            "Bodies shown compact. expand_chunk(chunk_id, scope=body|file|neighbors) for more; \
+             related_context(chunk_id) for import-graph neighbours.\n",
+        );
+    }
+    if let Some(id) = query_id {
+        out.push_str(&format!("query_id: {id}\n"));
+        out.push_str(&format!(
+            "Rate this with record_feedback (query_id=\"{id}\", helpful=true|false).\n"
+        ));
+    }
+    out
 }
 
 /// Append a `search` event and return its id (the query-id), fail-open.
@@ -874,37 +1296,109 @@ pub fn expand_chunk(server: &McpServer, args: &Value) -> ToolOutput {
     // L6: record the well-formed expand call (even if the id later proves stale — the
     // agent still made it) in the session ledger.
     server.record_expand(chunk_id, scope);
-    let index = match working_index(server) {
-        Ok(i) => i,
-        Err(msg) => return ToolOutput::ok(msg),
-    };
-    let Some(target) = index.chunks.iter().find(|c| c.chunk_id == chunk_id) else {
-        return ToolOutput::ok(stale_chunk_message(chunk_id));
-    };
-    match scope {
-        // scope=body recovers the EXACT full body (round-trips `detail:full`).
-        "body" => ToolOutput::ok(target.content.clone()),
-        "file" => {
-            let file_chunks = chunks_in_file(&index, &target.file_path);
-            let blocks: Vec<(&Chunk, String)> =
-                file_chunks.iter().map(|c| (*c, c.content.clone())).collect();
-            let title = format!("file {} — {} chunk(s):", target.file_path, blocks.len());
-            ToolOutput::ok(render_group(&title, &blocks))
-        }
-        _ => {
-            let ns = neighbor_chunks(&index, &target.file_path);
-            if ns.is_empty() {
-                return ToolOutput::ok(format!(
-                    "no import-graph neighbours for {} in the current index.",
-                    target.file_path
-                ));
-            }
-            let blocks: Vec<(&Chunk, String)> =
-                ns.iter().map(|c| (*c, c.content.clone())).collect();
-            let title = format!("neighbours of {} — {} chunk(s):", target.file_path, blocks.len());
-            ToolOutput::ok(render_group(&title, &blocks))
+    let code_index = working_index(server);
+    // Code chunk first — unchanged behaviour for a code chunk_id.
+    if let Ok(index) = &code_index {
+        if let Some(target) = index.chunks.iter().find(|c| c.chunk_id == chunk_id) {
+            return match scope {
+                // scope=body recovers the EXACT full body (round-trips `detail:full`).
+                "body" => ToolOutput::ok(target.content.clone()),
+                "file" => {
+                    let file_chunks = chunks_in_file(index, &target.file_path);
+                    let blocks: Vec<(&Chunk, String)> =
+                        file_chunks.iter().map(|c| (*c, c.content.clone())).collect();
+                    let title = format!("file {} — {} chunk(s):", target.file_path, blocks.len());
+                    ToolOutput::ok(render_group(&title, &blocks))
+                }
+                _ => {
+                    let ns = neighbor_chunks(index, &target.file_path);
+                    if ns.is_empty() {
+                        return ToolOutput::ok(format!(
+                            "no import-graph neighbours for {} in the current index.",
+                            target.file_path
+                        ));
+                    }
+                    let blocks: Vec<(&Chunk, String)> =
+                        ns.iter().map(|c| (*c, c.content.clone())).collect();
+                    let title =
+                        format!("neighbours of {} — {} chunk(s):", target.file_path, blocks.len());
+                    ToolOutput::ok(render_group(&title, &blocks))
+                }
+            };
         }
     }
+    // Knowledge chunk fallback (SPEC-V2.6 §5): body / same-document sections.
+    if let Some(out) = expand_knowledge_chunk(server, chunk_id, scope) {
+        return out;
+    }
+    // Found in neither pool: a missing code index shows the friendly guidance; an
+    // unknown id with an index present is stale (unchanged for code-only setups).
+    match code_index {
+        Ok(_) => ToolOutput::ok(stale_chunk_message(chunk_id)),
+        Err(msg) => ToolOutput::ok(msg),
+    }
+}
+
+/// A one-line header for a knowledge section in expand/related output:
+/// `«record_id»:«start»-«end» («kind») #«chunk_id»`.
+fn knowledge_chunk_header(kc: &crate::knowledge::KnowledgeChunk) -> String {
+    format!("{}:{}-{} ({}) #{}", kc.record_id, kc.start_line, kc.end_line, kc.kind, kc.chunk_id)
+}
+
+/// Render a titled group of knowledge sections (header + body each). Deterministic.
+fn render_knowledge_group(
+    title: &str,
+    blocks: &[(&crate::knowledge::KnowledgeChunk, String)],
+) -> String {
+    let mut out = title.to_string();
+    out.push('\n');
+    for (kc, body) in blocks {
+        out.push('\n');
+        out.push_str(&knowledge_chunk_header(kc));
+        out.push('\n');
+        out.push_str(body);
+        if !body.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// `expand_chunk` over a knowledge chunk_id (SPEC-V2.6 §5). `body` returns the section;
+/// `file`/`neighbors` return the document's sections (neighbours exclude the target).
+/// Returns `None` when the id is not a knowledge chunk, so the caller can fall through.
+fn expand_knowledge_chunk(server: &McpServer, chunk_id: &str, scope: &str) -> Option<ToolOutput> {
+    let root = server.root();
+    if !KnowledgeConfig::load(&root).enabled {
+        return None;
+    }
+    let store = KnowledgeStore::load_current(&root).ok()?;
+    let target = store.chunks.iter().find(|c| c.chunk_id == chunk_id)?;
+    let out = match scope {
+        "body" => target.content.clone(),
+        "file" => {
+            let sections = same_document_sections(&store, &target.record_id, None);
+            let blocks: Vec<(&crate::knowledge::KnowledgeChunk, String)> =
+                sections.iter().map(|c| (*c, c.content.clone())).collect();
+            let title = format!("document {} — {} section(s):", target.record_id, blocks.len());
+            render_knowledge_group(&title, &blocks)
+        }
+        _ => {
+            let sections = same_document_sections(&store, &target.record_id, Some(chunk_id));
+            if sections.is_empty() {
+                return Some(ToolOutput::ok(format!(
+                    "no same-document neighbours for {} in the knowledge store.",
+                    target.record_id
+                )));
+            }
+            let blocks: Vec<(&crate::knowledge::KnowledgeChunk, String)> =
+                sections.iter().map(|c| (*c, c.content.clone())).collect();
+            let title =
+                format!("neighbours of {} — {} section(s):", target.record_id, blocks.len());
+            render_knowledge_group(&title, &blocks)
+        }
+    };
+    Some(ToolOutput::ok(out))
 }
 
 /// `related_context` (SPEC-V2.5 §7): import-graph neighbours (imports AND consumers)
@@ -924,26 +1418,69 @@ pub fn related_context(server: &McpServer, args: &Value) -> ToolOutput {
         .unwrap_or(MCP_DEFAULT_TOP_K);
     // L6: record the well-formed related_context call in the session ledger.
     server.record_related(chunk_id);
-    let index = match working_index(server) {
-        Ok(i) => i,
-        Err(msg) => return ToolOutput::ok(msg),
-    };
-    let Some(target) = index.chunks.iter().find(|c| c.chunk_id == chunk_id) else {
-        return ToolOutput::ok(stale_chunk_message(chunk_id));
-    };
-    let mut ns = neighbor_chunks(&index, &target.file_path);
-    ns.truncate(top_k);
-    if ns.is_empty() {
-        return ToolOutput::ok(format!("no import-graph neighbours for {}.", target.file_path));
+    let code_index = working_index(server);
+    if let Ok(index) = &code_index {
+        if let Some(target) = index.chunks.iter().find(|c| c.chunk_id == chunk_id) {
+            let mut ns = neighbor_chunks(index, &target.file_path);
+            ns.truncate(top_k);
+            if ns.is_empty() {
+                return ToolOutput::ok(format!(
+                    "no import-graph neighbours for {}.",
+                    target.file_path
+                ));
+            }
+            let registry = Registry::default();
+            let blocks: Vec<(&Chunk, String)> = ns
+                .iter()
+                .map(|c| (*c, compress(&registry, &c.file_path, &c.content, DetailLevel::Compact)))
+                .collect();
+            let title = format!(
+                "related to {} via import graph — {} chunk(s):",
+                target.file_path,
+                blocks.len()
+            );
+            return ToolOutput::ok(render_group(&title, &blocks));
+        }
     }
-    let registry = Registry::default();
-    let blocks: Vec<(&Chunk, String)> = ns
+    // Knowledge chunk fallback (SPEC-V2.6 §5): related = same-document neighbours.
+    if let Some(out) = related_knowledge_chunk(server, chunk_id, top_k) {
+        return out;
+    }
+    match code_index {
+        Ok(_) => ToolOutput::ok(stale_chunk_message(chunk_id)),
+        Err(msg) => ToolOutput::ok(msg),
+    }
+}
+
+/// `related_context` over a knowledge chunk_id (SPEC-V2.6 §5): the other sections of the
+/// same document, COMPACT, up to `top_k`. `None` when the id is not a knowledge chunk.
+fn related_knowledge_chunk(server: &McpServer, chunk_id: &str, top_k: usize) -> Option<ToolOutput> {
+    let root = server.root();
+    if !KnowledgeConfig::load(&root).enabled {
+        return None;
+    }
+    let store = KnowledgeStore::load_current(&root).ok()?;
+    let target = store.chunks.iter().find(|c| c.chunk_id == chunk_id)?;
+    let mut sections = same_document_sections(&store, &target.record_id, Some(chunk_id));
+    sections.truncate(top_k);
+    if sections.is_empty() {
+        return Some(ToolOutput::ok(format!(
+            "no same-document neighbours for {} in the knowledge store.",
+            target.record_id
+        )));
+    }
+    let blocks: Vec<(&crate::knowledge::KnowledgeChunk, String)> = sections
         .iter()
-        .map(|c| (*c, compress(&registry, &c.file_path, &c.content, DetailLevel::Compact)))
+        .map(|c| {
+            (*c, compress(&Registry::default(), &c.record_id, &c.content, DetailLevel::Compact))
+        })
         .collect();
-    let title =
-        format!("related to {} via import graph — {} chunk(s):", target.file_path, blocks.len());
-    ToolOutput::ok(render_group(&title, &blocks))
+    let title = format!(
+        "related to {} in the same document — {} section(s):",
+        target.record_id,
+        blocks.len()
+    );
+    Some(ToolOutput::ok(render_knowledge_group(&title, &blocks)))
 }
 
 /// The message for a chunk_id absent from the current index (stale after re-index).
