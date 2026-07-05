@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.0] - 2026-07-05
+
+### Added
+- **Knowledge Sources (v2.6 Phase A)** — a markdown-heading chunker (tree-sitter-markdown; each `##`
+  section becomes a content-addressed chunk), the neutral **`cce.knowledge/v1`** ingest contract, and
+  **`cce knowledge index <file.jsonl>`** which renders + heading-chunks records into a *separate,
+  snapshot-keyed knowledge store* (redacted before write; issue/doc metadata as facets). **Fully
+  additive** — the code index, `conformance.json`, and the Sync artifact are byte-identical. Config:
+  `markdown.max_section_tokens` (400), `knowledge.enabled`.
+
 ## [2.5.5] - 2026-07-05
 
 ### Documentation

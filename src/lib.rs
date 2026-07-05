@@ -21,6 +21,8 @@ pub mod eval;
 pub mod embedder;
 pub mod packs;
 pub mod chunker;
+pub mod markdown;
+pub mod knowledge;
 pub mod compress;
 pub mod sensitive;
 pub mod redactor;

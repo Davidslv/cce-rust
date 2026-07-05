@@ -216,6 +216,11 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Ingest a `cce.knowledge/v1` feed into the knowledge store (SPEC-V2.6 §4).
+    Knowledge {
+        #[command(subcommand)]
+        cmd: KnowledgeCmd,
+    },
     /// Run the real-world A/B eval harness over recorded runs (SPEC-V2.5 §7).
     ///
     /// Correctness-gated (punts excluded) and cost-primary (cost includes
@@ -302,6 +307,20 @@ enum SyncCmd {
     },
 }
 
+/// Subcommands of `cce knowledge` (SPEC-V2.6 §4).
+#[derive(Subcommand)]
+enum KnowledgeCmd {
+    /// Index a `cce.knowledge/v1` NDJSON feed into `<dir>/.cce/knowledge/`.
+    Index {
+        /// The `cce.knowledge/v1` file to ingest (NDJSON, one record per line).
+        file: PathBuf,
+        /// Project root whose `.cce/knowledge/` store receives the snapshot
+        /// (default: current directory).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+}
+
 /// Subcommands of `cce workspace` (SPEC-V2.2 §3/§9).
 #[derive(Subcommand)]
 enum WorkspaceCmd {
@@ -381,6 +400,9 @@ fn main() -> ExitCode {
         Command::Conformance { fixture_dir, output } => cmd_conformance(&fixture_dir, &output),
         Command::Packs { validate } => cmd_packs(validate),
         Command::Savings { dir, store, metrics, json } => cmd_savings(dir, store, metrics, json),
+        Command::Knowledge { cmd } => match cmd {
+            KnowledgeCmd::Index { file, dir } => cmd_knowledge_index(&file, dir),
+        },
         Command::Eval { runs, questions, json } => cmd_eval(&runs, &questions, json),
     };
     match result {
@@ -754,6 +776,30 @@ fn cmd_savings(
     println!();
     println!("  This is the internal \"vs full-file\" figure, NOT your real agent cost.");
     println!("  For the real end-to-end delta, run the A/B eval harness: see eval/README.md.");
+    Ok(())
+}
+
+/// `cce knowledge index <file.jsonl> [--dir <root>]` (SPEC-V2.6 §4): ingest a
+/// `cce.knowledge/v1` feed into the snapshot-keyed knowledge store under
+/// `<root>/.cce/knowledge/`, heading-chunked (M1) and redacted before write. Offline,
+/// deterministic; a newer snapshot supersedes the old. Honours
+/// `markdown.max_section_tokens` and `knowledge.enabled` from `<root>/.cce/config`.
+fn cmd_knowledge_index(file: &Path, dir: Option<PathBuf>) -> Result<(), String> {
+    if !file.is_file() {
+        return Err(format!("not a file: {}", file.display()));
+    }
+    let root = dir.unwrap_or_else(|| PathBuf::from("."));
+    if !cce::config::KnowledgeConfig::load(&root).enabled {
+        return Err("knowledge is disabled (knowledge.enabled: false in .cce/config)".to_string());
+    }
+    let budget = cce::config::MarkdownConfig::load(&root).max_section_tokens;
+    let summary = cce::knowledge::ingest_file(file, &root, budget)?;
+    println!("Indexed knowledge from {}", file.display());
+    println!("  schema    : {}", cce::knowledge::KNOWLEDGE_SCHEMA_ID);
+    println!("  records   : {}", summary.records);
+    println!("  chunks    : {}", summary.chunks);
+    println!("  snapshot  : {}", summary.snapshot);
+    println!("  store     : {}", summary.store_path.display());
     Ok(())
 }
 
