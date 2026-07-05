@@ -7,6 +7,50 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.4.1] - 2026-07-05
+
+The **closing consolidation of the v2.4 milestone**: a refreshed dashboard that
+surfaces the capabilities landed since v1.1, plus a verified, gapless, offline-first
+documentation sweep. **Additive patch release** — the metrics schema grows only by
+adding fields (older logs still parse), the base engine and single-repo
+`conformance.json` are byte-for-byte unchanged, and `SYNC_FORMAT_VERSION` stays
+`"2.3"` so the shared golden checksum
+`581cbd0ff682a38d7d1250f3eec44f4ce456bdd660d4cb29aaaadd9e95072f48` is untouched.
+
+### Added
+
+- **Dashboard refresh (`src/dashboard.rs`, `src/aggregator.rs`)** — four new panels:
+  **agent-vs-human usage** (CLI vs MCP searches), **per-package breakdown**
+  (savings/searches/quality per workspace member — now with `mean_top_score`),
+  **index freshness / sync status** (indexed `sha`, local-vs-pulled source,
+  behind-remote), and **secret-safety** (sensitive-files-skipped count). The page
+  stays loopback-only, read-only, and self-contained (inline CSS/JS, hand-drawn SVG,
+  no external network).
+- **Metrics schema — additive fields.** `search` events carry
+  `source: "cli" | "mcp"` (the CLI `search` path tags `"cli"`; the MCP
+  `context_search` path tags `"mcp"`). `index` events carry `sha`, `source`, and
+  `sensitive_skipped`. Absent/unknown fields degrade gracefully (a pre-v2.4.1 search
+  reads back as `"cli"`; an index event as `"local"`).
+- **Aggregator sections.** `/api/metrics` gains `usage_by_source`, `secret_safety`,
+  and `index_freshness` (log-derived, pure, cross-language-identical), and
+  `totals.mean_top_score`. The dashboard edge layers the live, offline-safe
+  `remote_latest`/`behind_remote` onto `index_freshness`.
+- **Documentation sweep** — a dedicated, **verified offline-first** section proving
+  `index` / `search` / `stats` / `dashboard` / `workspace` / `cce mcp` all run with
+  no network and no remote; macOS **and** Ubuntu setup with explicit prerequisites
+  (toolchain, C compiler, git, git-LFS); a Sync + MCP best-practices section; and
+  both an online and an offline cold-start transcript in
+  [`docs/VERIFIED.md`](docs/VERIFIED.md).
+
+### Changed
+
+- `retriever::build_search_record` takes a `source` argument so the CLI and MCP
+  search paths tag their metrics events.
+- `dashboard::run` / `serve` / `route` take the project `root` so the freshness
+  panel can read the sync marker (offline-safe: no remote ⇒ no network).
+- Version bumped to **2.4.1** (`Cargo.toml`, `CITATION.cff`). `SYNC_FORMAT_VERSION`
+  deliberately **unchanged** at `"2.3"`.
+
 ## [2.4.0] - 2026-07-05
 
 **CCE MCP** — a [Model Context Protocol](https://modelcontextprotocol.io) server

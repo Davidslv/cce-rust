@@ -97,6 +97,9 @@ fn file_hints(query: &str) -> Vec<String> {
 /// log an identical `cce.metrics/v1` event to `metrics.jsonl` — that identity is
 /// what lets `cce dashboard` surface agent usage the same way it surfaces CLI use.
 /// `latency_ms` is measured by the caller (the one non-deterministic input).
+/// `source` tags who issued the search — `"cli"` (the `cce search` path) or
+/// `"mcp"` (the agent's `context_search` tool) — feeding the dashboard's
+/// agent-vs-human split (v2.4.1).
 pub fn build_search_record(
     index: &Index,
     results: &[SearchResult],
@@ -104,6 +107,7 @@ pub fn build_search_record(
     top_k: usize,
     graph_enabled: bool,
     latency_ms: f64,
+    source: &str,
 ) -> SearchRecord {
     let result_count = results.len();
     let baseline_tokens = index.baseline_tokens(results.iter().map(|r| r.file_path.as_str()));
@@ -137,6 +141,7 @@ pub fn build_search_record(
         empty,
         low_confidence,
         latency_ms,
+        source: source.to_string(),
     }
 }
 

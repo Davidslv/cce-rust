@@ -20,6 +20,8 @@
 
 use crate::aggregator::aggregate;
 use crate::metrics::{format_iso, read_log};
+use crate::sync::commands::{freshness, IndexSource};
+use serde_json::{json, Value};
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -39,15 +41,41 @@ fn now_secs() -> i64 {
 
 /// Build the `/api/metrics` JSON body: the §4 aggregate plus a non-conformance
 /// `generated_ts` wall-clock stamp, computed fresh from the log at `metrics_path`.
-pub fn metrics_body(metrics_path: &Path, price: f64) -> String {
+/// `root` is the project root — used only to layer the live sync
+/// `remote_latest`/`behind_remote` onto `index_freshness` (offline-safe: no remote
+/// configured ⇒ no network, and any remote error leaves them null/false).
+pub fn metrics_body(metrics_path: &Path, root: &Path, price: f64) -> String {
     let now = now_secs();
     let log = read_log(metrics_path);
     let agg = aggregate(&log.events, now, price);
-    let mut val = serde_json::to_value(&agg).unwrap_or(serde_json::Value::Null);
+    let mut val = serde_json::to_value(&agg).unwrap_or(Value::Null);
     if let Some(obj) = val.as_object_mut() {
-        obj.insert("generated_ts".to_string(), serde_json::Value::String(format_iso(now)));
+        obj.insert("generated_ts".to_string(), Value::String(format_iso(now)));
     }
+    augment_index_freshness(&mut val, root);
     serde_json::to_string_pretty(&val).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Layer the live sync comparison onto the log-derived `index_freshness`
+/// (v2.4.1). A pulled index's authoritative source/sha come from the sync marker;
+/// `remote_latest`/`behind_remote` come from a best-effort, offline-safe remote
+/// lookup (both null/false when there is no remote or it is unreachable).
+fn augment_index_freshness(val: &mut Value, root: &Path) {
+    let f = freshness(root);
+    let Some(obj) = val.get_mut("index_freshness").and_then(|v| v.as_object_mut()) else {
+        return;
+    };
+    if f.source == IndexSource::Pulled {
+        obj.insert("source".to_string(), json!("pulled"));
+        if let Some(sha) = &f.sha {
+            obj.insert("sha".to_string(), json!(sha));
+        }
+    }
+    obj.insert(
+        "remote_latest".to_string(),
+        f.remote_latest.as_ref().map(|s| json!(s)).unwrap_or(Value::Null),
+    );
+    obj.insert("behind_remote".to_string(), json!(f.behind_remote));
 }
 
 /// Build the `/api/health` JSON body.
@@ -62,7 +90,7 @@ fn health_body(metrics_path: &Path) -> String {
 }
 
 /// Route a request path to a response (DASHBOARD-SPEC §6). Read-only.
-pub fn route(path: &str, metrics_path: &Path, price: f64) -> HttpResponse {
+pub fn route(path: &str, metrics_path: &Path, root: &Path, price: f64) -> HttpResponse {
     // Ignore any query string.
     let clean = path.split('?').next().unwrap_or(path);
     match clean {
@@ -74,7 +102,7 @@ pub fn route(path: &str, metrics_path: &Path, price: f64) -> HttpResponse {
         "/api/metrics" => HttpResponse {
             status: 200,
             content_type: "application/json",
-            body: metrics_body(metrics_path, price),
+            body: metrics_body(metrics_path, root, price),
         },
         "/api/health" => HttpResponse {
             status: 200,
@@ -102,14 +130,19 @@ fn reason(status: u16) -> &'static str {
 pub fn handle_connection(
     mut stream: TcpStream,
     metrics_path: &Path,
+    root: &Path,
     price: f64,
 ) -> std::io::Result<()> {
-    handle_connection_with(stream_router(metrics_path, price), &mut stream)
+    handle_connection_with(stream_router(metrics_path, root, price), &mut stream)
 }
 
 /// A router closure resolving a request path to a response.
-fn stream_router<'a>(metrics_path: &'a Path, price: f64) -> impl Fn(&str) -> HttpResponse + 'a {
-    move |path: &str| route(path, metrics_path, price)
+fn stream_router<'a>(
+    metrics_path: &'a Path,
+    root: &'a Path,
+    price: f64,
+) -> impl Fn(&str) -> HttpResponse + 'a {
+    move |path: &str| route(path, metrics_path, root, price)
 }
 
 /// Read the request line from `stream`, route it via `router`, write the response.
@@ -140,12 +173,18 @@ pub fn handle_connection_with(
 
 /// Serve connections from `listener`. When `max` is `Some(n)`, stop after `n`
 /// connections (used by tests for a clean shutdown); `None` serves forever.
-pub fn serve(listener: TcpListener, metrics_path: PathBuf, price: f64, max: Option<usize>) {
+pub fn serve(
+    listener: TcpListener,
+    metrics_path: PathBuf,
+    root: PathBuf,
+    price: f64,
+    max: Option<usize>,
+) {
     let mut served = 0usize;
     for stream in listener.incoming() {
         match stream {
             Ok(s) => {
-                let _ = handle_connection(s, &metrics_path, price);
+                let _ = handle_connection(s, &metrics_path, &root, price);
             }
             Err(_) => break,
         }
@@ -158,14 +197,15 @@ pub fn serve(listener: TcpListener, metrics_path: PathBuf, price: f64, max: Opti
     }
 }
 
-/// Bind `127.0.0.1:port` and serve the dashboard forever. Prints the URL.
-pub fn run(metrics_path: PathBuf, price: f64, port: u16) -> std::io::Result<()> {
+/// Bind `127.0.0.1:port` and serve the dashboard forever. Prints the URL. `root`
+/// is the project root, used only for the offline-safe sync-freshness panel.
+pub fn run(metrics_path: PathBuf, root: PathBuf, price: f64, port: u16) -> std::io::Result<()> {
     let listener = TcpListener::bind(("127.0.0.1", port))?;
     let addr = listener.local_addr()?;
     println!("cce dashboard: serving http://{addr}/  (loopback only, read-only)");
     println!("metrics log : {}", metrics_path.display());
     println!("press Ctrl-C to stop.");
-    serve(listener, metrics_path, price, None);
+    serve(listener, metrics_path, root, price, None);
     Ok(())
 }
 
@@ -173,13 +213,19 @@ pub fn run(metrics_path: PathBuf, price: f64, port: u16) -> std::io::Result<()> 
 
 /// Build the workspace `/api/metrics` JSON body: the §4 roll-up over every
 /// member's events plus a `by_package` breakdown (federation), computed fresh
-/// from the members' logs at request time, with a wall-clock `generated_ts`.
-pub fn workspace_metrics_body(members: &[crate::federation::MemberMetrics], price: f64) -> String {
+/// from the members' logs at request time, with a wall-clock `generated_ts` and
+/// the offline-safe `index_freshness` sync panel rooted at the workspace `root`.
+pub fn workspace_metrics_body(
+    members: &[crate::federation::MemberMetrics],
+    root: &Path,
+    price: f64,
+) -> String {
     let now = now_secs();
     let mut val = crate::federation::federated_metrics_json(members, now, price);
     if let Some(obj) = val.as_object_mut() {
-        obj.insert("generated_ts".to_string(), serde_json::Value::String(format_iso(now)));
+        obj.insert("generated_ts".to_string(), Value::String(format_iso(now)));
     }
+    augment_index_freshness(&mut val, root);
     serde_json::to_string_pretty(&val).unwrap_or_else(|_| "{}".to_string())
 }
 
@@ -187,6 +233,7 @@ pub fn workspace_metrics_body(members: &[crate::federation::MemberMetrics], pric
 pub fn route_workspace(
     path: &str,
     members: &[crate::federation::MemberMetrics],
+    root: &Path,
     price: f64,
 ) -> HttpResponse {
     let clean = path.split('?').next().unwrap_or(path);
@@ -199,7 +246,7 @@ pub fn route_workspace(
         "/api/metrics" => HttpResponse {
             status: 200,
             content_type: "application/json",
-            body: workspace_metrics_body(members, price),
+            body: workspace_metrics_body(members, root, price),
         },
         "/api/health" => {
             let events: usize =
@@ -224,8 +271,10 @@ pub fn route_workspace(
 }
 
 /// Bind `127.0.0.1:port` and serve the federated workspace dashboard forever.
+/// `root` is the workspace root, used only for the offline-safe sync-freshness panel.
 pub fn run_workspace(
     members: Vec<crate::federation::MemberMetrics>,
+    root: PathBuf,
     price: f64,
     port: u16,
 ) -> std::io::Result<()> {
@@ -236,7 +285,7 @@ pub fn run_workspace(
     println!("press Ctrl-C to stop.");
     for stream in listener.incoming().flatten() {
         let mut stream = stream;
-        let _ = handle_connection_with(|p| route_workspace(p, &members, price), &mut stream);
+        let _ = handle_connection_with(|p| route_workspace(p, &members, &root, price), &mut stream);
     }
     Ok(())
 }
@@ -364,6 +413,59 @@ function render(m){
     .forEach(([k,v])=> cards.appendChild($('div',{class:'card'},[$('div',{class:'k',text:k}),$('div',{class:'v',text:v})])));
   main.appendChild(cards);
 
+  // --- v2.4.1 panels: freshness/secret-safety, agent-vs-human, by-package ---
+  const fresh=m.index_freshness||{}, sec=m.secret_safety||{}, usage=m.usage_by_source||{};
+  const freshSource = fresh.source ? (fresh.source==='pulled'?'pulled via sync':'local') : '—';
+  const behind = fresh.behind_remote ? 'yes — pull latest'
+               : (fresh.remote_latest ? 'no (up to date)' : 'n/a (no remote)');
+  const info=$('div',{class:'cards'});
+  [['Index source',freshSource],
+   ['Indexed sha', fresh.sha ? String(fresh.sha).slice(0,12) : '—'],
+   ['Behind remote',behind],
+   ['Sensitive skipped',int(sec.sensitive_skipped)]]
+    .forEach(([k,v])=> info.appendChild($('div',{class:'card'},[$('div',{class:'k',text:k}),$('div',{class:'v',text:String(v)})])));
+  main.appendChild($('section',{},[
+    $('h2',{text:'Index freshness & secret-safety'}),
+    $('div',{class:'hint',text:'is my context current (sync), and is redaction working'}),
+    info
+  ]));
+
+  // Agent vs human usage (CLI vs MCP searches).
+  const srcRow=(label,u)=>{ u=u||{}; return $('tr',{},[
+    $('td',{text:label}),
+    $('td',{class:'num',text:int(u.searches)}),
+    $('td',{class:'num',text:int(u.tokens_saved)}),
+    $('td',{class:'num',text:pct(u.mean_savings_ratio)}),
+    $('td',{class:'num',text:sc(u.mean_top_score)})
+  ]); };
+  main.appendChild($('section',{},[
+    $('h2',{text:'Agent vs human usage'}),
+    $('div',{class:'hint',text:'how much your agent (MCP) leans on CCE vs the CLI'}),
+    $('table',{},[
+      $('thead',{},[$('tr',{},['Source','Searches','Saved','Ratio','Top'].map(h=>$('th',{text:h})))]),
+      $('tbody',{},[srcRow('Human (CLI)',usage.cli), srcRow('Agent (MCP)',usage.mcp)])
+    ])
+  ]));
+
+  // Per-package breakdown (workspace only — present iff federated).
+  if(Array.isArray(m.by_package) && m.by_package.length){
+    const pkgRows=m.by_package.map(p=>$('tr',{},[
+      $('td',{text:p.package}),
+      $('td',{class:'num',text:int(p.searches)}),
+      $('td',{class:'num',text:int(p.tokens_saved)}),
+      $('td',{class:'num',text:pct(p.mean_savings_ratio)}),
+      $('td',{class:'num',text:sc(p.mean_top_score)})
+    ]));
+    main.appendChild($('section',{},[
+      $('h2',{text:'By package'}),
+      $('div',{class:'hint',text:'where in the ecosystem CCE is helping most'}),
+      $('table',{},[
+        $('thead',{},[$('tr',{},['Package','Searches','Saved','Ratio','Top'].map(h=>$('th',{text:h})))]),
+        $('tbody',{},pkgRows)
+      ])
+    ]));
+  }
+
   const daily=m.series.daily||[];
   // North-star A: savings
   const sv=m.north_star.savings;
@@ -430,9 +532,14 @@ mod tests {
         ))
     }
 
+    /// A project root with no sync config (freshness stays offline-safe & local).
+    fn fixture_root() -> PathBuf {
+        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/test/fixture/base"))
+    }
+
     #[test]
     fn root_serves_self_contained_html() {
-        let resp = route("/", &fixture_metrics(), 3.00);
+        let resp = route("/", &fixture_metrics(), &fixture_root(), 3.00);
         assert_eq!(resp.status, 200);
         assert_eq!(resp.content_type, "text/html; charset=utf-8");
         assert!(resp.body.contains("<title>CCE Dashboard</title>"));
@@ -450,7 +557,7 @@ mod tests {
 
     #[test]
     fn health_reports_event_and_skipped_counts() {
-        let resp = route("/api/health", &fixture_metrics(), 3.00);
+        let resp = route("/api/health", &fixture_metrics(), &fixture_root(), 3.00);
         assert_eq!(resp.status, 200);
         let v: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
         assert_eq!(v["status"], "ok");
@@ -481,26 +588,32 @@ mod tests {
             });
         }
 
-        let page = route_workspace("/", &members, 3.00);
+        let root = tmp.path().to_path_buf();
+        let page = route_workspace("/", &members, &root, 3.00);
         assert!(page.body.contains("<title>CCE Dashboard</title>"));
 
-        let health = route_workspace("/api/health", &members, 3.00);
+        let health = route_workspace("/api/health", &members, &root, 3.00);
         let hv: serde_json::Value = serde_json::from_str(&health.body).unwrap();
         assert_eq!(hv["events"], 2);
         assert_eq!(hv["members"], 2);
 
-        let metrics = route_workspace("/api/metrics", &members, 3.00);
+        let metrics = route_workspace("/api/metrics", &members, &root, 3.00);
         let mv: serde_json::Value = serde_json::from_str(&metrics.body).unwrap();
         assert_eq!(mv["totals"]["tokens_saved"], 4000);
         assert!(mv.get("generated_ts").is_some());
         assert_eq!(mv["by_package"].as_array().unwrap().len(), 2);
+        // v2.4.1: the roll-up carries the source split and the offline-safe
+        // freshness panel (no remote configured ⇒ null/false, no network).
+        assert_eq!(mv["usage_by_source"]["cli"]["searches"], 2);
+        assert_eq!(mv["index_freshness"]["behind_remote"], false);
+        assert!(mv["index_freshness"]["remote_latest"].is_null());
 
-        assert_eq!(route_workspace("/nope", &members, 3.00).status, 404);
+        assert_eq!(route_workspace("/nope", &members, &root, 3.00).status, 404);
     }
 
     #[test]
     fn metrics_endpoint_is_aggregate_plus_generated_ts() {
-        let resp = route("/api/metrics", &fixture_metrics(), 3.00);
+        let resp = route("/api/metrics", &fixture_metrics(), &fixture_root(), 3.00);
         assert_eq!(resp.status, 200);
         assert_eq!(resp.content_type, "application/json");
         let v: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
@@ -508,11 +621,16 @@ mod tests {
         assert!(v.get("generated_ts").is_some());
         assert_eq!(v["totals"]["searches"], 4);
         assert_eq!(v["totals"]["tokens_saved"], 53000);
+        // v2.4.1 panels are present and offline-safe on the fixture root.
+        assert_eq!(v["usage_by_source"]["cli"]["searches"], 4);
+        assert_eq!(v["secret_safety"]["sensitive_skipped"], 0);
+        assert_eq!(v["index_freshness"]["source"], "local");
+        assert_eq!(v["index_freshness"]["behind_remote"], false);
     }
 
     #[test]
     fn unknown_path_is_404() {
-        let resp = route("/nope", &fixture_metrics(), 3.00);
+        let resp = route("/nope", &fixture_metrics(), &fixture_root(), 3.00);
         assert_eq!(resp.status, 404);
         let v: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
         assert!(v.get("error").is_some());
@@ -520,15 +638,19 @@ mod tests {
 
     #[test]
     fn query_string_is_ignored() {
-        let resp = route("/api/health?x=1", &fixture_metrics(), 3.00);
+        let resp = route("/api/health?x=1", &fixture_metrics(), &fixture_root(), 3.00);
         assert_eq!(resp.status, 200);
     }
 
     #[test]
     fn missing_log_yields_empty_but_valid_metrics() {
-        let resp = route("/api/metrics", Path::new("/no/such/metrics.jsonl"), 3.00);
+        let resp =
+            route("/api/metrics", Path::new("/no/such/metrics.jsonl"), Path::new("/no/such"), 3.00);
         assert_eq!(resp.status, 200);
         let v: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
         assert_eq!(v["totals"]["searches"], 0);
+        // No index events ⇒ freshness panel is a clean null/local-less state.
+        assert_eq!(v["index_freshness"]["indexes"], 0);
+        assert!(v["index_freshness"]["source"].is_null());
     }
 }

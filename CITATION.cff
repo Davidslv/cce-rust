@@ -8,12 +8,15 @@ abstract: >-
   index on disk as JSON, then answers queries with hybrid vector + BM25 retrieval.
   Built test-first from SPEC v1.0, the Dashboard addendum (v1.1), the v2.0
   language-packs evolution, v2.1 secret protection, v2.2 workspace mode
-  (federating a multi-codebase ecosystem while each member stays isolated), and
+  (federating a multi-codebase ecosystem while each member stays isolated),
   v2.3 CCE Sync (an offline-first, content-addressed git cache for the index, with a
-  byte-exact cross-language interchange artifact), and v2.4 CCE MCP (a Model Context
-  Protocol server so an agent uses CCE as a native tool, plus `cce init`).
+  byte-exact cross-language interchange artifact), v2.4 CCE MCP (a Model Context
+  Protocol server so an agent uses CCE as a native tool, plus `cce init`), and the
+  v2.4.1 consolidation (a refreshed dashboard — agent-vs-human, per-package,
+  index-freshness, and secret-safety panels — plus a verified, offline-first
+  documentation sweep).
 type: software
-version: 2.4.0
+version: 2.4.1
 date-released: "2026-07-05"
 license: MIT
 repository-code: "https://github.com/davidslv/cce-rust"

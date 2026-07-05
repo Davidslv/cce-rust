@@ -19,18 +19,31 @@
 
 use crate::config::{DIRECTION_EPSILON, RECENT_SEARCHES_LIMIT, TREND_WINDOW_DAYS};
 use crate::embedder::round6;
-use crate::metrics::{date_str, Event, FeedbackEvent, SearchEvent};
+use crate::metrics::{date_str, Event, FeedbackEvent, IndexEvent, SearchEvent};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
 const DAY_SECS: i64 = 86_400;
 
 /// The aggregate, minus `generated_ts` (added by the API at serialization time).
+///
+/// `usage_by_source`, `secret_safety`, `index_freshness`, and `totals.mean_top_score`
+/// were added additively in v2.4.1 to feed the refreshed dashboard panels. They are
+/// pure functions of the log, so both engines reproduce them identically; the live
+/// sync `remote_latest`/`behind_remote` are layered onto `index_freshness` at the
+/// API edge (like `generated_ts`), not here.
 #[derive(Debug, Serialize)]
 pub struct Aggregate {
     pub schema: String,
     pub totals: Totals,
     pub north_star: NorthStar,
+    /// Agent-vs-human split of searches, keyed by `source` (v2.4.1).
+    pub usage_by_source: UsageBySource,
+    /// Secret-safety reassurance: sensitive files skipped across index runs (v2.4.1).
+    pub secret_safety: SecretSafety,
+    /// Index freshness from the latest index event (v2.4.1); the API edge adds the
+    /// live `remote_latest`/`behind_remote`.
+    pub index_freshness: IndexFreshness,
     pub series: Series,
     pub recent_searches: Vec<RecentSearch>,
 }
@@ -43,9 +56,47 @@ pub struct Totals {
     pub tokens_saved: u64,
     pub cost_saved_usd: f64,
     pub mean_savings_ratio: f64,
+    /// Lifetime mean of `top_score` over non-empty searches (v2.4.1); `0.0` if none.
+    pub mean_top_score: f64,
     pub helpful: u64,
     pub not_helpful: u64,
     pub helpful_rate: Option<f64>,
+}
+
+/// The agent-vs-human usage split (v2.4.1): CLI (`cce search`) vs MCP (agent
+/// `context_search`) searches. `source` values other than `"mcp"` count as `cli`.
+#[derive(Debug, Serialize)]
+pub struct UsageBySource {
+    pub cli: SourceUsage,
+    pub mcp: SourceUsage,
+}
+
+/// One source bucket's usage: how many searches and how much they saved/scored.
+#[derive(Debug, Serialize)]
+pub struct SourceUsage {
+    pub searches: u64,
+    pub tokens_saved: u64,
+    pub mean_savings_ratio: f64,
+    pub mean_top_score: f64,
+}
+
+/// Secret-safety reassurance (v2.4.1): the sensitive files the secure-by-default
+/// walk skipped, summed over the log's index runs.
+#[derive(Debug, Serialize)]
+pub struct SecretSafety {
+    pub sensitive_skipped: u64,
+    pub index_runs: u64,
+}
+
+/// Index freshness (v2.4.1): the latest index event's provenance. `source`/`sha`/
+/// `indexed_ts` are `None` when the log has no index event yet. The API edge adds
+/// `remote_latest` and `behind_remote` from the live sync marker (offline-safe).
+#[derive(Debug, Serialize)]
+pub struct IndexFreshness {
+    pub indexes: u64,
+    pub source: Option<String>,
+    pub sha: Option<String>,
+    pub indexed_ts: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -159,17 +210,17 @@ pub fn aggregate(events: &[Event], now_secs: i64, price: f64) -> Aggregate {
     // "latest wins" feedback resolution and the recent-searches tie-break).
     let mut searches: Vec<(usize, &SearchEvent)> = Vec::new();
     let mut feedback: Vec<(usize, &FeedbackEvent)> = Vec::new();
-    let mut index_count: u64 = 0;
+    let mut indexes: Vec<(usize, &IndexEvent)> = Vec::new();
     for (i, e) in events.iter().enumerate() {
         match e {
             Event::Search(s) => searches.push((i, s)),
             Event::Feedback(f) => feedback.push((i, f)),
-            Event::Index(_) => index_count += 1,
+            Event::Index(x) => indexes.push((i, x)),
             Event::Unknown => {}
         }
     }
 
-    let totals = compute_totals(&searches, &feedback, index_count, price);
+    let totals = compute_totals(&searches, &feedback, indexes.len() as u64, price);
     let north_star = NorthStar {
         savings: compute_savings(&searches, now_secs),
         quality: compute_quality(&searches, &feedback, now_secs),
@@ -181,8 +232,68 @@ pub fn aggregate(events: &[Event], now_secs: i64, price: f64) -> Aggregate {
         schema: crate::config::METRICS_SCHEMA.to_string(),
         totals,
         north_star,
+        usage_by_source: compute_usage_by_source(&searches),
+        secret_safety: compute_secret_safety(&indexes),
+        index_freshness: compute_index_freshness(&indexes),
         series,
         recent_searches,
+    }
+}
+
+/// `is_mcp` for a search's `source` tag: only the exact `"mcp"` value counts as an
+/// agent search; every other value (`"cli"`, empty, unknown) is a human search.
+fn is_mcp(source: &str) -> bool {
+    source == "mcp"
+}
+
+/// The lifetime mean of `top_score` over non-empty searches in `searches` (0.0 if
+/// none). Shared by totals and the per-source split.
+fn mean_top_score_of(searches: &[&SearchEvent]) -> f64 {
+    let scores: Vec<f64> =
+        searches.iter().filter(|s| s.result_count > 0).map(|s| s.top_score).collect();
+    round6(mean(&scores))
+}
+
+/// Split searches into the CLI (human) and MCP (agent) buckets (v2.4.1).
+fn compute_usage_by_source(searches: &[(usize, &SearchEvent)]) -> UsageBySource {
+    let mcp: Vec<&SearchEvent> =
+        searches.iter().filter(|(_, s)| is_mcp(&s.source)).map(|(_, s)| *s).collect();
+    let cli: Vec<&SearchEvent> =
+        searches.iter().filter(|(_, s)| !is_mcp(&s.source)).map(|(_, s)| *s).collect();
+    UsageBySource { cli: source_usage(&cli), mcp: source_usage(&mcp) }
+}
+
+/// The usage figures for one source bucket.
+fn source_usage(searches: &[&SearchEvent]) -> SourceUsage {
+    let tokens_saved: u64 = searches.iter().map(|s| s.tokens_saved).sum();
+    let ratios: Vec<f64> = searches.iter().map(|s| s.savings_ratio).collect();
+    SourceUsage {
+        searches: searches.len() as u64,
+        tokens_saved,
+        mean_savings_ratio: round6(mean(&ratios)),
+        mean_top_score: mean_top_score_of(searches),
+    }
+}
+
+/// Sum the sensitive-files-skipped over the log's index runs (v2.4.1).
+fn compute_secret_safety(indexes: &[(usize, &IndexEvent)]) -> SecretSafety {
+    SecretSafety {
+        sensitive_skipped: indexes.iter().map(|(_, x)| x.sensitive_skipped).sum(),
+        index_runs: indexes.len() as u64,
+    }
+}
+
+/// Freshness from the latest index event (by ts, then file order). Log-derived and
+/// pure; the API edge layers the live remote comparison on top (v2.4.1).
+fn compute_index_freshness(indexes: &[(usize, &IndexEvent)]) -> IndexFreshness {
+    // Latest = greatest (secs, file-index); ties resolve to later in the file.
+    let latest =
+        indexes.iter().max_by(|a, b| (a.1.secs, a.0).cmp(&(b.1.secs, b.0))).map(|(_, x)| *x);
+    IndexFreshness {
+        indexes: indexes.len() as u64,
+        source: latest.map(|x| x.source.clone()),
+        sha: latest.and_then(|x| x.sha.clone()),
+        indexed_ts: latest.map(|x| x.ts.clone()),
     }
 }
 
@@ -194,6 +305,7 @@ fn compute_totals(
 ) -> Totals {
     let tokens_saved: u64 = searches.iter().map(|(_, s)| s.tokens_saved).sum();
     let ratios: Vec<f64> = searches.iter().map(|(_, s)| s.savings_ratio).collect();
+    let all: Vec<&SearchEvent> = searches.iter().map(|(_, s)| *s).collect();
     let helpful = feedback.iter().filter(|(_, f)| f.helpful).count() as u64;
     let not_helpful = feedback.iter().filter(|(_, f)| !f.helpful).count() as u64;
     Totals {
@@ -203,6 +315,7 @@ fn compute_totals(
         tokens_saved,
         cost_saved_usd: round2(tokens_saved as f64 / 1_000_000.0 * price),
         mean_savings_ratio: round6(mean(&ratios)),
+        mean_top_score: mean_top_score_of(&all),
         helpful,
         not_helpful,
         helpful_rate: helpful_rate(helpful, not_helpful),
@@ -519,10 +632,70 @@ mod tests {
         assert_eq!(agg.totals.tokens_saved, 0);
         assert_eq!(agg.totals.cost_saved_usd, 0.0);
         assert_eq!(agg.totals.mean_savings_ratio, 0.0);
+        assert_eq!(agg.totals.mean_top_score, 0.0);
         assert_eq!(agg.totals.helpful_rate, None);
         assert_eq!(agg.north_star.savings.direction, "flat");
         assert_eq!(agg.north_star.quality.direction, "flat");
+        // v2.4.1 panels degrade gracefully to a clean zero/none state.
+        assert_eq!(agg.usage_by_source.cli.searches, 0);
+        assert_eq!(agg.usage_by_source.mcp.searches, 0);
+        assert_eq!(agg.secret_safety.sensitive_skipped, 0);
+        assert_eq!(agg.secret_safety.index_runs, 0);
+        assert_eq!(agg.index_freshness.indexes, 0);
+        assert_eq!(agg.index_freshness.source, None);
+        assert_eq!(agg.index_freshness.sha, None);
         assert!(agg.series.daily.is_empty());
         assert!(agg.recent_searches.is_empty());
+    }
+
+    #[test]
+    fn anchor_mean_top_score_and_source_split() {
+        // The §4.1 anchor has no `source` on any search, so every search is CLI.
+        let agg = aggregate(&sample_log(), now(), 3.00);
+        // Lifetime mean top score over non-empty searches (0.9, 0.6, 0.4).
+        assert_eq!(agg.totals.mean_top_score, 0.633333);
+        // Agent-vs-human split: all four are CLI; none are MCP.
+        assert_eq!(agg.usage_by_source.cli.searches, 4);
+        assert_eq!(agg.usage_by_source.cli.tokens_saved, 53000);
+        assert_eq!(agg.usage_by_source.cli.mean_savings_ratio, 0.525000);
+        assert_eq!(agg.usage_by_source.cli.mean_top_score, 0.633333);
+        assert_eq!(agg.usage_by_source.mcp.searches, 0);
+        assert_eq!(agg.usage_by_source.mcp.tokens_saved, 0);
+        assert_eq!(agg.usage_by_source.mcp.mean_savings_ratio, 0.0);
+        assert_eq!(agg.usage_by_source.mcp.mean_top_score, 0.0);
+        // The anchor's single index event has no sensitive_skipped (→ 0), source
+        // defaults to "local", and no sha.
+        assert_eq!(agg.secret_safety.sensitive_skipped, 0);
+        assert_eq!(agg.secret_safety.index_runs, 1);
+        assert_eq!(agg.index_freshness.indexes, 1);
+        assert_eq!(agg.index_freshness.source.as_deref(), Some("local"));
+        assert_eq!(agg.index_freshness.sha, None);
+        assert_eq!(agg.index_freshness.indexed_ts.as_deref(), Some("2026-07-01T09:00:00Z"));
+    }
+
+    #[test]
+    fn mcp_searches_and_index_freshness_split_out() {
+        // A synthetic log: one CLI search, one MCP search, and two index events
+        // whose latest carries a sha + a sensitive_skipped count.
+        let text = concat!(
+            "{\"event\":\"index\",\"ts\":\"2026-07-01T08:00:00Z\",\"id\":\"i0\",\"files_indexed\":5,\"chunks\":9,\"index_bytes\":1,\"duration_ms\":1.0,\"embedder\":\"hash\",\"full\":true,\"sha\":\"aaaa1111\",\"source\":\"local\",\"sensitive_skipped\":1}\n",
+            "{\"event\":\"index\",\"ts\":\"2026-07-02T08:00:00Z\",\"id\":\"i1\",\"files_indexed\":5,\"chunks\":9,\"index_bytes\":1,\"duration_ms\":1.0,\"embedder\":\"hash\",\"full\":true,\"sha\":\"bbbb2222\",\"source\":\"local\",\"sensitive_skipped\":3}\n",
+            "{\"event\":\"search\",\"ts\":\"2026-07-02T10:00:00Z\",\"id\":\"s0\",\"result_count\":2,\"tokens_saved\":100,\"savings_ratio\":0.5,\"top_score\":0.8,\"empty\":false,\"low_confidence\":false,\"source\":\"cli\"}\n",
+            "{\"event\":\"search\",\"ts\":\"2026-07-02T11:00:00Z\",\"id\":\"s1\",\"result_count\":3,\"tokens_saved\":300,\"savings_ratio\":0.75,\"top_score\":0.9,\"empty\":false,\"low_confidence\":false,\"source\":\"mcp\"}\n"
+        );
+        let events = parse_log(text).events;
+        let agg = aggregate(&events, now(), 3.00);
+        assert_eq!(agg.usage_by_source.cli.searches, 1);
+        assert_eq!(agg.usage_by_source.cli.tokens_saved, 100);
+        assert_eq!(agg.usage_by_source.mcp.searches, 1);
+        assert_eq!(agg.usage_by_source.mcp.tokens_saved, 300);
+        assert_eq!(agg.usage_by_source.mcp.mean_savings_ratio, 0.750000);
+        assert_eq!(agg.usage_by_source.mcp.mean_top_score, 0.900000);
+        // Secret-safety sums both runs (1 + 3).
+        assert_eq!(agg.secret_safety.sensitive_skipped, 4);
+        assert_eq!(agg.secret_safety.index_runs, 2);
+        // Freshness reflects the LATEST index event.
+        assert_eq!(agg.index_freshness.sha.as_deref(), Some("bbbb2222"));
+        assert_eq!(agg.index_freshness.indexed_ts.as_deref(), Some("2026-07-02T08:00:00Z"));
     }
 }

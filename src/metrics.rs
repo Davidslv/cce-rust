@@ -98,6 +98,11 @@ pub struct SearchRecord {
     pub empty: bool,
     pub low_confidence: bool,
     pub latency_ms: f64,
+    /// Which path issued the search: `"cli"` (a human at `cce search`) or `"mcp"`
+    /// (an agent via the `context_search` tool). Powers the dashboard's
+    /// agent-vs-human split (v2.4.1). Additive: older logs without this field read
+    /// back as `"cli"` (see `parse_log`).
+    pub source: String,
 }
 
 /// Payload of an `index` event.
@@ -109,6 +114,17 @@ pub struct IndexRecord {
     pub duration_ms: f64,
     pub embedder: String,
     pub full: bool,
+    /// The commit sha the index was built against, when `root` is a git checkout
+    /// (best-effort; `None` otherwise). Feeds the dashboard's index-freshness panel
+    /// (v2.4.1).
+    pub sha: Option<String>,
+    /// Where the index came from at write time: `"local"` (built by `cce index`).
+    /// A pulled cache's provenance is read live from the sync marker; this records
+    /// the log-time value. Additive: absent reads back as `"local"`.
+    pub source: String,
+    /// Files skipped by the Layer-1 sensitive-file policy (SPEC-V2.1). Feeds the
+    /// dashboard's secret-safety panel (v2.4.1).
+    pub sensitive_skipped: u64,
 }
 
 /// Appends events to a metrics log. Best-effort: honours `enabled`, and never
@@ -152,6 +168,7 @@ impl<'a> MetricsWriter<'a> {
             "empty": rec.empty,
             "low_confidence": rec.low_confidence,
             "latency_ms": rec.latency_ms,
+            "source": rec.source,
         });
         self.append(&obj).map(|_| id)
     }
@@ -173,6 +190,9 @@ impl<'a> MetricsWriter<'a> {
             "duration_ms": rec.duration_ms,
             "embedder": rec.embedder,
             "full": rec.full,
+            "sha": rec.sha,
+            "source": rec.source,
+            "sensitive_skipped": rec.sensitive_skipped,
         });
         self.append(&obj).map(|_| id)
     }
@@ -237,12 +257,22 @@ pub struct SearchEvent {
     pub top_score: f64,
     pub empty: bool,
     pub low_confidence: bool,
+    /// `"cli"` or `"mcp"`; an absent field (pre-v2.4.1 logs) normalises to `"cli"`.
+    pub source: String,
 }
 
-/// A parsed `index` event (only its instant matters to the aggregator).
+/// A parsed `index` event. Carries its instant plus the v2.4.1 freshness/secret
+/// fields the dashboard panels read (all optional so older logs still parse).
 #[derive(Debug, Clone)]
 pub struct IndexEvent {
     pub secs: i64,
+    pub ts: String,
+    /// The indexed commit sha, when recorded (`None` on non-git or older logs).
+    pub sha: Option<String>,
+    /// `"local"`; an absent field (pre-v2.4.1 logs) normalises to `"local"`.
+    pub source: String,
+    /// Sensitive files skipped during this index run (0 on older logs).
+    pub sensitive_skipped: u64,
 }
 
 /// A parsed `feedback` event.
@@ -317,11 +347,18 @@ pub fn parse_log(text: &str) -> ParsedLog {
                     top_score: get_f64(&v, "top_score"),
                     empty: get_bool(&v, "empty"),
                     low_confidence: get_bool(&v, "low_confidence"),
+                    source: normalize_source(&get_str(&v, "source"), "cli"),
                 })),
                 None => out.skipped += 1,
             },
             Some("index") => match parse_ts(&v) {
-                Some(secs) => out.events.push(Event::Index(IndexEvent { secs })),
+                Some(secs) => out.events.push(Event::Index(IndexEvent {
+                    secs,
+                    ts: get_str(&v, "ts"),
+                    sha: v.get("sha").and_then(Value::as_str).map(|s| s.to_string()),
+                    source: normalize_source(&get_str(&v, "source"), "local"),
+                    sensitive_skipped: get_u64(&v, "sensitive_skipped"),
+                })),
                 None => out.skipped += 1,
             },
             Some("feedback") => match parse_ts(&v) {
@@ -357,6 +394,17 @@ fn get_f64(v: &Value, key: &str) -> f64 {
 
 fn get_bool(v: &Value, key: &str) -> bool {
     v.get(key).and_then(Value::as_bool).unwrap_or(false)
+}
+
+/// Normalise a `source` tag: an empty/absent value falls back to `default`. Keeps
+/// the additive v2.4.1 schema graceful — pre-v2.4.1 logs with no `source` read as
+/// the sensible default (`"cli"` for searches, `"local"` for index events).
+fn normalize_source(raw: &str, default: &str) -> String {
+    if raw.trim().is_empty() {
+        default.to_string()
+    } else {
+        raw.to_string()
+    }
 }
 
 // --- UTC date/time arithmetic (no external time crate) ---
@@ -519,6 +567,7 @@ mod tests {
                 empty: false,
                 low_confidence: false,
                 latency_ms: 5.0,
+                source: "cli".to_string(),
             })
             .unwrap();
         assert_eq!(id, "aaaaaaaaaaaa");
@@ -534,6 +583,7 @@ mod tests {
                 assert_eq!(s.secs, parse_iso("2026-07-05T13:04:11Z").unwrap());
                 assert_eq!(s.tokens_saved, 32000);
                 assert_eq!(s.savings_ratio, 0.8);
+                assert_eq!(s.source, "cli");
                 assert!(!s.empty);
             }
             _ => panic!("first event should be a search"),
@@ -562,6 +612,9 @@ mod tests {
                 duration_ms: 4.0,
                 embedder: "hash".to_string(),
                 full: true,
+                sha: None,
+                source: "local".to_string(),
+                sensitive_skipped: 0,
             })
             .is_none());
         assert!(!path.exists(), "no file should be created when disabled");
@@ -593,6 +646,7 @@ mod tests {
             empty: true,
             low_confidence: false,
             latency_ms: 1.0,
+            source: "cli".to_string(),
         };
         assert!(w.log_search(&rec).is_none());
     }
@@ -616,6 +670,45 @@ mod tests {
         assert!(matches!(log.events[0], Event::Search(_)));
         assert!(matches!(log.events[1], Event::Feedback(_)));
         assert!(matches!(log.events[2], Event::Unknown));
+    }
+
+    #[test]
+    fn v241_source_and_freshness_fields_parse_and_default() {
+        // A v2.4.1 mcp search + an index event carrying sha/source/sensitive_skipped,
+        // and a pre-v2.4.1 search with no `source` (must default to "cli").
+        let text = concat!(
+            "{\"event\":\"search\",\"ts\":\"2026-07-01T10:00:00Z\",\"id\":\"a\",\"result_count\":1,\"tokens_saved\":10,\"savings_ratio\":0.5,\"top_score\":0.4,\"empty\":false,\"low_confidence\":false,\"source\":\"mcp\"}\n",
+            "{\"event\":\"search\",\"ts\":\"2026-07-01T11:00:00Z\",\"id\":\"b\",\"result_count\":1,\"tokens_saved\":10,\"savings_ratio\":0.5,\"top_score\":0.4,\"empty\":false,\"low_confidence\":false}\n",
+            "{\"event\":\"index\",\"ts\":\"2026-07-01T09:00:00Z\",\"id\":\"i\",\"files_indexed\":3,\"chunks\":9,\"index_bytes\":1,\"duration_ms\":1.0,\"embedder\":\"hash\",\"full\":true,\"sha\":\"deadbeef\",\"source\":\"local\",\"sensitive_skipped\":2}\n",
+            "{\"event\":\"index\",\"ts\":\"2026-07-01T08:00:00Z\",\"id\":\"j\",\"files_indexed\":1,\"chunks\":1,\"index_bytes\":1,\"duration_ms\":1.0,\"embedder\":\"hash\",\"full\":true}\n"
+        );
+        let log = parse_log(text);
+        assert_eq!(log.skipped, 0);
+        assert_eq!(log.event_count(), 4);
+        match &log.events[0] {
+            Event::Search(s) => assert_eq!(s.source, "mcp"),
+            _ => panic!("expected search"),
+        }
+        match &log.events[1] {
+            Event::Search(s) => assert_eq!(s.source, "cli"), // absent → default
+            _ => panic!("expected search"),
+        }
+        match &log.events[2] {
+            Event::Index(i) => {
+                assert_eq!(i.sha.as_deref(), Some("deadbeef"));
+                assert_eq!(i.source, "local");
+                assert_eq!(i.sensitive_skipped, 2);
+            }
+            _ => panic!("expected index"),
+        }
+        match &log.events[3] {
+            Event::Index(i) => {
+                assert_eq!(i.sha, None); // absent → None
+                assert_eq!(i.source, "local"); // absent → default
+                assert_eq!(i.sensitive_skipped, 0);
+            }
+            _ => panic!("expected index"),
+        }
     }
 
     #[test]

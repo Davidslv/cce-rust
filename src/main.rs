@@ -455,6 +455,9 @@ fn cmd_index(
         duration_ms: elapsed * 1000.0,
         embedder: index.embedder_name.clone(),
         full: true,
+        sha: cce::sync::git::head_sha(dir),
+        source: "local".to_string(),
+        sensitive_skipped: stats.sensitive_skipped as u64,
     });
 
     println!("Indexed {}", dir.display());
@@ -502,7 +505,8 @@ fn cmd_search(
 
     // Best-effort metrics: a search event (DASHBOARD-SPEC §2.1). The write is
     // fail-open, so it never affects the result or the exit code.
-    let record = build_search_record(&index, &results, query, top_k, graph_enabled, latency_ms);
+    let record =
+        build_search_record(&index, &results, query, top_k, graph_enabled, latency_ms, "cli");
     let clock = SystemClock;
     let ids = HexIdSource::default();
     let writer =
@@ -614,10 +618,21 @@ fn cmd_dashboard(
     price: Option<f64>,
     _no_open: bool,
 ) -> Result<(), String> {
+    // The freshness panel reads `<root>/.cce/synced.json` (offline-safe): the root
+    // is `--dir`, else the store's grand-parent, else the current directory.
+    let root = dir.clone().unwrap_or_else(|| {
+        store
+            .as_deref()
+            .and_then(|s| s.parent())
+            .and_then(|p| p.parent())
+            .map(Path::to_path_buf)
+            .unwrap_or_else(|| PathBuf::from("."))
+    });
     let metrics_path = resolve_metrics_path(metrics, store, dir);
     let port = port.unwrap_or(DEFAULT_DASHBOARD_PORT);
     let price = price.unwrap_or(DEFAULT_INPUT_PRICE_PER_MILLION);
-    cce::dashboard::run(metrics_path, price, port).map_err(|e| format!("dashboard failed: {e}"))
+    cce::dashboard::run(metrics_path, root, price, port)
+        .map_err(|e| format!("dashboard failed: {e}"))
 }
 
 fn cmd_stats(store: Option<PathBuf>, dir: Option<PathBuf>) -> Result<(), String> {
@@ -764,6 +779,9 @@ fn cmd_index_workspace(
             duration_ms: elapsed * 1000.0,
             embedder: index.embedder_name.clone(),
             full: true,
+            sha: cce::sync::git::head_sha(&root),
+            source: "local".to_string(),
+            sensitive_skipped: stats.sensitive_skipped as u64,
         });
 
         total_files += stats.files_indexed;
@@ -921,7 +939,7 @@ fn cmd_dashboard_workspace(
     let members = member_metrics(&root, &manifest);
     let port = port.unwrap_or(DEFAULT_DASHBOARD_PORT);
     let price = price.unwrap_or(DEFAULT_INPUT_PRICE_PER_MILLION);
-    cce::dashboard::run_workspace(members, price, port)
+    cce::dashboard::run_workspace(members, root, price, port)
         .map_err(|e| format!("dashboard failed: {e}"))
 }
 

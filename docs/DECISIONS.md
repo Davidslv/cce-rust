@@ -461,5 +461,38 @@ that names the *artifact format*, used everywhere the sync layer stamps the vers
 when the artifact bytes actually change shape — then both engines bump it in lockstep.
 The shared golden checksum on `test/fixture/samples` therefore stays
 `581cbd0ff682a38d7d1250f3eec44f4ce456bdd660d4cb29aaaadd9e95072f48`, equal to Ruby's.
-The app/crate version is 2.4.0 (`Cargo.toml`, `CITATION.cff`); `conformance.json` is
-independent of both and stays byte-identical.
+The app/crate version is 2.4.1 (`Cargo.toml`, `CITATION.cff`) — the v2.4.1 dashboard
+refresh + docs sweep is additive and does **not** touch `SYNC_FORMAT_VERSION`, so the
+golden checksum above is unchanged; `conformance.json` is independent of both and stays
+byte-identical.
+
+## v2.4.1 — dashboard refresh & offline-first docs sweep
+
+**The metrics schema grows only by adding fields.** The reader already tolerated
+unknown/absent fields, so v2.4.1 extends it in place rather than versioning it:
+`search` events gain `source`, `index` events gain `sha`/`source`/`sensitive_skipped`.
+A pre-v2.4.1 log still parses — a search with no `source` normalises to `"cli"`, an
+index event to `"local"`. No `cce.metrics/v2`; the schema tag stays `cce.metrics/v1`.
+
+**Agent-vs-human bucketing is a single crisp rule.** Only the exact value `"mcp"`
+counts as an agent search; every other `source` (`"cli"`, empty, unknown) is a human
+search. This keeps the CLI path (`cce search` → `"cli"`) and the MCP path
+(`context_search` → `"mcp"`) as the two buckets, and makes an ambiguous/old event fall
+into the human bucket deterministically — the same rule in both engines.
+
+**Freshness is split: pure aggregator vs live edge.** `index_freshness`'s log-derived
+part (`source`, `sha`, `indexed_ts`, `indexes` — from the latest index event) lives in
+the pure aggregator, so both engines reproduce it identically and it is offline. The
+live `remote_latest`/`behind_remote` — and the authoritative `pulled` source/sha from
+the sync marker — are layered on at the dashboard **edge** via the offline-safe
+`sync::commands::freshness`, exactly like `generated_ts`. With no remote configured this
+touches no network, so `cce dashboard` stays fully offline; `remote_latest` is then
+`null` and `behind_remote` is `false`.
+
+**The dashboard stays self-contained and offline.** The four new panels
+(agent-vs-human, per-package, index-freshness, secret-safety) render from the same
+`/api/metrics` body with inline JS/SVG — no new endpoint, no external asset, still
+loopback-only and read-only. `secret_safety.sensitive_skipped` sums the index events'
+skip counts (the only source of that datum), so it needs the additive `index.sensitive_skipped`
+field. `by_package` gains `mean_top_score` so the per-member panel shows quality, not
+just savings.
