@@ -98,6 +98,31 @@ pub fn search(
     top_k: usize,
     graph_enabled: bool,
 ) -> Vec<SearchResult> {
+    let qvec = embedder.embed(query);
+    let mut results = rank_core(index, &qvec, query, top_k);
+
+    // --- Graph expansion (SPEC §6.7) ---
+    if graph_enabled {
+        expand_graph(index, &qvec, &mut results);
+    }
+
+    for (i, r) in results.iter_mut().enumerate() {
+        r.rank = i + 1;
+    }
+    results
+}
+
+/// The core §6 ranking (embed → candidates → RRF → confidence → penalty →
+/// diversity cap → top-K), WITHOUT graph expansion and WITHOUT assigning final
+/// ranks. Exposed so federated search (SPEC-V2.2 §6) can run the identical
+/// pipeline over the union of members' chunks and then apply its own expansion.
+/// `qvec` is the pre-embedded query vector (so callers embed once).
+pub fn rank_core(
+    index: &Index,
+    qvec: &[f64],
+    query: &str,
+    top_k: usize,
+) -> Vec<SearchResult> {
     let chunks = &index.chunks;
     let query_tokens = tokenize(query);
     if query_tokens.is_empty() || chunks.is_empty() {
@@ -111,8 +136,7 @@ pub fn search(
     };
 
     // --- Vector candidates (SPEC §6.2) ---
-    let qvec = embedder.embed(query);
-    let ranked = rank_by_cosine(&qvec, chunks); // all chunks, best first
+    let ranked = rank_by_cosine(qvec, chunks); // all chunks, best first
     let mut cosine_by_idx = vec![0.0f64; chunks.len()];
     for (idx, cos) in &ranked {
         cosine_by_idx[*idx] = *cos;
@@ -161,7 +185,7 @@ pub fn search(
             cosine_by_idx[idx]
         } else {
             // BM25-only: compute cosine now (SPEC §6.5)
-            cosine(&qvec, &chunk.embedding)
+            cosine(qvec, &chunk.embedding)
         };
         let vector_distance = 1.0 - cos;
         let normalized_distance = (vector_distance / 2.0).clamp(0.0, 1.0);
@@ -209,18 +233,7 @@ pub fn search(
         }
     }
 
-    let mut results: Vec<SearchResult> =
-        kept.iter().map(|(idx, sc)| result_from(&chunks[*idx], *sc)).collect();
-
-    // --- Graph expansion (SPEC §6.7) ---
-    if graph_enabled {
-        expand_graph(index, &qvec, &mut results);
-    }
-
-    for (i, r) in results.iter_mut().enumerate() {
-        r.rank = i + 1;
-    }
-    results
+    kept.iter().map(|(idx, sc)| result_from(&chunks[*idx], *sc)).collect()
 }
 
 /// keyword_distance per SPEC §6.5: 0 if any query token substring of lowercased
@@ -247,7 +260,9 @@ fn has_penalty_marker(file_path: &str) -> bool {
     PATH_PENALTY_MARKERS.iter().any(|m| lower.contains(m))
 }
 
-fn result_from(chunk: &Chunk, score: f64) -> SearchResult {
+/// Build a `SearchResult` from a chunk + score (rank assigned later). Shared with
+/// federated search (SPEC-V2.2 §6).
+pub fn result_from(chunk: &Chunk, score: f64) -> SearchResult {
     SearchResult {
         rank: 0,
         chunk_id: chunk.chunk_id.clone(),
@@ -262,7 +277,8 @@ fn result_from(chunk: &Chunk, score: f64) -> SearchResult {
 }
 
 /// Import-graph expansion (SPEC §6.7). Appends bonus chunks after `results`.
-fn expand_graph(index: &Index, qvec: &[f64], results: &mut Vec<SearchResult>) {
+/// Public so federated search reuses the identical intra-store expansion.
+pub fn expand_graph(index: &Index, qvec: &[f64], results: &mut Vec<SearchResult>) {
     if results.is_empty() {
         return;
     }

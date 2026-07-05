@@ -77,6 +77,18 @@ pub const RECENT_SEARCHES_LIMIT: usize = 20;
 /// Delta magnitude at or below this is treated as "flat" (no direction).
 pub const DIRECTION_EPSILON: f64 = 1e-9;
 
+// --- Workspace mode (SPEC-V2.2 §1) ---
+
+/// The workspace manifest filename, written under the workspace root `.cce/`.
+pub const WORKSPACE_FILE: &str = "workspace.yml";
+/// The cross-member dependency graph filename, under the root `.cce/`.
+pub const WORKSPACE_GRAPH_FILE: &str = "workspace-graph.json";
+/// Max number of distinct target members a single federated search expands into
+/// via cross-member dependency edges (SPEC-V2.2 §6).
+pub const GRAPH_MAX_BONUS_MEMBERS: usize = 2;
+/// Max chunks pulled from each cross-member target during graph expansion.
+pub const GRAPH_BONUS_MEMBER_CHUNKS: usize = 2;
+
 /// Selects the embedding backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbedderKind {

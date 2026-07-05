@@ -84,6 +84,19 @@ impl Index {
         Index { chunks, file_imports, file_tokens, embedder_name, bm25, graph }
     }
 
+    /// Assemble a ready-to-query `Index` from raw parts. Used by federated search
+    /// (SPEC-V2.2 §6) to build the union corpus over several members' chunks; the
+    /// derived BM25 index and import graph are recomputed here exactly as for a
+    /// freshly built store.
+    pub fn from_parts(
+        chunks: Vec<Chunk>,
+        file_imports: BTreeMap<String, Vec<String>>,
+        file_tokens: BTreeMap<String, usize>,
+        embedder_name: String,
+    ) -> Index {
+        Index::assemble(chunks, file_imports, file_tokens, embedder_name)
+    }
+
     /// Sum the whole-file token counts of a set of files (DASHBOARD-SPEC §3).
     /// Callers pass the DISTINCT file paths of a search's returned results; a
     /// file with no recorded count contributes 0.

@@ -31,6 +31,8 @@ pub mod conformance;
 pub mod metrics;
 pub mod aggregator;
 pub mod dashboard;
+pub mod workspace;
+pub mod federation;
 
 pub use chunker::Chunk;
 pub use retriever::SearchResult;

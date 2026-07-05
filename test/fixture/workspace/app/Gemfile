@@ -1,0 +1,5 @@
+source "https://rubygems.org"
+
+# The app depends on the billing engine (a workspace member). This declared
+# dependency is what produces the cross-member edge app -> billing (gemfile).
+gem "billing"
