@@ -20,6 +20,7 @@
 
 use crate::aggregator::aggregate;
 use crate::metrics::{format_iso, read_log};
+use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
@@ -39,13 +40,18 @@ fn now_secs() -> i64 {
 
 /// Build the `/api/metrics` JSON body: the §4 aggregate plus a non-conformance
 /// `generated_ts` wall-clock stamp, computed fresh from the log at `metrics_path`.
+///
+/// **Zero network calls.** Every panel — including `index_freshness` — is a pure
+/// function of the log, so the dashboard stays self-contained and works offline.
+/// A live behind-remote comparison belongs in `cce sync status` / MCP
+/// `index_status`, not here.
 pub fn metrics_body(metrics_path: &Path, price: f64) -> String {
     let now = now_secs();
     let log = read_log(metrics_path);
     let agg = aggregate(&log.events, now, price);
-    let mut val = serde_json::to_value(&agg).unwrap_or(serde_json::Value::Null);
+    let mut val = serde_json::to_value(&agg).unwrap_or(Value::Null);
     if let Some(obj) = val.as_object_mut() {
-        obj.insert("generated_ts".to_string(), serde_json::Value::String(format_iso(now)));
+        obj.insert("generated_ts".to_string(), Value::String(format_iso(now)));
     }
     serde_json::to_string_pretty(&val).unwrap_or_else(|_| "{}".to_string())
 }
@@ -174,11 +180,12 @@ pub fn run(metrics_path: PathBuf, price: f64, port: u16) -> std::io::Result<()> 
 /// Build the workspace `/api/metrics` JSON body: the §4 roll-up over every
 /// member's events plus a `by_package` breakdown (federation), computed fresh
 /// from the members' logs at request time, with a wall-clock `generated_ts`.
+/// **Zero network calls** — every panel is log-derived (see `metrics_body`).
 pub fn workspace_metrics_body(members: &[crate::federation::MemberMetrics], price: f64) -> String {
     let now = now_secs();
     let mut val = crate::federation::federated_metrics_json(members, now, price);
     if let Some(obj) = val.as_object_mut() {
-        obj.insert("generated_ts".to_string(), serde_json::Value::String(format_iso(now)));
+        obj.insert("generated_ts".to_string(), Value::String(format_iso(now)));
     }
     serde_json::to_string_pretty(&val).unwrap_or_else(|_| "{}".to_string())
 }
@@ -364,6 +371,58 @@ function render(m){
     .forEach(([k,v])=> cards.appendChild($('div',{class:'card'},[$('div',{class:'k',text:k}),$('div',{class:'v',text:v})])));
   main.appendChild(cards);
 
+  // --- v2.4.1 panels: freshness/secret-safety, agent-vs-human, by-package ---
+  const fresh=m.index_freshness||{}, sec=m.secret_safety||{}, usage=m.by_source||{};
+  const freshSource = fresh.source ? (fresh.source==='sync-pull'?'pulled via sync':fresh.source) : '—';
+  const lastIndexed = fresh.indexed_ts ? String(fresh.indexed_ts).replace('T',' ').replace('Z','') : '—';
+  const info=$('div',{class:'cards'});
+  [['Index source',freshSource],
+   ['Indexed sha', fresh.sha ? String(fresh.sha).slice(0,12) : '—'],
+   ['Last indexed',lastIndexed],
+   ['Sensitive skipped',int(sec.sensitive_skipped)]]
+    .forEach(([k,v])=> info.appendChild($('div',{class:'card'},[$('div',{class:'k',text:k}),$('div',{class:'v',text:String(v)})])));
+  main.appendChild($('section',{},[
+    $('h2',{text:'Index freshness & secret-safety'}),
+    $('div',{class:'hint',text:'index provenance (local vs sync-pull) & secret redaction · behind-remote lives in cce sync status'}),
+    info
+  ]));
+
+  // Agent vs human usage (CLI vs MCP searches).
+  const srcRow=(label,u)=>{ u=u||{}; return $('tr',{},[
+    $('td',{text:label}),
+    $('td',{class:'num',text:int(u.searches)}),
+    $('td',{class:'num',text:int(u.tokens_saved)}),
+    $('td',{class:'num',text:pct(u.mean_savings_ratio)}),
+    $('td',{class:'num',text:sc(u.mean_top_score)})
+  ]); };
+  main.appendChild($('section',{},[
+    $('h2',{text:'Agent vs human usage'}),
+    $('div',{class:'hint',text:'how much your agent (MCP) leans on CCE vs the CLI'}),
+    $('table',{},[
+      $('thead',{},[$('tr',{},['Source','Searches','Saved','Ratio','Top'].map(h=>$('th',{text:h})))]),
+      $('tbody',{},[srcRow('Human (CLI)',usage.cli), srcRow('Agent (MCP)',usage.mcp)])
+    ])
+  ]));
+
+  // Per-package breakdown (workspace only — present iff federated).
+  if(Array.isArray(m.by_package) && m.by_package.length){
+    const pkgRows=m.by_package.map(p=>$('tr',{},[
+      $('td',{text:p.package}),
+      $('td',{class:'num',text:int(p.searches)}),
+      $('td',{class:'num',text:int(p.tokens_saved)}),
+      $('td',{class:'num',text:pct(p.mean_savings_ratio)}),
+      $('td',{class:'num',text:sc(p.mean_top_score)})
+    ]));
+    main.appendChild($('section',{},[
+      $('h2',{text:'By package'}),
+      $('div',{class:'hint',text:'where in the ecosystem CCE is helping most'}),
+      $('table',{},[
+        $('thead',{},[$('tr',{},['Package','Searches','Saved','Ratio','Top'].map(h=>$('th',{text:h})))]),
+        $('tbody',{},pkgRows)
+      ])
+    ]));
+  }
+
   const daily=m.series.daily||[];
   // North-star A: savings
   const sv=m.north_star.savings;
@@ -493,7 +552,16 @@ mod tests {
         let mv: serde_json::Value = serde_json::from_str(&metrics.body).unwrap();
         assert_eq!(mv["totals"]["tokens_saved"], 4000);
         assert!(mv.get("generated_ts").is_some());
-        assert_eq!(mv["by_package"].as_array().unwrap().len(), 2);
+        let by_package = mv["by_package"].as_array().unwrap();
+        assert_eq!(by_package.len(), 2);
+        // by_package is an array of objects, each with a `package` field, sorted.
+        assert_eq!(by_package[0]["package"], "app");
+        assert_eq!(by_package[1]["package"], "billing");
+        // v2.4.1: the roll-up carries the agent-vs-human split. index_freshness is
+        // purely log-derived (no remote_latest/behind_remote — no network call).
+        assert_eq!(mv["by_source"]["cli"]["searches"], 2);
+        assert!(mv["index_freshness"].get("behind_remote").is_none());
+        assert!(mv["index_freshness"].get("remote_latest").is_none());
 
         assert_eq!(route_workspace("/nope", &members, 3.00).status, 404);
     }
@@ -508,6 +576,12 @@ mod tests {
         assert!(v.get("generated_ts").is_some());
         assert_eq!(v["totals"]["searches"], 4);
         assert_eq!(v["totals"]["tokens_saved"], 53000);
+        // v2.4.1 panels are present and purely log-derived (no network call).
+        assert_eq!(v["by_source"]["cli"]["searches"], 4);
+        assert_eq!(v["secret_safety"]["sensitive_skipped"], 0);
+        assert_eq!(v["index_freshness"]["source"], "local");
+        assert!(v["index_freshness"].get("behind_remote").is_none());
+        assert!(v["index_freshness"].get("remote_latest").is_none());
     }
 
     #[test]
@@ -530,5 +604,8 @@ mod tests {
         assert_eq!(resp.status, 200);
         let v: serde_json::Value = serde_json::from_str(&resp.body).unwrap();
         assert_eq!(v["totals"]["searches"], 0);
+        // No index events ⇒ freshness panel is a clean null/local-less state.
+        assert_eq!(v["index_freshness"]["indexes"], 0);
+        assert!(v["index_freshness"]["source"].is_null());
     }
 }

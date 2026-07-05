@@ -1,42 +1,46 @@
 # CCE — cold-start verification transcripts
 
 This file records the **mandatory cold-start passes**: the documented install +
-walkthroughs followed from scratch, confirming every documented command runs verbatim
-and its output matches the docs. Two features are verified here:
+walkthroughs followed from scratch, confirming **every documented command runs
+verbatim** and its output matches the docs. A doc example that does not run is a bug.
 
-- **CCE Sync (v2.3)** — against a local bare git remote (`file://`, fully hermetic,
-  no network).
-- **CCE MCP (v2.4)** — `cce init` → a real `cce mcp` stdio session → `cce dashboard`,
-  plus the `cce init --remote` sync-pull plug-and-play flow.
+Two passes are recorded, both real captured runs:
 
-- **Engine:** `cce 2.4.0` (release build).
+- **Offline cold start (THE guarantee)** — with **no network and no sync remote
+  configured**, `index` · `search` · `stats` · `dashboard` · `workspace` · `cce mcp`
+  all work exactly as documented (Part 1).
+- **Online cold start** — the parts that *do* touch the network: `cce sync
+  init/push/pull/verify` against a git cache, and the `cce init --remote`
+  plug-and-play flow (Part 2).
+
+- **Engine:** `cce 2.4.1` (release build).
 - **Environment:** macOS (Darwin 25.3.0), `git version 2.50.1`.
 - **git-LFS:** *not installed on this machine* — so the Sync walkthrough uses
   `--no-lfs` (a plain-git cache), and the LFS smoke test
   (`tests/sync.rs::lfs_round_trip_smoke_or_skip`) **SKIPS** gracefully, exactly as
   SPEC-SYNC §11 requires.
 - **Isolation:** `CCE_HOME` was pointed at a temp dir so the working clone never
-  touched `~/.cce`. Absolute paths and the commit `<sha>` below are
-  environment-specific; the **checksums and chunk counts are the real, stable
-  values** a Ruby or CI build of the same `repo@sha` must reproduce.
+  touched `~/.cce`. Absolute paths appear as `$WORK`; the concrete commit shas differ
+  per environment, but the **checksums and chunk counts are the real, stable values**
+  a Ruby or CI build of the same `repo@sha` must reproduce.
 - **Sync format:** the reconciled canonical artifact — `cce_version = "2.3"`, the
   **artifact format version, decoupled from the app version** (`SYNC_FORMAT_VERSION`).
-  CCE MCP (v2.4) is additive and does **not** change the artifact format, so the
-  format version stays `2.3` and the content address stays `hash/2.3/…` — a v2.4
-  release does not invalidate existing caches or diverge from Ruby. No provenance,
-  `file_tokens` in the manifest,
-  `pack_set_id = c,javascript,python,ruby,rust,typescript`. The shared golden checksum
-  on `test/fixture/samples` (`repo_id=cce/demo`, `sha=0…0`, 21 chunks, `edges:[]`) is
+  The v2.4.1 consolidation is additive and does **not** change the artifact format, so
+  the format version stays `2.3` and the content address stays `hash/2.3/…` — this
+  release does not invalidate existing caches or diverge from Ruby. The shared golden
+  checksum on `test/fixture/samples` (`repo_id=cce/demo`, `sha=0…0`, 21 chunks,
+  `edges:[]`) is
   `581cbd0ff682a38d7d1250f3eec44f4ce456bdd660d4cb29aaaadd9e95072f48` — **equal to
-  Ruby's** — and the raw bytes are emitted to `/tmp/cce_artifact_rust.cce` for a
-  byte-for-byte diff against Ruby.
-
-The commands are copy-pasteable verbatim. Only the absolute scratch path (shown here
-as `$WORK`) and the concrete commit sha differ per environment.
+  Ruby's**.
 
 ---
 
-# Part A — CCE MCP (v2.4)
+# Part 1 — Offline cold start (no network, no remote)
+
+Everything in this part runs with **no network access and no sync remote
+configured**. These commands make zero network calls by construction — the only
+things that ever touch the network are the optional Ollama embedder, `cce sync
+push/pull`, and installing the binary (see [Offline-first](../README.md#offline-first-verified)).
 
 ## 0. Versions
 
@@ -44,68 +48,96 @@ as `$WORK`) and the concrete commit sha differ per environment.
 $ git --version
 git version 2.50.1 (Apple Git-155)
 $ cce --version
-cce 2.4.0
+cce 2.4.1
 ```
 
-## 1. A tiny project, then `cce init`
+## 1. A tiny project
 
 ```console
-$ cd "$WORK/myproject"          # contains auth.py + payments.py
-$ cce init .
-CCE is wired up for Claude Code.
-  index     : built 2 chunk(s) from 2 file(s)
-  .mcp.json : ./.mcp.json (server "cce")
-  CLAUDE.md : ./CLAUDE.md (context_search guidance)
-
-Next steps:
-  1. Restart your editor (Claude Code) so it loads .mcp.json.
-  2. Ask a question about this codebase — the agent calls context_search.
-  3. Confirm it was used: cce dashboard
+$ cd "$WORK/myproject"
+$ git init -q -b main
+$ printf 'def hash_password(pw):\n    return pw + "salt"\n' > auth.py
+$ printf 'import auth\n\ndef process_payment(amount):\n    return auth.hash_password(str(amount))\n' > payments.py
+$ git add -A && git commit -q -m "initial project"
+$ git rev-parse --short HEAD
+4d8f068
 ```
 
-`.mcp.json` is valid and idempotent (a second `cce init` leaves it byte-identical):
+## 2. `cce index` — build the local index (offline)
 
 ```console
-$ cat .mcp.json
-{
-  "mcpServers": {
-    "cce": {
-      "args": [
-        "mcp",
-        "--dir",
-        "."
-      ],
-      "command": "cce"
-    }
-  }
-}
+$ cce index .
+Indexed .
+  files indexed     : 2
+  files skipped     : 0
+  sensitive skipped : 0
+  total chunks      : 2
+  embedder          : hash
+  store             : ./.cce/index.json
+  elapsed           : 0.002s
 ```
 
-`CLAUDE.md` carries the marker-bounded block steering the agent to prefer
-`context_search`:
+## 3. `cce search` — hybrid retrieval (offline)
 
 ```console
-$ sed -n '3,5p' CLAUDE.md
-<!-- BEGIN CCE MCP -->
-## Code Context Engine (CCE)
+$ cce search "where is the password hashed" --top-k 3
+ 1. [0.825000] auth.py:1-2 (function/function_definition)
+    def hash_password(pw):
+ 2. [0.816803] payments.py:3-4 (function/function_definition)
+    def process_payment(amount):
+query-id: 58bf435c5c8b  ·  rate with: cce feedback 58bf435c5c8b --helpful|--not-helpful
 ```
 
-## 2. An MCP session — the shape the editor drives (piped JSON-RPC over stdio)
+## 4. `cce stats` (offline)
+
+```console
+$ cce stats
+Store: ./.cce/index.json
+  chunks         : 2
+  files          : 2
+  avg token/chunk: 14.0
+  store size     : 2904 bytes
+  by language:
+    python      : 2
+  by kind:
+    function_definition : 2
+```
+
+## 5. Secret-safety — a sensitive file is skipped by default
+
+Add a secret file and re-index; the secure-by-default walk skips it, and the count
+feeds the dashboard's secret-safety panel.
+
+```console
+$ printf 'AWS_SECRET_ACCESS_KEY=wJalrXUtnFEMI/K7MDENG/bPxRfiCYEXAMPLEKEY\n' > .env
+$ cce index .
+Indexed .
+  files indexed     : 2
+  files skipped     : 0
+  sensitive skipped : 1
+  total chunks      : 2
+  embedder          : hash
+  store             : ./.cce/index.json
+  elapsed           : 0.001s
+```
+
+## 6. `cce mcp` — serve the local index to an agent (offline)
+
+The editor drives `cce mcp` over stdio. Here the exact JSON-RPC it sends is piped in.
+An agent `context_search` runs the same §6 retrieval as the CLI and tags its metrics
+event `source: "mcp"`.
 
 ```console
 $ printf '%s\n' \
     '{"jsonrpc":"2.0","id":1,"method":"initialize","params":{}}' \
     '{"jsonrpc":"2.0","method":"notifications/initialized"}' \
-    '{"jsonrpc":"2.0","id":2,"method":"tools/list"}' \
-    '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"context_search","arguments":{"query":"where is the password hashed","top_k":3}}}' \
-    '{"jsonrpc":"2.0","id":4,"method":"tools/call","params":{"name":"index_status"}}' \
+    '{"jsonrpc":"2.0","id":2,"method":"tools/call","params":{"name":"context_search","arguments":{"query":"process a payment","top_k":2}}}' \
+    '{"jsonrpc":"2.0","id":3,"method":"tools/call","params":{"name":"index_status"}}' \
   | cce mcp --dir .
 ```
 
-- **initialize** →
-  `{"protocolVersion":"2025-06-18","capabilities":{"tools":{}},"serverInfo":{"name":"cce","version":"2.4.0"}}`
-- **tools/list** → `["context_search","index_status","record_feedback"]`
-- **context_search** (id 3) →
+- **initialize** → `serverInfo {"name":"cce","version":"2.4.1"}`
+- **context_search** (id 2) →
 
   ```
    1. [0.825000] auth.py:1-2 (function/function_definition)
@@ -116,11 +148,11 @@ $ printf '%s\n' \
   def process_payment(amount):
       return auth.hash_password(str(amount))
 
-  query_id: 8c017cf1214f
-  Rate this with record_feedback (query_id="8c017cf1214f", helpful=true|false).
+  query_id: cb30eaa953a0
+  Rate this with record_feedback (query_id="cb30eaa953a0", helpful=true|false).
   ```
 
-- **index_status** (id 4) →
+- **index_status** (id 3) →
 
   ```
   Index status
@@ -137,133 +169,196 @@ $ printf '%s\n' \
     remote  : (no sync remote configured — pure local)
   ```
 
-## 3. The search is recorded for the dashboard
+## 7. `cce dashboard` — the refreshed panels (offline, loopback-only)
 
 ```console
-$ cat .cce/metrics.jsonl
-{"baseline_tokens":32,"embedder":"hash","empty":false,"event":"search","graph_enabled":true,"id":"8c017cf1214f","latency_ms":0.078,"low_confidence":false,"mean_score":0.820…,"query":"where is the password hashed","result_count":2,"savings_ratio":0.125,"schema":"cce.metrics/v1","served_tokens":28,"tokens_saved":4,"top_k":3,"top_score":0.825,"ts":"2026-07-05T13:33:57Z"}
+$ cce search "hash the password" --top-k 2   # a CLI search, tagged source: "cli"
 $ cce dashboard --no-open
 cce dashboard: serving http://127.0.0.1:8787/  (loopback only, read-only)
 metrics log : ./.cce/metrics.jsonl
 press Ctrl-C to stop.
 ```
 
-The agent's `context_search` is a `search` event on the dashboard — proof of use and
-of value (`tokens_saved`).
-
-## 4. Plug-and-play team context: `cce init --remote` (pulls the CI-built index)
+`GET /api/metrics` returns the v2.4.1 panels — **agent-vs-human** (`by_source`),
+**secret-safety**, and **index-freshness** — all computed from the log with **no
+network call** (`index_freshness` is purely log-derived — no `remote_latest`/
+`behind_remote`; that live comparison lives in `cce sync status`):
 
 ```console
-$ cce init . --remote "file://$WORK/cache.git"
-CCE is wired up for Claude Code.
-  index     : pulled from sync remote (cce sync pull --latest)
-  .mcp.json : ./.mcp.json (server "cce")
-  CLAUDE.md : ./CLAUDE.md (context_search guidance)
-  ...
-$ printf '%s\n' '{"id":1,"method":"tools/call","params":{"name":"index_status"}}' | cce mcp --dir .
-Index status
-  ...
-  source  : pulled via cce sync (sha b84bc45d7685)
-  remote latest: b84bc45d7685
-  behind remote: no
+$ curl -s http://127.0.0.1:8787/api/metrics | jq '{by_source, secret_safety, index_freshness, mean_top_score: .totals.mean_top_score}'
+{
+  "by_source": {
+    "cli": { "searches": 2, "tokens_saved": 8, "mean_savings_ratio": 0.125, "mean_top_score": 0.825 },
+    "mcp": { "searches": 1, "tokens_saved": 4, "mean_savings_ratio": 0.125, "mean_top_score": 0.825 }
+  },
+  "secret_safety": { "sensitive_skipped": 1, "index_runs": 2 },
+  "index_freshness": {
+    "indexes": 2,
+    "source": "local",
+    "sha": "4d8f068ab19ec441a5a80230d81f3be20c702b28",
+    "indexed_ts": "2026-07-05T14:44:38Z"
+  },
+  "mean_top_score": 0.825
+}
+$ curl -s http://127.0.0.1:8787/api/health
+{"status":"ok","events":5,"skipped":0}
 ```
 
-`index_status` reports the index **source (pulled), its sha, and behind-remote** — the
-sync freshness is observable. With no remote configured the same server works fully on
-the local index, offline (Part A step 2).
+The agent's `context_search` (`mcp`) sits beside the human's `cce search` (`cli`) —
+the agent-vs-human split is proven offline. `index_freshness` carries only what the
+log knows (`source: "local"`, the indexed `sha`, `indexed_ts`); the dashboard makes
+**zero network calls**, so it works with the network fully down.
+
+## 8. `cce workspace` — federated ecosystem (offline)
+
+```console
+$ cd "$WORK/shop"                       # web/ (package.json) + api/, committed
+$ cce workspace init .
+Wrote ./.cce/workspace.yml
+workspace: shop
+members (1):
+  web              javascript   web · package web
+$ cce index --workspace .
+Indexing workspace: shop
+  web              files    2 · chunks    2 · ./web/.cce/index.json
+workspace totals: files 2 · chunks 2
+cross-member edges (0) → ./.cce/workspace-graph.json
+$ cce search "shopping cart" --workspace . --top-k 3
+ 1. [0.869194] web · src/index.ts:1-1 (function/function_declaration)
+ 2. [0.490902] web · package.json:1-2 (module/module)
+$ cce stats --workspace .
+workspace: shop
+  web (package web)
+    files : 2
+    chunks: 2
+      function_declaration: 1
+      module            : 1
+totals: files 2 · chunks 2
+edges (0):
+```
+
+The federated dashboard's **per-package** panel breaks savings/searches/quality down
+by member (populated here by a member-scoped `cce search --dir web`):
+
+```console
+$ cce dashboard --workspace . --no-open &   # loopback only
+$ curl -s http://127.0.0.1:8787/api/metrics | jq '.by_package'
+[
+  {
+    "package": "web",
+    "searches": 1,
+    "tokens_saved": 2,
+    "mean_savings_ratio": 0.166667,
+    "mean_top_score": 0.869194
+  }
+]
+```
+
+**Result: OFFLINE cold-start PASSED.** `index` · `search` · `stats` · `dashboard`
+(all four refreshed panels) · `workspace` · `cce mcp` all ran verbatim with no network
+and no remote.
 
 ---
 
-# Part B — CCE Sync (v2.3)
+# Part 2 — Online cold start (the network-touching parts)
 
-## 0. Versions
+The only workflows that need the network are `cce sync push/pull` (a git cache) and
+installing the binary. This part runs them against a local **bare git remote**
+(`file://`, fully hermetic — no internet), which exercises the exact same code path a
+real SSH/HTTPS remote would.
 
-```console
-$ cce --version
-cce 2.4.0
-```
-
-## 1. Create the cache remote (a bare git repo)
+## 1. Create the cache remote and a project
 
 ```console
 $ git init --bare -q -b main "$WORK/cache.git"
-```
-
-## 2. A project to index, committed
-
-```console
-$ cd "$WORK/billing" && git init -q -b main && git add -A && git commit -q -m "initial billing service"
+$ cd "$WORK/billing"                     # src/auth.py + src/pay.py + .gitignore (.cce/)
+$ git add -A && git commit -q -m "initial billing service"
 $ git rev-parse --short HEAD
-b84bc45
+71400cd
+$ cce index .                            # a hash index is what gets shared
 ```
 
-## 3. `cce sync init`
+## 2. `cce sync init` + `cce sync push`
 
 ```console
 $ cce sync init --remote "file://$WORK/cache.git" --no-lfs --repo-id github.com__acme__billing
 Configured sync remote: file://$WORK/cache.git
   git-LFS       : disabled
   repo_id       : github.com__acme__billing
-  working clone : $CCE_HOME/sync/24e7837b9bdb4382
+  working clone : $CCE_HOME/sync/e1b946a294f94ae3
   config        : ./.cce/config
+$ cce sync push
+Pushed github.com__acme__billing@71400cd6d8c1211475e034aedf6d79f18a54e977
+  key      : hash/2.3/github.com__acme__billing/71400cd6d8c1211475e034aedf6d79f18a54e977.cce
+  checksum : 7deb21139c1fac4a74db5ab9dc936b4dd5859e26790a61ea478efba10f062337
 ```
 
-## 4. `cce sync push`
+## 3. A teammate clones, pulls, and verifies — bit-for-bit
 
 ```console
-$ cce sync push
-Pushed github.com__acme__billing@b84bc45d76855cdb8f3f8d7ce47868517838e519
-  key      : hash/2.3/github.com__acme__billing/b84bc45d76855cdb8f3f8d7ce47868517838e519.cce
-  checksum : eb40a7eab5aa6d2d12e8889912ed87ef35b6268d9a97d0f9b8ce5fb641611289
+$ git clone -q "file://$WORK/billing" "$WORK/billing-teammate" && cd "$WORK/billing-teammate"
+$ cce sync init --remote "file://$WORK/cache.git" --no-lfs --repo-id github.com__acme__billing
+$ cce sync pull
+Pulled github.com__acme__billing@71400cd6d8c1211475e034aedf6d79f18a54e977
+  chunks   : 3
+  checksum : 7deb21139c1fac4a74db5ab9dc936b4dd5859e26790a61ea478efba10f062337
+  store    : ./.cce/index.json
+  tree     : matches — pulled index used as-is
+$ cce sync verify
+verify OK: github.com__acme__billing@71400cd6d8c1211475e034aedf6d79f18a54e977
+  checksum : 7deb21139c1fac4a74db5ab9dc936b4dd5859e26790a61ea478efba10f062337
 ```
 
-## 5. `cce sync status`
+The pull checksum `7deb2113…` is **identical** to the push checksum — content
+addressability proven end-to-end. Search then runs fully offline over the pulled index:
+
+```console
+$ cce search "authenticate user password" --no-metrics --top-k 2
+ 1. [0.908333] src/auth.py:1-2 (function/function_definition)
+    def login(user, password):
+ 2. [0.856835] src/pay.py:3-4 (function/function_definition)
+    def charge(user, amount):
+```
+
+## 4. Sync freshness — where each fact lives
+
+A `cce sync pull` records a `sync-pull` **index event** in the log, so the dashboard's
+**index-freshness** panel shows the pulled provenance **purely from the log — no
+network call** (`index_freshness` is exactly `{indexes, source, sha, indexed_ts}`):
+
+```console
+$ curl -s http://127.0.0.1:8787/api/metrics | jq '.index_freshness'
+{
+  "indexes": 1,
+  "source": "sync-pull",
+  "sha": "71400cd6d8c1211475e034aedf6d79f18a54e977",
+  "indexed_ts": "2026-07-05T14:46:22Z"
+}
+```
+
+The **live behind-remote comparison** belongs in `cce sync status` and MCP
+`index_status` (which *do* consult the remote), never on the dashboard:
 
 ```console
 $ cce sync status
 remote        : file://$WORK/cache.git
 git-LFS       : off
 repo_id       : github.com__acme__billing
-local cache   : (none pulled yet)
-remote latest : b84bc45d76855cdb8f3f8d7ce47868517838e519 (ref main)
-working tree  : b84bc45d76855cdb8f3f8d7ce47868517838e519
+local cache   : 71400cd6d8c1211475e034aedf6d79f18a54e977 (7deb21139c1f)
+remote latest : 71400cd6d8c1211475e034aedf6d79f18a54e977 (ref main)
+working tree  : 71400cd6d8c1211475e034aedf6d79f18a54e977
+$ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"index_status"}}' | cce mcp --dir .
+Index status
+  ...
+  source  : pulled via cce sync (sha 71400cd6d8c1)
+  remote latest: 71400cd6d8c1
+  behind remote: no
 ```
 
-## 6–8. A teammate clones, configures, and pulls — the checksum matches, bit-for-bit
+(The `cce init --remote <url>` plug-and-play flow wraps the same `cce sync pull
+--latest` and then wires `.mcp.json` + `CLAUDE.md` — see [`docs/mcp.md`](mcp.md).)
 
-```console
-$ git clone -q "file://$WORK/billing" "$WORK/billing-teammate" && cd "$WORK/billing-teammate"
-$ cce sync init --remote "file://$WORK/cache.git" --no-lfs --repo-id github.com__acme__billing
-$ cce sync pull
-Pulled github.com__acme__billing@b84bc45d76855cdb8f3f8d7ce47868517838e519
-  chunks   : 3
-  checksum : eb40a7eab5aa6d2d12e8889912ed87ef35b6268d9a97d0f9b8ce5fb641611289
-  store    : ./.cce/index.json
-  tree     : matches — pulled index used as-is
-```
-
-The pull checksum `eb40a7ea…` is **identical** to the push checksum in step 4 —
-content-addressability proven end-to-end.
-
-## 9. `cce sync verify` and `cce search` over the pulled index
-
-```console
-$ cce sync verify
-verify OK: github.com__acme__billing@b84bc45d76855cdb8f3f8d7ce47868517838e519
-  checksum : eb40a7eab5aa6d2d12e8889912ed87ef35b6268d9a97d0f9b8ce5fb641611289
-
-$ cce search "authenticate user password" --no-metrics
- 1. [0.897169] src/auth.py:1-2 (function/function_definition)
-    def login(user, password):
- 2. [0.855379] src/pay.py:3-5 (function/function_definition)
-    def charge(user, amount):
- 3. [0.841146] src/auth.py:4-5 (function/function_definition)
-    def logout(user):
-```
-
----
-
-## Offline-first & error paths (SPEC-SYNC §9)
+## 5. Offline-first & error paths (SPEC-SYNC §9)
 
 **A. No remote configured — local commands are unaffected:**
 
@@ -295,18 +390,20 @@ still starts, warms silently (no crash/hang), and answers `index_status` (verifi
 ## Automated gates (re-run to reproduce)
 
 ```console
-$ cargo test                                                   # 298 tests, all green
+$ cargo test                                                   # 301 tests, all green
 $ cargo clippy --all-targets --all-features -- -D warnings     # clean
 $ cargo fmt --check                                            # clean
-$ cargo llvm-cov --summary-only                                # total ≥ 92% (93.8% line)
+$ cargo llvm-cov --summary-only                                # total 93.6% line (≥ 92%)
+$ cce conformance test/fixture/samples                         # conformance.json byte-identical
 ```
 
-The hermetic MCP integration suite (`tests/mcp.rs`) drives the real binary over stdio
-through exactly this flow — initialize → tools/list → context_search (with a metrics
-event) → index_status → record_feedback → the missing-index path → `cce init`
-idempotency → the sync auto-pull soft dependency behind a `file://` bare remote
-(offline-safe when absent). The sync suite (`tests/sync.rs`) covers init → push → pull
-→ search → verify plus the refusals and the offline guarantee.
+The hermetic MCP suite (`tests/mcp.rs`) drives the real binary over stdio through
+initialize → tools/list → context_search (logging a metrics event) → index_status →
+record_feedback → the missing-index path → `cce init` idempotency → the sync auto-pull
+soft dependency behind a `file://` bare remote (offline-safe when absent). The sync
+suite (`tests/sync.rs`) covers init → push → pull → search → verify plus the refusals
+and the offline guarantee. The dashboard suites (`src/dashboard.rs`, `tests/dashboard.rs`)
+assert the refreshed `/api/metrics` panels over a real loopback socket.
 
-**Result: cold-start PASSED (MCP + Sync).** Every documented command ran verbatim and
-its output matched the docs.
+**Result: cold-start PASSED (offline + online).** Every documented command ran verbatim
+and its output matched the docs.

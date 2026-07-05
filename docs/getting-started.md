@@ -38,7 +38,7 @@ sudo apt-get update && sudo apt-get install -y build-essential
 git clone https://github.com/davidslv/cce-rust
 cd cce-rust
 cargo build --release     # binary at target/release/cce
-cargo test                # 129 tests — confirms a green build
+cargo test                # 301 tests — confirms a green build
 ```
 
 Optionally put the binary on your PATH:

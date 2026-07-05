@@ -65,6 +65,11 @@ fn serves_page_api_and_health_on_ephemeral_port() {
     assert_eq!(v["totals"]["searches"], 4);
     assert_eq!(v["totals"]["tokens_saved"], 53000);
     assert!(v.get("generated_ts").is_some());
+    // v2.4.1 refreshed panels are served over the real socket, purely log-derived.
+    assert_eq!(v["by_source"]["cli"]["searches"], 4);
+    assert_eq!(v["secret_safety"]["sensitive_skipped"], 0);
+    assert_eq!(v["index_freshness"]["source"], "local");
+    assert!(v["index_freshness"].get("behind_remote").is_none());
 
     // Unknown path -> 404
     let (status, body) = http_get(port, "/nope");

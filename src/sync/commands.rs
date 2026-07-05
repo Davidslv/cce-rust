@@ -268,6 +268,30 @@ fn install_artifact(root: &Path, bytes: &[u8]) -> Result<Artifact, String> {
     }
     .save(root)
     .map_err(|e| format!("could not write sync marker: {e}"))?;
+
+    // Best-effort: record a `sync-pull` index event so the dashboard's freshness
+    // panel shows the pulled provenance (purely log-derived — the dashboard makes no
+    // live lookup). Never fatal to the pull.
+    let clock = crate::metrics::SystemClock;
+    let ids = crate::metrics::HexIdSource::default();
+    let writer = crate::metrics::MetricsWriter::new(
+        crate::store::default_metrics_path(root),
+        &clock,
+        &ids,
+        true,
+    );
+    writer.log_index(&crate::metrics::IndexRecord {
+        files_indexed: index.files().len(),
+        chunks: index.chunks.len(),
+        index_bytes: bytes.len() as u64,
+        duration_ms: 0.0,
+        embedder: HASH_EMBEDDER.to_string(),
+        full: true,
+        sha: Some(artifact.manifest.sha.clone()),
+        source: "sync-pull".to_string(),
+        sensitive_skipped: 0,
+    });
+
     Ok(artifact)
 }
 

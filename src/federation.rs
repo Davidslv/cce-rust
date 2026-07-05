@@ -330,13 +330,16 @@ pub fn member_metrics(root: &Path, manifest: &Manifest) -> Vec<MemberMetrics> {
         .collect()
 }
 
-/// One `by_package` breakdown row (SPEC-V2.2 §7).
+/// One `by_package` breakdown row (SPEC-V2.2 §7). `mean_top_score` (retrieval
+/// quality per member) was added in v2.4.1 so the per-package panel shows savings,
+/// searches, AND quality.
 #[derive(Debug, Clone, Serialize)]
 pub struct PackageRollup {
     pub package: String,
     pub searches: u64,
     pub tokens_saved: u64,
     pub mean_savings_ratio: f64,
+    pub mean_top_score: f64,
 }
 
 /// Build the federated metrics aggregate as a JSON value: the normal §4 roll-up
@@ -358,7 +361,7 @@ pub fn federated_metrics_json(
     let rollup = aggregate(&all_events, now_secs, price);
     let mut val = serde_json::to_value(&rollup).unwrap_or(serde_json::Value::Null);
 
-    let by_package: Vec<PackageRollup> = members
+    let mut by_package: Vec<PackageRollup> = members
         .iter()
         .map(|m| {
             let log = read_log(&m.metrics_path);
@@ -368,9 +371,12 @@ pub fn federated_metrics_json(
                 searches: agg.totals.searches,
                 tokens_saved: agg.totals.tokens_saved,
                 mean_savings_ratio: round6(agg.totals.mean_savings_ratio),
+                mean_top_score: round6(agg.totals.mean_top_score),
             }
         })
         .collect();
+    // Deterministic, cross-engine-identical ordering: sort by package name.
+    by_package.sort_by(|a, b| a.package.cmp(&b.package));
 
     if let Some(obj) = val.as_object_mut() {
         obj.insert("by_package".to_string(), serde_json::to_value(&by_package).unwrap_or_default());
@@ -556,7 +562,11 @@ mod tests {
         let app = by.iter().find(|p| p["package"] == "app").unwrap();
         assert_eq!(app["searches"], 1);
         assert_eq!(app["tokens_saved"], 1000);
+        assert_eq!(app["mean_top_score"], 0.9); // v2.4.1: quality per member
         let billing = by.iter().find(|p| p["package"] == "billing").unwrap();
         assert_eq!(billing["tokens_saved"], 3000);
+        // The roll-up carries the v2.4.1 agent-vs-human split (all CLI here).
+        assert_eq!(json["by_source"]["cli"]["searches"], 2);
+        assert_eq!(json["by_source"]["mcp"]["searches"], 0);
     }
 }

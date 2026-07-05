@@ -30,7 +30,14 @@ exact tree-sitter node type) alongside the coarse `chunk_type`.
 IDs are allowed** (`src/metrics.rs`, `src/aggregator.rs`, `src/dashboard.rs`).
 Everywhere else stays deterministic. In metrics, the clock and id source are
 **injected** so tests pin them; the aggregator is a **pure function** of
-`(events, now, price)` with no ambient time. Keep it that way.
+`(events, now, price)` with no ambient time. Keep it that way. The metrics schema
+grows **only additively** — the reader tolerates absent/unknown fields (v2.4.1 added
+`search.source`, `index.{sha,source,sensitive_skipped}`, and the `by_source` /
+`secret_safety` / `index_freshness` aggregate sections), so older logs still parse and
+both engines stay in parity. Every `/api/metrics` panel is a **pure function of the
+log**, so the **dashboard makes zero network calls** — `index_freshness` carries no
+`remote_latest`/`behind_remote`; a live behind-remote comparison lives only in
+`cce sync status` and MCP `index_status`.
 
 ## The gates that must stay green
 
@@ -61,7 +68,7 @@ Tests must be **deterministic and hermetic** — no network, no wall-clock, no
 ambient filesystem state. The only network-touching test (Ollama) is `#[ignore]`.
 The metrics tests inject a fixed clock/id source, and the dashboard's socket test
 binds an **ephemeral loopback port** and serves a bounded number of connections.
-Keep coverage at or above the baseline (**129 tests, 94.76% line coverage** via
+Keep coverage at or above the baseline (**301 tests, ~93.6% line coverage** via
 `cargo llvm-cov`); a change that lowers coverage should add tests. The CI test
 gate also runs the three-layer validators over every language pack.
 

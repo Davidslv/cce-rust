@@ -455,6 +455,9 @@ fn cmd_index(
         duration_ms: elapsed * 1000.0,
         embedder: index.embedder_name.clone(),
         full: true,
+        sha: cce::sync::git::head_sha(dir),
+        source: "local".to_string(),
+        sensitive_skipped: stats.sensitive_skipped as u64,
     });
 
     println!("Indexed {}", dir.display());
@@ -502,7 +505,8 @@ fn cmd_search(
 
     // Best-effort metrics: a search event (DASHBOARD-SPEC §2.1). The write is
     // fail-open, so it never affects the result or the exit code.
-    let record = build_search_record(&index, &results, query, top_k, graph_enabled, latency_ms);
+    let record =
+        build_search_record(&index, &results, query, top_k, graph_enabled, latency_ms, "cli");
     let clock = SystemClock;
     let ids = HexIdSource::default();
     let writer =
@@ -764,6 +768,9 @@ fn cmd_index_workspace(
             duration_ms: elapsed * 1000.0,
             embedder: index.embedder_name.clone(),
             full: true,
+            sha: cce::sync::git::head_sha(&root),
+            source: "local".to_string(),
+            sensitive_skipped: stats.sensitive_skipped as u64,
         });
 
         total_files += stats.files_indexed;

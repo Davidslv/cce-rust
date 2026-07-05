@@ -153,7 +153,7 @@ fn context_search_single(
 
     // Identical to the CLI path: a `cce.metrics/v1` search event beside the store,
     // so `cce dashboard` shows the agent's query and token savings.
-    let record = build_search_record(&index, &results, query, top_k, !no_graph, latency_ms);
+    let record = build_search_record(&index, &results, query, top_k, !no_graph, latency_ms, "mcp");
     let query_id = write_search_event(&server.metrics_path(), &record);
 
     let rows: Vec<Row> = results.iter().map(Row::from_single).collect();
@@ -217,7 +217,8 @@ fn context_search_workspace(
             content: r.content.clone(),
         })
         .collect();
-    let record = build_search_record(&combined, &namespaced, query, top_k, !no_graph, latency_ms);
+    let record =
+        build_search_record(&combined, &namespaced, query, top_k, !no_graph, latency_ms, "mcp");
     let query_id = write_search_event(&server.metrics_path(), &record);
 
     let total_chunks: usize = members.iter().map(|m| m.index.chunks.len()).sum();

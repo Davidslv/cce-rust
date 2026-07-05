@@ -60,8 +60,12 @@ second precision), and `id` (12 lowercase-hex chars, unique per event).
  "mean_score":0.7,          // mean final score of returned results (0.0 if empty)
  "empty":false,             // result_count == 0
  "low_confidence":false,    // result_count > 0 AND top_score < 0.30
- "latency_ms":5.0}          // captured; no dedicated panel in v1.1
+ "latency_ms":5.0,          // captured; no dedicated panel
+ "source":"cli"}            // v2.4.1: "cli" (cce search) or "mcp" (agent context_search)
 ```
+
+`source` (added additively in v2.4.1) powers the agent-vs-human panel. Older logs
+without it read back as `"cli"`.
 
 `baseline_tokens` is the "read the whole file" counterfactual. To make it
 accurate, `cce index` now persists each indexed file's **whole-file token count**
@@ -74,8 +78,14 @@ missing entry contributes 0).
 ```json
 {"schema":"cce.metrics/v1","event":"index","ts":"...","id":"...",
  "files_indexed":231,"chunks":1728,"index_bytes":123456,"duration_ms":740.0,
- "embedder":"hash","full":true}
+ "embedder":"hash","full":true,
+ "sha":"25bd0098…",        // v2.4.1: indexed commit sha (null on non-git)
+ "source":"local",          // v2.4.1: "local" (cce index) | "sync-pull" (cce sync pull)
+ "sensitive_skipped":1}     // v2.4.1: sensitive files skipped (secret-safety panel)
 ```
+
+`sha` / `source` / `sensitive_skipped` were added additively in v2.4.1; older logs
+without them read back as `null` / `"local"` / `0`.
 
 ### `feedback` (appended by `cce feedback`)
 
@@ -123,15 +133,46 @@ Output shape (keys, some nested objects elided):
 
 ```
 schema, totals{searches, indexes, feedback, tokens_saved, cost_saved_usd,
-               mean_savings_ratio, helpful, not_helpful, helpful_rate},
+               mean_savings_ratio, mean_top_score, helpful, not_helpful, helpful_rate},
 north_star{ savings{current, prior, delta_ratio, direction},
             quality{current, prior, delta_top_score, direction} },
+by_source{ cli{searches, tokens_saved, mean_savings_ratio, mean_top_score},
+           mcp{searches, tokens_saved, mean_savings_ratio, mean_top_score} },
+secret_safety{ sensitive_skipped, index_runs },
+index_freshness{ indexes, source, sha, indexed_ts },     // PURELY log-derived — no network call
 series{ daily:[ {date, searches, tokens_saved, mean_savings_ratio,
                  mean_top_score, empty_rate, low_conf_rate, helpful,
                  not_helpful} ] },        // one per UTC date with ANY search/feedback, ascending
 recent_searches:[ {ts, id, query, result_count, tokens_saved, savings_ratio,
                    top_score, empty, feedback} ]   // ≤20, newest first
+by_package:[ {package, searches, tokens_saved, mean_savings_ratio, mean_top_score} ]
+                                          // workspace dashboard only (SPEC-V2.2 §7)
 ```
+
+### v2.4.1 dashboard refresh — the panels
+
+The dashboard was built at v1.1 (savings + quality only). v2.4.1 adds four panels for
+the capabilities that landed since, all fed from the additive schema above:
+
+- **Agent vs human usage** (`by_source`) — CLI searches vs MCP/agent searches: how much
+  your agent leans on CCE. A search's `source` other than `"mcp"` counts as `cli`.
+- **Per-package breakdown** (`by_package`, workspace only) — an **array of objects**,
+  each `{package, searches, tokens_saved, mean_savings_ratio, mean_top_score}`, sorted by
+  `package`: savings, searches, and **quality** per member, i.e. where in the ecosystem
+  CCE helps most.
+- **Index freshness** (`index_freshness`) — the indexed `sha`, the source (`local` for
+  `cce index`, `sync-pull` for a `cce sync pull` install), `indexed_ts`, and the count of
+  index runs. **Purely log-derived**, so the dashboard makes **zero network calls** and
+  works fully offline. It deliberately carries **no** `remote_latest`/`behind_remote` — a
+  live behind-remote comparison lives in `cce sync status` and MCP `index_status`, which
+  are allowed to consult the remote.
+- **Secret-safety** (`secret_safety`) — the sensitive-files-skipped count across index
+  runs: reassurance that secure-by-default redaction is working.
+
+`by_source`, `secret_safety`, `index_freshness`, and `totals.mean_top_score` are all
+**pure functions of the log**, so — like the §4.1 anchor — the Ruby and Rust engines
+produce identical numbers from the same log, and the dashboard request path touches no
+network.
 
 `recent_searches[*].feedback` is resolved by matching `feedback.target_id` to the
 search `id` (latest wins) → `helpful` / `not_helpful` / `none`. A day with
@@ -164,8 +205,10 @@ serves mutates any file. Endpoints:
 - Any other path — `404` with a small JSON body.
 
 The page foregrounds the two north-stars with ↑ improving / ↓ degrading / → flat
-indicators, KPI cards (tokens saved, est. $ saved, searches, helpful-rate), daily
-SVG charts, and a recent-searches table, with a friendly empty state. See
+indicators, KPI cards (tokens saved, est. $ saved, searches, helpful-rate), the
+v2.4.1 refresh panels (index-freshness & secret-safety cards, an agent-vs-human table,
+and — in workspace mode — a by-package table), daily SVG charts, and a recent-searches
+table, with a friendly empty state. See
 [`SECURITY.md`](../SECURITY.md) for the server's place in the threat model
 (loopback-only, read-only, self-contained; a token would be required if a future
 version ever bound a non-loopback address).

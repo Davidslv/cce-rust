@@ -98,7 +98,7 @@ cargo test                # confirm a green build
 
 ```bash
 cargo install --path .    # installs `cce` into ~/.cargo/bin
-cce --version             # cce 2.4.0
+cce --version             # cce 2.4.1
 ```
 
 ### Optional: the semantic embedder (Ollama)
@@ -326,6 +326,14 @@ dashboard visualizes two north-stars — **token/cost savings** and **retrieval
 quality** — each trended current-vs-prior with an ↑ improving / ↓ degrading / →
 flat indicator, plus a recent-searches table. (The base engine and
 `conformance.json` are untouched by any of this.)
+
+**Refreshed in v2.4.1** with four panels for the capabilities that landed since:
+**agent-vs-human usage** (CLI vs MCP/agent searches), a **per-package breakdown**
+(savings/searches/quality per workspace member), **index freshness** (indexed `sha`,
+local-vs-`sync-pull` source), and **secret-safety** (the sensitive-files-skipped
+count). Every panel is **purely log-derived**, so the dashboard makes **zero network
+calls** (behind-remote lives in `cce sync status`); the metrics schema grew only by
+adding fields, so old logs still parse.
 
 ![CCE dashboard — token/cost savings and retrieval quality, trended](docs/dashboard.png)
 
@@ -559,6 +567,69 @@ configured, MCP works fully on the local index, offline. See
 [`docs/mcp.md`](docs/mcp.md) for the tool schemas, the workspace (`--workspace`)
 flow, and the sync-freshness details.
 
+## Offline-first (verified)
+
+**CCE is local-first: every core workflow runs with no network and no remote.**
+With no sync remote configured, all of these work fully offline and are recorded as a
+real offline cold-start run in [`docs/VERIFIED.md`](docs/VERIFIED.md):
+
+| Command | Offline? | Notes |
+|---|---|---|
+| `cce index` | ✅ fully offline | walk → AST-chunk → hash-embed → write local JSON |
+| `cce search` | ✅ fully offline | reopens the local store; no re-embedding of the corpus |
+| `cce stats` | ✅ fully offline | reads the local store |
+| `cce dashboard` | ✅ fully offline | loopback-only, read-only; inlines all CSS/JS/SVG; **every panel is purely log-derived, so it makes zero network calls** (behind-remote is answered by `cce sync status`) |
+| `cce workspace` / `--workspace` | ✅ fully offline | detection, federated index/search/stats/dashboard |
+| `cce mcp` | ✅ fully offline | serves the **local** index to the agent; auto-pull is a soft dependency that no-ops with no remote |
+| `cce feedback` / `cce conformance` / `cce packs` / `cce bench` | ✅ fully offline | pure local operations |
+
+The **only** things that ever touch the network are, explicitly:
+
+1. **The optional Ollama embedder** (`--embedder ollama`) — a `localhost` HTTP call;
+   unreachable ⇒ it warns and falls back to the offline hash embedder.
+2. **`cce sync push` / `cce sync pull`** — the git cache transport. Everything else,
+   including reading a *previously* pulled index, is offline.
+3. **Installing the binary** (`cargo install`, `git clone`) — a one-time step.
+
+Everything else is fully offline by construction. The default test suite makes **no
+network calls** (the metrics clock/id source are injected; dashboard tests bind an
+ephemeral loopback port; sync tests use a `file://` bare remote).
+
+## Best practices — CCE Sync & CCE MCP
+
+**CCE Sync**
+
+- **One sync repo per access boundary.** Anyone who can read the cache repo can read
+  the indexed code's structure — scope the cache repo to the same audience as the
+  source. Use a separate cache repo per team/trust boundary.
+- **Make CI the canonical pusher.** Let a CI job index `main` and `cce sync push` on
+  every merge ([`docs/ci/cce-sync.yml`](docs/ci/cce-sync.yml)); developers only ever
+  **pull**. The CI token needs *write* to the cache repo only; developers need *read*.
+- **`.gitignore` your `.cce/`.** The local store and metrics log are machine-local —
+  keep them out of the source repo. A one-line `.gitignore` entry (`.cce/`) also keeps
+  `cce sync push`'s clean-tree check from tripping on store churn.
+- **Only the hash embedder is shareable.** `cce sync push` refuses a non-hash index or
+  a dirty tree — a cache is content-addressed by commit, so it must be reproducible.
+- **`cce sync verify` when in doubt.** It re-indexes locally and confirms the pulled
+  checksum, byte-for-byte.
+
+**CCE MCP**
+
+- **Wire it once with `cce init`, then confirm via the dashboard.** After the agent
+  runs, `cce dashboard`'s agent-vs-human panel shows the `mcp` searches — proof the
+  agent used CCE and what it saved. That closes the loop.
+- **Prefer `context_search` over Read/Grep** — the `CLAUDE.md` block `cce init` writes
+  already steers the agent this way; keep it.
+- **Use a workspace for an ecosystem, a single repo for one codebase.** `cce mcp
+  --workspace` federates members; plain `cce mcp` serves one store. Match the mode to
+  the tree.
+- **Team-shared context: `cce init --remote <cache>`.** Pull the CI-built index in
+  seconds instead of a full local re-index; turn on `sync.auto_pull` to have `cce mcp`
+  refresh to `main@sha` on startup. It stays a soft dependency — offline still works.
+- **Secret-safe by default.** Indexing skips sensitive files and redacts secrets before
+  they reach the store (`--allow-secrets` opts out, loudly). The dashboard's
+  secret-safety panel shows the skip count.
+
 ## Supported languages
 
 Language support is a set of pluggable **language packs** (SPEC-V2). The core
@@ -601,13 +672,13 @@ node type in a `kind` field alongside the coarse `chunk_type`
 ## Tests & coverage
 
 ```bash
-cargo test                                                  # 298 tests
+cargo test                                                  # 301 tests
 cargo clippy --all-targets --all-features -- -D warnings    # lint gate
 cargo fmt --check                                           # format gate
 ```
 
-The suite is **298 passing tests** (+1 `#[ignore]` Ollama integration test) and
-measures **93.8% line coverage** via `cargo llvm-cov`. The default suite is
+The suite is **301 passing tests** (+1 `#[ignore]` Ollama integration test) and
+measures **93.6% line coverage** via `cargo llvm-cov`. The default suite is
 fully deterministic and makes no network calls — including the metrics subsystem,
 whose clock and id source are injected and whose dashboard tests bind an
 ephemeral loopback port. A CI test gate runs the three-layer validators over every
@@ -626,7 +697,7 @@ language pack, and a guard test asserts the core chunker names no language.
 | [`SPEC-MCP.md`](SPEC-MCP.md) | The CCE MCP design spec (v2.4) |
 | [`docs/sync.md`](docs/sync.md) | CCE Sync: model, artifact format, content address, permissions, troubleshooting |
 | [`docs/mcp.md`](docs/mcp.md) | CCE MCP: the server, the three tools, `cce init`, sync freshness, and how to confirm agent use |
-| [`docs/VERIFIED.md`](docs/VERIFIED.md) | CCE Sync + CCE MCP cold-start verification transcripts |
+| [`docs/VERIFIED.md`](docs/VERIFIED.md) | Offline + online cold-start verification transcripts (index/search/stats/dashboard/workspace/MCP offline; Sync online) |
 | [`docs/ci/cce-sync.yml`](docs/ci/cce-sync.yml) | Ready-to-copy GitHub Actions cache-push workflow |
 | [`docs/getting-started.md`](docs/getting-started.md) | Install → first index + search |
 | [`docs/adding-a-language.md`](docs/adding-a-language.md) | Step-by-step guide to adding a language pack |

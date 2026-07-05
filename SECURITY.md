@@ -88,6 +88,11 @@ not — do makes the real attack surface clear.
   loopback-only, no authentication is required or offered; **if a future version
   ever allowed binding a non-loopback address, it must require a token** before
   doing so. There is no browser auto-open (the command only prints the URL).
+  The v2.4.1 refresh keeps this posture exactly: **every panel — including
+  index-freshness — is purely log-derived, so the dashboard makes ZERO network calls**
+  (no git read, no remote lookup) on any request path, configured remote or not. The
+  live behind-remote comparison lives only in `cce sync status` and MCP `index_status`,
+  where a read of the remote is expected and never a write.
 
 - **The MCP server (v2.4) is read-only, offline, and local-transport-only.**
   `cce mcp` speaks JSON-RPC 2.0 over **stdin/stdout** — it opens **no socket** and

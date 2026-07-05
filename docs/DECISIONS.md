@@ -461,5 +461,43 @@ that names the *artifact format*, used everywhere the sync layer stamps the vers
 when the artifact bytes actually change shape — then both engines bump it in lockstep.
 The shared golden checksum on `test/fixture/samples` therefore stays
 `581cbd0ff682a38d7d1250f3eec44f4ce456bdd660d4cb29aaaadd9e95072f48`, equal to Ruby's.
-The app/crate version is 2.4.0 (`Cargo.toml`, `CITATION.cff`); `conformance.json` is
-independent of both and stays byte-identical.
+The app/crate version is 2.4.1 (`Cargo.toml`, `CITATION.cff`) — the v2.4.1 dashboard
+refresh + docs sweep is additive and does **not** touch `SYNC_FORMAT_VERSION`, so the
+golden checksum above is unchanged; `conformance.json` is independent of both and stays
+byte-identical.
+
+## v2.4.1 — dashboard refresh & offline-first docs sweep
+
+**The metrics schema grows only by adding fields.** The reader already tolerated
+unknown/absent fields, so v2.4.1 extends it in place rather than versioning it:
+`search` events gain `source`, `index` events gain `sha`/`source`/`sensitive_skipped`.
+A pre-v2.4.1 log still parses — a search with no `source` normalises to `"cli"`, an
+index event to `"local"`. No `cce.metrics/v2`; the schema tag stays `cce.metrics/v1`.
+
+**Agent-vs-human bucketing is a single crisp rule.** Only the exact value `"mcp"`
+counts as an agent search; every other `source` (`"cli"`, empty, unknown) is a human
+search. This keeps the CLI path (`cce search` → `"cli"`) and the MCP path
+(`context_search` → `"mcp"`) as the two buckets, and makes an ambiguous/old event fall
+into the human bucket deterministically — the same rule in both engines. The top-level
+key is `by_source` (the reconciled cross-engine name).
+
+**`index_freshness` is PURELY log-derived — the dashboard makes zero network calls.**
+Its shape is exactly `{indexes, source, sha, indexed_ts}`, computed from the latest index
+event, so both engines reproduce it identically and `cce dashboard` stays self-contained
+and fully offline. It deliberately carries **no** `remote_latest`/`behind_remote`: a
+live remote comparison would mean a git fetch on the request path, which breaks the
+offline/self-contained posture. That comparison lives only in `cce sync status` and MCP
+`index_status`, which are expected to consult the remote. To make the *pulled* state
+observable without a live lookup, `cce sync pull` records a `source: "sync-pull"` index
+event in the log (with the pulled sha) — so `index_freshness.source` reads `"local"`
+(built by `cce index`) or `"sync-pull"` (installed by `cce sync pull`) straight from the
+log.
+
+**The dashboard stays self-contained and offline.** The four new panels
+(agent-vs-human, per-package, index-freshness, secret-safety) render from the same
+`/api/metrics` body with inline JS/SVG — no new endpoint, no external asset, no network
+call, still loopback-only and read-only. `secret_safety.sensitive_skipped` sums the
+index events' skip counts (the only source of that datum), so it needs the additive
+`index.sensitive_skipped` field. `by_package` (workspace only) is an array of objects,
+each with a `package` field, **sorted by package** for deterministic cross-engine order,
+and gains `mean_top_score` so the per-member panel shows quality, not just savings.
