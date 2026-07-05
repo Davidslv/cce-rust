@@ -70,6 +70,13 @@ fn serves_page_api_and_health_on_ephemeral_port() {
     assert_eq!(v["secret_safety"]["sensitive_skipped"], 0);
     assert_eq!(v["index_freshness"]["source"], "local");
     assert!(v["index_freshness"].get("behind_remote").is_none());
+    // SPEC-V2.5 §3: the seven-bucket ledger is served, purely log-derived, labelled.
+    let ledger = &v["savings_by_layer"];
+    assert_eq!(ledger["retrieval"]["saved_tokens"], 53000);
+    assert_eq!(ledger["retrieval"]["baseline_tokens"], 70000);
+    assert_eq!(ledger["total"]["saved_tokens"], 53000);
+    assert_eq!(ledger["chunk_compression"]["saved_tokens"], 0);
+    assert_eq!(ledger["note"], "vs full-file baseline — not your real end-to-end agent cost");
 
     // Unknown path -> 404
     let (status, body) = http_get(port, "/nope");

@@ -15,12 +15,12 @@
 //! - Own the deterministic sort (rounded score desc, chunk_id asc).
 //! - It does NOT walk, chunk, embed corpora, or persist.
 
-use crate::chunker::{token_count, Chunk};
+use crate::chunker::Chunk;
 use crate::config::*;
 use crate::embedder::{cosine, score_key, Embedder};
 use crate::metrics::SearchRecord;
 use crate::store::Index;
-use crate::tokenizer::tokenize;
+use crate::tokenizer::{estimate_tokens, tokenize};
 use crate::vector_store::rank_by_cosine;
 use std::collections::{HashMap, HashSet};
 
@@ -109,9 +109,14 @@ pub fn build_search_record(
     latency_ms: f64,
     source: &str,
 ) -> SearchRecord {
+    // SPEC-V2.5 §2 (Layer 1) + §4: both the baseline (whole returned files, deduped)
+    // and the served tokens are counted with the ONE savings estimator
+    // (`cce.tokens/v1`). `baseline_tokens` sums per-file whole-file estimates the
+    // index persisted with that same estimator, so `saved = baseline − served` is
+    // coherent and attributed to the `retrieval` bucket.
     let result_count = results.len();
     let baseline_tokens = index.baseline_tokens(results.iter().map(|r| r.file_path.as_str()));
-    let served_tokens: u64 = results.iter().map(|r| token_count(&r.content) as u64).sum();
+    let served_tokens: u64 = results.iter().map(|r| estimate_tokens(&r.content)).sum();
     let tokens_saved = baseline_tokens.saturating_sub(served_tokens);
     let savings_ratio = if baseline_tokens == 0 {
         0.0

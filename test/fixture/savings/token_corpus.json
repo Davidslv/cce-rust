@@ -1,0 +1,22 @@
+[
+  "",
+  "a",
+  "abcd",
+  "abcdefgh",
+  "def hash_password(user_id):",
+  "    return bcrypt.hashpw(pw, salt)  # secure",
+  "SELECT * FROM users WHERE id = ?;",
+  "The quick brown fox jumps over the lazy dog.",
+  "你好世界",
+  "こんにちは、世界",
+  "안녕하세요 세계",
+  "café résumé naïve",
+  "emoji 😀🚀 test",
+  "tabs\tand\nnewlines\r\nhere",
+  "                        deeply indented",
+  "a b c d e f g h i j k l m n o p",
+  "CamelCaseIdentifier_with_snake",
+  "混合 mixed 语言 text 内容",
+  "{\"key\": \"value\", \"n\": 42}",
+  " no break spaces stay ordinary"
+]

@@ -1,0 +1,12 @@
+{"question_id": "q1-hash-password", "condition": "off", "answer": "The hashing lives in auth.py; the function is hash_password(user_id).", "cost_usd": 0.42, "subagent_cost_usd": 0.00}
+{"question_id": "q1-hash-password", "condition": "on", "answer": "auth.py defines hash_password.", "cost_usd": 0.11, "subagent_cost_usd": 0.00}
+{"question_id": "q2-process-payment", "condition": "off", "answer": "payments.py has process_payment(amount).", "cost_usd": 0.55, "subagent_cost_usd": 0.10}
+{"question_id": "q2-process-payment", "condition": "on", "answer": "See payments.py -> process_payment.", "cost_usd": 0.14, "subagent_cost_usd": 0.00}
+{"question_id": "q3-token-estimator", "condition": "off", "answer": "It is estimate_tokens in the tokenizer module.", "cost_usd": 0.60, "subagent_cost_usd": 0.20}
+{"question_id": "q3-token-estimator", "condition": "on", "answer": "tokenizer::estimate_tokens does it.", "cost_usd": 0.18, "subagent_cost_usd": 0.05}
+{"question_id": "q4-savings-buckets", "condition": "off", "answer": "I couldn't find a definitive count in the code.", "cost_usd": 0.30, "subagent_cost_usd": 0.00, "punted": true}
+{"question_id": "q4-savings-buckets", "condition": "on", "answer": "There are seven buckets; the first is retrieval.", "cost_usd": 0.16, "subagent_cost_usd": 0.00}
+{"question_id": "q5-metrics-schema", "condition": "off", "answer": "Every event carries cce.metrics/v1.", "cost_usd": 0.25, "subagent_cost_usd": 0.00}
+{"question_id": "q5-metrics-schema", "condition": "on", "answer": "The schema tag is cce.metrics/v1.", "cost_usd": 0.09, "subagent_cost_usd": 0.00}
+{"question_id": "q6-dashboard-loopback", "condition": "off", "answer": "It binds to 127.0.0.1, loopback only.", "cost_usd": 0.33, "subagent_cost_usd": 0.00}
+{"question_id": "q6-dashboard-loopback", "condition": "on", "answer": "127.0.0.1 loopback only.", "cost_usd": 0.10, "subagent_cost_usd": 0.00}

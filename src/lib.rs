@@ -15,6 +15,9 @@
 
 pub mod config;
 pub mod tokenizer;
+pub mod pricing;
+pub mod savings;
+pub mod eval;
 pub mod embedder;
 pub mod packs;
 pub mod chunker;

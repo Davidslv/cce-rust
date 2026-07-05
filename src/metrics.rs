@@ -20,6 +20,7 @@
 //!   lets a write error break the calling command.
 
 use crate::config::METRICS_SCHEMA;
+use crate::savings::SavingsBuckets;
 use serde_json::Value;
 use sha2::{Digest, Sha256};
 use std::io::Write;
@@ -149,6 +150,12 @@ impl<'a> MetricsWriter<'a> {
             return None;
         }
         let id = self.ids.next_id();
+        // SPEC-V2.5 §3: the seven-bucket ledger, additive. Only `retrieval` is
+        // populated in Stage ① (from the Layer 1 accounting); the other six ship
+        // present-and-zero, ready for later stages. The legacy top-level
+        // `baseline_tokens`/`served_tokens`/`tokens_saved`/`savings_ratio` fields
+        // stay for backward compatibility with the v2.4 dashboard aggregator.
+        let savings = SavingsBuckets::retrieval_only(rec.tokens_saved, rec.baseline_tokens);
         let obj = serde_json::json!({
             "schema": METRICS_SCHEMA,
             "event": "search",
@@ -163,6 +170,7 @@ impl<'a> MetricsWriter<'a> {
             "served_tokens": rec.served_tokens,
             "tokens_saved": rec.tokens_saved,
             "savings_ratio": rec.savings_ratio,
+            "savings": savings.to_value(),
             "top_score": rec.top_score,
             "mean_score": rec.mean_score,
             "empty": rec.empty,
@@ -259,6 +267,10 @@ pub struct SearchEvent {
     pub low_confidence: bool,
     /// `"cli"` or `"mcp"`; an absent field (pre-v2.4.1 logs) normalises to `"cli"`.
     pub source: String,
+    /// The seven-bucket savings ledger for this search (SPEC-V2.5 §3). Parsed from
+    /// the event's `savings` object; a pre-2.5 event with no such object has its
+    /// `retrieval` bucket reconstructed from `tokens_saved`/`baseline_tokens`.
+    pub savings: SavingsBuckets,
 }
 
 /// A parsed `index` event. Carries its instant plus the v2.4.1 freshness/secret
@@ -348,6 +360,7 @@ pub fn parse_log(text: &str) -> ParsedLog {
                     empty: get_bool(&v, "empty"),
                     low_confidence: get_bool(&v, "low_confidence"),
                     source: normalize_source(&get_str(&v, "source"), "cli"),
+                    savings: SavingsBuckets::from_event(&v),
                 })),
                 None => out.skipped += 1,
             },

@@ -20,6 +20,7 @@
 use crate::config::{DIRECTION_EPSILON, RECENT_SEARCHES_LIMIT, TREND_WINDOW_DAYS};
 use crate::embedder::round6;
 use crate::metrics::{date_str, Event, FeedbackEvent, IndexEvent, SearchEvent};
+use crate::savings::{sum_by_layer, SavingsByLayer};
 use serde::Serialize;
 use std::collections::BTreeMap;
 
@@ -44,6 +45,10 @@ pub struct Aggregate {
     /// Index freshness from the latest index event (v2.4.1) — purely log-derived,
     /// no network call.
     pub index_freshness: IndexFreshness,
+    /// The seven-bucket savings ledger rolled up over the log (SPEC-V2.5 §3).
+    /// Purely log-derived, cross-language-identical shape; only `retrieval` is
+    /// populated in Stage ①. Carries the mandatory honesty `note`.
+    pub savings_by_layer: SavingsByLayer,
     pub series: Series,
     pub recent_searches: Vec<RecentSearch>,
 }
@@ -238,6 +243,7 @@ pub fn aggregate(events: &[Event], now_secs: i64, price: f64) -> Aggregate {
         by_source: compute_usage_by_source(&searches),
         secret_safety: compute_secret_safety(&indexes),
         index_freshness: compute_index_freshness(&indexes),
+        savings_by_layer: sum_by_layer(searches.iter().map(|(_, s)| &s.savings)),
         series,
         recent_searches,
     }
@@ -674,6 +680,34 @@ mod tests {
         assert_eq!(agg.index_freshness.source.as_deref(), Some("local"));
         assert_eq!(agg.index_freshness.sha, None);
         assert_eq!(agg.index_freshness.indexed_ts.as_deref(), Some("2026-07-01T09:00:00Z"));
+    }
+
+    #[test]
+    fn anchor_savings_by_layer_from_pre_2_5_log() {
+        // The §4.1 anchor log predates v2.5 (no `savings` object), so every search's
+        // retrieval bucket is reconstructed from its top-level tokens_saved/baseline.
+        let agg = aggregate(&sample_log(), now(), 3.00);
+        let s = &agg.savings_by_layer;
+        assert_eq!(s.retrieval.saved_tokens, 53000);
+        assert_eq!(s.retrieval.baseline_tokens, 70000);
+        // The six unbuilt layers ship present-and-zero.
+        assert_eq!(s.chunk_compression, crate::savings::Bucket::default());
+        assert_eq!(s.progressive_disclosure, crate::savings::Bucket::default());
+        // Total equals retrieval (the only populated bucket) and the honesty note is set.
+        assert_eq!(s.total.saved_tokens, 53000);
+        assert_eq!(s.total.baseline_tokens, 70000);
+        assert_eq!(s.note, crate::savings::SAVINGS_NOTE);
+    }
+
+    #[test]
+    fn savings_by_layer_reads_a_v2_5_savings_object() {
+        // A v2.5 search event carrying an explicit `savings` object.
+        let text = "{\"event\":\"search\",\"ts\":\"2026-07-02T10:00:00Z\",\"id\":\"s0\",\"result_count\":2,\"tokens_saved\":1,\"baseline_tokens\":2,\"savings_ratio\":0.5,\"top_score\":0.8,\"empty\":false,\"low_confidence\":false,\"source\":\"mcp\",\"savings\":{\"retrieval\":{\"saved_tokens\":900,\"baseline_tokens\":1000}}}\n";
+        let events = parse_log(text).events;
+        let agg = aggregate(&events, now(), 3.00);
+        // The object's retrieval bucket wins over the legacy top-level fields.
+        assert_eq!(agg.savings_by_layer.retrieval.saved_tokens, 900);
+        assert_eq!(agg.savings_by_layer.retrieval.baseline_tokens, 1000);
     }
 
     #[test]
