@@ -53,6 +53,14 @@ depends on across files — instead of pre-loading whole neighbourhoods; expand 
 `expand_chunk(chunk_id)`. Pairs with `context_search` (find first) and `expand_chunk` (read the \
 full body).";
 
+const SET_OUTPUT_COMPRESSION_DESC: &str = "Set how terse THIS session's answers should be — the \
+output-compression level the agent applies to its OWN replies. Levels: `off` (no rules), `lite` \
+(concise; drop filler/preamble/postamble), `standard` (fewest correct words; code as minimal \
+diffs, never whole files; no preamble or postamble), `max` (standard + telegraphic prose; code \
+as minimal diffs only). Use it to dial verbosity down when you want terse diffs, or up (`off`) \
+when you want full explanations — mid-session, without editing CLAUDE.md. It sets a session \
+preference only; it does not rewrite CLAUDE.md and resets when the server restarts.";
+
 /// Write a tiny self-contained Python repo into `dir`.
 fn write_tiny_repo(dir: &Path) {
     std::fs::write(dir.join("auth.py"), "def hash_password(pw):\n    return pw + 'salt'\n")
@@ -120,7 +128,7 @@ fn handshake_list_and_search_over_a_fixture_index_logs_metrics() {
     assert_eq!(init["result"]["serverInfo"]["name"], "cce");
     assert!(init["result"]["capabilities"]["tools"].is_object());
 
-    // tools/list — exactly the five tools, in fixed order, with the schemas.
+    // tools/list — exactly the six tools, in fixed order, with the schemas.
     let list = by_id(&resps, 2);
     let tools = list["result"]["tools"].as_array().unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -131,7 +139,8 @@ fn handshake_list_and_search_over_a_fixture_index_logs_metrics() {
             "index_status",
             "record_feedback",
             "expand_chunk",
-            "related_context"
+            "related_context",
+            "set_output_compression"
         ]
     );
     assert_eq!(tools[0]["inputSchema"]["required"], serde_json::json!(["query"]));
@@ -146,6 +155,7 @@ fn handshake_list_and_search_over_a_fixture_index_logs_metrics() {
     assert_eq!(tools[0]["description"].as_str().unwrap(), CONTEXT_SEARCH_DESC);
     assert_eq!(tools[3]["description"].as_str().unwrap(), EXPAND_CHUNK_DESC);
     assert_eq!(tools[4]["description"].as_str().unwrap(), RELATED_CONTEXT_DESC);
+    assert_eq!(tools[5]["description"].as_str().unwrap(), SET_OUTPUT_COMPRESSION_DESC);
     // The expand-first rule is present and steers away from the re-search reflex.
     assert!(CONTEXT_SEARCH_DESC
         .contains("do NOT re-issue `context_search` for a target you already found"));
@@ -153,6 +163,12 @@ fn handshake_list_and_search_over_a_fixture_index_logs_metrics() {
     // The Layer-7 tools carry their pinned schemas.
     assert_eq!(tools[3]["inputSchema"]["properties"]["scope"]["default"], "body");
     assert_eq!(tools[4]["inputSchema"]["required"], serde_json::json!(["chunk_id"]));
+    // The Layer-4 tool carries its pinned schema: a required `level` enum.
+    assert_eq!(tools[5]["inputSchema"]["required"], serde_json::json!(["level"]));
+    assert_eq!(
+        tools[5]["inputSchema"]["properties"]["level"]["enum"],
+        serde_json::json!(["off", "lite", "standard", "max"])
+    );
 
     // context_search
     let search = by_id(&resps, 3);
@@ -260,6 +276,33 @@ fn expand_chunk_unknown_id_is_friendly_not_a_crash() {
     let text = by_id(&resps, 1)["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("no chunk with id deadbeefdeadbeef"), "got: {text}");
     assert_eq!(by_id(&resps, 1)["result"]["isError"], false);
+}
+
+#[test]
+fn set_output_compression_switches_the_session_level_over_the_binary() {
+    // SPEC-V2.5 §2 Layer 4: the 6th tool sets the running session's output level.
+    let tmp = tempfile::tempdir().unwrap();
+    write_tiny_repo(tmp.path());
+    index_dir(tmp.path());
+    let dir = tmp.path().to_string_lossy().to_string();
+
+    // A valid switch confirms the active level; a bad one is an actionable error.
+    let input = concat!(
+        "{\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"set_output_compression\",\"arguments\":{\"level\":\"max\"}}}\n",
+        "{\"id\":2,\"method\":\"tools/call\",\"params\":{\"name\":\"set_output_compression\",\"arguments\":{\"level\":\"turbo\"}}}\n"
+    );
+    let out = drive(&["mcp", "--dir", &dir], input, &[]);
+    let resps = responses(&out);
+
+    let ok = by_id(&resps, 1);
+    assert_eq!(ok["result"]["isError"], false);
+    let text = ok["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("max"), "confirmation missing active level: {text}");
+    assert!(text.contains("CLAUDE.md unchanged"), "should note it is session-only: {text}");
+
+    let bad = by_id(&resps, 2);
+    assert_eq!(bad["result"]["isError"], true);
+    assert!(bad["result"]["content"][0]["text"].as_str().unwrap().contains("unknown level"));
 }
 
 #[test]

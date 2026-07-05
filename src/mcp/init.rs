@@ -8,14 +8,19 @@
 //! **What it is / does:** Ensures an index (via `cce sync pull --latest` when a
 //! remote is configured/passed, else a local `cce index` / workspace index), then
 //! merges a `cce` server entry into `<dir>/.mcp.json` and a marker-bounded block
-//! into `<dir>/CLAUDE.md`, and prints next steps. Re-running adds no duplicates.
+//! into `<dir>/CLAUDE.md`, and prints next steps. The CLAUDE.md block carries an
+//! L4 output-compression section whose text is chosen by the configured
+//! `output.level` (SPEC-V2.5 §2 Layer 4, §5) — each level's block is static and
+//! byte-pinned. Re-running adds no duplicates.
 //!
 //! **Responsibilities:**
-//! - Own index-ensuring, `.mcp.json` merge, and the bounded `CLAUDE.md` block.
+//! - Own index-ensuring, `.mcp.json` merge, and the bounded `CLAUDE.md` block
+//!   (including the byte-pinned per-level output-compression section).
 //! - Reuse `sync` for the remote path; never reimplement pull.
 //! - It does NOT run the server (that is `server`) nor touch the network unless a
 //!   remote is configured/requested.
 
+use crate::config::{OutputConfig, OutputLevel};
 use crate::embedder::HashEmbedder;
 use crate::store::{default_store_path, Index};
 use crate::sync::commands::{cmd_init as sync_init, cmd_pull, PullTarget};
@@ -28,6 +33,44 @@ use std::path::{Path, PathBuf};
 /// removed without disturbing the rest of the file (SPEC-MCP §"cce init").
 const CLAUDE_BEGIN: &str = "<!-- BEGIN CCE MCP -->";
 const CLAUDE_END: &str = "<!-- END CCE MCP -->";
+
+// --- L4 output-compression section (SPEC-V2.5 §2 Layer 4, §5) ---
+//
+// The four level blocks below are STATIC and BYTE-PINNED: the exact bytes `cce init`
+// writes into the CLAUDE.md block for each `output.level`, defined verbatim so every
+// run — and cce-ruby's later catch-up — emits identical text. Each non-`off` block is
+// a self-contained markdown subsection (leading blank line + `### Output compression`
+// heading + one instruction paragraph + trailing newline); `off` contributes nothing,
+// leaving the agent's default verbosity untouched. Chosen by `output_rules_block`.
+
+/// `off`: no output rules — the section is omitted entirely.
+const OUTPUT_BLOCK_OFF: &str = "";
+
+/// `lite`: be concise; drop filler/preamble/postamble.
+const OUTPUT_BLOCK_LITE: &str =
+    "\n### Output compression\n\nBe concise; drop filler, preamble, and postamble.\n";
+
+/// `standard` (default): fewest correct words; code as minimal diffs, never whole
+/// files; no preamble or postamble.
+const OUTPUT_BLOCK_STANDARD: &str = "\n### Output compression\n\nAnswer in the fewest words that \
+are correct; when editing code show ONLY the changed lines (a minimal diff), never reprint whole \
+files; no preamble or postamble.\n";
+
+/// `max`: standard + telegraphic prose; code as minimal diffs only.
+const OUTPUT_BLOCK_MAX: &str = "\n### Output compression\n\nAnswer in the fewest words that are \
+correct; when editing code show ONLY the changed lines (a minimal diff), never reprint whole \
+files; no preamble or postamble. Telegraphic prose; code as minimal diffs only.\n";
+
+/// The byte-pinned output-compression section for `level` (SPEC-V2.5 §2 Layer 4).
+/// A pure function of the level, so both engines emit identical bytes.
+pub const fn output_rules_block(level: OutputLevel) -> &'static str {
+    match level {
+        OutputLevel::Off => OUTPUT_BLOCK_OFF,
+        OutputLevel::Lite => OUTPUT_BLOCK_LITE,
+        OutputLevel::Standard => OUTPUT_BLOCK_STANDARD,
+        OutputLevel::Max => OUTPUT_BLOCK_MAX,
+    }
+}
 
 /// Resolved options for `cce init`.
 pub struct InitOptions {
@@ -57,7 +100,9 @@ pub fn run(opts: &InitOptions) -> Result<String, String> {
 
     let index_line = ensure_index(opts, is_workspace)?;
     let mcp_path = write_mcp_json(dir, is_workspace)?;
-    let claude_path = write_claude_md(dir)?;
+    // The CLAUDE.md block honours the configured L4 output level (SPEC-V2.5 §5).
+    let output_level = OutputConfig::load(dir).level;
+    let claude_path = write_claude_md(dir, output_level)?;
 
     let mode = if is_workspace { " (workspace)" } else { "" };
     let mut out = String::new();
@@ -165,8 +210,10 @@ fn write_mcp_json(dir: &Path, is_workspace: bool) -> Result<PathBuf, String> {
     Ok(path)
 }
 
-/// The marker-bounded CLAUDE.md block (SPEC-MCP §"cce init").
-fn claude_block() -> String {
+/// The marker-bounded CLAUDE.md block (SPEC-MCP §"cce init" + SPEC-V2.5 §2 Layer 4).
+/// The trailing output-compression section is chosen by `level` and byte-pinned.
+fn claude_block(level: OutputLevel) -> String {
+    let output_section = output_rules_block(level);
     format!(
         "{CLAUDE_BEGIN}\n\
 ## Code Context Engine (CCE)\n\
@@ -176,6 +223,7 @@ This project is indexed by CCE, exposed as MCP tools. Prefer them over reading o
 - **PREFER `context_search`** to locate code, understand behaviour, or answer \"where is X / how does Y work\". It returns the most relevant code chunks (file:line + kind) from a hybrid vector + BM25 index, so you do not pay tokens for whole files.\n\
 - Reserve file reads for opening a specific path `context_search` points you to.\n\
 - Use `index_status` to check how fresh the index is, and `record_feedback` to rate a result.\n\
+{output_section}\
 {CLAUDE_END}\n"
     )
 }
@@ -183,9 +231,9 @@ This project is indexed by CCE, exposed as MCP tools. Prefer them over reading o
 /// Write/merge the bounded CCE block into `<dir>/CLAUDE.md` (idempotent). If the
 /// markers already exist their region is replaced; otherwise the block is appended
 /// (or the file is created). A re-run produces byte-identical output.
-fn write_claude_md(dir: &Path) -> Result<PathBuf, String> {
+fn write_claude_md(dir: &Path, level: OutputLevel) -> Result<PathBuf, String> {
     let path = dir.join("CLAUDE.md");
-    let block = claude_block();
+    let block = claude_block(level);
     let new_content = match std::fs::read_to_string(&path) {
         Ok(text) => {
             if let (Some(b), Some(e)) = (text.find(CLAUDE_BEGIN), text.find(CLAUDE_END)) {
@@ -305,6 +353,102 @@ mod tests {
         let claude2 = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
         assert_eq!(claude2.matches(CLAUDE_BEGIN).count(), 1);
         assert!(claude2.starts_with("# My Project"));
+    }
+
+    /// Write a `.cce/config` selecting an L4 output level.
+    fn write_output_config(dir: &Path, level: &str) {
+        let cce = dir.join(".cce");
+        std::fs::create_dir_all(&cce).unwrap();
+        std::fs::write(cce.join("config"), format!("output:\n  level: {level}\n")).unwrap();
+    }
+
+    #[test]
+    fn output_blocks_are_byte_pinned() {
+        // The four level blocks are STATIC and BYTE-PINNED (SPEC-V2.5 §2 Layer 4).
+        // A change here is a cross-language format break and must be intentional.
+        assert_eq!(output_rules_block(OutputLevel::Off), "");
+        assert_eq!(
+            output_rules_block(OutputLevel::Lite),
+            "\n### Output compression\n\nBe concise; drop filler, preamble, and postamble.\n"
+        );
+        assert_eq!(
+            output_rules_block(OutputLevel::Standard),
+            "\n### Output compression\n\nAnswer in the fewest words that are correct; when editing \
+             code show ONLY the changed lines (a minimal diff), never reprint whole files; no \
+             preamble or postamble.\n"
+        );
+        assert_eq!(
+            output_rules_block(OutputLevel::Max),
+            "\n### Output compression\n\nAnswer in the fewest words that are correct; when editing \
+             code show ONLY the changed lines (a minimal diff), never reprint whole files; no \
+             preamble or postamble. Telegraphic prose; code as minimal diffs only.\n"
+        );
+        // `max` is `standard` plus the telegraphic sentence.
+        let std_body = output_rules_block(OutputLevel::Standard).trim_end();
+        assert!(output_rules_block(OutputLevel::Max).starts_with(std_body));
+        assert!(output_rules_block(OutputLevel::Max)
+            .contains("Telegraphic prose; code as minimal diffs only."));
+    }
+
+    #[test]
+    fn output_block_lengths_are_pinned() {
+        // Byte-length checksums — a cheap tamper-evident pin on the exact bytes.
+        assert_eq!(output_rules_block(OutputLevel::Off).len(), 0);
+        assert_eq!(output_rules_block(OutputLevel::Lite).len(), 75);
+        assert_eq!(output_rules_block(OutputLevel::Standard).len(), 187);
+        assert_eq!(output_rules_block(OutputLevel::Max).len(), 234);
+    }
+
+    #[test]
+    fn init_writes_the_default_standard_output_block() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_tiny_repo(tmp.path());
+        run(&opts(tmp.path())).unwrap();
+        let claude = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
+        // No config ⇒ the default `standard` block is present.
+        assert!(claude.contains("### Output compression"));
+        assert!(claude.contains("Answer in the fewest words that are correct"));
+        assert!(!claude.contains("Telegraphic prose"), "standard leaked max text");
+    }
+
+    #[test]
+    fn init_honours_each_output_level_and_stays_idempotent() {
+        for (level, present, absent) in [
+            ("off", None, Some("### Output compression")),
+            ("lite", Some("Be concise; drop filler"), Some("Telegraphic prose")),
+            ("standard", Some("fewest words that are correct"), Some("Telegraphic prose")),
+            ("max", Some("Telegraphic prose; code as minimal diffs only."), None),
+        ] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_tiny_repo(tmp.path());
+            write_output_config(tmp.path(), level);
+            run(&opts(tmp.path())).unwrap();
+            let claude = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
+            if let Some(p) = present {
+                assert!(claude.contains(p), "level {level}: missing {p:?} in:\n{claude}");
+            }
+            if let Some(a) = absent {
+                assert!(!claude.contains(a), "level {level}: unexpected {a:?} in:\n{claude}");
+            }
+            // Idempotent: a re-run leaves the file byte-identical, one block.
+            let first = claude.clone();
+            run(&opts(tmp.path())).unwrap();
+            let second = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
+            assert_eq!(first, second, "level {level}: re-run changed CLAUDE.md");
+            assert_eq!(second.matches(CLAUDE_BEGIN).count(), 1, "level {level}: duplicate block");
+        }
+    }
+
+    #[test]
+    fn init_off_level_writes_no_output_section() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_tiny_repo(tmp.path());
+        write_output_config(tmp.path(), "off");
+        run(&opts(tmp.path())).unwrap();
+        let claude = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
+        assert!(claude.contains(CLAUDE_BEGIN));
+        assert!(claude.contains("PREFER `context_search`"));
+        assert!(!claude.contains("### Output compression"), "off must add no output rules");
     }
 
     #[test]

@@ -144,6 +144,99 @@ impl RetrievalConfig {
     }
 }
 
+// --- Output compression / L4 (SPEC-V2.5 §2 Layer 4, §5) ---
+
+/// The L4 output-compression level `cce init` writes into CLAUDE.md and the
+/// `set_output_compression` MCP tool switches at runtime (SPEC-V2.5 §2 Layer 4).
+/// Each level maps to a static, byte-pinned instruction block — the transform is a
+/// pure function of the level, so both engines emit identical bytes.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum OutputLevel {
+    /// No output rules — the agent's default verbosity.
+    Off,
+    /// Be concise; drop filler/preamble/postamble.
+    Lite,
+    /// Fewest correct words; code as minimal diffs, never whole files; no pre/postamble.
+    /// The config default (SPEC-V2.5 §5, `output.level`).
+    Standard,
+    /// Standard + telegraphic prose; code as minimal diffs only.
+    Max,
+}
+
+impl OutputLevel {
+    /// Parse the config/tool string form (case-insensitive). Unknown ⇒ `None`, so
+    /// callers can surface an actionable error rather than silently defaulting.
+    pub fn parse(s: &str) -> Option<OutputLevel> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" => Some(OutputLevel::Off),
+            "lite" => Some(OutputLevel::Lite),
+            "standard" => Some(OutputLevel::Standard),
+            "max" => Some(OutputLevel::Max),
+            _ => None,
+        }
+    }
+
+    /// The canonical string form.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            OutputLevel::Off => "off",
+            OutputLevel::Lite => "lite",
+            OutputLevel::Standard => "standard",
+            OutputLevel::Max => "max",
+        }
+    }
+}
+
+/// The default L4 output level when neither `.cce/config` nor a tool call overrides
+/// it (SPEC-V2.5 §5, `output.level`). Chosen to save by default: `standard`.
+pub const DEFAULT_OUTPUT_LEVEL: OutputLevel = OutputLevel::Standard;
+
+/// The `output.*` runtime configuration (SPEC-V2.5 §5). Only `level` is defined.
+/// Absent block / absent key / unrecognised value all fall back to the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct OutputConfig {
+    pub level: OutputLevel,
+}
+
+impl Default for OutputConfig {
+    fn default() -> Self {
+        OutputConfig { level: DEFAULT_OUTPUT_LEVEL }
+    }
+}
+
+impl OutputConfig {
+    /// Parse from the `.cce/config` YAML text. Tolerant: no `output:` block, an
+    /// absent `level`, or an unrecognised value all fall back to the default.
+    pub fn from_yaml(text: &str) -> OutputConfig {
+        #[derive(serde::Deserialize)]
+        struct RawOutput {
+            level: Option<String>,
+        }
+        #[derive(serde::Deserialize)]
+        struct RawRoot {
+            output: Option<RawOutput>,
+        }
+        let mut cfg = OutputConfig::default();
+        if let Ok(raw) = serde_yaml::from_str::<RawRoot>(text) {
+            if let Some(l) = raw.output.and_then(|o| o.level) {
+                if let Some(level) = OutputLevel::parse(&l) {
+                    cfg.level = level;
+                }
+            }
+        }
+        cfg
+    }
+
+    /// Load the output config for `root`: the per-project `.cce/config` if it
+    /// exists and parses, else the default. Offline, read-only.
+    pub fn load(root: &std::path::Path) -> OutputConfig {
+        std::fs::read_to_string(root.join(".cce").join("config"))
+            .ok()
+            .map(|t| OutputConfig::from_yaml(&t))
+            .unwrap_or_default()
+    }
+}
+
 /// Selects the embedding backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbedderKind {
@@ -238,5 +331,55 @@ mod tests {
         std::fs::create_dir_all(&cce).unwrap();
         std::fs::write(cce.join("config"), "retrieval:\n  detail: signature\n").unwrap();
         assert_eq!(RetrievalConfig::load(tmp.path()).detail, DetailLevel::Signature);
+    }
+
+    #[test]
+    fn output_level_parse_and_as_str_round_trip() {
+        for (s, lvl) in [
+            ("off", OutputLevel::Off),
+            ("lite", OutputLevel::Lite),
+            ("standard", OutputLevel::Standard),
+            ("max", OutputLevel::Max),
+        ] {
+            assert_eq!(OutputLevel::parse(s), Some(lvl));
+            assert_eq!(OutputLevel::parse(&s.to_uppercase()), Some(lvl));
+            assert_eq!(lvl.as_str(), s);
+        }
+        // Unknown / blank ⇒ None (so callers can error, not silently default).
+        assert_eq!(OutputLevel::parse("bogus"), None);
+        assert_eq!(OutputLevel::parse(""), None);
+    }
+
+    #[test]
+    fn output_default_level_is_standard() {
+        assert_eq!(OutputConfig::default().level, OutputLevel::Standard);
+        assert_eq!(DEFAULT_OUTPUT_LEVEL, OutputLevel::Standard);
+    }
+
+    #[test]
+    fn output_config_reads_level_and_tolerates_junk() {
+        assert_eq!(OutputConfig::from_yaml("output:\n  level: off\n").level, OutputLevel::Off);
+        assert_eq!(OutputConfig::from_yaml("output:\n  level: lite\n").level, OutputLevel::Lite);
+        assert_eq!(OutputConfig::from_yaml("output:\n  level: max\n").level, OutputLevel::Max);
+        // Absent block, absent key, unknown value, and bad YAML all fall back.
+        assert_eq!(OutputConfig::from_yaml("sync:\n  lfs: true\n").level, OutputLevel::Standard);
+        assert_eq!(OutputConfig::from_yaml("output: {}\n").level, OutputLevel::Standard);
+        assert_eq!(
+            OutputConfig::from_yaml("output:\n  level: bogus\n").level,
+            OutputLevel::Standard
+        );
+        assert_eq!(OutputConfig::from_yaml("not: yaml: [").level, OutputLevel::Standard);
+    }
+
+    #[test]
+    fn output_config_load_from_disk_and_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Absent ⇒ default.
+        assert_eq!(OutputConfig::load(tmp.path()).level, OutputLevel::Standard);
+        // Present ⇒ honoured.
+        let cce = tmp.path().join(".cce");
+        std::fs::create_dir_all(&cce).unwrap();
+        std::fs::write(cce.join("config"), "output:\n  level: max\n").unwrap();
+        assert_eq!(OutputConfig::load(tmp.path()).level, OutputLevel::Max);
     }
 }
