@@ -23,7 +23,7 @@ abstract: >-
   A/B eval harness, surfaced through nine cross-language MCP tools. v2.5.5 is a
   verified documentation sweep of the complete track.
 type: software
-version: 2.6.0
+version: 2.6.1
 date-released: "2026-07-05"
 license: MIT
 repository-code: "https://github.com/davidslv/cce-rust"

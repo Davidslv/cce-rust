@@ -7,6 +7,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.1] - 2026-07-06
+
+### Added
+- **Knowledge Sources (v2.6 Phase B)** — knowledge chunks are searchable through the same hybrid
+  retrieval as code (hash embedder + BM25 + RRF). `context_search` gains an optional
+  `source: code|knowledge|both` (**still 9 tools**; code-only behaviour byte-identical when no
+  knowledge store). Knowledge hits carry provenance (`[knowledge] <title> — <state> · <updated_at> ·
+  <url>`) with deterministic staleness weighting (recency; drop `not_planned`/`wontfix`; merged-PR
+  boost) and a precision-filtered recall floor; `expand_chunk`/`related_context` work on knowledge
+  chunks. Fully additive: `conformance.json` + the Sync artifact are byte-identical.
+
 ## [2.6.0] - 2026-07-05
 
 ### Added
