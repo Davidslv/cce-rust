@@ -206,6 +206,8 @@ impl McpServer {
             "expand_chunk" => tools::expand_chunk(self, &args),
             "related_context" => tools::related_context(self, &args),
             "set_output_compression" => tools::set_output_compression(self, &args),
+            "record_decision" => tools::record_decision(self, &args),
+            "session_recall" => tools::session_recall(self, &args),
             other => {
                 return Ok(unknown_tool_result(other));
             }
@@ -274,7 +276,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_returns_the_six_tools_in_fixed_order() {
+    fn tools_list_returns_the_eight_tools_in_fixed_order() {
         let tmp = tempfile::tempdir().unwrap();
         let s = server_for(tmp.path());
         let resp = s.handle_line(r#"{"id":2,"method":"tools/list"}"#).unwrap();
@@ -293,9 +295,43 @@ mod tests {
                 "record_feedback",
                 "expand_chunk",
                 "related_context",
-                "set_output_compression"
+                "set_output_compression",
+                "record_decision",
+                "session_recall"
             ]
         );
+    }
+
+    #[test]
+    fn record_decision_then_session_recall_over_json_rpc() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = server_for(tmp.path());
+        // record_decision appends a memory entry.
+        let rec = s
+            .handle_line(
+                r#"{"id":1,"method":"tools/call","params":{"name":"record_decision","arguments":{"text":"cache invalidation uses versioned keys","area":"cache"}}}"#,
+            )
+            .unwrap();
+        let rv: Value = serde_json::from_str(&rec).unwrap();
+        assert_eq!(rv["result"]["isError"], false);
+        assert!(rv["result"]["content"][0]["text"]
+            .as_str()
+            .unwrap()
+            .contains("Recorded decision #"));
+
+        // session_recall retrieves it.
+        let rc = s
+            .handle_line(
+                r#"{"id":2,"method":"tools/call","params":{"name":"session_recall","arguments":{"query":"cache invalidation keys"}}}"#,
+            )
+            .unwrap();
+        let cv: Value = serde_json::from_str(&rc).unwrap();
+        assert_eq!(cv["result"]["isError"], false);
+        assert!(cv["result"]["content"][0]["text"].as_str().unwrap().contains("versioned keys"));
+
+        // The memory store exists and holds exactly one entry.
+        let entries = crate::memory::load_entries(&[crate::memory::memory_path(tmp.path())]);
+        assert_eq!(entries.len(), 1);
     }
 
     #[test]

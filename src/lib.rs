@@ -28,6 +28,7 @@ pub mod vector_store;
 pub mod keyword_store;
 pub mod graph_store;
 pub mod store;
+pub mod memory;
 pub mod walker;
 pub mod retriever;
 pub mod bench;

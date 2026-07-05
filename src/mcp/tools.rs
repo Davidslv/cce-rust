@@ -1,4 +1,4 @@
-//! # mcp::tools — the six CCE MCP tools (SPEC-MCP §"Tools" + SPEC-V2.5 §6/§7)
+//! # mcp::tools — the eight CCE MCP tools (SPEC-MCP §"Tools" + SPEC-V2.5 §6/§7)
 //!
 //! **Why this file exists:** The tool contract — names, input schemas, and output
 //! shape — is the cross-language interface an agent binds to. It MUST be byte-for-
@@ -6,28 +6,34 @@
 //! whichever engine serves. This module owns that contract and each tool's
 //! read-only execution over the local index.
 //!
-//! **What it is / does:** Declares the six tools and their handlers. The three v2.4
+//! **What it is / does:** Declares the eight tools and their handlers. The three v2.4
 //! tools — `context_search` (now serving L2-compressed bodies at a `detail` level +
 //! each result's `chunk_id`), `index_status`, `record_feedback` — plus the two
 //! Layer-7 progressive-disclosure tools: `expand_chunk` (body/file/neighbors; body
 //! recovers the exact full bytes) and `related_context` (import-graph neighbours,
 //! imports AND consumers) — plus the Layer-4 `set_output_compression`, which switches
-//! the running session's output-compression preference in memory (NOT CLAUDE.md).
-//! `context_search` logs an identical `search` metrics event carrying the retrieval +
-//! `chunk_compression` savings buckets (SPEC-V2.5 §2/§3).
+//! the running session's output-compression preference in memory (NOT CLAUDE.md) —
+//! plus the two Layer-5 memory tools: `record_decision` (redact → dedupe → append a
+//! VALIDATED decision to the local `.cce/memory.jsonl`) and `session_recall`
+//! (precision-filtered hybrid search over that memory). `context_search` logs an
+//! identical `search` metrics event carrying the retrieval + `chunk_compression`
+//! savings buckets (SPEC-V2.5 §2/§3).
 //!
 //! **Responsibilities:**
-//! - Own the six tool schemas, output formatting, L2 serving, and `max_tokens`.
-//! - Reuse `retriever`/`federation`/`compress`/`metrics`/`sync` — never reimplement.
-//! - Handle a missing/empty index or a stale chunk_id with a friendly message.
+//! - Own the eight tool schemas, output formatting, L2 serving, and `max_tokens`.
+//! - Reuse `retriever`/`federation`/`compress`/`metrics`/`memory`/`sync` — never
+//!   reimplement.
+//! - Handle a missing/empty index, a stale chunk_id, or disabled memory with a
+//!   friendly message.
 
 use crate::chunker::{token_count, Chunk};
 use crate::compress::{compress, DetailLevel};
-use crate::config::{OutputLevel, RetrievalConfig, CHARS_PER_TOKEN};
+use crate::config::{MemoryConfig, OutputLevel, RetrievalConfig, CHARS_PER_TOKEN};
 use crate::embedder::{format6, Embedder, HashEmbedder, OllamaEmbedder};
 use crate::federation::{combined_index, federated_search, load_member_stores, workspace_stats};
 use crate::mcp::server::McpServer;
 use crate::mcp::MCP_DEFAULT_TOP_K;
+use crate::memory::{self, RecallHit};
 use crate::metrics::{HexIdSource, MetricsWriter, SystemClock};
 use crate::packs::Registry;
 use crate::retriever::{build_search_record, search, SearchResult};
@@ -36,7 +42,7 @@ use crate::sync::commands::{freshness, IndexSource};
 use crate::workspace::{Manifest, WorkspaceGraph};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
-use std::path::Path;
+use std::path::{Path, PathBuf};
 use std::time::Instant;
 
 /// The `context_search` description (SPEC-V2.5 §6 + SPEC-V2.5-TUNING §B): core
@@ -109,11 +115,33 @@ as minimal diffs only). Use it to dial verbosity down when you want terse diffs,
 when you want full explanations — mid-session, without editing CLAUDE.md. It sets a session \
 preference only; it does not rewrite CLAUDE.md and resets when the server restarts.";
 
-/// The six tool definitions returned by `tools/list`, with the EXACT byte-pinned
+/// The `record_decision` description (SPEC-V2.5 §2 Layer 5, §6): remember ONE
+/// validated decision, with the explicit anti-pollution warning that this is for
+/// confirmed decisions only, never raw model output. Byte-pinned; mirrored verbatim
+/// in the Ruby engine.
+const RECORD_DECISION_DESC: &str = "Remember a VALIDATED decision for future sessions — an \
+explicit, deliberate note you or the user have confirmed is correct (an architecture choice, a \
+convention, a resolved trade-off), so it need not be re-derived later. The text is secret-redacted \
+before storage, content-addressed, and de-duplicated: recording the same decision twice is a \
+no-op that returns the same id. Do NOT record raw model output, guesses, or unverified answers — \
+memory that replays a bad answer POLLUTES future context. Optional `tags` and an `area` help \
+recall. Returns the decision's id; retrieve later with `session_recall`.";
+
+/// The `session_recall` description (SPEC-V2.5 §2 Layer 5, §6): search remembered
+/// decisions, precision-filtered, agent-chosen (not auto-injected). Byte-pinned.
+const SESSION_RECALL_DESC: &str = "Search THIS project's remembered decisions (recorded with \
+`record_decision`) for ones relevant to `query`, so you don't re-derive what was already settled. \
+Hybrid vector + BM25 search, PRECISION-FILTERED: it returns only high-confidence matches (a small \
+top_k) as compact entries with ids, which you CHOOSE to use — it is never an auto-injected blob. \
+Returning nothing when there is no confident match is normal and correct; proceed without it \
+rather than forcing a weak memory into context.";
+
+/// The eight tool definitions returned by `tools/list`, with the EXACT byte-pinned
 /// schemas of SPEC-MCP §"Tools" + SPEC-V2.5 §6. The order is stable and fixed:
 /// the three v2.4 tools first (context_search the headline), then the two Layer-7
-/// progressive-disclosure tools, then the Layer-4 `set_output_compression`. Mirrored
-/// verbatim for cce-ruby's catch-up.
+/// progressive-disclosure tools, then the Layer-4 `set_output_compression`, then the
+/// two Layer-5 memory tools appended in order (`record_decision`, `session_recall`).
+/// Mirrored verbatim for cce-ruby's catch-up.
 pub fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
@@ -183,6 +211,31 @@ pub fn tool_definitions() -> Vec<Value> {
                     "level": { "type": "string", "enum": ["off", "lite", "standard", "max"], "description": "how terse THIS session's answers should be" }
                 },
                 "required": ["level"]
+            }
+        }),
+        json!({
+            "name": "record_decision",
+            "description": RECORD_DECISION_DESC,
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "text": { "type": "string", "description": "the validated decision to remember" },
+                    "tags": { "type": "array", "items": { "type": "string" }, "description": "optional labels" },
+                    "area": { "type": "string", "description": "optional area/component this decision is about" }
+                },
+                "required": ["text"]
+            }
+        }),
+        json!({
+            "name": "session_recall",
+            "description": SESSION_RECALL_DESC,
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "query":  { "type": "string" },
+                    "top_k":  { "type": "integer", "default": 5 }
+                },
+                "required": ["query"]
             }
         }),
     ]
@@ -531,6 +584,141 @@ pub fn set_output_compression(server: &McpServer, args: &Value) -> ToolOutput {
     }
 }
 
+// --- Layer 5: memory recall (record_decision / session_recall) ---
+
+/// The memory store `record_decision` WRITES to: the workspace-level (root) store in
+/// workspace mode, else the single-repo store — resolved like the other `.cce/`
+/// stores. A cross-cutting decision lands at the root; per-member memory arises
+/// naturally when `cce mcp` is rooted inside a member directory.
+fn memory_write_path(server: &McpServer) -> PathBuf {
+    memory::memory_path(&server.root())
+}
+
+/// The memory stores `session_recall` READS (as a union): always the workspace-level
+/// (root) store, plus — in workspace mode — every member's `.cce/memory.jsonl`. So a
+/// decision recorded at either scope is recalled at the workspace level. De-dup by id
+/// is handled by `memory::load_entries`.
+fn memory_read_paths(server: &McpServer) -> Vec<PathBuf> {
+    let root = server.root();
+    let mut paths = vec![memory::memory_path(&root)];
+    if server.is_workspace() {
+        if let Ok(manifest) = Manifest::load(&root) {
+            for m in &manifest.members {
+                paths.push(memory::memory_path(&root.join(&m.path)));
+            }
+        }
+    }
+    paths
+}
+
+/// The message returned when `memory.enabled` is false (SPEC-V2.5 §5): a normal
+/// result, not an error — the tool is simply a no-op in this project.
+fn memory_disabled_message() -> String {
+    "Memory is disabled for this project (memory.enabled=false in .cce/config). \
+     Set it to true to record and recall decisions."
+        .to_string()
+}
+
+/// Collect a JSON string array into `Vec<String>` (trimmed, empties dropped).
+fn string_array(v: Option<&Value>) -> Vec<String> {
+    v.and_then(Value::as_array)
+        .map(|arr| {
+            arr.iter()
+                .filter_map(Value::as_str)
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string)
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
+/// `record_decision` (SPEC-V2.5 §2 Layer 5, §6): remember a VALIDATED decision.
+/// Redacts secrets, dedupes by content-addressed id, appends, and returns the id.
+/// This is an EXPLICIT call — it never auto-captures raw model output (anti-pollution).
+pub fn record_decision(server: &McpServer, args: &Value) -> ToolOutput {
+    if !MemoryConfig::load(&server.root()).enabled {
+        return ToolOutput::ok(memory_disabled_message());
+    }
+    let text = args.get("text").and_then(Value::as_str).unwrap_or("").trim();
+    if text.is_empty() {
+        return ToolOutput::err(
+            "record_decision requires a non-empty `text` (a validated decision to remember).",
+        );
+    }
+    let tags = string_array(args.get("tags"));
+    let area = args.get("area").and_then(Value::as_str).map(str::trim).filter(|s| !s.is_empty());
+
+    let path = memory_write_path(server);
+    let clock = SystemClock;
+    match memory::record(&path, text, &tags, area, &clock) {
+        Ok(outcome) => {
+            let verb = if outcome.is_new { "Recorded" } else { "Already recorded" };
+            ToolOutput::ok(format!(
+                "{verb} decision #{}. Retrieve it later with session_recall.",
+                outcome.entry.id
+            ))
+        }
+        Err(_) => {
+            ToolOutput::err("could not record the decision (the memory store is not writable).")
+        }
+    }
+}
+
+/// `session_recall` (SPEC-V2.5 §2 Layer 5, §6): precision-filtered hybrid search over
+/// remembered decisions. Returns compact entries + ids the agent CHOOSES to use —
+/// never an auto-injected blob; returns nothing when there is no confident match.
+pub fn session_recall(server: &McpServer, args: &Value) -> ToolOutput {
+    if !MemoryConfig::load(&server.root()).enabled {
+        return ToolOutput::ok(memory_disabled_message());
+    }
+    let query = args.get("query").and_then(Value::as_str).unwrap_or("").trim();
+    if query.is_empty() {
+        return ToolOutput::err("session_recall requires a non-empty `query`.");
+    }
+    let top_k = args
+        .get("top_k")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+        .filter(|n| *n > 0)
+        .unwrap_or(memory::MEMORY_DEFAULT_TOP_K);
+
+    let entries = memory::load_entries(&memory_read_paths(server));
+    let hits = memory::recall(&entries, query, top_k, memory::MEMORY_RECALL_MIN_SCORE);
+    ToolOutput::ok(format_recall(&hits, entries.len()))
+}
+
+/// Render the recall hits as a compact, byte-deterministic block. Empty ⇒ an
+/// explicit "nothing recalled" so the agent proceeds without forcing weak memory.
+fn format_recall(hits: &[RecallHit], total: usize) -> String {
+    if hits.is_empty() {
+        return format!(
+            "No confident memory match ({total} remembered decision(s) searched). \
+             Nothing recalled — proceed without memory."
+        );
+    }
+    let mut out = format!("Recalled {} of {} remembered decision(s):\n", hits.len(), total);
+    for h in hits {
+        out.push('\n');
+        let area = h.area.as_deref().map(|a| format!(" area={a}")).unwrap_or_default();
+        let tags = if h.tags.is_empty() {
+            String::new()
+        } else {
+            format!(" tags={}", h.tags.join(","))
+        };
+        out.push_str(&format!("{:>2}. [{}] #{}{}{}\n", h.rank, format6(h.score), h.id, area, tags));
+        out.push_str(&h.text);
+        if !h.text.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out.push_str(
+        "\nThese are validated decisions you MAY reuse — apply only what fits; \
+         they are not auto-injected.\n",
+    );
+    out
+}
+
 // --- Layer 7: progressive disclosure (expand_chunk / related_context) ---
 
 /// Resolve the read-only index that expand/related work over: the single-repo store,
@@ -861,13 +1049,15 @@ mod tests {
     #[test]
     fn tool_definitions_match_the_spec_contract() {
         let defs = tool_definitions();
-        assert_eq!(defs.len(), 6);
+        assert_eq!(defs.len(), 8);
         assert_eq!(defs[0]["name"], "context_search");
         assert_eq!(defs[1]["name"], "index_status");
         assert_eq!(defs[2]["name"], "record_feedback");
         assert_eq!(defs[3]["name"], "expand_chunk");
         assert_eq!(defs[4]["name"], "related_context");
         assert_eq!(defs[5]["name"], "set_output_compression");
+        assert_eq!(defs[6]["name"], "record_decision");
+        assert_eq!(defs[7]["name"], "session_recall");
 
         // context_search schema: required query, top_k default 8, no_graph default
         // false, and the new L2 `detail` enum (SPEC-V2.5 §6).
@@ -906,6 +1096,80 @@ mod tests {
         let so = &defs[5]["inputSchema"];
         assert_eq!(so["required"], json!(["level"]));
         assert_eq!(so["properties"]["level"]["enum"], json!(["off", "lite", "standard", "max"]));
+
+        // record_decision (L5): byte-pinned description + a required `text`, optional
+        // `tags` (string array) and `area` (SPEC-V2.5 §2 Layer 5, §6).
+        assert_eq!(defs[6]["description"], json!(RECORD_DECISION_DESC));
+        let rd = &defs[6]["inputSchema"];
+        assert_eq!(rd["required"], json!(["text"]));
+        assert_eq!(rd["properties"]["tags"]["type"], "array");
+        assert_eq!(rd["properties"]["tags"]["items"]["type"], "string");
+        assert_eq!(rd["properties"]["area"]["type"], "string");
+        // The anti-pollution warning is part of the pinned contract.
+        assert!(RECORD_DECISION_DESC.contains("Do NOT record raw model output"));
+
+        // session_recall (L5): byte-pinned description + required `query`, top_k
+        // default 5 (a small, precision-first default).
+        assert_eq!(defs[7]["description"], json!(SESSION_RECALL_DESC));
+        let sr = &defs[7]["inputSchema"];
+        assert_eq!(sr["required"], json!(["query"]));
+        assert_eq!(sr["properties"]["top_k"]["default"], 5);
+        assert!(SESSION_RECALL_DESC.contains("PRECISION-FILTERED"));
+    }
+
+    #[test]
+    fn record_decision_then_session_recall_round_trips() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = McpServer::new(Some(tmp.path().to_path_buf()), None, false);
+
+        let rec = record_decision(
+            &server,
+            &json!({ "text": "use RRF to fuse BM25 and vector ranks", "tags": ["ranking"], "area": "retriever" }),
+        );
+        assert!(!rec.is_error);
+        assert!(rec.text.contains("Recorded decision #"), "got: {}", rec.text);
+
+        // Recall finds it (shared tokens) and returns a compact, id-addressed entry.
+        let out = session_recall(&server, &json!({ "query": "fuse BM25 vector ranks" }));
+        assert!(!out.is_error);
+        assert!(out.text.contains("use RRF to fuse"), "got: {}", out.text);
+        assert!(out.text.contains("Recalled 1 of 1"), "got: {}", out.text);
+
+        // A query with no lexical overlap recalls nothing (anti-pollution).
+        let none = session_recall(&server, &json!({ "query": "unrelated kubernetes helm" }));
+        assert!(none.text.contains("Nothing recalled"), "got: {}", none.text);
+    }
+
+    #[test]
+    fn record_decision_dedupes_same_text() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = McpServer::new(Some(tmp.path().to_path_buf()), None, false);
+        let a = record_decision(&server, &json!({ "text": "prefer small top_k for memory" }));
+        let b = record_decision(&server, &json!({ "text": "prefer   small top_k for memory  " }));
+        assert!(a.text.contains("Recorded decision #"));
+        assert!(b.text.contains("Already recorded decision #"), "got: {}", b.text);
+    }
+
+    #[test]
+    fn memory_tools_validate_inputs() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = McpServer::new(Some(tmp.path().to_path_buf()), None, false);
+        assert!(record_decision(&server, &json!({})).is_error);
+        assert!(session_recall(&server, &json!({})).is_error);
+    }
+
+    #[test]
+    fn memory_tools_are_noops_when_disabled() {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".cce")).unwrap();
+        std::fs::write(tmp.path().join(".cce").join("config"), "memory:\n  enabled: false\n")
+            .unwrap();
+        let server = McpServer::new(Some(tmp.path().to_path_buf()), None, false);
+        let rec = record_decision(&server, &json!({ "text": "should not persist" }));
+        assert!(!rec.is_error);
+        assert!(rec.text.contains("Memory is disabled"), "got: {}", rec.text);
+        // Nothing was written.
+        assert!(!crate::memory::memory_path(tmp.path()).exists());
     }
 
     #[test]
