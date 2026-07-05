@@ -39,6 +39,11 @@ serde_yaml = "=0.9.34"
 # (SPEC-SYNC §2: base64 of 256 little-endian IEEE-754 f64 bytes), pinned. The
 # standard alphabet + padding guarantees byte-identical output across engines.
 base64 = "=0.22.1"
+# Markdown grammar for the knowledge heading-chunker (SPEC-V2.6 §2), pinned. Shares
+# the same `tree-sitter-language` (0.1.x) ABI as the tree-sitter core above, so it is
+# interchangeable. Used ONLY by the knowledge ingest — the code index never registers
+# it, so `conformance.json` and the Sync golden stay byte-identical (SPEC-V2.6 §1.2).
+tree-sitter-md = "=0.5.3"
 
 [profile.release]
 opt-level = 3

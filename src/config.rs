@@ -343,6 +343,108 @@ impl SummarizationConfig {
     }
 }
 
+// --- Markdown heading-chunker / Knowledge sources (SPEC-V2.6 §2/§8) ---
+
+/// The default `markdown.max_section_tokens` (SPEC-V2.6 §8): the byte-pinned split
+/// budget. A heading section whose estimated token count exceeds this splits at its
+/// deeper headings; below it, deeper headings roll into their parent.
+pub const DEFAULT_MARKDOWN_MAX_SECTION_TOKENS: usize = 400;
+
+/// The `markdown.*` runtime configuration (SPEC-V2.6 §8). Only `max_section_tokens`
+/// is defined. Absent block / absent key / bad YAML all fall back to the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MarkdownConfig {
+    pub max_section_tokens: usize,
+}
+
+impl Default for MarkdownConfig {
+    fn default() -> Self {
+        MarkdownConfig { max_section_tokens: DEFAULT_MARKDOWN_MAX_SECTION_TOKENS }
+    }
+}
+
+impl MarkdownConfig {
+    /// Parse from the `.cce/config` YAML text. Tolerant: no `markdown:` block, an
+    /// absent/zero `max_section_tokens`, or bad YAML all fall back to the default.
+    pub fn from_yaml(text: &str) -> MarkdownConfig {
+        #[derive(serde::Deserialize)]
+        struct RawMarkdown {
+            max_section_tokens: Option<usize>,
+        }
+        #[derive(serde::Deserialize)]
+        struct RawRoot {
+            markdown: Option<RawMarkdown>,
+        }
+        let mut cfg = MarkdownConfig::default();
+        if let Ok(raw) = serde_yaml::from_str::<RawRoot>(text) {
+            if let Some(t) = raw.markdown.and_then(|m| m.max_section_tokens) {
+                if t > 0 {
+                    cfg.max_section_tokens = t;
+                }
+            }
+        }
+        cfg
+    }
+
+    /// Load the markdown config for `root`: the per-project `.cce/config` if it
+    /// exists and parses, else the default. Offline, read-only.
+    pub fn load(root: &std::path::Path) -> MarkdownConfig {
+        std::fs::read_to_string(root.join(".cce").join("config"))
+            .ok()
+            .map(|t| MarkdownConfig::from_yaml(&t))
+            .unwrap_or_default()
+    }
+}
+
+/// The default for `knowledge.enabled` (SPEC-V2.6 §8): knowledge ingest/retrieval
+/// is ON by default. Absent config / absent block / absent key all resolve to this.
+pub const DEFAULT_KNOWLEDGE_ENABLED: bool = true;
+
+/// The `knowledge.*` runtime configuration (SPEC-V2.6 §8). Only `enabled` is defined
+/// in Phase A (the `source`/`min_score` retrieval keys arrive with M4). Absent block
+/// / absent key / bad YAML all fall back to the default (enabled).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct KnowledgeConfig {
+    pub enabled: bool,
+}
+
+impl Default for KnowledgeConfig {
+    fn default() -> Self {
+        KnowledgeConfig { enabled: DEFAULT_KNOWLEDGE_ENABLED }
+    }
+}
+
+impl KnowledgeConfig {
+    /// Parse from the `.cce/config` YAML text. Tolerant: no `knowledge:` block, an
+    /// absent `enabled`, or bad YAML all fall back to the default (enabled).
+    pub fn from_yaml(text: &str) -> KnowledgeConfig {
+        #[derive(serde::Deserialize)]
+        struct RawKnowledge {
+            enabled: Option<bool>,
+        }
+        #[derive(serde::Deserialize)]
+        struct RawRoot {
+            knowledge: Option<RawKnowledge>,
+        }
+        let mut cfg = KnowledgeConfig::default();
+        if let Ok(raw) = serde_yaml::from_str::<RawRoot>(text) {
+            if let Some(e) = raw.knowledge.and_then(|k| k.enabled) {
+                cfg.enabled = e;
+            }
+        }
+        cfg
+    }
+
+    /// Load the knowledge config for `root`: the per-project `.cce/config` if it
+    /// exists and parses, else the default. Offline, read-only.
+    pub fn load(root: &std::path::Path) -> KnowledgeConfig {
+        std::fs::read_to_string(root.join(".cce").join("config"))
+            .ok()
+            .map(|t| KnowledgeConfig::from_yaml(&t))
+            .unwrap_or_default()
+    }
+}
+
 /// Selects the embedding backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbedderKind {
@@ -554,5 +656,63 @@ mod tests {
         std::fs::create_dir_all(&cce).unwrap();
         std::fs::write(cce.join("config"), "summarization:\n  auto_tokens: 12000\n").unwrap();
         assert_eq!(SummarizationConfig::load(tmp.path()).auto_tokens, Some(12000));
+    }
+
+    #[test]
+    fn markdown_default_is_400_tokens() {
+        assert_eq!(MarkdownConfig::default().max_section_tokens, 400);
+        assert_eq!(DEFAULT_MARKDOWN_MAX_SECTION_TOKENS, 400);
+    }
+
+    #[test]
+    fn markdown_config_reads_budget_and_tolerates_junk() {
+        assert_eq!(
+            MarkdownConfig::from_yaml("markdown:\n  max_section_tokens: 250\n").max_section_tokens,
+            250
+        );
+        // Absent block, absent key, zero, and bad YAML all fall back to 400.
+        assert_eq!(MarkdownConfig::from_yaml("sync:\n  lfs: true\n").max_section_tokens, 400);
+        assert_eq!(MarkdownConfig::from_yaml("markdown: {}\n").max_section_tokens, 400);
+        assert_eq!(
+            MarkdownConfig::from_yaml("markdown:\n  max_section_tokens: 0\n").max_section_tokens,
+            400
+        );
+        assert_eq!(MarkdownConfig::from_yaml("not: yaml: [").max_section_tokens, 400);
+    }
+
+    #[test]
+    fn markdown_config_load_from_disk_and_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(MarkdownConfig::load(tmp.path()).max_section_tokens, 400);
+        let cce = tmp.path().join(".cce");
+        std::fs::create_dir_all(&cce).unwrap();
+        std::fs::write(cce.join("config"), "markdown:\n  max_section_tokens: 120\n").unwrap();
+        assert_eq!(MarkdownConfig::load(tmp.path()).max_section_tokens, 120);
+    }
+
+    #[test]
+    fn knowledge_default_is_enabled() {
+        assert!(KnowledgeConfig::default().enabled);
+        assert_eq!(KnowledgeConfig::default().enabled, DEFAULT_KNOWLEDGE_ENABLED);
+    }
+
+    #[test]
+    fn knowledge_config_reads_enabled_and_tolerates_junk() {
+        assert!(!KnowledgeConfig::from_yaml("knowledge:\n  enabled: false\n").enabled);
+        assert!(KnowledgeConfig::from_yaml("knowledge:\n  enabled: true\n").enabled);
+        // Absent block, absent key, and bad YAML all fall back to the default (true).
+        assert!(KnowledgeConfig::from_yaml("sync:\n  lfs: true\n").enabled);
+        assert!(KnowledgeConfig::from_yaml("knowledge: {}\n").enabled);
+        assert!(KnowledgeConfig::from_yaml("not: yaml: [").enabled);
+    }
+
+    #[test]
+    fn knowledge_config_load_from_disk_and_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert!(KnowledgeConfig::load(tmp.path()).enabled);
+        let cce = tmp.path().join(".cce");
+        std::fs::create_dir_all(&cce).unwrap();
+        std::fs::write(cce.join("config"), "knowledge:\n  enabled: false\n").unwrap();
+        assert!(!KnowledgeConfig::load(tmp.path()).enabled);
     }
 }

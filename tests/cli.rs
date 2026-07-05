@@ -313,3 +313,52 @@ fn conformance_invalid_dir_exits_nonzero() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("error"));
 }
+
+#[test]
+fn knowledge_index_ingests_a_feed_in_a_fresh_process() {
+    // SPEC-V2.6 §4: `cce knowledge index` reads a cce.knowledge/v1 feed and writes
+    // a snapshot-keyed store under <dir>/.cce/knowledge/, never the code cache.
+    let tmp = tempfile::tempdir().unwrap();
+    let feed = tmp.path().join("curated.jsonl");
+    std::fs::write(
+        &feed,
+        "{\"id\":\"gh:1\",\"title\":\"Policy\",\"body\":\"## Why\\n\\nBecause.\",\"source\":\"github-issues\",\"state\":\"open\"}\n",
+    )
+    .unwrap();
+    let root = tmp.path().join("proj");
+    std::fs::create_dir_all(&root).unwrap();
+
+    let out = Command::new(bin())
+        .args(["knowledge", "index"])
+        .arg(&feed)
+        .arg("--dir")
+        .arg(&root)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "knowledge index failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("cce.knowledge/v1"));
+    assert!(stdout.contains("records   : 1"));
+
+    // The store landed under .cce/knowledge/ (NOT the code index.json), with a
+    // `current` pointer naming the snapshot.
+    let kdir = root.join(".cce").join("knowledge");
+    assert!(kdir.join("current").exists());
+    assert!(!root.join(".cce").join("index.json").exists());
+    let ptr = std::fs::read_to_string(kdir.join("current")).unwrap();
+    assert!(kdir.join(format!("{}.json", ptr.trim())).exists());
+}
+
+#[test]
+fn knowledge_index_missing_file_exits_nonzero() {
+    let out = Command::new(bin())
+        .args(["knowledge", "index", "/definitely/not/a/real/file.jsonl"])
+        .output()
+        .unwrap();
+    assert!(!out.status.success());
+    assert!(String::from_utf8_lossy(&out.stderr).contains("error"));
+}

@@ -586,3 +586,43 @@ seven layers, the nine MCP tools, `cce savings`, the honest framing) and re-veri
 the documented commands from a cold start (recorded in [`VERIFIED.md`](VERIFIED.md)).
 `conformance.json` and the Sync artifact are byte-identical; only the app version
 moves, to 2.5.5.
+
+## v2.6 Phase A — Knowledge Sources (markdown-heading chunking + generic ingest)
+
+**Fully additive; the code index is byte-frozen.** The markdown-heading chunker is
+used ONLY by the new knowledge ingest and is deliberately **not** registered as a
+`LanguagePack`, so `Chunker::chunk_file` still treats a code-repo `.md` as one
+whole-file `module` chunk. `conformance.json` and the Sync *code* artifact are proven
+byte-identical (regenerated + diffed in `tests/knowledge_ingest.rs`). Heading-chunking
+code-repo `.md` too is a deferred future opt-in that would carry its own conformance
+bump.
+
+**tree-sitter-markdown over a line-based splitter.** The block grammar is consistent
+with the code packs, shares the same tree-sitter ABI (crate `tree-sitter-md` `=0.5.3`,
+one added dependency), and is robust to the cases a regex trips on — a `#` inside a
+fenced code block is a code token, not a heading. The chunker collects heading nodes
+(`atx_heading` / `setext_heading`) and applies its **own** same-or-higher boundary and
+budget-split logic rather than trusting the grammar's `section` nesting, because the
+grammar flattens setext headings; this keeps the rule uniform and byte-pinned.
+
+**Boundary/line rules (byte-pinned).** A chunk's stored bytes are the section's bytes
+with **trailing** whitespace trimmed (leading preserved for line accuracy); `end_line
+= start_line + newlines(trimmed content)`, so inter-section blank lines never inflate
+a span. The breadcrumb `name` reconstructs the markers from the heading level
+(`# Title › ## Section`, joined by U+203A with spaces); the preamble chunk uses the
+sentinel `(preamble)` for both `kind` and `name`.
+
+**A separate, snapshot-keyed knowledge store.** Knowledge is mutable, so it can never
+enter the `repo@sha` code cache. The store lives at `.cce/knowledge/<snapshot>.json`
+with a `current` pointer; the snapshot id is the first 16 hex of SHA-256 over the
+**input feed bytes** — location-independent, so the persisted store is byte-identical
+regardless of where the feed lives. A newer ingest supersedes the old via the pointer.
+
+**Redact before chunk.** The v2.1 redactor runs on the rendered `# <title>\n\n<body>`
+document *before* M1 chunking, mirroring the code index's Layer 2: the store never
+sees a secret and chunk ids/token counts derive from redacted text.
+
+**Chunk identity reuses the existing scheme.** Knowledge chunk ids use the same
+`SHA-256(path:start:end:prefix)` function, with the record `id` as the synthetic
+document path — so ids are stable across snapshots as long as a record's rendered,
+redacted content is unchanged.
