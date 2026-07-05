@@ -215,3 +215,43 @@ core's `tree-sitter-language` 0.1.x ABI: `tree-sitter-ruby 0.23.1`,
 `tree-sitter-rust 0.24.2`, `tree-sitter-typescript 0.23.2`, `tree-sitter-c 0.24.2`
 (TypeScript exposes `LANGUAGE_TYPESCRIPT`; the pack binds that, not the TSX
 variant). All pinned with `=` in `Cargo.toml`.
+
+## v2.1 — secret & sensitive-file protection (SPEC-V2.1)
+
+The following ambiguities in `SPEC-V2.1.md` were resolved to the simplest
+reasonable reading and are recorded here.
+
+**Generic pattern 10 never re-redacts an already-redacted value.** SPEC-V2.1 §1
+runs the nine specific patterns, then the generic `key = value` assignment. Its
+example — `token = "ghp_…"` → `token = "[REDACTED:GITHUB_TOKEN]"` (not
+`[REDACTED:SECRET]`) — is only reachable if the generic step skips a value the
+specific step already turned into `[REDACTED:…]`. So the placeholder guard also
+treats a leading `[REDACTED:` as "leave alone". This is forced by the spec's own
+worked example, keeps redaction idempotent, and preserves the more precise label.
+
+**A leading-dot-only filename has no "extension".** SPEC-V2.1 §1 compares "the
+file's final extension". For a name like `.env` or `.key` we follow OS convention
+(`std::path::Path::extension`), which reports *no* extension for a leading-dot
+name. `.env` is handled by the dotenv rule and `.pgpass`/`id_rsa`/… by the
+exact-basename rule; a bare `.key` (a hidden file, not a `*.key` secret) is not
+treated as sensitive. This avoids surprising matches while covering every case the
+fixture and spec name.
+
+**Layers are threaded through one builder, on by default.** `Index::build_protected`
+takes a `protect_secrets` bool; `build_from_dir`/`build_from_dir_filtered` keep
+their signatures and pass `true`, so every existing caller (conformance, bench,
+tests) stays secure-by-default with no change. Only `cce index --allow-secrets`
+passes `false`. `conformance` therefore runs with protection **on**; because the
+samples contain no secrets it is a no-op there and `conformance.json` stays
+byte-identical (re-verified).
+
+**`--allow-secrets` scope = `index`.** SPEC-V2.1 §2 says the flag applies to
+`index` "and any command that indexes". The only user-facing indexing command is
+`index`; `conformance` and `bench` index deterministically over fixtures with no
+secrets, so they need no opt-out and keep protection on. Adding the flag solely to
+`index` satisfies the requirement without widening the surface.
+
+**`regex` crate, pinned.** The redaction patterns need real regex (lazy `[\s\S]*?`
+for the private-key block, a closure over the generic match). `regex = "=1.12.4"`
+was already resolved transitively, so promoting it to a direct, `=`-pinned
+dependency adds no new code to the tree.

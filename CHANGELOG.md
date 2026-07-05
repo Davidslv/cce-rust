@@ -7,6 +7,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.1.0] - 2026-07-05
+
+**Secret & sensitive-file protection**, built test-first from
+[`SPEC-V2.1.md`](SPEC-V2.1.md). Indexing becomes **secret-safe by default** in two
+layers, with an explicit opt-out. This is an **additive minor release**: the base
+engine is untouched and `conformance.json` remains byte-identical.
+
+### Added
+
+- **Layer 1 — sensitive files are never read** (`src/sensitive.rs`). Before the
+  walker reads a file, its basename is tested against a fixed policy: sensitive
+  extensions (`pem`, `key`, `p12`, `pfx`, `keystore`, `jks`, `ppk`, `der`, `asc`),
+  exact basenames (`credentials.*`, `secrets.*`, `.netrc`, `.pgpass`, `.htpasswd`,
+  `.dockercfg`, `kubeconfig`, `id_rsa`/`id_dsa`/`id_ecdsa`/`id_ed25519`), and the
+  **dotenv rule** (`.env` / `.env.*` are sensitive **except** safe templates ending
+  `.example`/`.sample`/`.template`/`.dist`). Skipped files are counted separately
+  as **`sensitive skipped`** in the `index` summary and never read into memory.
+- **Layer 2 — secrets are redacted before chunking** (`src/redactor.rs`). Each
+  indexed file's content is scrubbed for high-confidence secrets — private-key
+  blocks, AWS/GitHub/Slack/Stripe/OpenAI/Anthropic/Google keys, JWTs, and a
+  guarded generic `key = value` assignment — replaced with `[REDACTED:<LABEL>]`
+  **before** it is chunked, embedded, or stored, so the store never contains the
+  raw value and `chunk_id`/`token_count` derive from the redacted text. A
+  placeholder guard leaves documentation examples (`API_KEY="your-api-key-here"`),
+  interpolations, and literals untouched. Redaction is deterministic, so the
+  cross-language equivalence guarantee still holds.
+- **`--allow-secrets`** flag on `cce index` (default off ⇒ protection **on**)
+  disables both layers for a run and prints a warning; content is then indexed
+  verbatim.
+- Fixture corpus `test/fixture/secrets/` (`.env`, `.env.example`, `id_rsa`,
+  `config.rb`) plus an end-to-end acceptance test of the skip/redact/opt-out
+  behaviour.
+- Test suite grows to 154 hermetic tests (+1 `#[ignore]` Ollama) at 95.08% line
+  coverage (`cargo llvm-cov`).
+
+### Changed
+
+- `cce index` summary adds a `sensitive skipped : N` line (and widens the label
+  column). No change to the store schema or to `conformance.json`.
+- New pinned dependency: `regex = "=1.12.4"` (redaction patterns).
+
 ## [2.0.0] - 2026-07-05
 
 Pluggable **language packs**, built test-first from [`SPEC-V2.md`](SPEC-V2.md).
@@ -119,7 +160,8 @@ Context Engine, built solely from [`SPEC.md`](SPEC.md) (SPEC v1.0).
 - Project documentation: `SPEC.md`, `docs/architecture.md`, `docs/getting-started.md`,
   `docs/how-to.md`, `docs/DECISIONS.md`, `docs/TDD.md`, `docs/BENCHMARKS.md`.
 
-[Unreleased]: https://github.com/davidslv/cce-rust/compare/v2.0.0...HEAD
+[Unreleased]: https://github.com/davidslv/cce-rust/compare/v2.1.0...HEAD
+[2.1.0]: https://github.com/davidslv/cce-rust/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/davidslv/cce-rust/compare/v1.1.0...v2.0.0
 [1.1.0]: https://github.com/davidslv/cce-rust/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/davidslv/cce-rust/releases/tag/v1.0.0

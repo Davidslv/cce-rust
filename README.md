@@ -116,16 +116,44 @@ The binary is `cce`. Examples below assume `target/release/cce` is on your PATH
 ```bash
 $ cce index ./src
 Indexed ./src
-  files indexed : 14
-  files skipped : 0
-  total chunks  : 14
-  embedder      : hash
-  store         : ./src/.cce/index.json
-  elapsed       : 0.004s
+  files indexed     : 14
+  files skipped     : 0
+  sensitive skipped : 0
+  total chunks      : 14
+  embedder          : hash
+  store             : ./src/.cce/index.json
+  elapsed           : 0.004s
 ```
 
 By default the store is written to `<dir>/.cce/index.json`. Override it with
 `--store <path>`, or select the embedder with `--embedder hash|ollama`.
+
+#### Secret protection (secure by default)
+
+Since v2.1, indexing is **secret-safe by default** — you do not have to opt in.
+Two layers keep credentials out of the on-disk store:
+
+- **Layer 1 — sensitive files are never read.** Files whose name marks them as
+  secret material are skipped before they are opened and tallied on the
+  `sensitive skipped` line: private-key/cert files (`*.pem`, `*.key`, `*.p12`,
+  `*.pfx`, `*.keystore`, `*.jks`, `*.ppk`, `*.der`, `*.asc`), credential dumps
+  (`credentials.*`, `secrets.*`, `.netrc`, `.pgpass`, `.htpasswd`, `.dockercfg`,
+  `kubeconfig`, `id_rsa`/`id_dsa`/`id_ecdsa`/`id_ed25519`), and `.env` /
+  `.env.*` — **except** safe templates ending `.example`, `.sample`, `.template`,
+  or `.dist`, which are indexed normally.
+- **Layer 2 — secrets are redacted before chunking.** In the files that *are*
+  indexed, high-confidence secrets (private-key blocks; AWS, GitHub, Slack,
+  Stripe, OpenAI, Anthropic, and Google keys; JWTs; and guarded `key = value`
+  assignments) are replaced with `[REDACTED:<LABEL>]` **before** the content is
+  chunked, embedded, or stored — so the raw value never reaches `.cce/`.
+  Documentation placeholders such as `API_KEY="your-api-key-here"` are left alone.
+
+To disable both layers for a run (and index sensitive files and raw secrets
+verbatim), pass `--allow-secrets`; `cce` prints a warning when you do.
+
+```bash
+$ cce index ./src --allow-secrets     # protection OFF — you own the risk
+```
 
 ### Search
 
@@ -360,13 +388,13 @@ node type in a `kind` field alongside the coarse `chunk_type`
 ## Tests & coverage
 
 ```bash
-cargo test                                                  # 129 tests
+cargo test                                                  # 154 tests
 cargo clippy --all-targets --all-features -- -D warnings    # lint gate
 cargo fmt --check                                           # format gate
 ```
 
-The suite is **129 passing tests** (+1 `#[ignore]` Ollama integration test) and
-measures **94.76% line coverage** via `cargo llvm-cov`. The default suite is
+The suite is **154 passing tests** (+1 `#[ignore]` Ollama integration test) and
+measures **95.08% line coverage** via `cargo llvm-cov`. The default suite is
 fully deterministic and makes no network calls — including the metrics subsystem,
 whose clock and id source are injected and whose dashboard tests bind an
 ephemeral loopback port. A CI test gate runs the three-layer validators over every

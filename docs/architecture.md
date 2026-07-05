@@ -40,8 +40,10 @@ responsibilities header.
 | `src/keyword_store.rs` | Lucene-form BM25 (SPEC §6.3) | `Bm25Index` |
 | `src/graph_store.rs` | Import graph + neighbor lookup (SPEC §6.7) | `Graph` |
 | `src/retriever.rs` | The hybrid pipeline (SPEC §6) | `search`, `is_code_lookup`, `SearchResult` |
-| `src/walker.rs` | Filesystem walk + ignore rules (SPEC §7.1) | `walk` |
-| `src/store.rs` | Index assembly + JSON persistence, whole-file token counts (SPEC §7, DASH §3) | `Index`, `build_from_dir`, `save`, `load`, `baseline_tokens` |
+| `src/walker.rs` | Filesystem walk + ignore rules + Layer-1 sensitive-file skip (SPEC §7.1, SPEC-V2.1 §2) | `walk` |
+| `src/sensitive.rs` | Layer-1 sensitive-file policy: is a basename secret material? (SPEC-V2.1 §1) | `is_sensitive` |
+| `src/redactor.rs` | Layer-2 secret redaction over indexed content (SPEC-V2.1 §1) | `redact` |
+| `src/store.rs` | Index assembly + JSON persistence, whole-file token counts (SPEC §7, DASH §3, SPEC-V2.1 §2) | `Index`, `build_from_dir`, `build_protected`, `save`, `load`, `baseline_tokens` |
 | `src/conformance.rs` | `conformance.json` emitter, v2 shape with `kind` (SPEC-V2 §7) | `generate` |
 | `src/bench.rs` | Per-language benchmark runner (SPEC-V2 §8) | `run`, `BenchReport` |
 | `src/metrics.rs` | Persisted metrics event log; injected clock/id source (DASH §2) | `MetricsWriter`, `read_log`, `parse_log`, `Clock`, `IdSource`, `parse_iso` |
@@ -61,17 +63,27 @@ schema, and the aggregation formulas live in [`dashboard.md`](dashboard.md).
 
 ```
 dir ──walker::walk──▶ [(rel_path, content)]         # ignore rules, UTF-8, ≤2 MB
+      │                                                # Layer 1: sensitive::is_sensitive → skip (never read)
+      └─ per file ─ redactor::redact ─▶ content'      # Layer 2: [REDACTED:LABEL] before chunking
+                      └ chunker::chunk_file ─▶ Chunk[] # registry.pack_for(path); pack grammar or module fallback
+                                            └▶ imports[] # pack.extract_imports(root, src)
       │
-      └─ per file ─ chunker::chunk_file ─▶ Chunk[]   # registry.pack_for(path); pack grammar or module fallback
-                                        └▶ imports[] # pack.extract_imports(root, src)
-      │
-      └─ per chunk ─ embedder.embed(content) ─▶ [f64; 256]
+      └─ per chunk ─ embedder.embed(content') ─▶ [f64; 256]
       │
       ▼
    store::Index { chunks, file_imports }             # BM25 + graph derived
       │
       └─ Index::save ─▶ <store>/index.json            # JSON, embeddings included
 ```
+
+Secret protection (SPEC-V2.1, since v2.1) is **secure by default** and sits on
+the index path in two layers: `walker::walk` consults `sensitive::is_sensitive`
+to skip credential files before reading them (tallied as `sensitive skipped`),
+and `store::build_protected` runs `redactor::redact` over each file's content
+**before** chunking — so the redacted text is what gets chunked, embedded, and
+stored, and `chunk_id`/`token_count` derive from it. `cce index --allow-secrets`
+turns both layers off. Because the shared sample corpus contains no secrets, both
+layers are no-ops there and `conformance.json` is unchanged.
 
 The BM25 index and the import graph are **derived** structures — recomputed on
 load, not persisted (SPEC §7 allows this).

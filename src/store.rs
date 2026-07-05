@@ -59,6 +59,8 @@ pub struct Index {
 pub struct BuildStats {
     pub files_indexed: usize,
     pub files_skipped: usize,
+    /// Files skipped by the Layer-1 sensitive-file policy (SPEC-V2.1 §2).
+    pub sensitive_skipped: usize,
     pub total_chunks: usize,
 }
 
@@ -96,20 +98,38 @@ impl Index {
         total
     }
 
-    /// Build an index by walking `root` and embedding with `embedder`.
+    /// Build an index by walking `root` and embedding with `embedder`, with the
+    /// secure-by-default secret protection of SPEC-V2.1 (Layers 1 & 2) enabled.
     pub fn build_from_dir(root: &Path, embedder: &dyn Embedder) -> (Index, BuildStats) {
         Index::build_from_dir_filtered(root, embedder, |_| true)
     }
 
-    /// Build an index over only the files for which `keep(rel_path)` is true.
-    /// Used by `cce bench` to index a repo's Python sources (SPEC §10.1).
+    /// Build an index over only the files for which `keep(rel_path)` is true, with
+    /// secret protection enabled. Used by `cce bench` (SPEC §10.1).
     pub fn build_from_dir_filtered(
         root: &Path,
         embedder: &dyn Embedder,
         keep: impl Fn(&str) -> bool,
     ) -> (Index, BuildStats) {
-        let walked = crate::walker::walk(root);
+        Index::build_protected(root, embedder, keep, true)
+    }
+
+    /// Build an index, choosing whether SPEC-V2.1 secret protection is on.
+    ///
+    /// When `protect_secrets` is true (the secure default), Layer 1 skips
+    /// sensitive files in the walk and Layer 2 redacts high-confidence secrets in
+    /// each file's content *before* chunking — so the redacted text is what gets
+    /// chunked, embedded, and stored. When false (`--allow-secrets`), both layers
+    /// are off and content is indexed verbatim.
+    pub fn build_protected(
+        root: &Path,
+        embedder: &dyn Embedder,
+        keep: impl Fn(&str) -> bool,
+        protect_secrets: bool,
+    ) -> (Index, BuildStats) {
+        let walked = crate::walker::walk(root, protect_secrets);
         let files_skipped = walked.skipped;
+        let sensitive_skipped = walked.sensitive_skipped;
         let kept_files: Vec<&(String, String)> =
             walked.files.iter().filter(|(p, _)| keep(p)).collect();
         let files_indexed = kept_files.len();
@@ -119,11 +139,18 @@ impl Index {
         let mut file_imports: BTreeMap<String, Vec<String>> = BTreeMap::new();
         let mut file_tokens: BTreeMap<String, usize> = BTreeMap::new();
 
-        for (rel_path, content) in kept_files {
+        for (rel_path, raw) in kept_files {
+            // Layer 2 (SPEC-V2.1 §2): redact before chunking, so the store never
+            // sees the secret and chunk_id/token_count derive from redacted text.
+            let content: String = if protect_secrets {
+                crate::redactor::redact(raw)
+            } else {
+                raw.clone()
+            };
             // Persist the whole-file token count for the baseline counterfactual
             // (DASHBOARD-SPEC §3), independent of how the file chunks.
-            file_tokens.insert(rel_path.clone(), token_count(content));
-            let fc = chunker.chunk_file(rel_path, content);
+            file_tokens.insert(rel_path.clone(), token_count(&content));
+            let fc = chunker.chunk_file(rel_path, &content);
             if !fc.imports.is_empty() {
                 file_imports.insert(rel_path.clone(), fc.imports);
             }
@@ -135,7 +162,7 @@ impl Index {
 
         let total_chunks = chunks.len();
         let index = Index::assemble(chunks, file_imports, file_tokens, embedder.name().to_string());
-        (index, BuildStats { files_indexed, files_skipped, total_chunks })
+        (index, BuildStats { files_indexed, files_skipped, sensitive_skipped, total_chunks })
     }
 
     /// Persist the index to `path` (JSON). Creates parent directories.

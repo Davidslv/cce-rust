@@ -3,12 +3,12 @@
 ## Supported versions
 
 cce-rust follows [Semantic Versioning](https://semver.org). Security fixes are
-provided for the current `1.1.x` line only.
+provided for the current `2.1.x` line only.
 
 | Version | Supported |
 |---|---|
-| 1.1.x | ✅ |
-| < 1.1 | ❌ |
+| 2.1.x | ✅ |
+| < 2.1 | ❌ |
 
 ## Threat model
 
@@ -35,6 +35,21 @@ not — do makes the real attack surface clear.
   indexed — do not share a store built from a private repository. The metrics log
   (`<store-dir>/metrics.jsonl`, since v1.1) sits beside it and likewise contains
   verbatim query strings and derived counts — treat it as equally sensitive.
+- **Secrets are kept out of the store by default (since v2.1).** Because the
+  store holds verbatim snippets, indexing is **secret-safe by default** in two
+  layers. **Layer 1** never reads files whose name marks them as secret material
+  (private keys/certs by extension; `credentials.*`/`secrets.*`/`.netrc`/`id_rsa`/
+  … by exact name; `.env`/`.env.*` unless a safe-template suffix) — they are
+  skipped before being opened and counted as `sensitive skipped`. **Layer 2**
+  redacts high-confidence secrets (private-key blocks; AWS/GitHub/Slack/Stripe/
+  OpenAI/Anthropic/Google keys; JWTs; guarded `key = value` assignments) to
+  `[REDACTED:<LABEL>]` **before** content is chunked, embedded, or stored, so the
+  raw value never lands on disk. **Residual risk:** this is a best-effort filter
+  over known patterns, not a guarantee — a novel or obfuscated secret can slip
+  through, and the store remains local-only data you must still protect. The
+  opt-out flag **`--allow-secrets`** disables **both** layers for a run (sensitive
+  files are indexed and secrets stored verbatim); `cce` prints a warning when it
+  is set, and you own the resulting store's sensitivity.
 - **The dashboard server (v1.1) is loopback-only, read-only, and
   self-contained.** `cce dashboard` binds **`127.0.0.1` only**, so it is not
   reachable from other hosts. Every endpoint is **read-only** — nothing it serves

@@ -18,6 +18,8 @@ pub mod tokenizer;
 pub mod embedder;
 pub mod packs;
 pub mod chunker;
+pub mod sensitive;
+pub mod redactor;
 pub mod vector_store;
 pub mod keyword_store;
 pub mod graph_store;
