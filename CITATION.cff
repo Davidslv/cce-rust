@@ -10,9 +10,10 @@ abstract: >-
   language-packs evolution, v2.1 secret protection, v2.2 workspace mode
   (federating a multi-codebase ecosystem while each member stays isolated), and
   v2.3 CCE Sync (an offline-first, content-addressed git cache for the index, with a
-  byte-exact cross-language interchange artifact).
+  byte-exact cross-language interchange artifact), and v2.4 CCE MCP (a Model Context
+  Protocol server so an agent uses CCE as a native tool, plus `cce init`).
 type: software
-version: 2.3.0
+version: 2.4.0
 date-released: "2026-07-05"
 license: MIT
 repository-code: "https://github.com/davidslv/cce-rust"
@@ -34,3 +35,6 @@ keywords:
   - monorepo
   - content-addressed-cache
   - offline-first
+  - mcp
+  - model-context-protocol
+  - agents

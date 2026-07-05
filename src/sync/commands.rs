@@ -24,7 +24,7 @@ use crate::sync::artifact::{Artifact, ManifestMeta};
 use crate::sync::config::SyncConfig;
 use crate::sync::remote::{GitRemote, SyncRemote};
 use crate::sync::{
-    content_address, git, normalize_repo_id, pointer_address, cce_version_minor, HASH_EMBEDDER,
+    content_address, git, normalize_repo_id, pointer_address, HASH_EMBEDDER, SYNC_FORMAT_VERSION,
 };
 use crate::workspace::Manifest;
 use serde::{Deserialize, Serialize};
@@ -186,7 +186,7 @@ fn push_one(
     let meta = ManifestMeta { repo_id: repo_id.to_string(), sha: sha.to_string() };
     let artifact = Artifact::from_index(&index, meta);
     let bytes = artifact.to_bytes();
-    let ver = cce_version_minor();
+    let ver = SYNC_FORMAT_VERSION.to_string();
     let key = content_address(HASH_EMBEDDER, &ver, repo_id, sha);
 
     // Update the ref pointer to this sha alongside the artifact, in one commit/push.
@@ -244,7 +244,7 @@ fn resolve_pull_sha(
             "cannot determine HEAD sha — pass --commit <sha> or --latest".to_string()
         }),
         PullTarget::Latest => {
-            let ver = cce_version_minor();
+            let ver = SYNC_FORMAT_VERSION.to_string();
             let pointer = pointer_address(HASH_EMBEDDER, &ver, repo_id, crate::sync::DEFAULT_REF);
             let bytes = remote.get(&pointer).map_err(|_| {
                 format!("no `--latest` pointer for {repo_id} on `{}`", crate::sync::DEFAULT_REF)
@@ -300,7 +300,7 @@ pub fn cmd_pull(
         }
     }
 
-    let ver = cce_version_minor();
+    let ver = SYNC_FORMAT_VERSION.to_string();
     let key = content_address(HASH_EMBEDDER, &ver, &repo_id, &sha);
     let bytes = remote.get(&key)?;
     let artifact = install_artifact(root, &bytes)?;
@@ -335,7 +335,7 @@ fn pull_workspace(
 ) -> Result<String, String> {
     let manifest = Manifest::load(root)?;
     let base = resolve_repo_id(root, cfg)?;
-    let ver = cce_version_minor();
+    let ver = SYNC_FORMAT_VERSION.to_string();
     let mut out = format!("Pulling workspace {}\n", manifest.name);
     for m in &manifest.members {
         let member_dir = root.join(&m.path);
@@ -386,7 +386,7 @@ pub fn cmd_status(root: &Path) -> Result<String, String> {
     // Remote latest is best-effort: offline ⇒ we still print everything else.
     match open_remote(&cfg) {
         Ok(remote) => {
-            let ver = cce_version_minor();
+            let ver = SYNC_FORMAT_VERSION.to_string();
             let pointer = pointer_address(HASH_EMBEDDER, &ver, &repo_id, crate::sync::DEFAULT_REF);
             match remote.get(&pointer) {
                 Ok(bytes) => out.push_str(&format!(
@@ -431,7 +431,7 @@ pub fn cmd_verify(root: &Path, commit: Option<String>) -> Result<String, String>
         _ => {
             // Fetch the artifact from the remote to learn its checksum.
             let remote = open_remote(&cfg)?;
-            let ver = cce_version_minor();
+            let ver = SYNC_FORMAT_VERSION.to_string();
             let key = content_address(HASH_EMBEDDER, &ver, &repo_id, &sha);
             let bytes = remote.get(&key)?;
             Artifact::from_bytes(&bytes)?.manifest.checksum
@@ -453,6 +453,63 @@ pub fn cmd_verify(root: &Path, commit: Option<String>) -> Result<String, String>
              or the cache is not trustworthy)."
         ))
     }
+}
+
+/// Where the local index came from (SPEC-MCP: `index_status` freshness).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IndexSource {
+    /// Built locally by `cce index` — no sync marker present.
+    Local,
+    /// Installed by `cce sync pull` — a `.cce/synced.json` marker is present.
+    Pulled,
+}
+
+/// A read-only freshness summary of the local index (SPEC-MCP §"Freshness is
+/// observable"). Pure of side effects; the remote lookup is best-effort and
+/// offline-safe (any error leaves `remote_latest = None`, `behind_remote = false`).
+#[derive(Debug, Clone)]
+pub struct Freshness {
+    /// Local vs pulled.
+    pub source: IndexSource,
+    /// The pulled sha, when the index came from the cache.
+    pub sha: Option<String>,
+    /// The remote's latest pushed sha for the default ref, if reachable.
+    pub remote_latest: Option<String>,
+    /// True only when both shas are known and differ (the local index is stale).
+    pub behind_remote: bool,
+}
+
+/// Summarise the local index's freshness for `root` (SPEC-MCP). Reads the sync
+/// marker for source/sha, then best-effort resolves the remote's latest sha to
+/// decide "behind remote." With no remote configured this touches no network and
+/// reports `Local`. Never errors — MCP's `index_status` must always answer.
+pub fn freshness(root: &Path) -> Freshness {
+    let state = SyncState::load(root);
+    let (source, sha) = match &state {
+        Some(s) => (IndexSource::Pulled, Some(s.sha.clone())),
+        None => (IndexSource::Local, None),
+    };
+
+    let cfg = SyncConfig::load(root);
+    let remote_latest = if cfg.remote.is_some() {
+        resolve_repo_id(root, &cfg).ok().and_then(|repo_id| {
+            open_remote(&cfg).ok().and_then(|remote| {
+                let ver = SYNC_FORMAT_VERSION.to_string();
+                let pointer =
+                    pointer_address(HASH_EMBEDDER, &ver, &repo_id, crate::sync::DEFAULT_REF);
+                remote.get(&pointer).ok().map(|b| String::from_utf8_lossy(&b).trim().to_string())
+            })
+        })
+    } else {
+        None
+    };
+
+    let behind_remote = match (&sha, &remote_latest) {
+        (Some(local), Some(remote)) => local != remote,
+        _ => false,
+    };
+
+    Freshness { source, sha, remote_latest, behind_remote }
 }
 
 #[cfg(test)]

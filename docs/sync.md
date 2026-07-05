@@ -70,7 +70,9 @@ line N+2      the graph JSON: { "edges": [...], "nodes": [...] }
   `""`; the real hex is then written into the field. Verify = set `checksum` to
   `""`, re-hash, compare.
 
-Manifest fields (sorted): `cce_version` (`"2.3"`), `checksum`, `chunk_count`,
+Manifest fields (sorted): `cce_version` (`"2.3"` — the **artifact format version**,
+`SYNC_FORMAT_VERSION`, decoupled from the app version; the format-compatible window,
+bumped only when the artifact bytes change shape), `checksum`, `chunk_count`,
 `embedder` (`"hash"`), `file_tokens` (sorted-key `{path: int}`), `pack_set_id`,
 `repo_id`, `sha`.
 
@@ -207,7 +209,7 @@ jobs:
       - name: Install git-LFS
         run: sudo apt-get update && sudo apt-get install -y git-lfs && git lfs install
       - name: Install cce
-        run: cargo install --git https://github.com/davidslv/cce-rust --tag v2.3.0
+        run: cargo install --git https://github.com/davidslv/cce-rust --tag v2.4.0
       - name: Configure git identity for the cache clone
         run: |
           git config --global user.name  "cce-ci"

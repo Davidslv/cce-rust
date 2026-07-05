@@ -13,7 +13,7 @@
 //! the sync home directory from the environment.
 //!
 //! **Responsibilities:**
-//! - Own `cce_version_minor`, `pack_set_id`, `normalize_repo_id`,
+//! - Own `SYNC_FORMAT_VERSION`, `pack_set_id`, `normalize_repo_id`,
 //!   `content_address`, `pointer_address`, `sync_home`, `remote_slug`.
 //! - Guarantee those are pure and deterministic (cross-language identical).
 //! - It does NOT export/import artifacts, drive git, or parse config — the
@@ -44,15 +44,16 @@ pub fn hex_lower(bytes: &[u8]) -> String {
     s
 }
 
-/// The `cce_version` used in the content address and the manifest: `major.minor`
-/// of the crate version (SPEC-SYNC §3 — a format-compatible window). e.g. `2.3`.
-pub fn cce_version_minor() -> String {
-    let v = env!("CARGO_PKG_VERSION");
-    let mut it = v.split('.');
-    let major = it.next().unwrap_or("0");
-    let minor = it.next().unwrap_or("0");
-    format!("{major}.{minor}")
-}
+/// The **sync artifact format version** stamped in the content address and the
+/// manifest `cce_version` field (SPEC-SYNC §3 — a format-compatible window).
+///
+/// This is deliberately **decoupled from the crate/app version**: it names the
+/// *artifact format*, not the release. Only bump it when the artifact bytes actually
+/// change shape. An additive app release (e.g. v2.4 CCE MCP, which does not touch the
+/// artifact format) must NOT move it — otherwise every release invalidates everyone's
+/// cache and the two engines' artifacts diverge, breaking the cross-engine
+/// byte-identity. Both the Ruby and Rust engines pin the same value.
+pub const SYNC_FORMAT_VERSION: &str = "2.3";
 
 /// A deterministic id for the active pack set (SPEC-SYNC §2 manifest, reconciled):
 /// the **sorted, comma-joined lowercase pack names** verbatim (e.g.
@@ -175,9 +176,11 @@ mod tests {
     use super::*;
 
     #[test]
-    fn cce_version_is_major_minor() {
-        // The crate is 2.3.x; the window is 2.3.
-        assert_eq!(cce_version_minor(), "2.3");
+    fn sync_format_version_is_decoupled_and_stable() {
+        // The artifact format version is pinned, NOT derived from the app version
+        // (which is 2.4.x). It only moves when the artifact bytes change shape, so an
+        // additive release does not invalidate caches or diverge from Ruby.
+        assert_eq!(SYNC_FORMAT_VERSION, "2.3");
     }
 
     #[test]

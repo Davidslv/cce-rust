@@ -5,13 +5,18 @@
 > vector + keyword index on disk as JSON — and answers queries with hybrid vector
 > + BM25 retrieval. It is a test-first Rust implementation of SPEC v1.0, a
 > Dashboard addendum (v1.1), the v2.0 language-packs evolution (SPEC-V2), v2.1
-> secret protection (SPEC-V2.1), and v2.2 workspace mode (SPEC-V2.2 — federating a
-> multi-codebase ecosystem while each member stays isolated); six packs ship
+> secret protection (SPEC-V2.1), v2.2 workspace mode (SPEC-V2.2 — federating a
+> multi-codebase ecosystem while each member stays isolated), v2.3 CCE Sync
+> (SPEC-SYNC — an offline-first, content-addressed git cache for the index, with a
+> byte-exact cross-language artifact), and v2.4 CCE MCP (SPEC-MCP — a Model Context
+> Protocol server so an agent uses CCE as a native `context_search` tool, plus
+> `cce init` to wire an editor up plug-and-play); six packs ship
 > (Python, JavaScript, Ruby, Rust, TypeScript, C) and every chunk records the
 > exact tree-sitter node type in a `kind` field. A sibling Ruby
 > implementation was built from the identical specs. MIT licensed, © 2026 David
 > Silva. No network calls by default: the semantic embedder over localhost is
-> opt-in, and `cce dashboard` is a loopback-only, read-only, self-contained UI.
+> opt-in, `cce dashboard` is a loopback-only, read-only, self-contained UI, and
+> `cce mcp` is a read-only, stdio-only MCP server.
 
 ## Documentation
 
@@ -21,7 +26,12 @@
 - [SPEC-V2.md](SPEC-V2.md): The language-packs evolution spec (v2.0) — pack interface, registry, validators, `kind`, conformance shape.
 - [SPEC-V2.1.md](SPEC-V2.1.md): The secret-protection evolution spec (v2.1) — sensitive-file skip + secret redaction.
 - [SPEC-V2.2.md](SPEC-V2.2.md): The workspace-mode evolution spec (v2.2) — detection, manifest, federation, cross-member edges.
+- [SPEC-SYNC.md](SPEC-SYNC.md): The CCE Sync design spec (v2.3) — content-addressed cache, artifact format, remotes, offline-first.
+- [SPEC-MCP.md](SPEC-MCP.md): The CCE MCP design spec (v2.4) — the stdio MCP server, the three tools, `cce init`, sync freshness.
 - [Workspace](docs/workspace.md): Workspace model, `workspace.yml`, detection rules, federation semantics, where it strains.
+- [Sync](docs/sync.md): CCE Sync model, artifact format, content address, permissions, troubleshooting.
+- [MCP](docs/mcp.md): CCE MCP — the server, the three tools, `cce init`, sync freshness, and how to confirm agent use.
+- [Verified](docs/VERIFIED.md): Cold-start verification transcripts for CCE Sync and CCE MCP.
 - [Getting started](docs/getting-started.md): Newcomer path from install to first successful index + search.
 - [Adding a language](docs/adding-a-language.md): Step-by-step guide to adding a language pack, with a worked example.
 - [How-to recipes](docs/how-to.md): Task recipes for index, search, packs, feedback, dashboard, stats, bench, conformance, and Ollama.
@@ -34,7 +44,7 @@
 ## Source (key files)
 
 - [src/lib.rs](src/lib.rs): Crate root; module tree and public surface.
-- [src/main.rs](src/main.rs): CLI (clap) — index, search, packs, feedback, dashboard, stats, bench, conformance.
+- [src/main.rs](src/main.rs): CLI (clap) — index, search, packs, feedback, dashboard, stats, bench, conformance, workspace, sync, mcp, init.
 - [src/config.rs](src/config.rs): Normative constants (SPEC §3, DASHBOARD-SPEC §1) and runtime config.
 - [src/tokenizer.rs](src/tokenizer.rs): The shared byte-exact tokenizer (SPEC §4.1).
 - [src/chunker.rs](src/chunker.rs): Generic tree-sitter chunking, chunk IDs, the `kind` field (SPEC §4.2–4.4, SPEC-V2 §3–4) — references no language.
@@ -47,6 +57,9 @@
 - [src/metrics.rs](src/metrics.rs): The persisted metrics event log — injected clock/id source (the one place wall-clock time is allowed), best-effort append, robust reader (DASHBOARD-SPEC §2).
 - [src/aggregator.rs](src/aggregator.rs): The pure aggregator — totals, north-stars, daily series, deltas (DASHBOARD-SPEC §4).
 - [src/dashboard.rs](src/dashboard.rs): The loopback-only, read-only, self-contained dashboard web server (DASHBOARD-SPEC §6).
+- [src/federation.rs](src/federation.rs): Federated indexing/search/stats/dashboard over workspace members (SPEC-V2.2 §4–7).
+- [src/sync/](src/sync/): CCE Sync — identity helpers, byte-exact artifact, `sync.*` config, git wrappers, the `SyncRemote` git backend, and `init/push/pull/status/verify` (SPEC-SYNC).
+- [src/mcp/](src/mcp/): CCE MCP — JSON-RPC 2.0 framing (`protocol`), the stdio dispatch loop (`server`), the three tools (`tools`), and `cce init` (`init`) (SPEC-MCP).
 
 ## Project
 

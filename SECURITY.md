@@ -89,8 +89,19 @@ not — do makes the real attack surface clear.
   ever allowed binding a non-loopback address, it must require a token** before
   doing so. There is no browser auto-open (the command only prints the URL).
 
+- **The MCP server (v2.4) is read-only, offline, and local-transport-only.**
+  `cce mcp` speaks JSON-RPC 2.0 over **stdin/stdout** — it opens **no socket** and
+  binds **no port**; the editor spawns it as a child process. It only ever loads the
+  index and returns chunks that are already in the store (redacted at index time by
+  v2.1), so it introduces **no new content to scrub** and **cannot mutate** source or
+  the store. It makes no network calls unless the index used the opt-in Ollama
+  embedder (localhost), and its optional CCE-Sync warm-on-startup is best-effort and
+  offline-safe. `cce init` writes only two local files (`.mcp.json`, `CLAUDE.md`) and
+  merges idempotently. A missing index yields a friendly message, never a crash.
+
 Because there is no attacker-reachable network surface by default — the only
-server is loopback-only and read-only, and the only outbound path is the opt-in
+server is loopback-only and read-only, the MCP server is stdio-only, and the only
+outbound path is the opt-in
 localhost Ollama embedder — the practical risk is limited to parser/robustness
 bugs on untrusted input, to whatever trust you place in a local Ollama server you
 opt into, and to the sensitivity of the store/metrics files you keep on disk.

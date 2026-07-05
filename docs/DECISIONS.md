@@ -401,3 +401,65 @@ orchestrator can `diff` it against Ruby byte-for-byte.
 working tree differs from the pulled sha, `pull` says so and the user runs a normal
 `cce index`. The incremental "reindex only changed files on top of the pulled base"
 is a documented fast-follow, out of scope for v1 (SPEC-SYNC §7/§12).
+
+## CCE MCP (v2.4.0, SPEC-MCP)
+
+**Hand-rolled JSON-RPC 2.0 over stdio, no MCP SDK crate.** The MCP stdio transport is
+newline-delimited JSON-RPC 2.0. Rather than add an unvetted, larger MCP SDK, the
+server hand-rolls exactly the slice it needs with `serde_json` (already a dependency)
+— the same choice the rest of the engine makes for its hand-rolled HTTP/YAML writers.
+This keeps every wire byte under our control, the dependency set pinned and minimal,
+and the protocol trivially testable by piping strings. `src/mcp/protocol.rs` owns
+request parsing and success/error encoding; `src/mcp/server.rs` owns the dispatch.
+
+**Protocol version pinned to `2025-06-18`.** The server advertises this MCP revision
+in `initialize` and both engines pin the same value, so an agent negotiates an
+identical protocol regardless of backend. The dispatch loop is transport-generic
+(`run<R: BufRead, W: Write>`), so unit tests drive it in-process and the integration
+suite pipes JSON-RPC to the real binary's stdin.
+
+**The dispatch loop is transport-generic; `serve()` wires it to process stdio.** This
+separation is what makes the server hermetically testable: `handle_line` is pure
+(string in, optional string out), `run` loops over any reader/writer, and only
+`serve` touches `std::io::stdin/stdout` (after the best-effort sync warm).
+
+**A missing index / unknown tool is a *tool result*, not a protocol error.**
+`context_search` over an unbuilt index returns a friendly "run `cce index`" text with
+`isError: false` (it is a normal state, not a failure); an unknown tool name returns
+`isError: true`. Only a malformed call (no `query`, no `helpful`, no tool `name`) is a
+real error. This keeps an agent's session alive and steers it, rather than crashing.
+
+**`context_search` reuses the CLI's exact retrieval and logs an identical metrics
+event.** `retriever::build_search_record` was lifted out of `main.rs` into the library
+so the CLI `search` and the MCP tool emit a byte-identical `cce.metrics/v1` event —
+that identity is what lets `cce dashboard` surface agent usage the same way it
+surfaces CLI use. The MCP default `top_k` is **8** (tighter than the CLI's 10) because
+an agent pays per token. Workspace metrics land in the workspace-root log so the root
+`cce dashboard --workspace` sees them.
+
+**`cce init` merges idempotently by owning a stable key/marker.** `.mcp.json` keeps
+its `mcpServers.cce` entry (other servers preserved); `CLAUDE.md` keeps a single
+`<!-- BEGIN CCE MCP --> … <!-- END CCE MCP -->` block whose region is replaced in
+place. Re-running produces byte-identical files. Workspace detection is
+`.cce/workspace.yml` exists → the server args become `["mcp", "--workspace"]`.
+
+**Sync is a soft dependency, gated on config.** On startup `cce mcp` warms the index
+via `sync pull --latest` only when a remote is configured **and** `sync.auto_pull` is
+on, with `force = false` (never clobber a WIP local cache) and every error swallowed
+— offline, no-remote, cache-miss, and sha-mismatch all fall back silently to the
+local index. `index_status` freshness (source/sha/behind-remote) is a new
+`sync::commands::freshness` that touches the network only when a remote is configured.
+MCP works fully with no Sync present.
+
+**The sync artifact format version is decoupled from the app version.** The artifact
+format did **not** change in v2.4 (CCE MCP is purely additive), so its compatibility
+version must not move with the release. The old `cce_version_minor()` derived it from
+the crate version, which would have made every release invalidate everyone's cache and
+diverge from Ruby. It is replaced by a dedicated constant `SYNC_FORMAT_VERSION = "2.3"`
+that names the *artifact format*, used everywhere the sync layer stamps the version
+(the content address `hash/2.3/…` and the manifest `cce_version` field). It moves only
+when the artifact bytes actually change shape — then both engines bump it in lockstep.
+The shared golden checksum on `test/fixture/samples` therefore stays
+`581cbd0ff682a38d7d1250f3eec44f4ce456bdd660d4cb29aaaadd9e95072f48`, equal to Ruby's.
+The app/crate version is 2.4.0 (`Cargo.toml`, `CITATION.cff`); `conformance.json` is
+independent of both and stays byte-identical.

@@ -15,9 +15,10 @@
 //! - Own the deterministic sort (rounded score desc, chunk_id asc).
 //! - It does NOT walk, chunk, embed corpora, or persist.
 
-use crate::chunker::Chunk;
+use crate::chunker::{token_count, Chunk};
 use crate::config::*;
 use crate::embedder::{cosine, score_key, Embedder};
+use crate::metrics::SearchRecord;
 use crate::store::Index;
 use crate::tokenizer::tokenize;
 use crate::vector_store::rank_by_cosine;
@@ -88,6 +89,55 @@ pub fn rrf(vrank: Option<usize>, frank: Option<usize>, fts_weight: f64) -> f64 {
 /// Extract crude file-hints from the raw query: whitespace terms containing '.'.
 fn file_hints(query: &str) -> Vec<String> {
     query.split_whitespace().filter(|t| t.contains('.')).map(|t| t.to_ascii_lowercase()).collect()
+}
+
+/// Assemble a `search` metrics record from a result set (DASHBOARD-SPEC §2.1, §3).
+///
+/// Shared by the CLI `search` path and the CCE MCP `context_search` tool so both
+/// log an identical `cce.metrics/v1` event to `metrics.jsonl` — that identity is
+/// what lets `cce dashboard` surface agent usage the same way it surfaces CLI use.
+/// `latency_ms` is measured by the caller (the one non-deterministic input).
+pub fn build_search_record(
+    index: &Index,
+    results: &[SearchResult],
+    query: &str,
+    top_k: usize,
+    graph_enabled: bool,
+    latency_ms: f64,
+) -> SearchRecord {
+    let result_count = results.len();
+    let baseline_tokens = index.baseline_tokens(results.iter().map(|r| r.file_path.as_str()));
+    let served_tokens: u64 = results.iter().map(|r| token_count(&r.content) as u64).sum();
+    let tokens_saved = baseline_tokens.saturating_sub(served_tokens);
+    let savings_ratio = if baseline_tokens == 0 {
+        0.0
+    } else {
+        tokens_saved as f64 / baseline_tokens as f64
+    };
+    let top_score = results.first().map(|r| r.score).unwrap_or(0.0);
+    let mean_score = if results.is_empty() {
+        0.0
+    } else {
+        results.iter().map(|r| r.score).sum::<f64>() / results.len() as f64
+    };
+    let empty = result_count == 0;
+    let low_confidence = !empty && top_score < LOW_CONFIDENCE_THRESHOLD;
+    SearchRecord {
+        query: query.to_string(),
+        top_k,
+        graph_enabled,
+        embedder: index.embedder_name.clone(),
+        result_count,
+        baseline_tokens,
+        served_tokens,
+        tokens_saved,
+        savings_ratio,
+        top_score,
+        mean_score,
+        empty,
+        low_confidence,
+        latency_ms,
+    }
 }
 
 /// The main retrieval entry point (SPEC §6).

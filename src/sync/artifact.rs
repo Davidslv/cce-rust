@@ -300,7 +300,7 @@ impl Artifact {
         let manifest = Manifest {
             repo_id: meta.repo_id,
             sha: meta.sha,
-            cce_version: crate::sync::cce_version_minor(),
+            cce_version: crate::sync::SYNC_FORMAT_VERSION.to_string(),
             embedder: crate::sync::HASH_EMBEDDER.to_string(),
             pack_set_id: crate::sync::pack_set_id(),
             chunk_count: chunks.len(),
