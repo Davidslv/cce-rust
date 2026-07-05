@@ -1,20 +1,25 @@
 //! # bench — the benchmark runner behind `cce bench`
 //!
-//! **Why this file exists:** SPEC §10 requires headline numbers (index speed,
-//! query latency, recall, token savings) measured on a pinned real repository
-//! using the default hashing embedder, written to `docs/BENCHMARKS.md`.
+//! **Why this file exists:** SPEC-V2 §8 requires headline numbers (index speed,
+//! query latency, recall, token savings) measured per language on a pinned real
+//! repository using the default hashing embedder, written to `docs/BENCHMARKS.md`.
 //!
-//! **What it is / does:** Indexes a given repo directory, runs a labeled query
-//! set, measures index throughput, per-query p50/p95 latency, Recall@5/@10, and
-//! mean token savings, and renders the Markdown report.
+//! **What it is / does:** Indexes a repo's sources for one language (filtered by
+//! that pack's extensions), runs the language's labeled query set, measures index
+//! throughput, per-query p50/p95 latency, Recall@5/@10, and mean token savings,
+//! and renders the Markdown report. The four benchmarked languages are Ruby,
+//! Rust, TypeScript, and C (SPEC-V2 §8); Python/JavaScript stay validated packs
+//! but are not shipped with labeled corpora (Python's flask set is kept for the
+//! back-compatible default).
 //!
 //! **Responsibilities:**
-//! - Own the default labeled query set (SPEC §10.2) and the metric math.
-//! - Own report rendering.
+//! - Own the per-language labeled query sets (SPEC-V2 §8) and the metric math.
+//! - Own report rendering and the language->extension filter (via the registry).
 //! - It does NOT clone the repo (the caller passes an already-checked-out dir).
 
 use crate::chunker::token_count;
 use crate::embedder::HashEmbedder;
+use crate::packs::default_registry;
 use crate::retriever::search;
 use crate::store::Index;
 use std::collections::BTreeSet;
@@ -27,8 +32,8 @@ struct Labeled {
     expected: &'static [&'static str],
 }
 
-/// SPEC §10.2 default query set. The routing query accepts app OR blueprints.
-const DEFAULT_QUERIES: &[Labeled] = &[
+/// Python (flask) set — the back-compatible default (base SPEC §10.2).
+const PYTHON_QUERIES: &[Labeled] = &[
     Labeled { query: "where are blueprints registered", expected: &["blueprints"] },
     Labeled { query: "application factory and app configuration", expected: &["app"] },
     Labeled { query: "load configuration from environment or file", expected: &["config"] },
@@ -40,6 +45,84 @@ const DEFAULT_QUERIES: &[Labeled] = &[
     Labeled { query: "request and response context management", expected: &["ctx"] },
     Labeled { query: "send a file as a response", expected: &["helpers"] },
 ];
+
+/// Ruby (sinatra/sinatra) labeled set (SPEC-V2 §8).
+const RUBY_QUERIES: &[Labeled] = &[
+    Labeled { query: "route matching and dispatch", expected: &["base"] },
+    Labeled { query: "render erb/haml template", expected: &["base"] },
+    Labeled { query: "session and cookies", expected: &["base"] },
+    Labeled { query: "mime type helpers", expected: &["base"] },
+    Labeled { query: "middleware stack", expected: &["base"] },
+    Labeled { query: "delegator methods", expected: &["base"] },
+    Labeled { query: "handle errors and show exceptions", expected: &["show_exceptions"] },
+    Labeled { query: "streaming responses", expected: &["base"] },
+    Labeled { query: "rack response building", expected: &["base"] },
+    Labeled { query: "url helpers", expected: &["base"] },
+];
+
+/// Rust (sharkdp/hyperfine) labeled set (SPEC-V2 §8).
+const RUST_QUERIES: &[Labeled] = &[
+    Labeled { query: "run a benchmark and measure timing", expected: &["benchmark"] },
+    Labeled { query: "parse command line options", expected: &["options"] },
+    Labeled { query: "export results as json", expected: &["export"] },
+    Labeled { query: "export as markdown", expected: &["export"] },
+    Labeled { query: "warmup runs", expected: &["benchmark"] },
+    Labeled { query: "shell spawning and command execution", expected: &["command"] },
+    Labeled { query: "outlier detection statistics", expected: &["outlier"] },
+    Labeled { query: "progress bar output", expected: &["benchmark"] },
+    Labeled { query: "parameter ranges", expected: &["parameter"] },
+    Labeled { query: "timing measurement", expected: &["timer"] },
+];
+
+/// TypeScript (pmndrs/zustand) labeled set (SPEC-V2 §8).
+const TYPESCRIPT_QUERIES: &[Labeled] = &[
+    Labeled { query: "create a store", expected: &["vanilla"] },
+    Labeled { query: "react hook to use the store", expected: &["react"] },
+    Labeled { query: "persist middleware", expected: &["middleware"] },
+    Labeled { query: "subscribe with selector", expected: &["middleware"] },
+    Labeled { query: "shallow equality", expected: &["shallow"] },
+    Labeled { query: "combine slices", expected: &["middleware"] },
+    Labeled { query: "devtools integration", expected: &["middleware"] },
+    Labeled { query: "set and get state", expected: &["vanilla"] },
+    Labeled { query: "immer middleware", expected: &["middleware"] },
+    Labeled { query: "context provider", expected: &["context"] },
+];
+
+/// C (jqlang/jq) labeled set (SPEC-V2 §8).
+const C_QUERIES: &[Labeled] = &[
+    Labeled { query: "parse a json value", expected: &["jv"] },
+    Labeled { query: "builtin functions", expected: &["builtin"] },
+    Labeled { query: "execute bytecode", expected: &["execute"] },
+    Labeled { query: "print/format json output", expected: &["jv_print"] },
+    Labeled { query: "lexer/tokenizer", expected: &["lexer"] },
+    Labeled { query: "compile the program", expected: &["compile"] },
+    Labeled { query: "object and array construction", expected: &["jv"] },
+    Labeled { query: "decode number", expected: &["jv"] },
+    Labeled { query: "main entry point", expected: &["main"] },
+    Labeled { query: "unicode handling", expected: &["jv_unicode"] },
+];
+
+/// The labeled query set for a language, or `None` for an unknown language.
+fn queries_for(lang: &str) -> Option<&'static [Labeled]> {
+    match lang {
+        "python" => Some(PYTHON_QUERIES),
+        "ruby" => Some(RUBY_QUERIES),
+        "rust" => Some(RUST_QUERIES),
+        "typescript" => Some(TYPESCRIPT_QUERIES),
+        "c" => Some(C_QUERIES),
+        _ => None,
+    }
+}
+
+/// The file extensions a language's pack claims (used to filter sources).
+fn extensions_for(lang: &str) -> Vec<String> {
+    default_registry()
+        .all()
+        .iter()
+        .find(|p| p.name() == lang)
+        .map(|p| p.extensions().iter().map(|s| s.to_string()).collect())
+        .unwrap_or_default()
+}
 
 /// Best-effort `rustc --version`; falls back to a generic label.
 fn detect_rustc_version() -> String {
@@ -64,6 +147,7 @@ fn percentile(sorted_ms: &[f64], pct: f64) -> f64 {
 
 /// Result of a benchmark run, ready to render.
 pub struct BenchReport {
+    pub language: String,
     pub total_files: usize,
     pub total_chunks: usize,
     pub index_seconds: f64,
@@ -78,14 +162,20 @@ pub struct BenchReport {
     pub markdown: String,
 }
 
-/// Run the benchmark against `repo_dir`. Writes nothing; returns the report.
-pub fn run(repo_dir: &Path, commit: &str, corpus_name: &str) -> BenchReport {
+/// Run the benchmark against `repo_dir` for `language`. Writes nothing; returns
+/// the report. An unknown language falls back to the Python (flask) query set.
+pub fn run(repo_dir: &Path, commit: &str, corpus_name: &str, language: &str) -> BenchReport {
     let embedder = HashEmbedder;
+    let queries = queries_for(language).unwrap_or(PYTHON_QUERIES);
+    let exts = extensions_for(language);
+    // If the language is unknown to the registry, fall back to Python's `.py`.
+    let keep_exts: Vec<String> = if exts.is_empty() { vec![".py".to_string()] } else { exts };
 
-    // --- Index (timed) --- Python sources only, per SPEC §10.1.
+    // --- Index (timed) --- only this language's sources (SPEC-V2 §8).
     let t0 = Instant::now();
-    let (index, stats) =
-        Index::build_from_dir_filtered(repo_dir, &embedder, |p| p.ends_with(".py"));
+    let (index, stats) = Index::build_from_dir_filtered(repo_dir, &embedder, |p| {
+        keep_exts.iter().any(|e| p.to_ascii_lowercase().ends_with(e.as_str()))
+    });
     let index_seconds = t0.elapsed().as_secs_f64();
     let total_chunks = stats.total_chunks;
     let total_files = stats.files_indexed;
@@ -103,15 +193,13 @@ pub fn run(repo_dir: &Path, commit: &str, corpus_name: &str) -> BenchReport {
     let mut savings_n = 0usize;
     let repeats = 5;
 
-    for lab in DEFAULT_QUERIES {
-        // Latency: repeat >= 5x
+    for lab in queries {
         let mut last: Vec<crate::retriever::SearchResult> = Vec::new();
         for _ in 0..repeats {
             let t = Instant::now();
             last = search(&index, &embedder, lab.query, 10, false);
             latencies.push(t.elapsed().as_secs_f64() * 1000.0);
         }
-        // Recall@5 / @10
         let hit_in = |k: usize| -> bool {
             last.iter().take(k).any(|r| {
                 lab.expected.iter().any(|sub| !sub.is_empty() && r.file_path.contains(sub))
@@ -123,7 +211,6 @@ pub fn run(repo_dir: &Path, commit: &str, corpus_name: &str) -> BenchReport {
         if hit_in(10) {
             hits10 += 1;
         }
-        // Token savings
         let served: usize = last.iter().map(|r| chunk_token_count(&index, r)).sum();
         let distinct_files: BTreeSet<String> = last.iter().map(|r| r.file_path.clone()).collect();
         let baseline: usize =
@@ -137,7 +224,7 @@ pub fn run(repo_dir: &Path, commit: &str, corpus_name: &str) -> BenchReport {
     latencies.sort_by(|a, b| a.partial_cmp(b).unwrap());
     let p50_ms = percentile(&latencies, 50.0);
     let p95_ms = percentile(&latencies, 95.0);
-    let n_q = DEFAULT_QUERIES.len() as f64;
+    let n_q = queries.len() as f64;
     let recall_at_5 = hits5 as f64 / n_q;
     let recall_at_10 = hits10 as f64 / n_q;
     let token_savings_pct = if savings_n > 0 {
@@ -147,6 +234,7 @@ pub fn run(repo_dir: &Path, commit: &str, corpus_name: &str) -> BenchReport {
     };
 
     let markdown = render(
+        language,
         corpus_name,
         commit,
         total_files,
@@ -161,6 +249,7 @@ pub fn run(repo_dir: &Path, commit: &str, corpus_name: &str) -> BenchReport {
     );
 
     BenchReport {
+        language: language.to_string(),
         total_files,
         total_chunks,
         index_seconds,
@@ -191,6 +280,7 @@ fn whole_file_token_count(repo_dir: &Path, rel: &str) -> usize {
 
 #[allow(clippy::too_many_arguments)]
 fn render(
+    language: &str,
     corpus: &str,
     commit: &str,
     total_files: usize,
@@ -209,7 +299,8 @@ fn render(
 Generated by `cce bench` using the default deterministic **hash** embedder.\n\n\
 ## Environment\n\n\
 | Field | Value |\n|---|---|\n\
-| Language | Rust (`{rustc}`) |\n\
+| Language pack | {language} |\n\
+| Engine | Rust (`{rustc}`) |\n\
 | OS / Arch | {os} / {arch} |\n\
 | Embedder | hash (SPEC §5.1) |\n\
 | Corpus | {corpus} |\n\
@@ -237,6 +328,7 @@ handful of function-sized chunks instead of the whole files they live in, which 
 is exactly the point of the engine: feed a model precise snippets, not entire \
 files. Recall and token-savings numbers are deterministic and should match the \
 Ruby implementation on the same corpus; latency is language-specific.\n",
+        language = language,
         rustc = rustc,
         os = std::env::consts::OS,
         arch = std::env::consts::ARCH,
@@ -267,12 +359,36 @@ mod tests {
     }
 
     #[test]
+    fn query_sets_and_extensions_resolve_per_language() {
+        assert_eq!(queries_for("ruby").unwrap().len(), 10);
+        assert_eq!(queries_for("rust").unwrap().len(), 10);
+        assert_eq!(queries_for("typescript").unwrap().len(), 10);
+        assert_eq!(queries_for("c").unwrap().len(), 10);
+        assert!(queries_for("cobol").is_none());
+        assert_eq!(extensions_for("ruby"), vec![".rb"]);
+        assert_eq!(extensions_for("c"), vec![".c", ".h"]);
+    }
+
+    #[test]
     fn bench_runs_on_fixture() {
-        // The fixture is a tiny "repo"; ensures the runner wires up end-to-end.
-        let dir = std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/test/fixture"));
-        let rep = run(&dir, "fixture", "test-fixture");
+        // The base python fixture is a tiny "repo"; ensures the runner wires up.
+        let dir =
+            std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/test/fixture/base"));
+        let rep = run(&dir, "fixture", "test-fixture", "python");
         // bench indexes only Python sources (SPEC §10.1): 2 .py files -> 6 chunks.
         assert_eq!(rep.total_chunks, 6);
+        assert_eq!(rep.language, "python");
         assert!(rep.markdown.contains("# Benchmarks"));
+    }
+
+    #[test]
+    fn bench_runs_on_ruby_sample_corpus() {
+        // Point the runner at the samples dir with lang=ruby: only ruby.rb indexes.
+        let dir =
+            std::path::PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/test/fixture/samples"));
+        let rep = run(&dir, "fixture", "samples", "ruby");
+        assert_eq!(rep.language, "ruby");
+        assert_eq!(rep.total_files, 1); // just ruby.rb
+        assert!(rep.markdown.contains("| Language pack | ruby |"));
     }
 }

@@ -16,6 +16,7 @@
 pub mod config;
 pub mod tokenizer;
 pub mod embedder;
+pub mod packs;
 pub mod chunker;
 pub mod vector_store;
 pub mod keyword_store;

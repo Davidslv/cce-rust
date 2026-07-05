@@ -51,8 +51,12 @@ pub const DEFAULT_TOP_K: usize = 10;
 /// Maximum file size (bytes) we will index. Files larger than this are skipped.
 pub const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024;
 
-/// Spec version emitted in `conformance.json`.
+/// Spec version tag stamped on the persisted index file (internal).
 pub const SPEC_VERSION: &str = "1.0";
+
+/// Spec version emitted in `conformance.json` (SPEC-V2 §7). The v2 chunk shape
+/// adds `kind`, so both implementations agree on this tag for the equivalence gate.
+pub const CONFORMANCE_SPEC_VERSION: &str = "2.0";
 
 // --- Dashboard & observability (DASHBOARD-SPEC v1.1 §1) ---
 

@@ -189,7 +189,7 @@ mod tests {
     use crate::embedder::HashEmbedder;
 
     fn fixture_dir() -> PathBuf {
-        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/test/fixture"))
+        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/test/fixture/base"))
     }
 
     #[test]

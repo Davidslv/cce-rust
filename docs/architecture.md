@@ -1,8 +1,10 @@
 # Architecture
 
 This is the canonical architecture document for **cce-rust**. The authoritative
-description of *behaviour* is [`SPEC.md`](../SPEC.md); this document explains how
-the implementation is shaped, why, and where the design would strain.
+description of *behaviour* is [`SPEC.md`](../SPEC.md) (base engine),
+[`DASHBOARD-SPEC.md`](../DASHBOARD-SPEC.md) (dashboard), and
+[`SPEC-V2.md`](../SPEC-V2.md) (the v2 language-pack architecture); this document
+explains how the implementation is shaped, why, and where the design would strain.
 
 ## Design goals
 
@@ -30,15 +32,18 @@ responsibilities header.
 | `src/config.rs` | Normative constants (SPEC §3) + runtime config | `EMBED_DIM`, `RRF_K`, weights, `EmbedderKind` |
 | `src/tokenizer.rs` | The one shared byte-exact tokenizer (SPEC §4.1) | `tokenize` |
 | `src/embedder.rs` | Hashing embedder, cosine, rounding, Ollama (SPEC §5, §11) | `fnv1a64`, `HashEmbedder`, `OllamaEmbedder`, `cosine`, `round6`, `score_key`, `format6`, `Embedder` trait |
-| `src/chunker.rs` | tree-sitter chunking, chunk IDs, imports (SPEC §4.2–4.4) | `Chunk`, `Chunker`, `chunk_id`, `token_count` |
+| `src/chunker.rs` | Generic tree-sitter chunking, chunk IDs, `kind` (SPEC §4.2–4.4, SPEC-V2 §3–4) | `Chunk`, `Chunker`, `chunk_id`, `token_count`, `chunk_with_pack` |
+| `src/packs/mod.rs` | The `LanguagePack` trait + `Registry` (SPEC-V2 §1) | `LanguagePack`, `PackExpected`, `Registry`, `default_registry` |
+| `src/packs/{python,javascript,ruby,rust,typescript,c}.rs` | One pack per language (SPEC-V2 §2) | `PythonPack`, `RubyPack`, … |
+| `src/packs/validators.rs` | Three-layer pack validators (SPEC-V2 §5) | `validate_pack`, `validate_all`, `startup_check` |
 | `src/vector_store.rs` | Exact brute-force cosine ranking (SPEC §6.2) | `rank_by_cosine` |
 | `src/keyword_store.rs` | Lucene-form BM25 (SPEC §6.3) | `Bm25Index` |
 | `src/graph_store.rs` | Import graph + neighbor lookup (SPEC §6.7) | `Graph` |
 | `src/retriever.rs` | The hybrid pipeline (SPEC §6) | `search`, `is_code_lookup`, `SearchResult` |
 | `src/walker.rs` | Filesystem walk + ignore rules (SPEC §7.1) | `walk` |
 | `src/store.rs` | Index assembly + JSON persistence, whole-file token counts (SPEC §7, DASH §3) | `Index`, `build_from_dir`, `save`, `load`, `baseline_tokens` |
-| `src/conformance.rs` | `conformance.json` emitter (SPEC §8) | `generate` |
-| `src/bench.rs` | Benchmark runner (SPEC §10) | `run`, `BenchReport` |
+| `src/conformance.rs` | `conformance.json` emitter, v2 shape with `kind` (SPEC-V2 §7) | `generate` |
+| `src/bench.rs` | Per-language benchmark runner (SPEC-V2 §8) | `run`, `BenchReport` |
 | `src/metrics.rs` | Persisted metrics event log; injected clock/id source (DASH §2) | `MetricsWriter`, `read_log`, `parse_log`, `Clock`, `IdSource`, `parse_iso` |
 | `src/aggregator.rs` | Pure aggregate: totals, north-stars, series, deltas (DASH §4) | `aggregate`, `Aggregate`, `direction` |
 | `src/dashboard.rs` | Loopback-only, read-only, self-contained web server (DASH §6) | `run`, `serve`, `route` |
@@ -57,8 +62,8 @@ schema, and the aggregation formulas live in [`dashboard.md`](dashboard.md).
 ```
 dir ──walker::walk──▶ [(rel_path, content)]         # ignore rules, UTF-8, ≤2 MB
       │
-      └─ per file ─ chunker::chunk_file ─▶ Chunk[]   # tree-sitter or module fallback
-                                        └▶ imports[] # first dotted component
+      └─ per file ─ chunker::chunk_file ─▶ Chunk[]   # registry.pack_for(path); pack grammar or module fallback
+                                        └▶ imports[] # pack.extract_imports(root, src)
       │
       └─ per chunk ─ embedder.embed(content) ─▶ [f64; 256]
       │
@@ -101,8 +106,46 @@ Cross-language reproducibility hinges on three rules applied uniformly:
 
 Carries everything persistence needs to reconstruct the index: `chunk_id`,
 `file_path` (root-relative, `/` separators), `start_line`/`end_line` (1-based),
-`chunk_type` (`function`/`class`/`module`), `language`, `content`,
-`token_count`, and the `embedding` vector.
+`chunk_type` (`function`/`class`/`module`), `kind` (the exact tree-sitter node
+type, or `module` for the fallback), `language`, `content`, `token_count`, and
+the `embedding` vector. `kind` is **not** part of `chunk_id`.
+
+## Language packs (SPEC-V2)
+
+Language support is factored into pluggable **packs** so the core chunker/importer
+holds zero language-specific knowledge. Adding a language is a one-file change:
+add a pack, register it, pass validation — no core edits. A guard test asserts the
+core chunker names no language and no extension literal.
+
+**The interface (`LanguagePack`).** Each pack is one struct implementing a trait
+that declares: `name`, `extensions` (leading-dot, lowercase), `grammar()` (the
+tree-sitter `Language`), `function_types` / `class_types` (node-type sets),
+`import_node_types` (for the grammar-binding lint), `extract_imports`, a `sample`
+snippet, and its `expected` self-test contract.
+
+**The registry.** `Registry::register` rejects a pack whose extension is already
+claimed; `pack_for(path)` resolves a file to its pack by lowercased extension;
+`all()` lists them for `cce packs` and validation. `default_registry()` wires the
+six shipped packs in a stable order. The generic chunker asks
+`registry.pack_for(path)`; on `None` it emits the language-neutral module
+fallback, otherwise it parses with `pack.grammar()`, walks the tree emitting a
+chunk for every **named** node whose type is in the pack's function/class sets
+(nested included), and records `kind = node.kind()`.
+
+**The taxonomy.** Two levels: the coarse `chunk_type`
+(`function`/`class`/`module`) that retrieval ranks on, and the exact `kind` (e.g.
+`struct_specifier`, `trait_item`, `interface_declaration`, `method`) carried
+through persistence, search, stats, and conformance. `kind` is deterministic
+(straight from the node type), so both language implementations agree trivially.
+
+**The validators (three layers).** (1) *Structural* — name/extension well-formed
+and unique. (2) *Grammar-binding* — every declared node type is a real kind in the
+grammar; on a miss it suggests the nearest valid kind by edit distance ("did you
+mean"). (3) *Behavioural* — chunk the pack's own `sample` and assert it meets
+`expected` (min function/class counts, the set of kinds present, and
+`extract_imports == expected.imports` exactly). Surfaced by `cce packs
+--validate`, a CI test gate over all packs, and cheap fail-fast startup checks
+(duplicate extension, unloadable grammar) when the engine is constructed.
 
 ## Design rationale
 
@@ -150,10 +193,21 @@ Being honest about the edges of the design:
   phrased differently from the code will underperform. Real semantic search
   requires opting into Ollama, which then falls outside the deterministic
   conformance guarantee.
-- **Language coverage.** AST chunking exists only for Python and JavaScript;
-  every other language falls back to a single whole-file `module` chunk, which is
-  coarse and dilutes retrieval precision for those files. Adding a language means
-  adding a tree-sitter grammar and chunking rules.
+- **Language coverage.** Six packs ship (Python, JavaScript, Ruby, Rust,
+  TypeScript, C); every other language falls back to a single whole-file `module`
+  chunk, which is coarse and dilutes retrieval precision for those files. Adding a
+  language is now a one-file pack, but it still requires a tree-sitter grammar.
+- **One extension → one pack.** The registry maps each extension to exactly one
+  pack, so it cannot serve two languages that share an extension (e.g. `.h` for
+  both C and C++, or `.ts` for TypeScript vs. certain other tools). Nor can it do
+  **per-file dialect detection** (JSX-in-`.js`, TSX-in-`.ts`, or content-sniffed
+  variants) — resolution is purely by extension. A pack whose grammar needs
+  per-file mode selection would have to pick one grammar per extension.
+- **Structural, not semantic, node selection.** A pack lists node *types*; it
+  cannot express "a `struct_specifier` only when it has a body", so e.g. a C
+  struct **reference** in a parameter is emitted as a (bodyless) class chunk. This
+  keeps packs declarative and cross-language-identical at the cost of a few noisy
+  chunks.
 - **Concurrency and freshness.** There is no locking or watch mode. The store is
   a point-in-time snapshot; concurrent indexers writing the same store, or a repo
   changing under a running search, are out of scope.

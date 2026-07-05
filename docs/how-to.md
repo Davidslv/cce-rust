@@ -38,7 +38,8 @@ Flags:
 - `--no-graph` — skip import-graph expansion (step §6.7); results come only from
   direct vector + BM25 + RRF ranking.
 - `--json` — emit an object `{query_id, results: [{rank, chunk_id, file_path,
-  start_line, end_line, chunk_type, score}, ...]}` (since v1.1).
+  start_line, end_line, chunk_type, kind, score}, ...]}`. `kind` (the exact
+  tree-sitter node type) is new in v2; human output shows it as `chunk_type/kind`.
 - `--no-metrics` — do not append a search event to the metrics log (then
   `query_id` is null and no `query-id:` line is printed).
 
@@ -89,33 +90,51 @@ cce dashboard --metrics ./path/to/metrics.jsonl --price 5.00
 cce stats --dir ./my-project        # or --store <path>
 ```
 
-Reports chunk count, file count, average tokens per chunk, on-disk size, and a
-per-language breakdown.
+Reports chunk count, file count, average tokens per chunk, on-disk size, a
+per-language breakdown, and a per-`kind` breakdown (the exact node types).
+
+## List or validate the language packs
+
+```bash
+cce packs               # list the six registered packs
+cce packs --validate    # run the three validator layers; non-zero exit on failure
+```
+
+- `cce packs` prints each pack's name, extensions, function/class type counts, and
+  grammar node-kind count.
+- `cce packs --validate` runs the structural, grammar-binding, and behavioural
+  self-test layers over every pack and prints any diagnostics. Use it after adding
+  or editing a pack — see [`adding-a-language.md`](adding-a-language.md).
 
 ## Benchmark on a real repository
 
 ```bash
-cce bench /path/to/flask --name "pallets/flask@3.0.3"
+cce bench /path/to/sinatra --lang ruby --name "sinatra/sinatra@v4.1.1"
 ```
 
-- Runs the pipeline over a checked-out repo and writes
-  [`BENCHMARKS.md`](BENCHMARKS.md).
+- Runs the pipeline over a checked-out repo **for one language** (`--lang ruby |
+  rust | typescript | c`, default `python`) and writes
+  [`BENCHMARKS.md`](BENCHMARKS.md). Only that language's sources are indexed.
 - Records the corpus commit; by default it reads git `HEAD` of the repo, or pass
   `--commit <sha>`.
 - Uses the deterministic hash embedder, so recall and token-savings numbers are
   reproducible and comparable to the Ruby sibling; latency is language-specific.
+- The four benchmarked corpora are Ruby (sinatra), Rust (hyperfine), TypeScript
+  (zustand), and C (jq); Python/JavaScript stay validated packs but ship no
+  labeled corpus.
 
 ## Regenerate the conformance file
 
 ```bash
-cce conformance test/fixture -o conformance.json
+cce conformance test/fixture/samples -o conformance.json
 ```
 
-- Emits a byte-stable JSON of every chunk (path, lines, type, `chunk_id`,
-  `token_count`) for the fixture.
+- Emits a byte-stable JSON of every chunk (path, lines, `chunk_type`, `kind`,
+  `chunk_id`, `token_count`) over the seven-file sample corpus (v2 shape).
 - Designed to match the [Ruby sibling](https://github.com/davidslv/cce-ruby) on
-  the same fixture. If your change alters this output, that is a deliberate,
-  spec-level change — call it out (see [`../CONTRIBUTING.md`](../CONTRIBUTING.md)).
+  the same byte-identical samples. If your change alters this output, that is a
+  deliberate, spec-level change — call it out (see
+  [`../CONTRIBUTING.md`](../CONTRIBUTING.md)).
 
 ## Switch to semantic embeddings (Ollama)
 

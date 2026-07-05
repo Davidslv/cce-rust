@@ -414,7 +414,7 @@ mod tests {
     fn sample_log() -> Vec<Event> {
         let path = PathBuf::from(concat!(
             env!("CARGO_MANIFEST_DIR"),
-            "/test/fixture/metrics_sample.jsonl"
+            "/test/fixture/base/metrics_sample.jsonl"
         ));
         let text = std::fs::read_to_string(path).unwrap();
         parse_log(&text).events

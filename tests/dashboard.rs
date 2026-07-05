@@ -19,7 +19,7 @@ use std::net::{TcpListener, TcpStream};
 use std::path::PathBuf;
 
 fn fixture_metrics() -> PathBuf {
-    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/test/fixture/metrics_sample.jsonl"))
+    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/test/fixture/base/metrics_sample.jsonl"))
 }
 
 /// Issue one HTTP/1.1 GET on a fresh connection; return (status_line, body).

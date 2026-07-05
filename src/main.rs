@@ -104,7 +104,7 @@ enum Command {
         #[arg(long)]
         dir: Option<PathBuf>,
     },
-    /// Benchmark the pipeline on a real repository (SPEC §10).
+    /// Benchmark the pipeline on a real repository for one language (SPEC-V2 §8).
     Bench {
         repo_dir: PathBuf,
         #[arg(long)]
@@ -117,12 +117,21 @@ enum Command {
         /// Human-readable corpus name for the report.
         #[arg(long, default_value = "pallets/flask@3.0.3")]
         name: String,
+        /// Language to benchmark: ruby, rust, typescript, c (or python default).
+        #[arg(long, default_value = "python")]
+        lang: String,
     },
-    /// Emit conformance.json for a fixture directory (SPEC §8).
+    /// Emit conformance.json for a fixture directory (SPEC-V2 §7).
     Conformance {
         fixture_dir: PathBuf,
         #[arg(short = 'o', long, default_value = "conformance.json")]
         output: PathBuf,
+    },
+    /// List the registered language packs, or validate them (SPEC-V2 §5).
+    Packs {
+        /// Run the three validator layers over every pack; exit non-zero on failure.
+        #[arg(long)]
+        validate: bool,
     },
 }
 
@@ -142,10 +151,11 @@ fn main() -> ExitCode {
             cmd_dashboard(dir, store, metrics, port, price, no_open)
         }
         Command::Stats { store, dir } => cmd_stats(store, dir),
-        Command::Bench { repo_dir, queries, store, commit, name } => {
-            cmd_bench(&repo_dir, queries, store, commit, &name)
+        Command::Bench { repo_dir, queries, store, commit, name, lang } => {
+            cmd_bench(&repo_dir, queries, store, commit, &name, &lang)
         }
         Command::Conformance { fixture_dir, output } => cmd_conformance(&fixture_dir, &output),
+        Command::Packs { validate } => cmd_packs(validate),
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,
@@ -359,6 +369,7 @@ fn results_json(results: &[SearchResult], query_id: Option<&str>) -> String {
                 "start_line": r.start_line,
                 "end_line": r.end_line,
                 "chunk_type": r.chunk_type,
+                "kind": r.kind,
                 "score": format6(r.score),
             })
         })
@@ -377,13 +388,14 @@ fn print_human(results: &[SearchResult]) {
     for r in results {
         let snippet: String = r.content.lines().next().unwrap_or("").chars().take(80).collect();
         println!(
-            "{:>2}. [{}] {}:{}-{} ({})\n    {}",
+            "{:>2}. [{}] {}:{}-{} ({}/{})\n    {}",
             r.rank,
             format6(r.score),
             r.file_path,
             r.start_line,
             r.end_line,
             r.chunk_type,
+            r.kind,
             snippet.trim()
         );
     }
@@ -454,9 +466,11 @@ fn cmd_stats(store: Option<PathBuf>, dir: Option<PathBuf>) -> Result<(), String>
     let chunk_count = index.chunks.len();
     let file_count = index.files().len();
     let mut per_lang: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
+    let mut per_kind: std::collections::BTreeMap<String, usize> = std::collections::BTreeMap::new();
     let mut total_tokens = 0usize;
     for c in &index.chunks {
         *per_lang.entry(c.language.clone()).or_insert(0) += 1;
+        *per_kind.entry(c.kind.clone()).or_insert(0) += 1;
         total_tokens += c.token_count;
     }
     let avg_tokens = if chunk_count > 0 {
@@ -475,7 +489,49 @@ fn cmd_stats(store: Option<PathBuf>, dir: Option<PathBuf>) -> Result<(), String>
     for (lang, n) in &per_lang {
         println!("    {lang:<12}: {n}");
     }
+    println!("  by kind:");
+    for (kind, n) in &per_kind {
+        println!("    {kind:<20}: {n}");
+    }
     Ok(())
+}
+
+/// `cce packs` / `cce packs --validate` (SPEC-V2 §5): list registered packs, or
+/// run the three validator layers over every pack and exit non-zero on failure.
+fn cmd_packs(validate: bool) -> Result<(), String> {
+    let registry = cce::packs::default_registry();
+    if validate {
+        let reports = cce::packs::validators::validate_all(&registry);
+        let mut failed = 0usize;
+        for report in &reports {
+            if report.ok() {
+                println!("[pack:{}] ok", report.name);
+            } else {
+                failed += 1;
+                for d in &report.diagnostics {
+                    println!("{d}");
+                }
+            }
+        }
+        if failed > 0 {
+            return Err(format!("{failed} pack(s) failed validation"));
+        }
+        println!("all {} packs passed validation", reports.len());
+        Ok(())
+    } else {
+        println!("Registered language packs ({}):", registry.all().len());
+        for pack in registry.all() {
+            println!(
+                "  {:<12} {:<24} {} fn / {} class types · grammar: {} node kinds",
+                pack.name(),
+                pack.extensions().join(","),
+                pack.function_types().len(),
+                pack.class_types().len(),
+                pack.grammar().node_kind_count(),
+            );
+        }
+        Ok(())
+    }
 }
 
 fn cmd_bench(
@@ -484,12 +540,13 @@ fn cmd_bench(
     _store: Option<PathBuf>,
     commit: Option<String>,
     name: &str,
+    lang: &str,
 ) -> Result<(), String> {
     if !repo_dir.is_dir() {
         return Err(format!("not a directory: {}", repo_dir.display()));
     }
     let commit = commit.unwrap_or_else(|| detect_commit(repo_dir));
-    let report = cce::bench::run(repo_dir, &commit, name);
+    let report = cce::bench::run(repo_dir, &commit, name, lang);
 
     let out_path = Path::new("docs/BENCHMARKS.md");
     if let Some(p) = out_path.parent() {
@@ -497,7 +554,10 @@ fn cmd_bench(
     }
     std::fs::write(out_path, &report.markdown).map_err(|e| e.to_string())?;
 
-    println!("Benchmark complete ({}, commit {}):", report.corpus_name, report.commit);
+    println!(
+        "Benchmark complete ({}, {}, commit {}):",
+        report.corpus_name, report.language, report.commit
+    );
     println!("  files/chunks : {}/{}", report.total_files, report.total_chunks);
     println!(
         "  index        : {:.3}s ({:.1} chunks/s)",
