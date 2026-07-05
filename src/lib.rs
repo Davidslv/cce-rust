@@ -21,6 +21,7 @@ pub mod eval;
 pub mod embedder;
 pub mod packs;
 pub mod chunker;
+pub mod compress;
 pub mod sensitive;
 pub mod redactor;
 pub mod vector_store;

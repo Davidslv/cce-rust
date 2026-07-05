@@ -1,4 +1,4 @@
-//! # mcp::tools — the three CCE MCP tools (SPEC-MCP §"Tools")
+//! # mcp::tools — the five CCE MCP tools (SPEC-MCP §"Tools" + SPEC-V2.5 §6/§7)
 //!
 //! **Why this file exists:** The tool contract — names, input schemas, and output
 //! shape — is the cross-language interface an agent binds to. It MUST be byte-for-
@@ -6,25 +6,28 @@
 //! whichever engine serves. This module owns that contract and each tool's
 //! read-only execution over the local index.
 //!
-//! **What it is / does:** Declares `context_search`, `index_status`, and
-//! `record_feedback`: their JSON schemas (`tool_definitions`) and their handlers.
-//! `context_search` runs the exact §6 retrieval (single-repo) or SPEC-V2.2
-//! federation (workspace), logs an identical `search` metrics event to
-//! `.cce/metrics.jsonl`, and renders ranked chunks + a `query_id`. `index_status`
-//! reports counts + sync freshness; `record_feedback` appends a `feedback` event.
+//! **What it is / does:** Declares the five tools and their handlers. The three v2.4
+//! tools — `context_search` (now serving L2-compressed bodies at a `detail` level +
+//! each result's `chunk_id`), `index_status`, `record_feedback` — plus the two
+//! Layer-7 progressive-disclosure tools: `expand_chunk` (body/file/neighbors; body
+//! recovers the exact full bytes) and `related_context` (import-graph neighbours,
+//! imports AND consumers). `context_search` logs an identical `search` metrics event
+//! carrying the retrieval + `chunk_compression` savings buckets (SPEC-V2.5 §2/§3).
 //!
 //! **Responsibilities:**
-//! - Own the tool schemas, output formatting, and `max_tokens` trimming.
-//! - Reuse `retriever`/`federation`/`metrics`/`sync` — never reimplement them.
-//! - Handle a missing/empty index with a friendly message, never a crash.
+//! - Own the five tool schemas, output formatting, L2 serving, and `max_tokens`.
+//! - Reuse `retriever`/`federation`/`compress`/`metrics`/`sync` — never reimplement.
+//! - Handle a missing/empty index or a stale chunk_id with a friendly message.
 
-use crate::chunker::token_count;
-use crate::config::CHARS_PER_TOKEN;
+use crate::chunker::{token_count, Chunk};
+use crate::compress::{compress, DetailLevel};
+use crate::config::{RetrievalConfig, CHARS_PER_TOKEN};
 use crate::embedder::{format6, Embedder, HashEmbedder, OllamaEmbedder};
 use crate::federation::{combined_index, federated_search, load_member_stores, workspace_stats};
 use crate::mcp::server::McpServer;
 use crate::mcp::MCP_DEFAULT_TOP_K;
 use crate::metrics::{HexIdSource, MetricsWriter, SystemClock};
+use crate::packs::Registry;
 use crate::retriever::{build_search_record, search, SearchResult};
 use crate::store::Index;
 use crate::sync::commands::{freshness, IndexSource};
@@ -67,8 +70,22 @@ impl ToolOutput {
     }
 }
 
-/// The three tool definitions returned by `tools/list`, with the EXACT schemas of
-/// SPEC-MCP §"Tools". The order is stable (context_search first — the headline).
+/// The `expand_chunk` description (SPEC-V2.5 §7, Layer 7 progressive disclosure).
+const EXPAND_CHUNK_DESC: &str = "Fetch more of a chunk returned by `context_search`. \
+`context_search` serves COMPACT chunks by default (signature + first line); call this to pull \
+detail only when you need it. scope=body recovers the exact full body; scope=file returns every \
+chunk in the same file; scope=neighbors returns chunks from import-graph-related files.";
+
+/// The `related_context` description (SPEC-V2.5 §7, Layer 7).
+const RELATED_CONTEXT_DESC: &str = "Given a chunk_id from `context_search`, return chunks from \
+files related to it through the import graph — both what it imports AND its consumers (reverse \
+edges) — as compact entries you can expand with `expand_chunk`. Use to widen context on demand \
+instead of pre-loading whole neighbourhoods.";
+
+/// The five tool definitions returned by `tools/list`, with the EXACT byte-pinned
+/// schemas of SPEC-MCP §"Tools" + SPEC-V2.5 §6. The order is stable and fixed:
+/// the three v2.4 tools first (context_search the headline), then the two Layer-7
+/// progressive-disclosure tools. Mirrored verbatim for cce-ruby's catch-up.
 pub fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
@@ -81,7 +98,8 @@ pub fn tool_definitions() -> Vec<Value> {
                     "top_k":      { "type": "integer", "default": 8 },
                     "package":    { "type": "string", "description": "scope to one workspace member (optional)" },
                     "no_graph":   { "type": "boolean", "default": false },
-                    "max_tokens": { "type": "integer", "description": "cap the returned context (optional)" }
+                    "max_tokens": { "type": "integer", "description": "cap the returned context (optional)" },
+                    "detail":     { "type": "string", "enum": ["signature", "compact", "full"], "description": "chunk compression level (optional; default from config, usually compact)" }
                 },
                 "required": ["query"]
             }
@@ -104,6 +122,30 @@ pub fn tool_definitions() -> Vec<Value> {
                 "required": ["query_id", "helpful"]
             }
         }),
+        json!({
+            "name": "expand_chunk",
+            "description": EXPAND_CHUNK_DESC,
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "chunk_id": { "type": "string" },
+                    "scope":    { "type": "string", "enum": ["body", "file", "neighbors"], "default": "body" }
+                },
+                "required": ["chunk_id"]
+            }
+        }),
+        json!({
+            "name": "related_context",
+            "description": RELATED_CONTEXT_DESC,
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "chunk_id": { "type": "string" },
+                    "top_k":    { "type": "integer", "default": 8 }
+                },
+                "required": ["chunk_id"]
+            }
+        }),
     ]
 }
 
@@ -124,11 +166,18 @@ pub fn context_search(server: &McpServer, args: &Value) -> ToolOutput {
     let no_graph = args.get("no_graph").and_then(Value::as_bool).unwrap_or(false);
     let max_tokens = args.get("max_tokens").and_then(Value::as_u64).map(|n| n as usize);
     let package = args.get("package").and_then(Value::as_str).map(|s| s.to_string());
+    // L2 detail (SPEC-V2.5 §2): the tool arg wins; absent ⇒ `.cce/config`
+    // `retrieval.detail`; absent ⇒ the compiled default (compact).
+    let detail = args
+        .get("detail")
+        .and_then(Value::as_str)
+        .and_then(DetailLevel::parse)
+        .unwrap_or_else(|| RetrievalConfig::load(&server.root()).detail);
 
     if server.is_workspace() {
-        context_search_workspace(server, &query, top_k, no_graph, max_tokens, package)
+        context_search_workspace(server, &query, top_k, no_graph, max_tokens, package, detail)
     } else {
-        context_search_single(server, &query, top_k, no_graph, max_tokens)
+        context_search_single(server, &query, top_k, no_graph, max_tokens, detail)
     }
 }
 
@@ -139,6 +188,7 @@ fn context_search_single(
     top_k: usize,
     no_graph: bool,
     max_tokens: Option<usize>,
+    detail: DetailLevel,
 ) -> ToolOutput {
     let store = server.store_path();
     let index = match Index::load(&store) {
@@ -152,15 +202,18 @@ fn context_search_single(
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     // Identical to the CLI path: a `cce.metrics/v1` search event beside the store,
-    // so `cce dashboard` shows the agent's query and token savings.
-    let record = build_search_record(&index, &results, query, top_k, !no_graph, latency_ms, "mcp");
+    // so `cce dashboard` shows the agent's query and token savings. `detail` drives
+    // the L2 chunk_compression bucket (SPEC-V2.5 §2).
+    let record =
+        build_search_record(&index, &results, query, top_k, !no_graph, latency_ms, "mcp", detail);
     let query_id = write_search_event(&server.metrics_path(), &record);
 
     let rows: Vec<Row> = results.iter().map(Row::from_single).collect();
-    ToolOutput::ok(format_rows(&rows, query_id.as_deref(), max_tokens, index.chunks.len()))
+    ToolOutput::ok(format_rows(&rows, query_id.as_deref(), max_tokens, index.chunks.len(), detail))
 }
 
 /// Workspace retrieval: SPEC-V2.2 federation over the in-scope members.
+#[allow(clippy::too_many_arguments)]
 fn context_search_workspace(
     server: &McpServer,
     query: &str,
@@ -168,6 +221,7 @@ fn context_search_workspace(
     no_graph: bool,
     max_tokens: Option<usize>,
     package: Option<String>,
+    detail: DetailLevel,
 ) -> ToolOutput {
     let root = server.root();
     let manifest = match Manifest::load(&root) {
@@ -217,13 +271,21 @@ fn context_search_workspace(
             content: r.content.clone(),
         })
         .collect();
-    let record =
-        build_search_record(&combined, &namespaced, query, top_k, !no_graph, latency_ms, "mcp");
+    let record = build_search_record(
+        &combined,
+        &namespaced,
+        query,
+        top_k,
+        !no_graph,
+        latency_ms,
+        "mcp",
+        detail,
+    );
     let query_id = write_search_event(&server.metrics_path(), &record);
 
     let total_chunks: usize = members.iter().map(|m| m.index.chunks.len()).sum();
     let rows: Vec<Row> = results.iter().map(Row::from_fed).collect();
-    ToolOutput::ok(format_rows(&rows, query_id.as_deref(), max_tokens, total_chunks))
+    ToolOutput::ok(format_rows(&rows, query_id.as_deref(), max_tokens, total_chunks, detail))
 }
 
 /// Append a `search` event and return its id (the query-id), fail-open.
@@ -401,6 +463,165 @@ pub fn record_feedback(server: &McpServer, args: &Value) -> ToolOutput {
     }
 }
 
+// --- Layer 7: progressive disclosure (expand_chunk / related_context) ---
+
+/// Resolve the read-only index that expand/related work over: the single-repo store,
+/// or the member-namespaced union in workspace mode (so a chunk_id from a workspace
+/// `context_search` resolves). A missing index yields the friendly guidance string.
+fn working_index(server: &McpServer) -> Result<Index, String> {
+    if server.is_workspace() {
+        let root = server.root();
+        let manifest = Manifest::load(&root).map_err(|_| missing_index_message(true))?;
+        let members = load_member_stores(&root, &manifest, None)?;
+        Ok(combined_index(&members))
+    } else {
+        Index::load(&server.store_path()).map_err(|_| missing_index_message(false))
+    }
+}
+
+/// A one-line chunk header for expand/related output:
+/// `file:start-end (chunk_type/kind) #chunk_id`.
+fn chunk_header(c: &Chunk) -> String {
+    format!(
+        "{}:{}-{} ({}/{}) #{}",
+        c.file_path, c.start_line, c.end_line, c.chunk_type, c.kind, c.chunk_id
+    )
+}
+
+/// Render a titled group of `(chunk, body)` blocks (header + body each). Byte-pinned
+/// and deterministic — callers pass an already-sorted slice.
+fn render_group(title: &str, blocks: &[(&Chunk, String)]) -> String {
+    let mut out = title.to_string();
+    out.push('\n');
+    for (c, body) in blocks {
+        out.push('\n');
+        out.push_str(&chunk_header(c));
+        out.push('\n');
+        out.push_str(body);
+        if !body.ends_with('\n') {
+            out.push('\n');
+        }
+    }
+    out
+}
+
+/// The chunks of `file_path`, sorted deterministically by `(start_line, chunk_id)`.
+fn chunks_in_file<'a>(index: &'a Index, file_path: &str) -> Vec<&'a Chunk> {
+    let mut v: Vec<&Chunk> = index.chunks.iter().filter(|c| c.file_path == file_path).collect();
+    v.sort_by(|a, b| a.start_line.cmp(&b.start_line).then(a.chunk_id.cmp(&b.chunk_id)));
+    v
+}
+
+/// The chunks of every import-graph neighbour of `file_path`, sorted by
+/// `(file_path, start_line, chunk_id)`. `neighbors` unions successors (imports) AND
+/// predecessors (consumers / reverse edges), so callers see who depends on it too.
+fn neighbor_chunks<'a>(index: &'a Index, file_path: &str) -> Vec<&'a Chunk> {
+    let neighbors = index.graph.neighbors(file_path);
+    let mut v: Vec<&Chunk> =
+        index.chunks.iter().filter(|c| neighbors.iter().any(|n| n == &c.file_path)).collect();
+    v.sort_by(|a, b| {
+        a.file_path
+            .cmp(&b.file_path)
+            .then(a.start_line.cmp(&b.start_line))
+            .then(a.chunk_id.cmp(&b.chunk_id))
+    });
+    v
+}
+
+/// `expand_chunk` (SPEC-V2.5 §7): pull more of a chunk `context_search` returned.
+/// `scope=body` recovers the EXACT full bytes (round-trips `detail:full`);
+/// `scope=file` returns every chunk in the file; `scope=neighbors` returns chunks
+/// from import-graph-related files. All output is store-derived (already redacted).
+pub fn expand_chunk(server: &McpServer, args: &Value) -> ToolOutput {
+    let chunk_id = args.get("chunk_id").and_then(Value::as_str).unwrap_or("").trim();
+    if chunk_id.is_empty() {
+        return ToolOutput::err(
+            "expand_chunk requires a `chunk_id` (from a prior context_search result).",
+        );
+    }
+    let scope = args.get("scope").and_then(Value::as_str).unwrap_or("body").trim();
+    if !matches!(scope, "body" | "file" | "neighbors") {
+        return ToolOutput::err(format!(
+            "expand_chunk: unknown scope {scope:?}; use \"body\", \"file\", or \"neighbors\"."
+        ));
+    }
+    let index = match working_index(server) {
+        Ok(i) => i,
+        Err(msg) => return ToolOutput::ok(msg),
+    };
+    let Some(target) = index.chunks.iter().find(|c| c.chunk_id == chunk_id) else {
+        return ToolOutput::ok(stale_chunk_message(chunk_id));
+    };
+    match scope {
+        // scope=body recovers the EXACT full body (round-trips `detail:full`).
+        "body" => ToolOutput::ok(target.content.clone()),
+        "file" => {
+            let file_chunks = chunks_in_file(&index, &target.file_path);
+            let blocks: Vec<(&Chunk, String)> =
+                file_chunks.iter().map(|c| (*c, c.content.clone())).collect();
+            let title = format!("file {} — {} chunk(s):", target.file_path, blocks.len());
+            ToolOutput::ok(render_group(&title, &blocks))
+        }
+        _ => {
+            let ns = neighbor_chunks(&index, &target.file_path);
+            if ns.is_empty() {
+                return ToolOutput::ok(format!(
+                    "no import-graph neighbours for {} in the current index.",
+                    target.file_path
+                ));
+            }
+            let blocks: Vec<(&Chunk, String)> =
+                ns.iter().map(|c| (*c, c.content.clone())).collect();
+            let title = format!("neighbours of {} — {} chunk(s):", target.file_path, blocks.len());
+            ToolOutput::ok(render_group(&title, &blocks))
+        }
+    }
+}
+
+/// `related_context` (SPEC-V2.5 §7): import-graph neighbours (imports AND consumers)
+/// of a chunk, as COMPACT entries with chunk_ids to expand. Deterministic ordering.
+pub fn related_context(server: &McpServer, args: &Value) -> ToolOutput {
+    let chunk_id = args.get("chunk_id").and_then(Value::as_str).unwrap_or("").trim();
+    if chunk_id.is_empty() {
+        return ToolOutput::err(
+            "related_context requires a `chunk_id` (from a prior context_search result).",
+        );
+    }
+    let top_k = args
+        .get("top_k")
+        .and_then(Value::as_u64)
+        .map(|n| n as usize)
+        .filter(|n| *n > 0)
+        .unwrap_or(MCP_DEFAULT_TOP_K);
+    let index = match working_index(server) {
+        Ok(i) => i,
+        Err(msg) => return ToolOutput::ok(msg),
+    };
+    let Some(target) = index.chunks.iter().find(|c| c.chunk_id == chunk_id) else {
+        return ToolOutput::ok(stale_chunk_message(chunk_id));
+    };
+    let mut ns = neighbor_chunks(&index, &target.file_path);
+    ns.truncate(top_k);
+    if ns.is_empty() {
+        return ToolOutput::ok(format!("no import-graph neighbours for {}.", target.file_path));
+    }
+    let registry = Registry::default();
+    let blocks: Vec<(&Chunk, String)> = ns
+        .iter()
+        .map(|c| (*c, compress(&registry, &c.file_path, &c.content, DetailLevel::Compact)))
+        .collect();
+    let title =
+        format!("related to {} via import graph — {} chunk(s):", target.file_path, blocks.len());
+    ToolOutput::ok(render_group(&title, &blocks))
+}
+
+/// The message for a chunk_id absent from the current index (stale after re-index).
+fn stale_chunk_message(chunk_id: &str) -> String {
+    format!(
+        "no chunk with id {chunk_id} in the current index — it may be stale; re-run context_search."
+    )
+}
+
 // --- output formatting ---
 
 /// One row of the rendered result list (single-repo or federated).
@@ -408,6 +629,7 @@ struct Row<'a> {
     rank: usize,
     score: f64,
     package: Option<&'a str>,
+    chunk_id: &'a str,
     file_path: &'a str,
     start: usize,
     end: usize,
@@ -422,6 +644,7 @@ impl<'a> Row<'a> {
             rank: r.rank,
             score: r.score,
             package: None,
+            chunk_id: &r.chunk_id,
             file_path: &r.file_path,
             start: r.start_line,
             end: r.end_line,
@@ -435,6 +658,7 @@ impl<'a> Row<'a> {
             rank: r.rank,
             score: r.score,
             package: Some(&r.package),
+            chunk_id: &r.chunk_id,
             file_path: &r.file_path,
             start: r.start_line,
             end: r.end_line,
@@ -446,13 +670,16 @@ impl<'a> Row<'a> {
 }
 
 /// Render the results as the SPEC-MCP §1 text block: one header line per result —
-/// `#. [score] <package · >file:start-end (chunk_type/kind)` — followed by the
-/// chunk body, trimmed to `max_tokens` if given, then a `query_id` line.
+/// `#. [score] <package · >file:start-end (chunk_type/kind) #chunk_id` — followed by
+/// the chunk body **served at `detail`** (L2 chunk compression, SPEC-V2.5 §2),
+/// trimmed to `max_tokens` if given, then the `query_id` + progressive-disclosure
+/// hint. The `#chunk_id` is what the agent passes to `expand_chunk`/`related_context`.
 fn format_rows(
     rows: &[Row],
     query_id: Option<&str>,
     max_tokens: Option<usize>,
     total_chunks: usize,
+    detail: DetailLevel,
 ) -> String {
     if rows.is_empty() {
         let mut s = format!(
@@ -465,6 +692,7 @@ fn format_rows(
         return s;
     }
 
+    let registry = Registry::default();
     let mut out = String::new();
     let mut used = 0usize;
     let mut truncated = false;
@@ -474,7 +702,7 @@ fn format_rows(
             None => String::new(),
         };
         out.push_str(&format!(
-            "{:>2}. [{}] {}{}:{}-{} ({}/{})\n",
+            "{:>2}. [{}] {}{}:{}-{} ({}/{}) #{}\n",
             row.rank,
             format6(row.score),
             pkg,
@@ -482,15 +710,19 @@ fn format_rows(
             row.start,
             row.end,
             row.chunk_type,
-            row.kind
+            row.kind,
+            row.chunk_id
         ));
+        // Serve the body at the requested detail (L2). The store keeps the full body;
+        // this is a serialization-time transform only. `expand_chunk` recovers it.
+        let served = compress(&registry, row.file_path, row.content, detail);
         let body = match max_tokens {
             Some(max) => {
-                let (b, cut) = trim_to_tokens(row.content, max.saturating_sub(used));
+                let (b, cut) = trim_to_tokens(&served, max.saturating_sub(used));
                 truncated |= cut;
                 b
             }
-            None => row.content.to_string(),
+            None => served,
         };
         out.push_str(&body);
         if !body.ends_with('\n') {
@@ -507,6 +739,12 @@ fn format_rows(
     }
     if truncated {
         out.push_str("… (context truncated to max_tokens)\n\n");
+    }
+    if detail != DetailLevel::Full {
+        out.push_str(
+            "Bodies shown compact. expand_chunk(chunk_id, scope=body|file|neighbors) for more; \
+             related_context(chunk_id) for import-graph neighbours.\n",
+        );
     }
     if let Some(id) = query_id {
         out.push_str(&format!("query_id: {id}\n"));
@@ -555,20 +793,35 @@ mod tests {
     #[test]
     fn tool_definitions_match_the_spec_contract() {
         let defs = tool_definitions();
-        assert_eq!(defs.len(), 3);
+        assert_eq!(defs.len(), 5);
         assert_eq!(defs[0]["name"], "context_search");
         assert_eq!(defs[1]["name"], "index_status");
         assert_eq!(defs[2]["name"], "record_feedback");
+        assert_eq!(defs[3]["name"], "expand_chunk");
+        assert_eq!(defs[4]["name"], "related_context");
 
-        // context_search schema: required query, top_k default 8, no_graph default false.
+        // context_search schema: required query, top_k default 8, no_graph default
+        // false, and the new L2 `detail` enum (SPEC-V2.5 §6).
         let cs = &defs[0]["inputSchema"];
         assert_eq!(cs["required"], json!(["query"]));
         assert_eq!(cs["properties"]["top_k"]["default"], 8);
         assert_eq!(cs["properties"]["no_graph"]["default"], false);
+        assert_eq!(cs["properties"]["detail"]["enum"], json!(["signature", "compact", "full"]));
         assert!(defs[0]["description"].as_str().unwrap().contains("PREFERRED"));
 
         // record_feedback requires query_id + helpful.
         assert_eq!(defs[2]["inputSchema"]["required"], json!(["query_id", "helpful"]));
+
+        // expand_chunk: required chunk_id, scope enum with default "body".
+        let ec = &defs[3]["inputSchema"];
+        assert_eq!(ec["required"], json!(["chunk_id"]));
+        assert_eq!(ec["properties"]["scope"]["enum"], json!(["body", "file", "neighbors"]));
+        assert_eq!(ec["properties"]["scope"]["default"], "body");
+
+        // related_context: required chunk_id, top_k default 8.
+        let rc = &defs[4]["inputSchema"];
+        assert_eq!(rc["required"], json!(["chunk_id"]));
+        assert_eq!(rc["properties"]["top_k"]["default"], 8);
     }
 
     #[test]
@@ -587,17 +840,18 @@ mod tests {
 
     #[test]
     fn format_rows_empty_reports_chunk_count_and_query_id() {
-        let s = format_rows(&[], Some("abc123def456"), None, 7);
+        let s = format_rows(&[], Some("abc123def456"), None, 7, DetailLevel::Compact);
         assert!(s.contains("The index has 7 chunk(s)"));
         assert!(s.contains("query_id: abc123def456"));
     }
 
     #[test]
-    fn format_rows_renders_header_body_and_feedback_hint() {
+    fn format_rows_full_renders_header_with_chunk_id_body_and_feedback_hint() {
         let rows = vec![Row {
             rank: 1,
             score: 0.5,
             package: None,
+            chunk_id: "cafef00dcafef00d",
             file_path: "auth.py",
             start: 1,
             end: 3,
@@ -605,11 +859,39 @@ mod tests {
             kind: "function_definition",
             content: "def hash_password(pw):\n    return pw\n",
         }];
-        let s = format_rows(&rows, Some("id0000000000"), None, 5);
-        assert!(s.contains(" 1. [0.500000] auth.py:1-3 (function/function_definition)"));
+        // detail:full serves the whole body and shows the chunk_id for expansion.
+        let s = format_rows(&rows, Some("id0000000000"), None, 5, DetailLevel::Full);
+        assert!(s.contains(
+            " 1. [0.500000] auth.py:1-3 (function/function_definition) #cafef00dcafef00d"
+        ));
         assert!(s.contains("def hash_password"));
+        assert!(s.contains("return pw"));
         assert!(s.contains("query_id: id0000000000"));
         assert!(s.contains("record_feedback"));
+    }
+
+    #[test]
+    fn format_rows_compact_reduces_body_and_hints_expansion() {
+        let rows = vec![Row {
+            rank: 1,
+            score: 0.5,
+            package: None,
+            chunk_id: "cafef00dcafef00d",
+            file_path: "auth.py",
+            start: 1,
+            end: 4,
+            chunk_type: "function",
+            kind: "function_definition",
+            content:
+                "def hash_password(pw):\n    salt = gen()\n    digest = h(pw)\n    return digest",
+        }];
+        let s = format_rows(&rows, Some("id0000000000"), None, 5, DetailLevel::Compact);
+        // Signature + first body line + elision; the deeper lines are elided.
+        assert!(s.contains("def hash_password(pw):"), "got: {s}");
+        assert!(s.contains("salt = gen()"), "got: {s}");
+        assert!(s.contains("… (+2 lines)"), "got: {s}");
+        assert!(!s.contains("return digest"), "compact leaked the elided body: {s}");
+        assert!(s.contains("expand_chunk(chunk_id"), "got: {s}");
     }
 
     #[test]
@@ -618,6 +900,7 @@ mod tests {
             rank: 1,
             score: 0.25,
             package: Some("billing"),
+            chunk_id: "0011223344556677",
             file_path: "lib/billing.rb",
             start: 2,
             end: 4,
@@ -625,7 +908,7 @@ mod tests {
             kind: "method",
             content: "def charge; end\n",
         }];
-        let s = format_rows(&rows, None, None, 3);
+        let s = format_rows(&rows, None, None, 3, DetailLevel::Full);
         assert!(s.contains("billing · lib/billing.rb:2-4"), "got: {s}");
     }
 

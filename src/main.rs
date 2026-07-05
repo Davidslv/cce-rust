@@ -536,9 +536,19 @@ fn cmd_search(
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     // Best-effort metrics: a search event (DASHBOARD-SPEC §2.1). The write is
-    // fail-open, so it never affects the result or the exit code.
-    let record =
-        build_search_record(&index, &results, query, top_k, graph_enabled, latency_ms, "cli");
+    // fail-open, so it never affects the result or the exit code. `cce search`
+    // serves whole chunk bodies (detail:full), so the L2 chunk_compression bucket
+    // is zero here — compression is the agent-facing `context_search` path.
+    let record = build_search_record(
+        &index,
+        &results,
+        query,
+        top_k,
+        graph_enabled,
+        latency_ms,
+        "cli",
+        cce::compress::DetailLevel::Full,
+    );
     let clock = SystemClock;
     let ids = HexIdSource::default();
     let writer =

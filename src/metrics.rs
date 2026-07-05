@@ -94,6 +94,12 @@ pub struct SearchRecord {
     pub served_tokens: u64,
     pub tokens_saved: u64,
     pub savings_ratio: f64,
+    /// L2 chunk-compression accounting (SPEC-V2.5 §2). `chunk_baseline_tokens` is
+    /// the full chunk bodies that would have been sent; `chunk_saved_tokens` is what
+    /// compression removed. Both feed the `chunk_compression` ledger bucket. Zero
+    /// when the results were served at `detail:full`.
+    pub chunk_baseline_tokens: u64,
+    pub chunk_saved_tokens: u64,
     pub top_score: f64,
     pub mean_score: f64,
     pub empty: bool,
@@ -150,12 +156,17 @@ impl<'a> MetricsWriter<'a> {
             return None;
         }
         let id = self.ids.next_id();
-        // SPEC-V2.5 §3: the seven-bucket ledger, additive. Only `retrieval` is
-        // populated in Stage ① (from the Layer 1 accounting); the other six ship
-        // present-and-zero, ready for later stages. The legacy top-level
+        // SPEC-V2.5 §3: the seven-bucket ledger, additive. Stage ② populates
+        // `retrieval` (Layer 1) AND `chunk_compression` (Layer 2); the other five
+        // ship present-and-zero, ready for later stages. The legacy top-level
         // `baseline_tokens`/`served_tokens`/`tokens_saved`/`savings_ratio` fields
         // stay for backward compatibility with the v2.4 dashboard aggregator.
-        let savings = SavingsBuckets::retrieval_only(rec.tokens_saved, rec.baseline_tokens);
+        let savings = SavingsBuckets::layers_1_2(
+            rec.tokens_saved,
+            rec.baseline_tokens,
+            rec.chunk_saved_tokens,
+            rec.chunk_baseline_tokens,
+        );
         let obj = serde_json::json!({
             "schema": METRICS_SCHEMA,
             "event": "search",
@@ -575,6 +586,8 @@ mod tests {
                 served_tokens: 8000,
                 tokens_saved: 32000,
                 savings_ratio: 0.8,
+                chunk_baseline_tokens: 8000,
+                chunk_saved_tokens: 6000,
                 top_score: 0.9,
                 mean_score: 0.7,
                 empty: false,
@@ -654,6 +667,8 @@ mod tests {
             served_tokens: 0,
             tokens_saved: 0,
             savings_ratio: 0.0,
+            chunk_baseline_tokens: 0,
+            chunk_saved_tokens: 0,
             top_score: 0.0,
             mean_score: 0.0,
             empty: true,

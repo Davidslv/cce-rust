@@ -182,6 +182,8 @@ impl McpServer {
             "context_search" => tools::context_search(self, &args),
             "index_status" => tools::index_status(self),
             "record_feedback" => tools::record_feedback(self, &args),
+            "expand_chunk" => tools::expand_chunk(self, &args),
+            "related_context" => tools::related_context(self, &args),
             other => {
                 return Ok(unknown_tool_result(other));
             }
@@ -250,7 +252,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_returns_the_three_tools() {
+    fn tools_list_returns_the_five_tools_in_fixed_order() {
         let tmp = tempfile::tempdir().unwrap();
         let s = server_for(tmp.path());
         let resp = s.handle_line(r#"{"id":2,"method":"tools/list"}"#).unwrap();
@@ -261,7 +263,16 @@ mod tests {
             .iter()
             .map(|t| t["name"].as_str().unwrap())
             .collect();
-        assert_eq!(names, vec!["context_search", "index_status", "record_feedback"]);
+        assert_eq!(
+            names,
+            vec![
+                "context_search",
+                "index_status",
+                "record_feedback",
+                "expand_chunk",
+                "related_context"
+            ]
+        );
     }
 
     #[test]

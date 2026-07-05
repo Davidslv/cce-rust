@@ -76,6 +76,29 @@ impl SavingsBuckets {
         }
     }
 
+    /// A ledger with the `retrieval` (Layer 1) AND `chunk_compression` (Layer 2)
+    /// buckets populated (Stage ②); the other five present-and-zero. A search event
+    /// records this so `cce savings` and the dashboard attribute each layer's saving
+    /// separately — retrieval saves vs whole files, chunk compression vs full chunks.
+    pub fn layers_1_2(
+        retrieval_saved: u64,
+        retrieval_baseline: u64,
+        chunk_saved: u64,
+        chunk_baseline: u64,
+    ) -> SavingsBuckets {
+        SavingsBuckets {
+            retrieval: Bucket {
+                saved_tokens: retrieval_saved,
+                baseline_tokens: retrieval_baseline,
+            },
+            chunk_compression: Bucket {
+                saved_tokens: chunk_saved,
+                baseline_tokens: chunk_baseline,
+            },
+            ..Default::default()
+        }
+    }
+
     /// Parse the `savings` object from a raw event value (read side, additive).
     ///
     /// If the event carries a `savings` object, each of the seven buckets is read

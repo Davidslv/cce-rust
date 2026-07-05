@@ -80,6 +80,17 @@ impl LanguagePack for RubyPack {
         &["call"]
     }
 
+    fn body_node_types(&self) -> &'static [&'static str] {
+        // Methods and classes/modules alike nest their body in a `body_statement`.
+        &["body_statement"]
+    }
+
+    fn doc_node_types(&self) -> &'static [&'static str] {
+        // A leading `# …` doc line inside the body (Ruby's `#` docs conventionally
+        // sit ABOVE the def, i.e. outside the chunk span, so this rarely fires).
+        &["comment"]
+    }
+
     fn extract_imports(&self, root: Node, src: &[u8]) -> Vec<String> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();

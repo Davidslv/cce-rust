@@ -70,6 +70,28 @@ pub trait LanguagePack {
     /// so the grammar-binding lint (Layer 2) can verify they are real node kinds.
     fn import_node_types(&self) -> &'static [&'static str];
 
+    /// AST node-type strings that are the *body* of a definition — the block or
+    /// member list a declaration's header stops before. L2 chunk compression
+    /// (SPEC-V2.5 §2) forms the signature view by keeping the bytes from a
+    /// definition node's start up to its first body child, and eliding the rest.
+    /// e.g. Rust `block`/`declaration_list`, Python `block`, Ruby `body_statement`.
+    /// Declared here (not hard-coded in the compressor) so the grammar-binding lint
+    /// verifies they are real node kinds. Default: none (chunk compression then
+    /// falls back to the language-neutral first-line rule — see `crate::compress`).
+    fn body_node_types(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// AST node-type strings that count as a *leading doc* when one is the first
+    /// named element inside a definition body — the docstring / doc-comment L2
+    /// keeps in the compact view (SPEC-V2.5 §2). A docstring wrapped in an
+    /// `expression_statement` (Python) is unwrapped one level before matching, so a
+    /// pack declares the inner kind (`string`). e.g. Ruby/JS/TS/C `comment`, Rust
+    /// `line_comment`/`block_comment`, Python `string`. Default: none.
+    fn doc_node_types(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Ordered, de-duplicated module/include names imported by `source`.
     /// Must never panic; on any trouble it returns what it has so far.
     fn extract_imports(&self, root: Node, source: &[u8]) -> Vec<String>;

@@ -89,6 +89,61 @@ pub const GRAPH_MAX_BONUS_MEMBERS: usize = 2;
 /// Max chunks pulled from each cross-member target during graph expansion.
 pub const GRAPH_BONUS_MEMBER_CHUNKS: usize = 2;
 
+// --- Retrieval / L2 chunk compression (SPEC-V2.5 §2, §5) ---
+
+/// The default L2 detail level `context_search` serves at when neither the tool
+/// call nor `.cce/config` overrides it (SPEC-V2.5 §5, `retrieval.detail`). Chosen
+/// to save by default: compact = signature + doc + first body line + elision.
+pub const DEFAULT_RETRIEVAL_DETAIL: crate::compress::DetailLevel =
+    crate::compress::DetailLevel::Compact;
+
+/// The `retrieval.*` runtime configuration (SPEC-V2.5 §5). Only `detail` is wired
+/// in Stage ② (L2); the other keys (`top_k`, `confidence_threshold`, `max_tokens`)
+/// remain tool inputs / later stages. All keys optional; absent ⇒ the default.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RetrievalConfig {
+    pub detail: crate::compress::DetailLevel,
+}
+
+impl Default for RetrievalConfig {
+    fn default() -> Self {
+        RetrievalConfig { detail: DEFAULT_RETRIEVAL_DETAIL }
+    }
+}
+
+impl RetrievalConfig {
+    /// Parse from the `.cce/config` YAML text. Tolerant: no `retrieval:` block, an
+    /// absent `detail`, or an unrecognised value all fall back to the default.
+    pub fn from_yaml(text: &str) -> RetrievalConfig {
+        #[derive(serde::Deserialize)]
+        struct RawRetrieval {
+            detail: Option<String>,
+        }
+        #[derive(serde::Deserialize)]
+        struct RawRoot {
+            retrieval: Option<RawRetrieval>,
+        }
+        let mut cfg = RetrievalConfig::default();
+        if let Ok(raw) = serde_yaml::from_str::<RawRoot>(text) {
+            if let Some(d) = raw.retrieval.and_then(|r| r.detail) {
+                if let Some(level) = crate::compress::DetailLevel::parse(&d) {
+                    cfg.detail = level;
+                }
+            }
+        }
+        cfg
+    }
+
+    /// Load the retrieval config for `root`: the per-project `.cce/config` if it
+    /// exists and parses, else the default. Offline, read-only.
+    pub fn load(root: &std::path::Path) -> RetrievalConfig {
+        std::fs::read_to_string(root.join(".cce").join("config"))
+            .ok()
+            .map(|t| RetrievalConfig::from_yaml(&t))
+            .unwrap_or_default()
+    }
+}
+
 /// Selects the embedding backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbedderKind {
@@ -142,5 +197,46 @@ mod tests {
     fn config_default_uses_hash_embedder() {
         let cfg = Config::default();
         assert_eq!(cfg.embedder, EmbedderKind::Hash);
+    }
+
+    #[test]
+    fn retrieval_default_detail_is_compact() {
+        use crate::compress::DetailLevel;
+        assert_eq!(RetrievalConfig::default().detail, DetailLevel::Compact);
+        assert_eq!(DEFAULT_RETRIEVAL_DETAIL, DetailLevel::Compact);
+    }
+
+    #[test]
+    fn retrieval_config_reads_detail_and_tolerates_junk() {
+        use crate::compress::DetailLevel;
+        assert_eq!(
+            RetrievalConfig::from_yaml("retrieval:\n  detail: signature\n").detail,
+            DetailLevel::Signature
+        );
+        assert_eq!(
+            RetrievalConfig::from_yaml("retrieval:\n  detail: full\n").detail,
+            DetailLevel::Full
+        );
+        // Absent block, absent key, and an unknown value all fall back to compact.
+        assert_eq!(RetrievalConfig::from_yaml("sync:\n  lfs: true\n").detail, DetailLevel::Compact);
+        assert_eq!(RetrievalConfig::from_yaml("retrieval: {}\n").detail, DetailLevel::Compact);
+        assert_eq!(
+            RetrievalConfig::from_yaml("retrieval:\n  detail: bogus\n").detail,
+            DetailLevel::Compact
+        );
+        assert_eq!(RetrievalConfig::from_yaml("not: yaml: [").detail, DetailLevel::Compact);
+    }
+
+    #[test]
+    fn retrieval_config_load_from_disk_and_absent() {
+        use crate::compress::DetailLevel;
+        let tmp = tempfile::tempdir().unwrap();
+        // Absent ⇒ default.
+        assert_eq!(RetrievalConfig::load(tmp.path()).detail, DetailLevel::Compact);
+        // Present ⇒ honoured.
+        let cce = tmp.path().join(".cce");
+        std::fs::create_dir_all(&cce).unwrap();
+        std::fs::write(cce.join("config"), "retrieval:\n  detail: signature\n").unwrap();
+        assert_eq!(RetrievalConfig::load(tmp.path()).detail, DetailLevel::Signature);
     }
 }

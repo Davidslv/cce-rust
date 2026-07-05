@@ -16,9 +16,11 @@
 //! - It does NOT walk, chunk, embed corpora, or persist.
 
 use crate::chunker::Chunk;
+use crate::compress::{compress, DetailLevel};
 use crate::config::*;
 use crate::embedder::{cosine, score_key, Embedder};
 use crate::metrics::SearchRecord;
+use crate::packs::Registry;
 use crate::store::Index;
 use crate::tokenizer::{estimate_tokens, tokenize};
 use crate::vector_store::rank_by_cosine;
@@ -100,6 +102,13 @@ fn file_hints(query: &str) -> Vec<String> {
 /// `source` tags who issued the search — `"cli"` (the `cce search` path) or
 /// `"mcp"` (the agent's `context_search` tool) — feeding the dashboard's
 /// agent-vs-human split (v2.4.1).
+///
+/// `detail` is the L2 chunk-compression level the results are SERVED at
+/// (SPEC-V2.5 §2). It drives the `chunk_compression` ledger bucket: the served
+/// (compressed) tokens are compared against the full chunk bodies with the same
+/// `cce.tokens/v1` counter, so `chunk_compression.saved = full_tokens −
+/// served_tokens`. At `Full`, nothing is compressed, so the bucket is zeroed.
+#[allow(clippy::too_many_arguments)]
 pub fn build_search_record(
     index: &Index,
     results: &[SearchResult],
@@ -108,6 +117,7 @@ pub fn build_search_record(
     graph_enabled: bool,
     latency_ms: f64,
     source: &str,
+    detail: DetailLevel,
 ) -> SearchRecord {
     // SPEC-V2.5 §2 (Layer 1) + §4: both the baseline (whole returned files, deduped)
     // and the served tokens are counted with the ONE savings estimator
@@ -131,6 +141,26 @@ pub fn build_search_record(
     };
     let empty = result_count == 0;
     let low_confidence = !empty && top_score < LOW_CONFIDENCE_THRESHOLD;
+
+    // SPEC-V2.5 §2 (Layer 2): the `chunk_compression` bucket. Baseline = the full
+    // chunk bodies we WOULD have sent; served = the compressed bodies we actually
+    // sent at `detail`. Counted with the same `cce.tokens/v1` estimator. At `Full`
+    // no compression is applied, so the bucket is zero (nothing was saved here).
+    let (chunk_baseline_tokens, chunk_saved_tokens) = if detail == DetailLevel::Full {
+        (0, 0)
+    } else {
+        let registry = Registry::default();
+        let mut base = 0u64;
+        let mut saved = 0u64;
+        for r in results {
+            let full = estimate_tokens(&r.content);
+            let served = estimate_tokens(&compress(&registry, &r.file_path, &r.content, detail));
+            base = base.saturating_add(full);
+            saved = saved.saturating_add(full.saturating_sub(served));
+        }
+        (base, saved)
+    };
+
     SearchRecord {
         query: query.to_string(),
         top_k,
@@ -141,6 +171,8 @@ pub fn build_search_record(
         served_tokens,
         tokens_saved,
         savings_ratio,
+        chunk_baseline_tokens,
+        chunk_saved_tokens,
         top_score,
         mean_score,
         empty,

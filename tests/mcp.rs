@@ -93,14 +93,30 @@ fn handshake_list_and_search_over_a_fixture_index_logs_metrics() {
     assert_eq!(init["result"]["serverInfo"]["name"], "cce");
     assert!(init["result"]["capabilities"]["tools"].is_object());
 
-    // tools/list — exactly the three tools, in order, with the schemas.
+    // tools/list — exactly the five tools, in fixed order, with the schemas.
     let list = by_id(&resps, 2);
     let tools = list["result"]["tools"].as_array().unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-    assert_eq!(names, vec!["context_search", "index_status", "record_feedback"]);
+    assert_eq!(
+        names,
+        vec![
+            "context_search",
+            "index_status",
+            "record_feedback",
+            "expand_chunk",
+            "related_context"
+        ]
+    );
     assert_eq!(tools[0]["inputSchema"]["required"], serde_json::json!(["query"]));
     assert_eq!(tools[0]["inputSchema"]["properties"]["top_k"]["default"], 8);
+    assert_eq!(
+        tools[0]["inputSchema"]["properties"]["detail"]["enum"],
+        serde_json::json!(["signature", "compact", "full"])
+    );
     assert!(tools[0]["description"].as_str().unwrap().contains("PREFERRED"));
+    // The Layer-7 tools carry their pinned schemas.
+    assert_eq!(tools[3]["inputSchema"]["properties"]["scope"]["default"], "body");
+    assert_eq!(tools[4]["inputSchema"]["required"], serde_json::json!(["chunk_id"]));
 
     // context_search
     let search = by_id(&resps, 3);
@@ -115,6 +131,99 @@ fn handshake_list_and_search_over_a_fixture_index_logs_metrics() {
     // A `search` event was logged for the dashboard.
     let log = std::fs::read_to_string(tmp.path().join(".cce").join("metrics.jsonl")).unwrap();
     assert!(log.contains("\"event\":\"search\""), "no search event logged: {log}");
+}
+
+/// The 16-hex `#chunk_id` on the first result header line mentioning `file_hint`.
+fn chunk_id_for(text: &str, file_hint: &str) -> String {
+    for line in text.lines() {
+        if line.contains(file_hint) {
+            if let Some(pos) = line.rfind('#') {
+                let id: String =
+                    line[pos + 1..].chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+                if id.len() == 16 {
+                    return id;
+                }
+            }
+        }
+    }
+    panic!("no chunk_id for {file_hint} in:\n{text}");
+}
+
+#[test]
+fn context_search_compact_then_expand_chunk_round_trips_to_full() {
+    // SPEC-V2.5 §2/§7: context_search serves compact + a chunk_id; expand_chunk
+    // (scope=body) recovers the EXACT full body the store holds.
+    let tmp = tempfile::tempdir().unwrap();
+    write_tiny_repo(tmp.path());
+    index_dir(tmp.path());
+    let dir = tmp.path().to_string_lossy().to_string();
+
+    // Compact search: the body is reduced but the chunk_id is present for expansion.
+    let input = "{\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"context_search\",\"arguments\":{\"query\":\"process payment amount\",\"no_graph\":true,\"detail\":\"compact\"}}}\n";
+    let out = drive(&["mcp", "--dir", &dir], input, &[]);
+    let resps = responses(&out);
+    let text = by_id(&resps, 1)["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("payments.py"), "got: {text}");
+    assert!(text.contains("def process_payment(amount):"), "compact signature missing: {text}");
+    // The compact footer advertises expansion.
+    assert!(text.contains("expand_chunk(chunk_id"), "no expansion hint: {text}");
+
+    let id = chunk_id_for(text, "payments.py");
+
+    // expand_chunk(body) returns the exact stored full body — byte-for-byte.
+    let einput = format!(
+        "{{\"id\":2,\"method\":\"tools/call\",\"params\":{{\"name\":\"expand_chunk\",\"arguments\":{{\"chunk_id\":\"{id}\",\"scope\":\"body\"}}}}}}\n"
+    );
+    let eout = drive(&["mcp", "--dir", &dir], &einput, &[]);
+    let eresps = responses(&eout);
+    let body = by_id(&eresps, 2)["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(body, "def process_payment(amount):\n    return amount");
+    assert_eq!(by_id(&eresps, 2)["result"]["isError"], false);
+}
+
+#[test]
+fn related_context_returns_import_graph_neighbours() {
+    // payments.py imports auth.py; related_context on a payments chunk surfaces the
+    // auth.py neighbour (SPEC-V2.5 §7), deterministically.
+    let tmp = tempfile::tempdir().unwrap();
+    write_tiny_repo(tmp.path());
+    index_dir(tmp.path());
+    let dir = tmp.path().to_string_lossy().to_string();
+
+    let input = "{\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"context_search\",\"arguments\":{\"query\":\"process payment amount\",\"no_graph\":true}}}\n";
+    let out = drive(&["mcp", "--dir", &dir], input, &[]);
+    let text =
+        by_id(&responses(&out), 1)["result"]["content"][0]["text"].as_str().unwrap().to_string();
+    let id = chunk_id_for(&text, "payments.py");
+
+    let rinput = format!(
+        "{{\"id\":2,\"method\":\"tools/call\",\"params\":{{\"name\":\"related_context\",\"arguments\":{{\"chunk_id\":\"{id}\"}}}}}}\n"
+    );
+    let rout = drive(&["mcp", "--dir", &dir], &rinput, &[]);
+    let rresps = responses(&rout);
+    let rtext = by_id(&rresps, 2)["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(rtext.contains("related to payments.py via import graph"), "got: {rtext}");
+    assert!(rtext.contains("auth.py"), "neighbour auth.py missing: {rtext}");
+    assert!(rtext.contains("hash_password"), "neighbour body missing: {rtext}");
+
+    // Deterministic across runs.
+    let rout2 = drive(&["mcp", "--dir", &dir], &rinput, &[]);
+    let rresps2 = responses(&rout2);
+    let rtext2 = by_id(&rresps2, 2)["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(rtext, rtext2);
+}
+
+#[test]
+fn expand_chunk_unknown_id_is_friendly_not_a_crash() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_tiny_repo(tmp.path());
+    index_dir(tmp.path());
+    let input = "{\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"expand_chunk\",\"arguments\":{\"chunk_id\":\"deadbeefdeadbeef\"}}}\n";
+    let out = drive(&["mcp", "--dir", &tmp.path().to_string_lossy()], input, &[]);
+    let resps = responses(&out);
+    let text = by_id(&resps, 1)["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("no chunk with id deadbeefdeadbeef"), "got: {text}");
+    assert_eq!(by_id(&resps, 1)["result"]["isError"], false);
 }
 
 #[test]

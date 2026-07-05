@@ -51,6 +51,18 @@ impl LanguagePack for PythonPack {
         &["import_statement", "import_from_statement"]
     }
 
+    fn body_node_types(&self) -> &'static [&'static str] {
+        // Both `function_definition` and `class_definition` nest their body in a
+        // `block` (SPEC-V2.5 §2 signature extraction stops before it).
+        &["block"]
+    }
+
+    fn doc_node_types(&self) -> &'static [&'static str] {
+        // A Python docstring is a `string` wrapped in an `expression_statement`;
+        // the compressor unwraps the statement before matching this inner kind.
+        &["string"]
+    }
+
     fn extract_imports(&self, root: Node, src: &[u8]) -> Vec<String> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
