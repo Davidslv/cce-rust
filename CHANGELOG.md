@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.3] - 2026-07-05
+
+### Added
+- **Turn summarization (L6)** — a `summarize_context(scope?)` MCP tool returning a **deterministic,
+  structured** digest of the session so far (files · chunks · queries · decisions touched — deduped,
+  sorted, capped with `… (+N more)`) — a structured ledger digest, NOT an LLM summary, so it stays
+  byte-deterministic and offline. Backed by an in-memory, wall-clock-free per-session ledger.
+  `summarization.auto_tokens` config (default null = manual-only). `tools/list` is now nine tools.
+  Additive; `conformance.json` and the Sync artifact unchanged.
+
 ## [2.5.2] - 2026-07-05
 
 ### Added
