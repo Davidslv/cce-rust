@@ -155,25 +155,25 @@ fn chunk_from_value(v: &Value) -> Result<Chunk, String> {
 ///
 /// - **nodes** = every indexed file (the keys of `file_tokens`), each `{"id": path}`,
 ///   sorted by `id`.
-/// - **edges** = every `file -> imported-module` pair from `file_imports`, each
-///   `{"source": file, "target": module, "type": "import"}`, sorted by
-///   `(source, target, type)`. Serializing the RAW imports (not the resolved
-///   file→file edges) keeps `file_imports` losslessly reconstructable on import.
+/// - **edges** = the **resolved** `file → file` import edges (base SPEC §6.7): an
+///   edge `A → B` exists only when a module imported by `A` resolves — by the same
+///   stem-matching the retriever's graph expansion uses — to a corpus file `B`.
+///   External / unresolved imports (e.g. `os`, `fs`, `std`) produce NO edge. Each
+///   edge is `{"source": A, "target": B, "type": "import"}`, sorted by
+///   `(source, target, type)`.
 fn graph_value(
     file_imports: &BTreeMap<String, Vec<String>>,
     file_tokens: &BTreeMap<String, usize>,
 ) -> Value {
-    let nodes: Vec<Value> = file_tokens.keys().map(|id| json!({ "id": id })).collect();
+    let files: Vec<String> = file_tokens.keys().cloned().collect();
+    let nodes: Vec<Value> = files.iter().map(|id| json!({ "id": id })).collect();
 
-    let mut edges: Vec<(String, String)> = Vec::new();
-    for (file, modules) in file_imports {
-        for m in modules {
-            edges.push((file.clone(), m.clone()));
-        }
-    }
-    // Sort by (source, target); the type is constant, so it does not affect order.
-    edges.sort();
-    let edges: Vec<Value> = edges
+    // Resolve module names to corpus files exactly as the query-time graph does;
+    // out_pairs yields resolved (source, target) edges in sorted order.
+    let graph = crate::graph_store::Graph::build(file_imports, &files);
+    let mut pairs = graph.out_pairs();
+    pairs.sort();
+    let edges: Vec<Value> = pairs
         .into_iter()
         .map(|(source, target)| json!({ "source": source, "target": target, "type": EDGE_TYPE }))
         .collect();
@@ -181,8 +181,21 @@ fn graph_value(
     json!({ "edges": edges, "nodes": nodes })
 }
 
-/// Reconstruct `file_imports` from the graph value's `edges` (grouping by
-/// `source`, preserving the sorted edge order).
+/// The filename stem of a path (basename without its last extension), used to turn
+/// a resolved `target` file back into a module name the resolver re-resolves to it.
+fn file_stem(path: &str) -> String {
+    let base = path.rsplit('/').next().unwrap_or(path);
+    match base.rsplit_once('.') {
+        Some((stem, _)) if !stem.is_empty() => stem.to_string(),
+        _ => base.to_string(),
+    }
+}
+
+/// Reconstruct `file_imports` from the graph value's resolved `edges`, grouping by
+/// `source` with each `target` reduced to a module name (its file stem). Because the
+/// serialized edges are already resolved, re-`build`ing the graph over these stems
+/// yields the identical file→file edges — so search-expansion behaviour is preserved
+/// (external imports that produced no edge are simply absent, which changes nothing).
 fn imports_from_graph(graph: &Value) -> Result<BTreeMap<String, Vec<String>>, String> {
     let edges = graph
         .get("edges")
@@ -198,7 +211,7 @@ fn imports_from_graph(graph: &Value) -> Result<BTreeMap<String, Vec<String>>, St
             .get("target")
             .and_then(|x| x.as_str())
             .ok_or_else(|| "edge missing string `target`".to_string())?;
-        out.entry(source.to_string()).or_default().push(target.to_string());
+        out.entry(source.to_string()).or_default().push(file_stem(target));
     }
     Ok(out)
 }
@@ -470,8 +483,9 @@ mod tests {
     }
 
     #[test]
-    fn graph_line_is_edges_then_nodes_sorted() {
-        // The base fixture: payments.py imports auth; other files have no imports.
+    fn graph_line_edges_are_resolved_file_to_file() {
+        // base fixture: payments.py imports `auth` (resolves to auth.py) and auth.py
+        // imports `hashlib` (external → NO edge).
         let a = built();
         let text = String::from_utf8(a.to_bytes()).unwrap();
         let graph_line = text.lines().nth(a.manifest.chunk_count + 1).unwrap();
@@ -483,11 +497,25 @@ mod tests {
         sorted.sort_unstable();
         assert_eq!(node_ids, sorted);
         assert!(node_ids.contains(&"auth.py"));
-        // The one raw import edge payments.py -> auth, typed "import".
+        // Exactly one RESOLVED edge: payments.py -> auth.py; the external hashlib
+        // import produces none.
         let edges = g["edges"].as_array().unwrap();
-        let e = edges.iter().find(|e| e["source"] == "payments.py").unwrap();
-        assert_eq!(e["target"], "auth");
-        assert_eq!(e["type"], "import");
+        assert_eq!(edges.len(), 1, "only the resolved edge is emitted");
+        assert_eq!(edges[0]["source"], "payments.py");
+        assert_eq!(edges[0]["target"], "auth.py");
+        assert_eq!(edges[0]["type"], "import");
+    }
+
+    #[test]
+    fn external_imports_produce_no_edges() {
+        // The samples corpus: every import (os, fs, std, …) is external, so edges=[].
+        let (idx, _) = Index::build_from_dir(&samples(), &HashEmbedder);
+        let a = Artifact::from_index(&idx, meta());
+        let text = String::from_utf8(a.to_bytes()).unwrap();
+        let graph_line = text.lines().nth(a.manifest.chunk_count + 1).unwrap();
+        let g: Value = serde_json::from_str(graph_line).unwrap();
+        assert!(g["edges"].as_array().unwrap().is_empty(), "no external edges");
+        assert_eq!(g["nodes"].as_array().unwrap().len(), 7);
     }
 
     #[test]
@@ -506,7 +534,8 @@ mod tests {
         let bytes = a.to_bytes();
         let parsed = Artifact::from_bytes(&bytes).unwrap();
         assert_eq!(parsed.manifest, a.manifest);
-        assert_eq!(parsed.file_imports, a.file_imports);
+        // The byte round-trip is exact (re-serializing the parsed artifact reproduces
+        // the input), which is the real cross-engine guarantee.
         assert_eq!(parsed.to_bytes(), bytes);
         assert_eq!(parsed.chunks.len(), a.chunks.len());
         for (x, y) in parsed.chunks.iter().zip(a.chunks.iter()) {
@@ -515,14 +544,21 @@ mod tests {
     }
 
     #[test]
-    fn import_reconstructs_a_functionally_identical_index() {
+    fn import_reconstructs_a_graph_with_identical_expansion_behaviour() {
         let (idx, _) = Index::build_from_dir(&fixture(), &HashEmbedder);
         let a = Artifact::from_index(&idx, meta());
-        let restored = a.into_index();
+        // Import from the SERIALIZED bytes, so file_imports is reconstructed from the
+        // resolved graph edges (dropping external imports is behaviour-preserving).
+        let restored = Artifact::from_bytes(&a.to_bytes()).unwrap().into_index();
         assert_eq!(restored.chunks.len(), idx.chunks.len());
-        assert_eq!(restored.file_imports, idx.file_imports);
         assert_eq!(restored.file_tokens, idx.file_tokens);
         assert_eq!(restored.embedder_name, "hash");
+        // The resolved import graph — what drives search expansion — is identical.
+        assert_eq!(restored.graph.out_pairs(), idx.graph.out_pairs());
+        assert_eq!(
+            restored.graph.out_pairs(),
+            vec![("payments.py".to_string(), "auth.py".to_string())]
+        );
     }
 
     #[test]
@@ -599,7 +635,7 @@ mod tests {
         assert_eq!(a.manifest.repo_id, "cce/demo");
         assert_eq!(
             a.manifest.checksum,
-            "028fa30ba1424e4fa119a5ab00bebc98f057088720bb3da2cdfc06c391733ca3"
+            "581cbd0ff682a38d7d1250f3eec44f4ce456bdd660d4cb29aaaadd9e95072f48"
         );
     }
 }

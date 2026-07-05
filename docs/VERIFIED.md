@@ -20,11 +20,12 @@ and its output matches the docs.
   (`SPEC-SYNC-RECONCILE.md`) — no provenance (`built_at`/`built_by` removed),
   `file_tokens` in the manifest, graph line `{"edges":[…],"nodes":[…]}`,
   `pack_set_id = c,javascript,python,ruby,rust,typescript`, checksum over the whole
-  stream with `checksum:""`. The shared golden checksum on `test/fixture/samples`
-  (`repo_id=cce/demo`, `sha=0…0`, 21 chunks) is
-  `028fa30ba1424e4fa119a5ab00bebc98f057088720bb3da2cdfc06c391733ca3`, and the raw
-  bytes are emitted to `/tmp/cce_artifact_rust.cce` for a byte-for-byte diff against
-  Ruby.
+  stream with `checksum:""`, and a graph line of **resolved** file→file edges
+  (external imports drop). The shared golden checksum on `test/fixture/samples`
+  (`repo_id=cce/demo`, `sha=0…0`, 21 chunks, `edges:[]`) is
+  `581cbd0ff682a38d7d1250f3eec44f4ce456bdd660d4cb29aaaadd9e95072f48` — **equal to
+  Ruby's** — and the raw bytes are emitted to `/tmp/cce_artifact_rust.cce` for a
+  byte-for-byte diff against Ruby (`/tmp/cce_artifact_ruby.cce`).
 
 The commands are copy-pasteable verbatim. Only the absolute scratch path (shown here
 as `$WORK`) and the concrete commit sha differ per environment.

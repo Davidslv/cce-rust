@@ -78,10 +78,14 @@ Chunk fields (sorted): `chunk_type, content, embedding, end_line, file_path, id,
 kind, language, start_line, token_count`.
 
 Graph line: `{"edges":[…],"nodes":[…]}` — `nodes` are every indexed file
-(`{"id": path}`, sorted by `id`); `edges` are the raw `file → imported-module`
-relationships (`{"source", "target", "type":"import"}`, sorted by
-`(source, target, type)`). Serializing the raw imports keeps `file_imports`
-losslessly reconstructable on import.
+(`{"id": path}`, sorted by `id`); `edges` are the **resolved** `file → file` import
+edges (base SPEC §6.7): an edge `A → B` exists only when a module imported by `A`
+resolves — by the same stem-matching the retriever's graph expansion uses — to a
+corpus file `B`. **External / unresolved imports (e.g. `os`, `fs`, `std`) produce no
+edge.** Each edge is `{"source", "target", "type":"import"}`, sorted by
+`(source, target, type)`. On import the graph is rebuilt from these resolved edges,
+giving identical search-expansion behaviour (external imports never produced a hop,
+so dropping them changes nothing).
 
 `pack_set_id` = the sorted, comma-joined lowercase pack names —
 `c,javascript,python,ruby,rust,typescript`.
@@ -89,10 +93,10 @@ losslessly reconstructable on import.
 A committed **shared golden** anchors the format cross-language
 (`src/sync/artifact.rs::shared_golden_checksum_for_samples`): the
 `test/fixture/samples` corpus exported with `repo_id=cce/demo`, `sha=0000…0000`
-yields
+(whose imports are all external, so `edges:[]`) yields
 
 ```
-028fa30ba1424e4fa119a5ab00bebc98f057088720bb3da2cdfc06c391733ca3   (21 chunks)
+581cbd0ff682a38d7d1250f3eec44f4ce456bdd660d4cb29aaaadd9e95072f48   (21 chunks)
 ```
 
 That test also writes the raw bytes to `/tmp/cce_artifact_rust.cce`. The Ruby
