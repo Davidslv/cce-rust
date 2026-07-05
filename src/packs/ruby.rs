@@ -91,6 +91,26 @@ impl LanguagePack for RubyPack {
         &["comment"]
     }
 
+    fn member_line_prefixes(&self) -> &'static [&'static str] {
+        // The Rails/ActiveRecord model DSL: association, validation, scope, enum,
+        // attribute and delegation macros. Each is a bare `call` node with no
+        // distinguishing kind, so the structural compact keeps it by its leading
+        // token — these are exactly the lines a "what are its associations /
+        // validations" question needs (SPEC-V2.5-TUNING §A, the regressed case).
+        &[
+            "has_many",
+            "has_one",
+            "belongs_to",
+            "has_and_belongs_to_many",
+            "validates",
+            "validate",
+            "scope",
+            "enum",
+            "attribute",
+            "delegate",
+        ]
+    }
+
     fn extract_imports(&self, root: Node, src: &[u8]) -> Vec<String> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();

@@ -68,6 +68,14 @@ impl LanguagePack for RustPack {
         &["line_comment", "block_comment"]
     }
 
+    fn member_node_types(&self) -> &'static [&'static str] {
+        // Struct/union fields (`field_declaration_list` → `field_declaration`),
+        // enum variants (`enum_variant_list` → `enum_variant`), and impl/trait
+        // constants (`declaration_list` → `const_item`). Methods (`function_item`)
+        // are kept via `function_types` (SPEC-V2.5-TUNING §A).
+        &["field_declaration", "enum_variant", "const_item"]
+    }
+
     fn extract_imports(&self, root: Node, src: &[u8]) -> Vec<String> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();

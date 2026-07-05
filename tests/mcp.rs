@@ -26,6 +26,33 @@ fn bin() -> &'static str {
     env!("CARGO_BIN_EXE_cce")
 }
 
+// Byte-pinned copies of the three expand-first tool descriptions (SPEC-V2.5 §6 +
+// SPEC-V2.5-TUNING §B). These mirror the private consts in `src/mcp/tools.rs`
+// verbatim; `tools/list` must serve exactly these bytes, and cce-ruby reconciles to
+// them. A drift here means the schema changed and both engines must be re-synced.
+const CONTEXT_SEARCH_DESC: &str = "Search THIS project's code by meaning, across files. Use it \
+FIRST for any cross-file question — \"where is X\", \"how does Y work\", \"what calls Z\" — or \
+whenever you cannot already name the exact file to open. Returns the most relevant code chunks \
+(file:line + kind) from a hybrid vector + BM25 index, so you don't pay tokens for whole files. \
+Skip it only when you already know the single file you need — reading that path directly is fine; \
+cce does not win there. Results are COMPACT and each carries a `chunk_id`; to read a full body \
+call `expand_chunk(chunk_id)` — do NOT re-issue `context_search` for a target you already found. \
+Widen to import-graph neighbours with `related_context(chunk_id)`.";
+
+const EXPAND_CHUNK_DESC: &str = "Read the FULL detail of a chunk `context_search` already \
+returned, by its `chunk_id`. `context_search` serves COMPACT chunks (a header + members, or a \
+signature + first line); when you need the real body, call this — do NOT re-run `context_search` \
+for a chunk you already have. scope=body recovers the exact full body; scope=file returns every \
+chunk in the same file; scope=neighbors returns chunks from import-graph-related files. A stale \
+or unknown `chunk_id` returns a short, actionable error you can retry from, never a crash.";
+
+const RELATED_CONTEXT_DESC: &str = "Given a `chunk_id` from `context_search`, return the chunks \
+connected to it through the import graph — both what it imports AND its consumers (reverse edges) \
+— as compact entries. Use it to widen context on demand — trace how a symbol is used or what it \
+depends on across files — instead of pre-loading whole neighbourhoods; expand any result with \
+`expand_chunk(chunk_id)`. Pairs with `context_search` (find first) and `expand_chunk` (read the \
+full body).";
+
 /// Write a tiny self-contained Python repo into `dir`.
 fn write_tiny_repo(dir: &Path) {
     std::fs::write(dir.join("auth.py"), "def hash_password(pw):\n    return pw + 'salt'\n")
@@ -113,7 +140,16 @@ fn handshake_list_and_search_over_a_fixture_index_logs_metrics() {
         tools[0]["inputSchema"]["properties"]["detail"]["enum"],
         serde_json::json!(["signature", "compact", "full"])
     );
-    assert!(tools[0]["description"].as_str().unwrap().contains("PREFERRED"));
+    // Tool descriptions are byte-pinned (part of the schema, SPEC-V2.5 §6): the
+    // expand-first rewrite (SPEC-V2.5-TUNING §B) must match to the byte, because the
+    // Ruby engine reconciles to these exact strings.
+    assert_eq!(tools[0]["description"].as_str().unwrap(), CONTEXT_SEARCH_DESC);
+    assert_eq!(tools[3]["description"].as_str().unwrap(), EXPAND_CHUNK_DESC);
+    assert_eq!(tools[4]["description"].as_str().unwrap(), RELATED_CONTEXT_DESC);
+    // The expand-first rule is present and steers away from the re-search reflex.
+    assert!(CONTEXT_SEARCH_DESC
+        .contains("do NOT re-issue `context_search` for a target you already found"));
+    assert!(EXPAND_CHUNK_DESC.contains("do NOT re-run `context_search`"));
     // The Layer-7 tools carry their pinned schemas.
     assert_eq!(tools[3]["inputSchema"]["properties"]["scope"]["default"], "body");
     assert_eq!(tools[4]["inputSchema"]["required"], serde_json::json!(["chunk_id"]));

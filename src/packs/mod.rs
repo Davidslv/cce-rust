@@ -92,6 +92,32 @@ pub trait LanguagePack {
         &[]
     }
 
+    /// AST node-type strings that, as a **direct child** of a container's body, are
+    /// kept as member declaration lines in the STRUCTURAL `compact` view of a
+    /// container chunk (SPEC-V2.5-TUNING §A). Methods are already kept via
+    /// `function_types` and need NOT be repeated here; this set declares the
+    /// NON-method members a language wants in the skeleton — e.g. Rust
+    /// `field_declaration`/`enum_variant`/`const_item`, TS `public_field_definition`/
+    /// `method_signature`/`property_signature`/`enum_assignment`, JS `field_definition`,
+    /// C `field_declaration`/`enumerator`. Declared here (not hard-coded in the
+    /// compressor) so the grammar-binding lint (Layer 2) verifies they are real node
+    /// kinds. Default: none (a container's skeleton then lists only its methods).
+    fn member_node_types(&self) -> &'static [&'static str] {
+        &[]
+    }
+
+    /// Leading-token line prefixes that mark a direct-child statement as a kept
+    /// member in the STRUCTURAL `compact` view, for members that are ordinary calls
+    /// with no distinguishing node kind — chiefly the **Ruby model DSL**
+    /// (`has_many`, `belongs_to`, `validates`, `scope`, `enum`, `delegate`, …). A
+    /// direct child whose trimmed first line's leading identifier equals one of these
+    /// is kept (SPEC-V2.5-TUNING §A, "the lines a 'what are its associations'
+    /// question needs"). These are source tokens, NOT node kinds, so the Layer-2
+    /// grammar-binding lint does not check them. Default: none.
+    fn member_line_prefixes(&self) -> &'static [&'static str] {
+        &[]
+    }
+
     /// Ordered, de-duplicated module/include names imported by `source`.
     /// Must never panic; on any trouble it returns what it has so far.
     fn extract_imports(&self, root: Node, source: &[u8]) -> Vec<String>;

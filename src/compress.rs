@@ -1,26 +1,39 @@
-//! # compress — L2 chunk compression (SPEC-V2.5 §2, the headline layer)
+//! # compress — L2 chunk compression (SPEC-V2.5 §2 + SPEC-V2.5-TUNING §A)
 //!
 //! **Why this file exists:** Returning full chunk bodies can cost more than a
-//! targeted grep+read; the real win is serving **signatures + a docstring + the
-//! first body line** and letting the agent expand on demand (Layer 7). This module
-//! owns that deterministic, AST-driven reduction. It is a **retrieval/serialization-
-//! time transform ONLY** — the index and store keep FULL chunk bodies; compression
-//! happens on the way OUT. So `conformance.json`, `token_count`, `file_tokens`, and
-//! the Sync artifact are untouched, and `expand_chunk` (Layer 7) recovers the exact
-//! `full` bytes by re-fetching the stored chunk, not by inverting this transform.
+//! targeted grep+read; the real win is serving a compressed view and letting the
+//! agent expand on demand (Layer 7). This module owns that deterministic, AST-driven
+//! reduction. It is a **retrieval/serialization-time transform ONLY** — the index and
+//! store keep FULL chunk bodies; compression happens on the way OUT. So
+//! `conformance.json`, `token_count`, `file_tokens`, and the Sync artifact are
+//! untouched, and `expand_chunk` (Layer 7) recovers the exact `full` bytes by
+//! re-fetching the stored chunk, not by inverting this transform.
 //!
 //! **What it is / does:** Defines `DetailLevel` (`signature` | `compact` | `full`)
 //! and `compress`, which re-parses a chunk's OWN body with its language pack's
-//! grammar, finds the outermost definition node, and — using the node-type sets the
-//! pack declares (`body_node_types`, `doc_node_types`) — extracts the signature
-//! header, an optional leading doc, and the first non-trivial body line. A chunk
-//! with no resolvable pack, or one whose body does not re-parse to a definition
-//! (e.g. a bare JS/TS class method, which is not a valid standalone program), falls
-//! back to a language-neutral first-line rule. Every output is byte-pinned.
+//! grammar and finds the outermost definition node. The `compact` view depends on
+//! whether that node is a **container** (class / module / struct / impl / trait /
+//! interface / enum) or a **leaf** (function / method):
+//! - **container** → the STRUCTURAL compact (SPEC-V2.5-TUNING §A): the header + a
+//!   leading doc + a deterministic list of the container's DIRECT members, each
+//!   trimmed to its first (signature) line with the rest of that member elided by
+//!   the byte-pinned `… (+N lines)` marker. Members are the pack's `function_types`
+//!   (methods) plus its declared `member_node_types` (Rust fields/variants, TS/JS/C
+//!   members, constants) plus any direct child whose leading token is in
+//!   `member_line_prefixes` (the Ruby model DSL). The agent sees the whole table of
+//!   contents — every method and association — without the bodies.
+//! - **leaf** → signature + optional leading doc + the first non-trivial body line +
+//!   the elision marker (unchanged from the first cut).
+//!
+//! A chunk with no resolvable pack, or one whose body does not re-parse to a
+//! definition (e.g. a bare JS/TS class method, which is not a valid standalone
+//! program), falls back to a language-neutral first-line rule. Every output is
+//! byte-pinned.
 //!
 //! **Responsibilities:**
 //! - Own `DetailLevel`, the byte-pinned `ELISION_MARKER` grammar, and `compress`.
-//! - Reuse each pack's declared node types — it names NO language itself.
+//! - Own the container-vs-leaf `compact` split and per-member rendering.
+//! - Reuse each pack's declared node types/prefixes — it names NO language itself.
 //! - It does NOT read the store, rank, or expand — callers wire those in.
 
 use crate::packs::{visit_pre, LanguagePack, Registry};
@@ -107,16 +120,66 @@ fn compress_with_pack(
         return Some(signature.to_string());
     }
 
-    // Compact = signature + leading doc (if any) + first non-trivial body line +
-    // the elision marker for the lines neither shown.
-    let mut lines: Vec<String> = vec![signature.to_string()];
-    let mut shown = line_span(signature);
-
     let body = match body_child {
         Some(b) => b,
         // No body to elide: compact == signature.
         None => return Some(signature.to_string()),
     };
+
+    // The compact view splits on shape: a container keeps its members (its table of
+    // contents); a leaf keeps its first body line (SPEC-V2.5-TUNING §A).
+    if pack.class_types().contains(&def.kind()) {
+        Some(compact_container(pack, content, signature, body))
+    } else {
+        Some(compact_leaf(pack, content, signature, body))
+    }
+}
+
+/// STRUCTURAL container compact (SPEC-V2.5-TUNING §A): the header, a leading doc if
+/// present, then every DIRECT member trimmed to its signature line (bodies elided).
+fn compact_container(
+    pack: &dyn LanguagePack,
+    content: &str,
+    signature: &str,
+    body: Node,
+) -> String {
+    let named: Vec<Node> = {
+        let mut cur = body.walk();
+        body.named_children(&mut cur).collect()
+    };
+    let mut lines: Vec<String> = vec![signature.to_string()];
+
+    // Leading doc: the first named body element (unwrapping a Python-style
+    // `expression_statement`), when its kind is one the pack declares as a doc. It is
+    // then skipped by the member pass.
+    let mut start = 0usize;
+    if let Some(first) = named.first() {
+        let doc_node = unwrap_doc(*first);
+        if pack.doc_node_types().contains(&doc_node.kind()) {
+            if let Some(text) = node_first_line(doc_node, content) {
+                lines.push(text);
+                start = 1;
+            }
+        }
+    }
+
+    // Members: each direct child kept by kind (methods via `function_types`, other
+    // members via `member_node_types`) or by leading token (`member_line_prefixes`),
+    // rendered as its trimmed first line plus a `… (+N lines)` marker for the rest.
+    for member in &named[start..] {
+        if let Some(rendered) = render_member(pack, *member, content) {
+            lines.extend(rendered);
+        }
+    }
+
+    lines.join("\n")
+}
+
+/// LEAF compact (unchanged): signature + a leading doc (if any) + the first
+/// non-trivial body line + the elision marker for the lines neither shown.
+fn compact_leaf(pack: &dyn LanguagePack, content: &str, signature: &str, body: Node) -> String {
+    let mut lines: Vec<String> = vec![signature.to_string()];
+    let mut shown = line_span(signature);
 
     let named: Vec<Node> = {
         let mut cur = body.walk();
@@ -145,7 +208,50 @@ fn compress_with_pack(
         }
     }
 
-    Some(with_elision(lines, shown, content))
+    with_elision(lines, shown, content)
+}
+
+/// Render one direct-child member of a container for the structural compact, or
+/// `None` when the child is not a kept member. A kept member is rendered as its
+/// trimmed first line; if the member spans more than one line, the byte-pinned
+/// `… (+N lines)` marker for the remaining `span − 1` lines follows on its own line.
+fn render_member(pack: &dyn LanguagePack, node: Node, content: &str) -> Option<Vec<String>> {
+    if !is_member(pack, node, content) {
+        return None;
+    }
+    let first = node_first_line(node, content)?;
+    let span = node_line_span(node);
+    let mut out = vec![first];
+    if span > 1 {
+        out.push(elision_marker(span - 1));
+    }
+    Some(out)
+}
+
+/// Whether `node` — a direct child of a container body — is a kept member: a method
+/// (`function_types`), a declared non-method member (`member_node_types`), or a
+/// statement whose leading token is a declared `member_line_prefix` (the Ruby DSL).
+fn is_member(pack: &dyn LanguagePack, node: Node, content: &str) -> bool {
+    let kind = node.kind();
+    if pack.function_types().contains(&kind) || pack.member_node_types().contains(&kind) {
+        return true;
+    }
+    if pack.member_line_prefixes().is_empty() {
+        return false;
+    }
+    match node_first_line(node, content) {
+        Some(line) => {
+            let token: String =
+                line.chars().take_while(|c| c.is_alphanumeric() || *c == '_').collect();
+            pack.member_line_prefixes().contains(&token.as_str())
+        }
+        None => false,
+    }
+}
+
+/// Number of physical source lines a node spans (inclusive): `end_row − start_row + 1`.
+fn node_line_span(node: Node) -> usize {
+    node.end_position().row - node.start_position().row + 1
 }
 
 /// Language-neutral fallback: the first non-blank line, plus (for `compact`) an
@@ -279,12 +385,54 @@ mod tests {
         let reg = default_registry();
         let s = "pub struct Store {\n    data: u32,\n    name: String,\n}";
         assert_eq!(compress(&reg, "s.rs", s, DetailLevel::Signature), "pub struct Store");
+        // Structural compact lists EVERY field (the container's table of contents),
+        // not just the first line (SPEC-V2.5-TUNING §A).
         assert_eq!(
             compress(&reg, "s.rs", s, DetailLevel::Compact),
-            "pub struct Store\ndata: u32\n… (+2 lines)"
+            "pub struct Store\ndata: u32\nname: String"
         );
         let imp = "impl Store {\n    pub fn get(&self) -> u32 {\n        0\n    }\n}";
         assert_eq!(compress(&reg, "s.rs", imp, DetailLevel::Signature), "impl Store");
+        // The impl's method is kept as its signature line, its body elided.
+        assert_eq!(
+            compress(&reg, "s.rs", imp, DetailLevel::Compact),
+            "impl Store\npub fn get(&self) -> u32 {\n… (+2 lines)"
+        );
+    }
+
+    #[test]
+    fn rust_enum_variants_are_listed_in_structural_compact() {
+        let reg = default_registry();
+        let e = "pub enum Kind {\n    Alpha,\n    Beta(u32),\n}";
+        assert_eq!(
+            compress(&reg, "s.rs", e, DetailLevel::Compact),
+            "pub enum Kind\nAlpha\nBeta(u32)"
+        );
+    }
+
+    #[test]
+    fn ruby_model_dsl_lines_appear_in_structural_compact() {
+        // The exact regression case (SPEC-V2.5-TUNING §A): a model whose associations
+        // and validations MUST survive compact so the agent need not re-search.
+        let reg = default_registry();
+        let model = "class Case < ApplicationRecord\n  belongs_to :assignee\n  has_many :comments\n  validates :title, presence: true\n\n  def close!\n    update!(closed: true)\n  end\nend";
+        assert_eq!(
+            compress(&reg, "case.rb", model, DetailLevel::Compact),
+            "class Case < ApplicationRecord\nbelongs_to :assignee\nhas_many :comments\nvalidates :title, presence: true\ndef close!\n… (+2 lines)"
+        );
+    }
+
+    #[test]
+    fn leaf_function_compact_is_unchanged_by_the_container_split() {
+        // A method inside a class re-parsed as a standalone chunk is a leaf, so it
+        // keeps the signature + first-body-line form, not the structural form.
+        let reg = default_registry();
+        let body =
+            "pub fn build_index() -> HashMap<String, u32> {\n    let m = HashMap::new();\n    m\n}";
+        assert_eq!(
+            compress(&reg, "s.rs", body, DetailLevel::Compact),
+            "pub fn build_index() -> HashMap<String, u32>\nlet m = HashMap::new();\n… (+2 lines)"
+        );
     }
 
     #[test]

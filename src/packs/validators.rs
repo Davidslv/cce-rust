@@ -128,6 +128,7 @@ fn layer2_grammar_binding(pack: &dyn LanguagePack, out: &mut Vec<String>) -> boo
         ("import node types", pack.import_node_types()),
         ("body node types", pack.body_node_types()),
         ("doc node types", pack.doc_node_types()),
+        ("member node types", pack.member_node_types()),
     ] {
         for &ty in types {
             if !kinds.iter().any(|k| k == ty) {

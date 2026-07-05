@@ -37,13 +37,18 @@ use std::collections::BTreeMap;
 use std::path::Path;
 use std::time::Instant;
 
-/// The `context_search` description, written to steer the agent to prefer it over
-/// Read/Grep (SPEC-MCP §1). Mirrored verbatim in the Ruby engine.
-const CONTEXT_SEARCH_DESC: &str = "PREFERRED tool for any question about THIS project's code. \
-Use INSTEAD OF reading or grepping files to locate functions, understand behaviour, or answer \
-'where is X / how does Y work'. Returns the most relevant code chunks (file:line + kind) from a \
-hybrid vector + BM25 index, so you don't pay tokens for whole files. Reserve file reads for \
-opening a specific path this tool points you to.";
+/// The `context_search` description (SPEC-V2.5 §6 + SPEC-V2.5-TUNING §B): core
+/// purpose, explicit trigger conditions from measured behaviour, the tool
+/// relationships, and the expand-first rule that stops the re-search reflex.
+/// Byte-pinned; mirrored verbatim in the Ruby engine.
+const CONTEXT_SEARCH_DESC: &str = "Search THIS project's code by meaning, across files. Use it \
+FIRST for any cross-file question — \"where is X\", \"how does Y work\", \"what calls Z\" — or \
+whenever you cannot already name the exact file to open. Returns the most relevant code chunks \
+(file:line + kind) from a hybrid vector + BM25 index, so you don't pay tokens for whole files. \
+Skip it only when you already know the single file you need — reading that path directly is fine; \
+cce does not win there. Results are COMPACT and each carries a `chunk_id`; to read a full body \
+call `expand_chunk(chunk_id)` — do NOT re-issue `context_search` for a target you already found. \
+Widen to import-graph neighbours with `related_context(chunk_id)`.";
 
 /// The result of running a tool: the text block shown to the agent plus the MCP
 /// `isError` flag. A missing/empty index is *not* an error — it is a normal result
@@ -70,17 +75,25 @@ impl ToolOutput {
     }
 }
 
-/// The `expand_chunk` description (SPEC-V2.5 §7, Layer 7 progressive disclosure).
-const EXPAND_CHUNK_DESC: &str = "Fetch more of a chunk returned by `context_search`. \
-`context_search` serves COMPACT chunks by default (signature + first line); call this to pull \
-detail only when you need it. scope=body recovers the exact full body; scope=file returns every \
-chunk in the same file; scope=neighbors returns chunks from import-graph-related files.";
+/// The `expand_chunk` description (SPEC-V2.5 §6/§7 + SPEC-V2.5-TUNING §B): the
+/// full-body reader for a chunk `context_search` already returned, carrying the same
+/// expand-first rule so the agent expands rather than re-searches. Byte-pinned.
+const EXPAND_CHUNK_DESC: &str = "Read the FULL detail of a chunk `context_search` already \
+returned, by its `chunk_id`. `context_search` serves COMPACT chunks (a header + members, or a \
+signature + first line); when you need the real body, call this — do NOT re-run `context_search` \
+for a chunk you already have. scope=body recovers the exact full body; scope=file returns every \
+chunk in the same file; scope=neighbors returns chunks from import-graph-related files. A stale \
+or unknown `chunk_id` returns a short, actionable error you can retry from, never a crash.";
 
-/// The `related_context` description (SPEC-V2.5 §7, Layer 7).
-const RELATED_CONTEXT_DESC: &str = "Given a chunk_id from `context_search`, return chunks from \
-files related to it through the import graph — both what it imports AND its consumers (reverse \
-edges) — as compact entries you can expand with `expand_chunk`. Use to widen context on demand \
-instead of pre-loading whole neighbourhoods.";
+/// The `related_context` description (SPEC-V2.5 §6/§7 + SPEC-V2.5-TUNING §B): the
+/// on-demand import-graph widener, stating its purpose and its place in the
+/// find → expand → widen chain. Byte-pinned.
+const RELATED_CONTEXT_DESC: &str = "Given a `chunk_id` from `context_search`, return the chunks \
+connected to it through the import graph — both what it imports AND its consumers (reverse edges) \
+— as compact entries. Use it to widen context on demand — trace how a symbol is used or what it \
+depends on across files — instead of pre-loading whole neighbourhoods; expand any result with \
+`expand_chunk(chunk_id)`. Pairs with `context_search` (find first) and `expand_chunk` (read the \
+full body).";
 
 /// The five tool definitions returned by `tools/list`, with the EXACT byte-pinned
 /// schemas of SPEC-MCP §"Tools" + SPEC-V2.5 §6. The order is stable and fixed:
@@ -807,7 +820,15 @@ mod tests {
         assert_eq!(cs["properties"]["top_k"]["default"], 8);
         assert_eq!(cs["properties"]["no_graph"]["default"], false);
         assert_eq!(cs["properties"]["detail"]["enum"], json!(["signature", "compact", "full"]));
-        assert!(defs[0]["description"].as_str().unwrap().contains("PREFERRED"));
+        // Descriptions are byte-pinned (SPEC-V2.5 §6 + SPEC-V2.5-TUNING §B): the
+        // exact expand-first strings, and the do-NOT-re-search rule on the two tools
+        // that carry a chunk_id, so the agent expands rather than re-issuing a search.
+        assert_eq!(defs[0]["description"], json!(CONTEXT_SEARCH_DESC));
+        assert_eq!(defs[3]["description"], json!(EXPAND_CHUNK_DESC));
+        assert_eq!(defs[4]["description"], json!(RELATED_CONTEXT_DESC));
+        assert!(CONTEXT_SEARCH_DESC
+            .contains("do NOT re-issue `context_search` for a target you already found"));
+        assert!(EXPAND_CHUNK_DESC.contains("do NOT re-run `context_search`"));
 
         // record_feedback requires query_id + helpful.
         assert_eq!(defs[2]["inputSchema"]["required"], json!(["query_id", "helpful"]));

@@ -59,6 +59,14 @@ impl LanguagePack for TypeScriptPack {
         &["comment"]
     }
 
+    fn member_node_types(&self) -> &'static [&'static str] {
+        // Class fields (`class_body` → `public_field_definition`), interface members
+        // (`interface_body` → `property_signature`/`method_signature`), and enum
+        // members (`enum_body` → `enum_assignment`). Class methods
+        // (`method_definition`) are kept via `function_types` (SPEC-V2.5-TUNING §A).
+        &["public_field_definition", "property_signature", "method_signature", "enum_assignment"]
+    }
+
     fn extract_imports(&self, root: Node, src: &[u8]) -> Vec<String> {
         let mut out = Vec::new();
         let mut seen = HashSet::new();
