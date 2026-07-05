@@ -1,0 +1,411 @@
+//! # tests/knowledge_search — the M4 retrieval blend, provenance & acceptance (SPEC-V2.6 §5/§9/§12)
+//!
+//! **Why this file exists:** Phase B makes the heading-chunked knowledge store
+//! *searchable* through the SAME hybrid retrieval as code, blended by one shared
+//! ranking, with byte-pinned provenance and deterministic staleness weighting. This
+//! suite is the contract for that: it drives the `source` filter over piped JSON-RPC
+//! (`code`/`knowledge`/`both`), pins the provenance line to the byte, proves a code
+//! result's bytes are unchanged, and — the point of v2.6 — proves a big multi-section
+//! document that was BURIED as a whole-file chunk now SURFACES its heading section as a
+//! top hit once heading-chunked.
+//!
+//! **What it is / does:** Builds a hermetic, SYNTHETIC knowledge fixture (no real
+//! company/project/domain names) + a tiny code repo, indexes both, and asserts the
+//! blended/filter behaviour over the real `cce mcp` stdio server; plus a library-level
+//! before/after acceptance on the whole-file-vs-heading-chunked store.
+//!
+//! **Responsibilities:**
+//! - Own the `source` filter, provenance, blend, and acceptance goldens.
+//! - Clean-room: synthetic data only.
+
+use cce::knowledge::{ingest, parse_ndjson, search_knowledge};
+use std::path::Path;
+use std::process::{Command, Stdio};
+
+fn bin() -> &'static str {
+    env!("CARGO_BIN_EXE_cce")
+}
+
+/// A tiny self-contained Python repo (mirrors the base fixture shape).
+fn write_tiny_repo(dir: &Path) {
+    std::fs::write(dir.join("auth.py"), "def hash_password(pw):\n    return pw + 'salt'\n")
+        .unwrap();
+    std::fs::write(
+        dir.join("payments.py"),
+        "import auth\n\ndef process_payment(amount):\n    return amount\n",
+    )
+    .unwrap();
+}
+
+fn index_dir(dir: &Path) {
+    let out = Command::new(bin()).args(["index"]).arg(dir).output().unwrap();
+    assert!(out.status.success(), "index failed: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// Write a `cce.knowledge/v1` feed and index it into `<dir>/.cce/knowledge/`.
+fn index_knowledge(dir: &Path, feed: &str) {
+    let path = dir.join("feed.jsonl");
+    std::fs::write(&path, feed).unwrap();
+    let out = Command::new(bin())
+        .args(["knowledge", "index"])
+        .arg(&path)
+        .args(["--dir"])
+        .arg(dir)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "knowledge index failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Drive an MCP session with `input` on stdin, returning stdout.
+fn drive(args: &[&str], input: &str) -> String {
+    let mut cmd = Command::new(bin());
+    cmd.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    let mut child = cmd.spawn().unwrap();
+    child.stdin.take().unwrap().write_all_str(input);
+    let out = child.wait_with_output().unwrap();
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// Small shim so `drive` reads cleanly without importing `std::io::Write` at the top.
+trait WriteAllStr {
+    fn write_all_str(&mut self, s: &str);
+}
+impl WriteAllStr for std::process::ChildStdin {
+    fn write_all_str(&mut self, s: &str) {
+        use std::io::Write;
+        self.write_all(s.as_bytes()).unwrap();
+    }
+}
+
+/// Extract the tool-result text for the response with the given id.
+fn tool_text(stdout: &str, id: i64) -> String {
+    for line in stdout.lines().filter(|l| !l.trim().is_empty()) {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        if v["id"] == id {
+            return v["result"]["content"][0]["text"].as_str().unwrap().to_string();
+        }
+    }
+    panic!("no response with id {id} in:\n{stdout}");
+}
+
+/// A one-line JSON-RPC `context_search` call with an explicit `source`.
+fn search_call(id: i64, query: &str, source: &str) -> String {
+    format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"tools/call\",\"params\":{{\"name\":\"context_search\",\"arguments\":{{\"query\":\"{query}\",\"source\":\"{source}\",\"detail\":\"full\"}}}}}}\n"
+    )
+}
+
+/// A two-record synthetic knowledge feed: a password-hashing policy (fully faceted, with
+/// a merged-PR link) and an unrelated data-retention note. No real names.
+fn feed() -> String {
+    let r1 = serde_json::json!({
+        "id": "kn:1",
+        "title": "Password hashing policy",
+        "body": "## Rule\n\nStore each password only as a salted slow hash; never keep the plaintext password.",
+        "source": "handbook",
+        "url": "https://example.test/1",
+        "state": "closed",
+        "state_reason": "completed",
+        "updated_at": "2026-02-01T10:00:00Z",
+        "labels": ["security"],
+        "links": ["https://example.test/pull/7"],
+    });
+    let r2 = serde_json::json!({
+        "id": "kn:2",
+        "title": "Data retention window",
+        "body": "## Rule\n\nPurge inactive account records after ninety days of no activity.",
+        "source": "handbook",
+        "url": "https://example.test/2",
+        "state": "open",
+        "updated_at": "2026-01-01T00:00:00Z",
+        "labels": ["privacy"],
+    });
+    format!("{}\n{}\n", serde_json::to_string(&r1).unwrap(), serde_json::to_string(&r2).unwrap())
+}
+
+#[test]
+fn source_filter_selects_the_right_pools_over_json_rpc() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_tiny_repo(tmp.path());
+    index_dir(tmp.path());
+    index_knowledge(tmp.path(), &feed());
+    let dir = tmp.path().to_string_lossy().to_string();
+
+    let input = format!(
+        "{}{}{}{}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+        search_call(2, "hash password", "code"),
+        search_call(3, "hash password", "knowledge"),
+        search_call(4, "hash password", "both"),
+    );
+    let out = drive(&["mcp", "--dir", &dir], &input);
+
+    let code = tool_text(&out, 2);
+    let knowledge = tool_text(&out, 3);
+    let both = tool_text(&out, 4);
+
+    // source:code — only the code pool; never a knowledge provenance line.
+    assert!(code.contains("auth.py"), "code pool missing auth.py:\n{code}");
+    assert!(!code.contains("[knowledge]"), "code pool leaked knowledge:\n{code}");
+
+    // source:knowledge — only the knowledge pool; never a code path.
+    assert!(
+        knowledge.contains("[knowledge] Password hashing policy"),
+        "knowledge pool missing hit:\n{knowledge}"
+    );
+    assert!(!knowledge.contains("auth.py"), "knowledge pool leaked code:\n{knowledge}");
+
+    // source:both — both pools present.
+    assert!(both.contains("auth.py"), "blend missing code:\n{both}");
+    assert!(
+        both.contains("[knowledge] Password hashing policy"),
+        "blend missing knowledge:\n{both}"
+    );
+}
+
+#[test]
+fn provenance_line_is_byte_pinned() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_tiny_repo(tmp.path());
+    index_dir(tmp.path());
+    index_knowledge(tmp.path(), &feed());
+    let dir = tmp.path().to_string_lossy().to_string();
+
+    let input = format!(
+        "{}{}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+        search_call(2, "hash password", "knowledge"),
+    );
+    let out = drive(&["mcp", "--dir", &dir], &input);
+    let text = tool_text(&out, 2);
+
+    // The provenance line renders EXACTLY `[knowledge] <title> — <state> · <updated_at> · <url>`.
+    assert!(
+        text.contains(
+            "[knowledge] Password hashing policy — closed · 2026-02-01T10:00:00Z · https://example.test/1"
+        ),
+        "provenance drifted:\n{text}"
+    );
+}
+
+/// Pull the 16-hex `#chunk_id` off the first knowledge header line in `text`.
+fn knowledge_chunk_id(text: &str) -> String {
+    for line in text.lines() {
+        if line.contains("[knowledge]") {
+            if let Some(pos) = line.rfind('#') {
+                let id: String =
+                    line[pos + 1..].chars().take_while(|c| c.is_ascii_hexdigit()).collect();
+                if id.len() == 16 {
+                    return id;
+                }
+            }
+        }
+    }
+    panic!("no knowledge chunk_id in:\n{text}");
+}
+
+#[test]
+fn expand_and_related_work_on_knowledge_chunks() {
+    // SPEC-V2.6 §5: expand_chunk (body/file) and related_context (same-document
+    // neighbours) resolve a knowledge chunk_id, not just code.
+    let tmp = tempfile::tempdir().unwrap();
+    // A single multi-section document, so a chunk HAS same-document neighbours.
+    index_knowledge(tmp.path(), &big_handbook_feed());
+    let dir = tmp.path().to_string_lossy().to_string();
+
+    // 1) Find a knowledge chunk_id via a knowledge search.
+    let find = format!(
+        "{}{}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+        search_call(2, "refund window within fourteen days", "knowledge"),
+    );
+    let out = drive(&["mcp", "--dir", &dir], &find);
+    let hit = tool_text(&out, 2);
+    let id = knowledge_chunk_id(&hit);
+
+    // 2) expand_chunk(body) recovers the section; expand_chunk(file) lists the document's
+    //    sections; related_context returns same-document neighbours (not import-graph).
+    let call = |id: i64, name: &str, extra: &str| {
+        format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"tools/call\",\"params\":{{\"name\":\"{name}\",\"arguments\":{{\"chunk_id\":\"{}\"{extra}}}}}}}\n",
+            knowledge_chunk_id(&hit)
+        )
+    };
+    let input = format!(
+        "{}{}{}{}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+        call(2, "expand_chunk", ",\"scope\":\"body\""),
+        call(3, "expand_chunk", ",\"scope\":\"file\""),
+        call(4, "related_context", ""),
+    );
+    let out = drive(&["mcp", "--dir", &dir], &input);
+
+    let body = tool_text(&out, 2);
+    assert!(body.contains("refund"), "expand body missing the refund section:\n{body}");
+
+    let file = tool_text(&out, 3);
+    assert!(file.contains("document kn:handbook"), "expand file missing document header:\n{file}");
+    // The document's OTHER sections are present (proving same-document grouping).
+    assert!(
+        file.contains("Password hashing") || file.contains("Rate limiting"),
+        "expand file missing siblings:\n{file}"
+    );
+
+    let related = tool_text(&out, 4);
+    assert!(related.contains("same document"), "related_context not same-document:\n{related}");
+    // The target section must NOT list itself among its neighbours.
+    assert!(
+        !related.contains(&format!("#{id}")),
+        "related_context included the target itself:\n{related}"
+    );
+}
+
+#[test]
+fn code_result_bytes_are_unchanged_between_code_and_both() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_tiny_repo(tmp.path());
+    index_dir(tmp.path());
+    index_knowledge(tmp.path(), &feed());
+    let dir = tmp.path().to_string_lossy().to_string();
+
+    let input = format!(
+        "{}{}{}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+        search_call(2, "hash password", "code"),
+        search_call(3, "hash password", "both"),
+    );
+    let out = drive(&["mcp", "--dir", &dir], &input);
+    let code = tool_text(&out, 2);
+    let both = tool_text(&out, 3);
+
+    // The auth.py header line, minus the leading rank (which reflects blended position),
+    // is byte-identical: the code grammar carries no provenance and no new fields.
+    let stable = |text: &str| -> String {
+        let line = text.lines().find(|l| l.contains("auth.py") && l.contains('#')).unwrap();
+        // Everything from the score bracket onwards (drop the `«rank». ` prefix).
+        let at = line.find('[').unwrap();
+        line[at..].to_string()
+    };
+    assert_eq!(stable(&code), stable(&both), "code result bytes changed under blend");
+    // And a code row never gains a provenance tag.
+    let code_line = both.lines().find(|l| l.contains("auth.py") && l.contains('#')).unwrap();
+    assert!(!code_line.contains("[knowledge]"), "code row got a provenance tag: {code_line}");
+}
+
+#[test]
+fn blend_interleaves_code_and_knowledge_by_shared_ranking() {
+    let tmp = tempfile::tempdir().unwrap();
+    write_tiny_repo(tmp.path());
+    index_dir(tmp.path());
+    index_knowledge(tmp.path(), &feed());
+    let dir = tmp.path().to_string_lossy().to_string();
+
+    let input = format!(
+        "{}{}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+        search_call(2, "hash password", "both"),
+    );
+    let out = drive(&["mcp", "--dir", &dir], &input);
+    let both = tool_text(&out, 2);
+
+    // Header lines are ranked `«n». [«score»] …`. Collect the (rank, score) pairs and
+    // assert they are ONE list ordered by score desc — i.e. code + knowledge blended by
+    // the shared ranking rather than concatenated pool-by-pool.
+    let mut scores: Vec<f64> = Vec::new();
+    let mut saw_code = false;
+    let mut saw_knowledge = false;
+    for line in both.lines() {
+        if let Some(open) = line.find("[") {
+            // Only result-header lines look like `«rank». [«0.dddddd»] …`.
+            let rest = &line[open + 1..];
+            if let Some(close) = rest.find(']') {
+                if let Ok(s) = rest[..close].parse::<f64>() {
+                    scores.push(s);
+                    if line.contains("[knowledge]") {
+                        saw_knowledge = true;
+                    } else if line.contains("auth.py") || line.contains("payments.py") {
+                        saw_code = true;
+                    }
+                }
+            }
+        }
+    }
+    assert!(saw_code && saw_knowledge, "blend must contain BOTH pools:\n{both}");
+    assert!(scores.len() >= 2, "expected multiple ranked results:\n{both}");
+    for w in scores.windows(2) {
+        assert!(w[0] >= w[1], "results not ordered by descending score: {scores:?}\n{both}");
+    }
+}
+
+// --- ACCEPTANCE (SPEC-V2.6 §12): buried whole-file chunk → surfaced heading section ---
+
+/// A big multi-section handbook: a large generic overview plus several `##` sections on
+/// DISTINCT topics. As a single whole-file chunk its embedding is diluted across every
+/// topic, so a specific-topic query cannot isolate the relevant part.
+fn big_handbook_feed() -> String {
+    let overview: String = std::iter::repeat_n(
+        "This handbook collects the operating rules for the service across many areas. ",
+        40,
+    )
+    .collect();
+    let body = format!(
+        "{overview}\n\n\
+         ## Rate limiting\n\nReject more than one hundred requests per minute from a single client.\n\n\
+         ## Password hashing\n\nStore each password only as a salted slow hash; never the plaintext.\n\n\
+         ## Session expiry\n\nExpire an idle session after thirty minutes of inactivity.\n\n\
+         ## Refund windows\n\nApprove a refund only within fourteen days of the original charge.\n\n\
+         ## Data retention\n\nPurge inactive account records after ninety days of no activity.\n"
+    );
+    // Encode as a one-line NDJSON record (escape newlines/quotes via serde).
+    let rec = serde_json::json!({
+        "id": "kn:handbook",
+        "title": "Service operations handbook",
+        "body": body,
+        "source": "handbook",
+        "url": "https://example.test/handbook",
+        "state": "open",
+        "updated_at": "2026-03-01T00:00:00Z",
+    });
+    format!("{}\n", serde_json::to_string(&rec).unwrap())
+}
+
+#[test]
+fn acceptance_heading_chunking_surfaces_the_buried_section() {
+    let feed = big_handbook_feed();
+    let recs = parse_ndjson(&feed).unwrap();
+    let query = "refund window within fourteen days of the charge";
+
+    // BEFORE — whole-file chunk: a huge split budget keeps the entire handbook as ONE
+    // chunk, so every topic is mixed together and the refund answer is buried.
+    let before = ingest(&recs, feed.as_bytes(), 100_000);
+    assert_eq!(before.chunks.len(), 1, "before: the handbook must be a single whole-file chunk");
+    let before_hits = search_knowledge(&before, query, 5, 0.30);
+    let before_top = &before_hits[0];
+    // The one chunk is the whole document (its `kind` is the document title, not a
+    // section), and its content mixes UNRELATED topics — the refund rule is buried.
+    assert_eq!(before_top.kind, "Service operations handbook");
+    assert!(before_top.content.contains("refund"));
+    assert!(
+        before_top.content.contains("password") && before_top.content.contains("Rate limiting"),
+        "before: the whole-file chunk should mix every topic (buried)"
+    );
+
+    // AFTER — heading-chunked at the default budget: each `##` section is its own chunk,
+    // so the refund SECTION surfaces as the top hit, focused on just its topic.
+    let after = ingest(&recs, feed.as_bytes(), 400);
+    assert!(after.chunks.len() > 1, "after: the handbook must split into heading sections");
+    let after_hits = search_knowledge(&after, query, 5, 0.30);
+    let after_top = &after_hits[0];
+    assert_eq!(after_top.kind, "Refund windows", "after: the refund section must be the top hit");
+    // The surfaced section is focused: it carries the refund rule and NOT the unrelated
+    // password/rate-limit topics that diluted the whole-file chunk.
+    assert!(after_top.content.contains("refund"));
+    assert!(
+        !after_top.content.contains("password") && !after_top.content.contains("Rate limiting"),
+        "after: the surfaced section must be topic-focused, not the mixed blob"
+    );
+}

@@ -46,12 +46,16 @@ fn ingest_is_byte_identical_and_ids_are_pinned() {
     let (store, json) = fixture_store();
     // Snapshot id (hash of the input feed) is pinned.
     assert_eq!(store.snapshot, "598e1b3891572bbb");
-    // The persisted store bytes are pinned (cce-ruby must reproduce this checksum).
+    // The persisted store bytes are pinned (cce-ruby must reproduce this checksum). The
+    // v2.6 Phase-B store additionally carries the M4 retrieval facets (`title`, `links`)
+    // and the deterministic hash embedding per chunk, so this checksum supersedes the
+    // Phase-A value; the chunk ids (content-addressed) are unchanged.
     assert_eq!(
         sha256_hex(json.as_bytes()),
-        "be2b5cc9f42f7867e62eeca7ce33016e62ed32b89ae1c43bfba8bfd47d052782"
+        "ab66052f618f84693cd229a1926dfb28d2570697d803fa9006281ee584a41110"
     );
-    // The chunk ids are pinned (content-addressed over the redacted rendered doc).
+    // The chunk ids are pinned (content-addressed over the redacted rendered doc) —
+    // UNCHANGED by the Phase-B store extension.
     let ids: Vec<&str> = store.chunks.iter().map(|c| c.chunk_id.as_str()).collect();
     assert_eq!(ids, vec!["5fb9ad2eca3c1ee6", "64a595c97b7c78af"]);
     assert_eq!(store.schema, "cce.knowledge/v1");

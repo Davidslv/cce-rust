@@ -176,6 +176,11 @@ fn handshake_list_and_search_over_a_fixture_index_logs_metrics() {
         tools[0]["inputSchema"]["properties"]["detail"]["enum"],
         serde_json::json!(["signature", "compact", "full"])
     );
+    // v2.6 M4: the backward-compatible `source` addition (still NINE tools, no new one).
+    assert_eq!(
+        tools[0]["inputSchema"]["properties"]["source"]["enum"],
+        serde_json::json!(["code", "knowledge", "both"])
+    );
     // Tool descriptions are byte-pinned (part of the schema, SPEC-V2.5 §6): the
     // expand-first rewrite (SPEC-V2.5-TUNING §B) must match to the byte, because the
     // Ruby engine reconciles to these exact strings.
