@@ -1,4 +1,4 @@
-//! # mcp::tools — the five CCE MCP tools (SPEC-MCP §"Tools" + SPEC-V2.5 §6/§7)
+//! # mcp::tools — the six CCE MCP tools (SPEC-MCP §"Tools" + SPEC-V2.5 §6/§7)
 //!
 //! **Why this file exists:** The tool contract — names, input schemas, and output
 //! shape — is the cross-language interface an agent binds to. It MUST be byte-for-
@@ -6,22 +6,24 @@
 //! whichever engine serves. This module owns that contract and each tool's
 //! read-only execution over the local index.
 //!
-//! **What it is / does:** Declares the five tools and their handlers. The three v2.4
+//! **What it is / does:** Declares the six tools and their handlers. The three v2.4
 //! tools — `context_search` (now serving L2-compressed bodies at a `detail` level +
 //! each result's `chunk_id`), `index_status`, `record_feedback` — plus the two
 //! Layer-7 progressive-disclosure tools: `expand_chunk` (body/file/neighbors; body
 //! recovers the exact full bytes) and `related_context` (import-graph neighbours,
-//! imports AND consumers). `context_search` logs an identical `search` metrics event
-//! carrying the retrieval + `chunk_compression` savings buckets (SPEC-V2.5 §2/§3).
+//! imports AND consumers) — plus the Layer-4 `set_output_compression`, which switches
+//! the running session's output-compression preference in memory (NOT CLAUDE.md).
+//! `context_search` logs an identical `search` metrics event carrying the retrieval +
+//! `chunk_compression` savings buckets (SPEC-V2.5 §2/§3).
 //!
 //! **Responsibilities:**
-//! - Own the five tool schemas, output formatting, L2 serving, and `max_tokens`.
+//! - Own the six tool schemas, output formatting, L2 serving, and `max_tokens`.
 //! - Reuse `retriever`/`federation`/`compress`/`metrics`/`sync` — never reimplement.
 //! - Handle a missing/empty index or a stale chunk_id with a friendly message.
 
 use crate::chunker::{token_count, Chunk};
 use crate::compress::{compress, DetailLevel};
-use crate::config::{RetrievalConfig, CHARS_PER_TOKEN};
+use crate::config::{OutputLevel, RetrievalConfig, CHARS_PER_TOKEN};
 use crate::embedder::{format6, Embedder, HashEmbedder, OllamaEmbedder};
 use crate::federation::{combined_index, federated_search, load_member_stores, workspace_stats};
 use crate::mcp::server::McpServer;
@@ -95,10 +97,23 @@ depends on across files — instead of pre-loading whole neighbourhoods; expand 
 `expand_chunk(chunk_id)`. Pairs with `context_search` (find first) and `expand_chunk` (read the \
 full body).";
 
-/// The five tool definitions returned by `tools/list`, with the EXACT byte-pinned
+/// The `set_output_compression` description (SPEC-V2.5 §6 + §2 Layer 4): its purpose
+/// (dial THIS session's answer terseness) and when to use it, plus the explicit note
+/// that it is a session preference, not a CLAUDE.md rewrite. Byte-pinned; mirrored
+/// verbatim in the Ruby engine.
+const SET_OUTPUT_COMPRESSION_DESC: &str = "Set how terse THIS session's answers should be — the \
+output-compression level the agent applies to its OWN replies. Levels: `off` (no rules), `lite` \
+(concise; drop filler/preamble/postamble), `standard` (fewest correct words; code as minimal \
+diffs, never whole files; no preamble or postamble), `max` (standard + telegraphic prose; code \
+as minimal diffs only). Use it to dial verbosity down when you want terse diffs, or up (`off`) \
+when you want full explanations — mid-session, without editing CLAUDE.md. It sets a session \
+preference only; it does not rewrite CLAUDE.md and resets when the server restarts.";
+
+/// The six tool definitions returned by `tools/list`, with the EXACT byte-pinned
 /// schemas of SPEC-MCP §"Tools" + SPEC-V2.5 §6. The order is stable and fixed:
 /// the three v2.4 tools first (context_search the headline), then the two Layer-7
-/// progressive-disclosure tools. Mirrored verbatim for cce-ruby's catch-up.
+/// progressive-disclosure tools, then the Layer-4 `set_output_compression`. Mirrored
+/// verbatim for cce-ruby's catch-up.
 pub fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
@@ -157,6 +172,17 @@ pub fn tool_definitions() -> Vec<Value> {
                     "top_k":    { "type": "integer", "default": 8 }
                 },
                 "required": ["chunk_id"]
+            }
+        }),
+        json!({
+            "name": "set_output_compression",
+            "description": SET_OUTPUT_COMPRESSION_DESC,
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "level": { "type": "string", "enum": ["off", "lite", "standard", "max"], "description": "how terse THIS session's answers should be" }
+                },
+                "required": ["level"]
             }
         }),
     ]
@@ -473,6 +499,35 @@ pub fn record_feedback(server: &McpServer, args: &Value) -> ToolOutput {
             ))
         }
         None => ToolOutput::err("could not record feedback (the metrics log is not writable)."),
+    }
+}
+
+// --- Layer 4: output compression (set_output_compression) ---
+
+/// `set_output_compression` (SPEC-V2.5 §2 Layer 4, §6): set THIS session's
+/// output-compression level. Updates the running server's in-memory session
+/// preference (NOT CLAUDE.md) and returns the active level + a one-line
+/// confirmation. A missing or unrecognised `level` is an actionable tool-level
+/// error, never a crash, and leaves the session level unchanged.
+pub fn set_output_compression(server: &McpServer, args: &Value) -> ToolOutput {
+    let raw = args.get("level").and_then(Value::as_str).unwrap_or("").trim();
+    if raw.is_empty() {
+        return ToolOutput::err(
+            "set_output_compression requires a `level` (one of: off, lite, standard, max).",
+        );
+    }
+    match OutputLevel::parse(raw) {
+        Some(level) => {
+            server.set_output_level(level);
+            ToolOutput::ok(format!(
+                "Output compression is now `{}` for this session (in-memory; CLAUDE.md unchanged).",
+                level.as_str()
+            ))
+        }
+        None => ToolOutput::err(format!(
+            "set_output_compression: unknown level {raw:?}; use \"off\", \"lite\", \"standard\", \
+             or \"max\"."
+        )),
     }
 }
 
@@ -806,12 +861,13 @@ mod tests {
     #[test]
     fn tool_definitions_match_the_spec_contract() {
         let defs = tool_definitions();
-        assert_eq!(defs.len(), 5);
+        assert_eq!(defs.len(), 6);
         assert_eq!(defs[0]["name"], "context_search");
         assert_eq!(defs[1]["name"], "index_status");
         assert_eq!(defs[2]["name"], "record_feedback");
         assert_eq!(defs[3]["name"], "expand_chunk");
         assert_eq!(defs[4]["name"], "related_context");
+        assert_eq!(defs[5]["name"], "set_output_compression");
 
         // context_search schema: required query, top_k default 8, no_graph default
         // false, and the new L2 `detail` enum (SPEC-V2.5 §6).
@@ -843,6 +899,52 @@ mod tests {
         let rc = &defs[4]["inputSchema"];
         assert_eq!(rc["required"], json!(["chunk_id"]));
         assert_eq!(rc["properties"]["top_k"]["default"], 8);
+
+        // set_output_compression: byte-pinned description + a required `level` enum
+        // of exactly the four L4 levels (SPEC-V2.5 §2 Layer 4, §6).
+        assert_eq!(defs[5]["description"], json!(SET_OUTPUT_COMPRESSION_DESC));
+        let so = &defs[5]["inputSchema"];
+        assert_eq!(so["required"], json!(["level"]));
+        assert_eq!(so["properties"]["level"]["enum"], json!(["off", "lite", "standard", "max"]));
+    }
+
+    #[test]
+    fn set_output_compression_sets_the_session_level_and_confirms() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = McpServer::new(Some(tmp.path().to_path_buf()), None, false);
+        assert_eq!(server.output_level(), OutputLevel::Standard); // default
+
+        let out = set_output_compression(&server, &json!({ "level": "lite" }));
+        assert!(!out.is_error);
+        assert!(out.text.contains("lite"), "confirmation missing level: {}", out.text);
+        assert_eq!(server.output_level(), OutputLevel::Lite);
+
+        // Every level round-trips through the tool.
+        for (arg, lvl) in [
+            ("off", OutputLevel::Off),
+            ("max", OutputLevel::Max),
+            ("standard", OutputLevel::Standard),
+        ] {
+            let out = set_output_compression(&server, &json!({ "level": arg }));
+            assert!(!out.is_error);
+            assert_eq!(server.output_level(), lvl);
+        }
+    }
+
+    #[test]
+    fn set_output_compression_rejects_bad_or_missing_level() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = McpServer::new(Some(tmp.path().to_path_buf()), None, false);
+        // Unknown level ⇒ actionable error, session unchanged.
+        let out = set_output_compression(&server, &json!({ "level": "turbo" }));
+        assert!(out.is_error);
+        assert!(out.text.contains("unknown level"), "got: {}", out.text);
+        assert_eq!(server.output_level(), OutputLevel::Standard);
+        // Missing level ⇒ actionable error.
+        let out = set_output_compression(&server, &json!({}));
+        assert!(out.is_error);
+        assert!(out.text.contains("requires a `level`"), "got: {}", out.text);
+        assert_eq!(server.output_level(), OutputLevel::Standard);
     }
 
     #[test]

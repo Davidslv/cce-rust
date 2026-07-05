@@ -18,7 +18,7 @@
 //! - It is READ-ONLY over the store and never blocks or errors on a missing index,
 //!   an absent remote, or an offline network.
 
-use crate::config::METRICS_FILE;
+use crate::config::{OutputConfig, OutputLevel, METRICS_FILE};
 use crate::mcp::protocol::{self, Request};
 use crate::mcp::tools;
 use crate::mcp::{MCP_PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION};
@@ -26,6 +26,7 @@ use crate::store::{default_metrics_path, default_store_path};
 use crate::sync::commands::{cmd_pull, PullTarget};
 use crate::sync::config::SyncConfig;
 use serde_json::{json, Value};
+use std::cell::Cell;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
@@ -37,17 +38,37 @@ pub struct McpServer {
     store: Option<PathBuf>,
     /// `--workspace`: federate over the workspace members (SPEC-V2.2).
     workspace: bool,
+    /// L4 session output-compression preference (SPEC-V2.5 §2 Layer 4). Seeded from
+    /// the project's `output.level` config and switched at runtime by the
+    /// `set_output_compression` tool. In-memory only — never rewrites CLAUDE.md, and
+    /// resets when the server restarts. `Cell` because the stdio loop is
+    /// single-threaded and every handler takes `&self`.
+    output_level: Cell<OutputLevel>,
 }
 
 impl McpServer {
-    /// Construct from the resolved CLI options.
+    /// Construct from the resolved CLI options. The session output level is seeded
+    /// from the project's `.cce/config` `output.level` (absent ⇒ the default).
     pub fn new(dir: Option<PathBuf>, store: Option<PathBuf>, workspace: bool) -> Self {
-        McpServer { dir, store, workspace }
+        let root = dir.clone().unwrap_or_else(|| PathBuf::from("."));
+        let output_level = Cell::new(OutputConfig::load(&root).level);
+        McpServer { dir, store, workspace, output_level }
     }
 
     /// Whether this session federates over a workspace.
     pub fn is_workspace(&self) -> bool {
         self.workspace
+    }
+
+    /// The current L4 session output-compression level (SPEC-V2.5 §2 Layer 4).
+    pub fn output_level(&self) -> OutputLevel {
+        self.output_level.get()
+    }
+
+    /// Set the L4 session output-compression level (in-memory session state, set by
+    /// the `set_output_compression` tool). Does NOT rewrite CLAUDE.md.
+    pub fn set_output_level(&self, level: OutputLevel) {
+        self.output_level.set(level);
     }
 
     /// The project root (for sync + workspace + default metrics): `--dir` or cwd.
@@ -184,6 +205,7 @@ impl McpServer {
             "record_feedback" => tools::record_feedback(self, &args),
             "expand_chunk" => tools::expand_chunk(self, &args),
             "related_context" => tools::related_context(self, &args),
+            "set_output_compression" => tools::set_output_compression(self, &args),
             other => {
                 return Ok(unknown_tool_result(other));
             }
@@ -252,7 +274,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_returns_the_five_tools_in_fixed_order() {
+    fn tools_list_returns_the_six_tools_in_fixed_order() {
         let tmp = tempfile::tempdir().unwrap();
         let s = server_for(tmp.path());
         let resp = s.handle_line(r#"{"id":2,"method":"tools/list"}"#).unwrap();
@@ -270,9 +292,43 @@ mod tests {
                 "index_status",
                 "record_feedback",
                 "expand_chunk",
-                "related_context"
+                "related_context",
+                "set_output_compression"
             ]
         );
+    }
+
+    #[test]
+    fn set_output_compression_changes_the_session_level() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = server_for(tmp.path());
+        // Default (no config) is standard.
+        assert_eq!(s.output_level(), OutputLevel::Standard);
+        let resp = s
+            .handle_line(
+                r#"{"id":1,"method":"tools/call","params":{"name":"set_output_compression","arguments":{"level":"max"}}}"#,
+            )
+            .unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["result"]["isError"], false);
+        assert!(v["result"]["content"][0]["text"].as_str().unwrap().contains("max"));
+        assert_eq!(s.output_level(), OutputLevel::Max);
+    }
+
+    #[test]
+    fn set_output_compression_bad_level_is_an_actionable_error_not_a_crash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = server_for(tmp.path());
+        let resp = s
+            .handle_line(
+                r#"{"id":1,"method":"tools/call","params":{"name":"set_output_compression","arguments":{"level":"turbo"}}}"#,
+            )
+            .unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["result"]["isError"], true);
+        assert!(v["result"]["content"][0]["text"].as_str().unwrap().contains("unknown level"));
+        // The session level is unchanged by a bad call.
+        assert_eq!(s.output_level(), OutputLevel::Standard);
     }
 
     #[test]
