@@ -80,7 +80,7 @@ missing entry contributes 0).
  "files_indexed":231,"chunks":1728,"index_bytes":123456,"duration_ms":740.0,
  "embedder":"hash","full":true,
  "sha":"25bd0098…",        // v2.4.1: indexed commit sha (null on non-git)
- "source":"local",          // v2.4.1: "local" (built by cce index)
+ "source":"local",          // v2.4.1: "local" (cce index) | "sync-pull" (cce sync pull)
  "sensitive_skipped":1}     // v2.4.1: sensitive files skipped (secret-safety panel)
 ```
 
@@ -136,11 +136,10 @@ schema, totals{searches, indexes, feedback, tokens_saved, cost_saved_usd,
                mean_savings_ratio, mean_top_score, helpful, not_helpful, helpful_rate},
 north_star{ savings{current, prior, delta_ratio, direction},
             quality{current, prior, delta_top_score, direction} },
-usage_by_source{ cli{searches, tokens_saved, mean_savings_ratio, mean_top_score},
-                 mcp{searches, tokens_saved, mean_savings_ratio, mean_top_score} },
+by_source{ cli{searches, tokens_saved, mean_savings_ratio, mean_top_score},
+           mcp{searches, tokens_saved, mean_savings_ratio, mean_top_score} },
 secret_safety{ sensitive_skipped, index_runs },
-index_freshness{ indexes, source, sha, indexed_ts,       // log-derived (pure)
-                 remote_latest, behind_remote },          // live, added at the API edge
+index_freshness{ indexes, source, sha, indexed_ts },     // PURELY log-derived — no network call
 series{ daily:[ {date, searches, tokens_saved, mean_savings_ratio,
                  mean_top_score, empty_rate, low_conf_rate, helpful,
                  not_helpful} ] },        // one per UTC date with ANY search/feedback, ascending
@@ -155,23 +154,25 @@ by_package:[ {package, searches, tokens_saved, mean_savings_ratio, mean_top_scor
 The dashboard was built at v1.1 (savings + quality only). v2.4.1 adds four panels for
 the capabilities that landed since, all fed from the additive schema above:
 
-- **Agent vs human usage** (`usage_by_source`) — CLI searches vs MCP/agent searches:
-  how much your agent leans on CCE. A search's `source` other than `"mcp"` counts as
-  `cli`.
-- **Per-package breakdown** (`by_package`, workspace only) — savings, searches, and
-  **quality** (`mean_top_score`) per member: where in the ecosystem CCE helps most.
-- **Index freshness / sync status** (`index_freshness`) — the indexed `sha`, the source
-  (`local` vs `pulled`), and whether the local index is behind the remote. `source`,
-  `sha`, `indexed_ts`, and `indexes` are **pure, log-derived** (both engines reproduce
-  them identically); `remote_latest` and `behind_remote` are layered on at the API edge
-  from a **best-effort, offline-safe** sync lookup (both `null`/`false` when there is no
-  remote or it is unreachable — so the panel works fully offline).
+- **Agent vs human usage** (`by_source`) — CLI searches vs MCP/agent searches: how much
+  your agent leans on CCE. A search's `source` other than `"mcp"` counts as `cli`.
+- **Per-package breakdown** (`by_package`, workspace only) — an **array of objects**,
+  each `{package, searches, tokens_saved, mean_savings_ratio, mean_top_score}`, sorted by
+  `package`: savings, searches, and **quality** per member, i.e. where in the ecosystem
+  CCE helps most.
+- **Index freshness** (`index_freshness`) — the indexed `sha`, the source (`local` for
+  `cce index`, `sync-pull` for a `cce sync pull` install), `indexed_ts`, and the count of
+  index runs. **Purely log-derived**, so the dashboard makes **zero network calls** and
+  works fully offline. It deliberately carries **no** `remote_latest`/`behind_remote` — a
+  live behind-remote comparison lives in `cce sync status` and MCP `index_status`, which
+  are allowed to consult the remote.
 - **Secret-safety** (`secret_safety`) — the sensitive-files-skipped count across index
   runs: reassurance that secure-by-default redaction is working.
 
-`usage_by_source`, `secret_safety`, `index_freshness`, and `totals.mean_top_score` are
-part of the pure aggregator, so — like the §4.1 anchor — the Ruby and Rust engines
-produce identical numbers from the same log.
+`by_source`, `secret_safety`, `index_freshness`, and `totals.mean_top_score` are all
+**pure functions of the log**, so — like the §4.1 anchor — the Ruby and Rust engines
+produce identical numbers from the same log, and the dashboard request path touches no
+network.
 
 `recent_searches[*].feedback` is resolved by matching `feedback.target_id` to the
 search `id` (latest wins) → `helpful` / `not_helpful` / `none`. A day with

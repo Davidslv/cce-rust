@@ -22,11 +22,6 @@ fn fixture_metrics() -> PathBuf {
     PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/test/fixture/base/metrics_sample.jsonl"))
 }
 
-/// A project root with no sync config, so the freshness panel stays offline-safe.
-fn fixture_root() -> PathBuf {
-    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/test/fixture/base"))
-}
-
 /// Issue one HTTP/1.1 GET on a fresh connection; return (status_line, body).
 fn http_get(port: u16, path: &str) -> (String, String) {
     let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
@@ -46,7 +41,7 @@ fn serves_page_api_and_health_on_ephemeral_port() {
 
     // Serve exactly the four connections this test makes, then the thread ends.
     let handle = std::thread::spawn(move || {
-        serve(listener, fixture_metrics(), fixture_root(), 3.00, Some(4));
+        serve(listener, fixture_metrics(), 3.00, Some(4));
     });
 
     // GET / -> HTML page
@@ -70,11 +65,11 @@ fn serves_page_api_and_health_on_ephemeral_port() {
     assert_eq!(v["totals"]["searches"], 4);
     assert_eq!(v["totals"]["tokens_saved"], 53000);
     assert!(v.get("generated_ts").is_some());
-    // v2.4.1 refreshed panels are served over the real socket, offline-safe.
-    assert_eq!(v["usage_by_source"]["cli"]["searches"], 4);
+    // v2.4.1 refreshed panels are served over the real socket, purely log-derived.
+    assert_eq!(v["by_source"]["cli"]["searches"], 4);
     assert_eq!(v["secret_safety"]["sensitive_skipped"], 0);
     assert_eq!(v["index_freshness"]["source"], "local");
-    assert_eq!(v["index_freshness"]["behind_remote"], false);
+    assert!(v["index_freshness"].get("behind_remote").is_none());
 
     // Unknown path -> 404
     let (status, body) = http_get(port, "/nope");

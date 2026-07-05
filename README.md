@@ -329,10 +329,11 @@ flat indicator, plus a recent-searches table. (The base engine and
 
 **Refreshed in v2.4.1** with four panels for the capabilities that landed since:
 **agent-vs-human usage** (CLI vs MCP/agent searches), a **per-package breakdown**
-(savings/searches/quality per workspace member), **index freshness / sync status**
-(indexed `sha`, local-vs-pulled source, behind-remote), and **secret-safety** (the
-sensitive-files-skipped count). The metrics schema grew only by adding fields, so old
-logs still parse.
+(savings/searches/quality per workspace member), **index freshness** (indexed `sha`,
+local-vs-`sync-pull` source), and **secret-safety** (the sensitive-files-skipped
+count). Every panel is **purely log-derived**, so the dashboard makes **zero network
+calls** (behind-remote lives in `cce sync status`); the metrics schema grew only by
+adding fields, so old logs still parse.
 
 ![CCE dashboard — token/cost savings and retrieval quality, trended](docs/dashboard.png)
 
@@ -577,7 +578,7 @@ real offline cold-start run in [`docs/VERIFIED.md`](docs/VERIFIED.md):
 | `cce index` | ✅ fully offline | walk → AST-chunk → hash-embed → write local JSON |
 | `cce search` | ✅ fully offline | reopens the local store; no re-embedding of the corpus |
 | `cce stats` | ✅ fully offline | reads the local store |
-| `cce dashboard` | ✅ fully offline | loopback-only, read-only; inlines all CSS/JS/SVG; the freshness panel's remote lookup is best-effort and offline-safe (`remote_latest: null`, `behind_remote: false`) |
+| `cce dashboard` | ✅ fully offline | loopback-only, read-only; inlines all CSS/JS/SVG; **every panel is purely log-derived, so it makes zero network calls** (behind-remote is answered by `cce sync status`) |
 | `cce workspace` / `--workspace` | ✅ fully offline | detection, federated index/search/stats/dashboard |
 | `cce mcp` | ✅ fully offline | serves the **local** index to the agent; auto-pull is a soft dependency that no-ops with no remote |
 | `cce feedback` / `cce conformance` / `cce packs` / `cce bench` | ✅ fully offline | pure local operations |

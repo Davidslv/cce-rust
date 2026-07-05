@@ -618,21 +618,10 @@ fn cmd_dashboard(
     price: Option<f64>,
     _no_open: bool,
 ) -> Result<(), String> {
-    // The freshness panel reads `<root>/.cce/synced.json` (offline-safe): the root
-    // is `--dir`, else the store's grand-parent, else the current directory.
-    let root = dir.clone().unwrap_or_else(|| {
-        store
-            .as_deref()
-            .and_then(|s| s.parent())
-            .and_then(|p| p.parent())
-            .map(Path::to_path_buf)
-            .unwrap_or_else(|| PathBuf::from("."))
-    });
     let metrics_path = resolve_metrics_path(metrics, store, dir);
     let port = port.unwrap_or(DEFAULT_DASHBOARD_PORT);
     let price = price.unwrap_or(DEFAULT_INPUT_PRICE_PER_MILLION);
-    cce::dashboard::run(metrics_path, root, price, port)
-        .map_err(|e| format!("dashboard failed: {e}"))
+    cce::dashboard::run(metrics_path, price, port).map_err(|e| format!("dashboard failed: {e}"))
 }
 
 fn cmd_stats(store: Option<PathBuf>, dir: Option<PathBuf>) -> Result<(), String> {
@@ -939,7 +928,7 @@ fn cmd_dashboard_workspace(
     let members = member_metrics(&root, &manifest);
     let port = port.unwrap_or(DEFAULT_DASHBOARD_PORT);
     let price = price.unwrap_or(DEFAULT_INPUT_PRICE_PER_MILLION);
-    cce::dashboard::run_workspace(members, root, price, port)
+    cce::dashboard::run_workspace(members, price, port)
         .map_err(|e| format!("dashboard failed: {e}"))
 }
 

@@ -478,21 +478,26 @@ index event to `"local"`. No `cce.metrics/v2`; the schema tag stays `cce.metrics
 counts as an agent search; every other `source` (`"cli"`, empty, unknown) is a human
 search. This keeps the CLI path (`cce search` → `"cli"`) and the MCP path
 (`context_search` → `"mcp"`) as the two buckets, and makes an ambiguous/old event fall
-into the human bucket deterministically — the same rule in both engines.
+into the human bucket deterministically — the same rule in both engines. The top-level
+key is `by_source` (the reconciled cross-engine name).
 
-**Freshness is split: pure aggregator vs live edge.** `index_freshness`'s log-derived
-part (`source`, `sha`, `indexed_ts`, `indexes` — from the latest index event) lives in
-the pure aggregator, so both engines reproduce it identically and it is offline. The
-live `remote_latest`/`behind_remote` — and the authoritative `pulled` source/sha from
-the sync marker — are layered on at the dashboard **edge** via the offline-safe
-`sync::commands::freshness`, exactly like `generated_ts`. With no remote configured this
-touches no network, so `cce dashboard` stays fully offline; `remote_latest` is then
-`null` and `behind_remote` is `false`.
+**`index_freshness` is PURELY log-derived — the dashboard makes zero network calls.**
+Its shape is exactly `{indexes, source, sha, indexed_ts}`, computed from the latest index
+event, so both engines reproduce it identically and `cce dashboard` stays self-contained
+and fully offline. It deliberately carries **no** `remote_latest`/`behind_remote`: a
+live remote comparison would mean a git fetch on the request path, which breaks the
+offline/self-contained posture. That comparison lives only in `cce sync status` and MCP
+`index_status`, which are expected to consult the remote. To make the *pulled* state
+observable without a live lookup, `cce sync pull` records a `source: "sync-pull"` index
+event in the log (with the pulled sha) — so `index_freshness.source` reads `"local"`
+(built by `cce index`) or `"sync-pull"` (installed by `cce sync pull`) straight from the
+log.
 
 **The dashboard stays self-contained and offline.** The four new panels
 (agent-vs-human, per-package, index-freshness, secret-safety) render from the same
-`/api/metrics` body with inline JS/SVG — no new endpoint, no external asset, still
-loopback-only and read-only. `secret_safety.sensitive_skipped` sums the index events'
-skip counts (the only source of that datum), so it needs the additive `index.sensitive_skipped`
-field. `by_package` gains `mean_top_score` so the per-member panel shows quality, not
-just savings.
+`/api/metrics` body with inline JS/SVG — no new endpoint, no external asset, no network
+call, still loopback-only and read-only. `secret_safety.sensitive_skipped` sums the
+index events' skip counts (the only source of that datum), so it needs the additive
+`index.sensitive_skipped` field. `by_package` (workspace only) is an array of objects,
+each with a `package` field, **sorted by package** for deterministic cross-engine order,
+and gains `mean_top_score` so the per-member panel shows quality, not just savings.

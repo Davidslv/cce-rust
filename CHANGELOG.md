@@ -22,19 +22,22 @@ adding fields (older logs still parse), the base engine and single-repo
 - **Dashboard refresh (`src/dashboard.rs`, `src/aggregator.rs`)** — four new panels:
   **agent-vs-human usage** (CLI vs MCP searches), **per-package breakdown**
   (savings/searches/quality per workspace member — now with `mean_top_score`),
-  **index freshness / sync status** (indexed `sha`, local-vs-pulled source,
-  behind-remote), and **secret-safety** (sensitive-files-skipped count). The page
-  stays loopback-only, read-only, and self-contained (inline CSS/JS, hand-drawn SVG,
-  no external network).
+  **index freshness** (indexed `sha`, local-vs-`sync-pull` source), and
+  **secret-safety** (sensitive-files-skipped count). Every panel is **purely
+  log-derived, so the dashboard makes zero network calls** and stays loopback-only,
+  read-only, and self-contained (inline CSS/JS, hand-drawn SVG). Behind-remote lives
+  in `cce sync status` / MCP `index_status`, not on the dashboard.
 - **Metrics schema — additive fields.** `search` events carry
   `source: "cli" | "mcp"` (the CLI `search` path tags `"cli"`; the MCP
-  `context_search` path tags `"mcp"`). `index` events carry `sha`, `source`, and
+  `context_search` path tags `"mcp"`). `index` events carry `sha`, `source`
+  (`"local"` for `cce index`, `"sync-pull"` for a `cce sync pull` install), and
   `sensitive_skipped`. Absent/unknown fields degrade gracefully (a pre-v2.4.1 search
   reads back as `"cli"`; an index event as `"local"`).
-- **Aggregator sections.** `/api/metrics` gains `usage_by_source`, `secret_safety`,
-  and `index_freshness` (log-derived, pure, cross-language-identical), and
-  `totals.mean_top_score`. The dashboard edge layers the live, offline-safe
-  `remote_latest`/`behind_remote` onto `index_freshness`.
+- **Aggregator sections.** `/api/metrics` gains `by_source`, `secret_safety`, and
+  `index_freshness` (`{indexes, source, sha, indexed_ts}`) — all pure, log-derived,
+  cross-language-identical — plus `totals.mean_top_score`. `by_package` (workspace)
+  gains `mean_top_score` and is sorted by package. `cce sync pull` records a
+  `sync-pull` index event so the pulled provenance is observable with no network call.
 - **Documentation sweep** — a dedicated, **verified offline-first** section proving
   `index` / `search` / `stats` / `dashboard` / `workspace` / `cce mcp` all run with
   no network and no remote; macOS **and** Ubuntu setup with explicit prerequisites
@@ -46,8 +49,8 @@ adding fields (older logs still parse), the base engine and single-repo
 
 - `retriever::build_search_record` takes a `source` argument so the CLI and MCP
   search paths tag their metrics events.
-- `dashboard::run` / `serve` / `route` take the project `root` so the freshness
-  panel can read the sync marker (offline-safe: no remote ⇒ no network).
+- `cce sync pull` now appends a `sync-pull` `index` event to the metrics log so the
+  dashboard's freshness panel is fully log-derived (no request-path network call).
 - Version bumped to **2.4.1** (`Cargo.toml`, `CITATION.cff`). `SYNC_FORMAT_VERSION`
   deliberately **unchanged** at `"2.3"`.
 

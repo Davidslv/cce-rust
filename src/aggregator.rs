@@ -27,22 +27,22 @@ const DAY_SECS: i64 = 86_400;
 
 /// The aggregate, minus `generated_ts` (added by the API at serialization time).
 ///
-/// `usage_by_source`, `secret_safety`, `index_freshness`, and `totals.mean_top_score`
+/// `by_source`, `secret_safety`, `index_freshness`, and `totals.mean_top_score`
 /// were added additively in v2.4.1 to feed the refreshed dashboard panels. They are
-/// pure functions of the log, so both engines reproduce them identically; the live
-/// sync `remote_latest`/`behind_remote` are layered onto `index_freshness` at the
-/// API edge (like `generated_ts`), not here.
+/// **pure functions of the log**, so both engines reproduce them identically and the
+/// dashboard makes NO network call. Behind-remote is intentionally NOT here — a live
+/// remote comparison belongs in `cce sync status` and MCP `index_status`.
 #[derive(Debug, Serialize)]
 pub struct Aggregate {
     pub schema: String,
     pub totals: Totals,
     pub north_star: NorthStar,
     /// Agent-vs-human split of searches, keyed by `source` (v2.4.1).
-    pub usage_by_source: UsageBySource,
+    pub by_source: UsageBySource,
     /// Secret-safety reassurance: sensitive files skipped across index runs (v2.4.1).
     pub secret_safety: SecretSafety,
-    /// Index freshness from the latest index event (v2.4.1); the API edge adds the
-    /// live `remote_latest`/`behind_remote`.
+    /// Index freshness from the latest index event (v2.4.1) — purely log-derived,
+    /// no network call.
     pub index_freshness: IndexFreshness,
     pub series: Series,
     pub recent_searches: Vec<RecentSearch>,
@@ -88,9 +88,12 @@ pub struct SecretSafety {
     pub index_runs: u64,
 }
 
-/// Index freshness (v2.4.1): the latest index event's provenance. `source`/`sha`/
-/// `indexed_ts` are `None` when the log has no index event yet. The API edge adds
-/// `remote_latest` and `behind_remote` from the live sync marker (offline-safe).
+/// Index freshness (v2.4.1): the latest index event's provenance — `source`
+/// (`"local"` for `cce index`, `"sync-pull"` for a `cce sync pull` install), `sha`,
+/// and `indexed_ts` — all `None` when the log has no index event yet. **Purely
+/// log-derived**: the dashboard makes NO network call, so this holds no live
+/// remote comparison. Behind-remote lives in `cce sync status` and MCP
+/// `index_status`, where a live lookup belongs.
 #[derive(Debug, Serialize)]
 pub struct IndexFreshness {
     pub indexes: u64,
@@ -232,7 +235,7 @@ pub fn aggregate(events: &[Event], now_secs: i64, price: f64) -> Aggregate {
         schema: crate::config::METRICS_SCHEMA.to_string(),
         totals,
         north_star,
-        usage_by_source: compute_usage_by_source(&searches),
+        by_source: compute_usage_by_source(&searches),
         secret_safety: compute_secret_safety(&indexes),
         index_freshness: compute_index_freshness(&indexes),
         series,
@@ -637,8 +640,8 @@ mod tests {
         assert_eq!(agg.north_star.savings.direction, "flat");
         assert_eq!(agg.north_star.quality.direction, "flat");
         // v2.4.1 panels degrade gracefully to a clean zero/none state.
-        assert_eq!(agg.usage_by_source.cli.searches, 0);
-        assert_eq!(agg.usage_by_source.mcp.searches, 0);
+        assert_eq!(agg.by_source.cli.searches, 0);
+        assert_eq!(agg.by_source.mcp.searches, 0);
         assert_eq!(agg.secret_safety.sensitive_skipped, 0);
         assert_eq!(agg.secret_safety.index_runs, 0);
         assert_eq!(agg.index_freshness.indexes, 0);
@@ -655,14 +658,14 @@ mod tests {
         // Lifetime mean top score over non-empty searches (0.9, 0.6, 0.4).
         assert_eq!(agg.totals.mean_top_score, 0.633333);
         // Agent-vs-human split: all four are CLI; none are MCP.
-        assert_eq!(agg.usage_by_source.cli.searches, 4);
-        assert_eq!(agg.usage_by_source.cli.tokens_saved, 53000);
-        assert_eq!(agg.usage_by_source.cli.mean_savings_ratio, 0.525000);
-        assert_eq!(agg.usage_by_source.cli.mean_top_score, 0.633333);
-        assert_eq!(agg.usage_by_source.mcp.searches, 0);
-        assert_eq!(agg.usage_by_source.mcp.tokens_saved, 0);
-        assert_eq!(agg.usage_by_source.mcp.mean_savings_ratio, 0.0);
-        assert_eq!(agg.usage_by_source.mcp.mean_top_score, 0.0);
+        assert_eq!(agg.by_source.cli.searches, 4);
+        assert_eq!(agg.by_source.cli.tokens_saved, 53000);
+        assert_eq!(agg.by_source.cli.mean_savings_ratio, 0.525000);
+        assert_eq!(agg.by_source.cli.mean_top_score, 0.633333);
+        assert_eq!(agg.by_source.mcp.searches, 0);
+        assert_eq!(agg.by_source.mcp.tokens_saved, 0);
+        assert_eq!(agg.by_source.mcp.mean_savings_ratio, 0.0);
+        assert_eq!(agg.by_source.mcp.mean_top_score, 0.0);
         // The anchor's single index event has no sensitive_skipped (→ 0), source
         // defaults to "local", and no sha.
         assert_eq!(agg.secret_safety.sensitive_skipped, 0);
@@ -685,12 +688,12 @@ mod tests {
         );
         let events = parse_log(text).events;
         let agg = aggregate(&events, now(), 3.00);
-        assert_eq!(agg.usage_by_source.cli.searches, 1);
-        assert_eq!(agg.usage_by_source.cli.tokens_saved, 100);
-        assert_eq!(agg.usage_by_source.mcp.searches, 1);
-        assert_eq!(agg.usage_by_source.mcp.tokens_saved, 300);
-        assert_eq!(agg.usage_by_source.mcp.mean_savings_ratio, 0.750000);
-        assert_eq!(agg.usage_by_source.mcp.mean_top_score, 0.900000);
+        assert_eq!(agg.by_source.cli.searches, 1);
+        assert_eq!(agg.by_source.cli.tokens_saved, 100);
+        assert_eq!(agg.by_source.mcp.searches, 1);
+        assert_eq!(agg.by_source.mcp.tokens_saved, 300);
+        assert_eq!(agg.by_source.mcp.mean_savings_ratio, 0.750000);
+        assert_eq!(agg.by_source.mcp.mean_top_score, 0.900000);
         // Secret-safety sums both runs (1 + 3).
         assert_eq!(agg.secret_safety.sensitive_skipped, 4);
         assert_eq!(agg.secret_safety.index_runs, 2);

@@ -58,7 +58,7 @@
 - [src/conformance.rs](src/conformance.rs): The byte-stable conformance.json emitter (SPEC §8).
 - [src/metrics.rs](src/metrics.rs): The persisted metrics event log — injected clock/id source (the one place wall-clock time is allowed), best-effort append, robust reader (DASHBOARD-SPEC §2).
 - [src/aggregator.rs](src/aggregator.rs): The pure aggregator — totals, north-stars, daily series, deltas, plus the v2.4.1 agent-vs-human, secret-safety, and index-freshness sections (DASHBOARD-SPEC §4).
-- [src/dashboard.rs](src/dashboard.rs): The loopback-only, read-only, self-contained dashboard web server; serves the refreshed v2.4.1 panels and layers offline-safe sync freshness at the API edge (DASHBOARD-SPEC §6).
+- [src/dashboard.rs](src/dashboard.rs): The loopback-only, read-only, self-contained dashboard web server; serves the refreshed v2.4.1 panels, all purely log-derived so it makes zero network calls (DASHBOARD-SPEC §6).
 - [src/federation.rs](src/federation.rs): Federated indexing/search/stats/dashboard over workspace members (SPEC-V2.2 §4–7).
 - [src/sync/](src/sync/): CCE Sync — identity helpers, byte-exact artifact, `sync.*` config, git wrappers, the `SyncRemote` git backend, and `init/push/pull/status/verify` (SPEC-SYNC).
 - [src/mcp/](src/mcp/): CCE MCP — JSON-RPC 2.0 framing (`protocol`), the stdio dispatch loop (`server`), the three tools (`tools`), and `cce init` (`init`) (SPEC-MCP).

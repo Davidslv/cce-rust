@@ -60,7 +60,7 @@ $ printf 'def hash_password(pw):\n    return pw + "salt"\n' > auth.py
 $ printf 'import auth\n\ndef process_payment(amount):\n    return auth.hash_password(str(amount))\n' > payments.py
 $ git add -A && git commit -q -m "initial project"
 $ git rev-parse --short HEAD
-25bd009
+4d8f068
 ```
 
 ## 2. `cce index` — build the local index (offline)
@@ -85,7 +85,7 @@ $ cce search "where is the password hashed" --top-k 3
     def hash_password(pw):
  2. [0.816803] payments.py:3-4 (function/function_definition)
     def process_payment(amount):
-query-id: e684d2686d65  ·  rate with: cce feedback e684d2686d65 --helpful|--not-helpful
+query-id: 58bf435c5c8b  ·  rate with: cce feedback 58bf435c5c8b --helpful|--not-helpful
 ```
 
 ## 4. `cce stats` (offline)
@@ -148,8 +148,8 @@ $ printf '%s\n' \
   def process_payment(amount):
       return auth.hash_password(str(amount))
 
-  query_id: 0aae712603f7
-  Rate this with record_feedback (query_id="0aae712603f7", helpful=true|false).
+  query_id: cb30eaa953a0
+  Rate this with record_feedback (query_id="cb30eaa953a0", helpful=true|false).
   ```
 
 - **index_status** (id 3) →
@@ -179,13 +179,15 @@ metrics log : ./.cce/metrics.jsonl
 press Ctrl-C to stop.
 ```
 
-`GET /api/metrics` returns the v2.4.1 panels — **agent-vs-human**, **secret-safety**,
-and **index-freshness** — all computed with no network:
+`GET /api/metrics` returns the v2.4.1 panels — **agent-vs-human** (`by_source`),
+**secret-safety**, and **index-freshness** — all computed from the log with **no
+network call** (`index_freshness` is purely log-derived — no `remote_latest`/
+`behind_remote`; that live comparison lives in `cce sync status`):
 
 ```console
-$ curl -s http://127.0.0.1:8787/api/metrics | jq '{usage_by_source, secret_safety, index_freshness, mean_top_score: .totals.mean_top_score}'
+$ curl -s http://127.0.0.1:8787/api/metrics | jq '{by_source, secret_safety, index_freshness, mean_top_score: .totals.mean_top_score}'
 {
-  "usage_by_source": {
+  "by_source": {
     "cli": { "searches": 2, "tokens_saved": 8, "mean_savings_ratio": 0.125, "mean_top_score": 0.825 },
     "mcp": { "searches": 1, "tokens_saved": 4, "mean_savings_ratio": 0.125, "mean_top_score": 0.825 }
   },
@@ -193,10 +195,8 @@ $ curl -s http://127.0.0.1:8787/api/metrics | jq '{usage_by_source, secret_safet
   "index_freshness": {
     "indexes": 2,
     "source": "local",
-    "sha": "25bd0098ca275930fb20a93ba8fce0d76893457e",
-    "indexed_ts": "2026-07-05T14:20:11Z",
-    "remote_latest": null,
-    "behind_remote": false
+    "sha": "4d8f068ab19ec441a5a80230d81f3be20c702b28",
+    "indexed_ts": "2026-07-05T14:44:38Z"
   },
   "mean_top_score": 0.825
 }
@@ -205,8 +205,9 @@ $ curl -s http://127.0.0.1:8787/api/health
 ```
 
 The agent's `context_search` (`mcp`) sits beside the human's `cce search` (`cli`) —
-the agent-vs-human split is proven offline. `remote_latest` is `null` and
-`behind_remote` is `false` because no remote is configured: **no network was touched.**
+the agent-vs-human split is proven offline. `index_freshness` carries only what the
+log knows (`source: "local"`, the indexed `sha`, `indexed_ts`); the dashboard makes
+**zero network calls**, so it works with the network fully down.
 
 ## 8. `cce workspace` — federated ecosystem (offline)
 
@@ -273,7 +274,7 @@ $ git init --bare -q -b main "$WORK/cache.git"
 $ cd "$WORK/billing"                     # src/auth.py + src/pay.py + .gitignore (.cce/)
 $ git add -A && git commit -q -m "initial billing service"
 $ git rev-parse --short HEAD
-7cb6176
+71400cd
 $ cce index .                            # a hash index is what gets shared
 ```
 
@@ -287,9 +288,9 @@ Configured sync remote: file://$WORK/cache.git
   working clone : $CCE_HOME/sync/e1b946a294f94ae3
   config        : ./.cce/config
 $ cce sync push
-Pushed github.com__acme__billing@7cb6176f855de5cc187cd6bc2a49f82517ba7eda
-  key      : hash/2.3/github.com__acme__billing/7cb6176f855de5cc187cd6bc2a49f82517ba7eda.cce
-  checksum : 30dcfecbea2cee6b4d5339e1dc6157a42a629635b9059c76c5236304d58a40e4
+Pushed github.com__acme__billing@71400cd6d8c1211475e034aedf6d79f18a54e977
+  key      : hash/2.3/github.com__acme__billing/71400cd6d8c1211475e034aedf6d79f18a54e977.cce
+  checksum : 7deb21139c1fac4a74db5ab9dc936b4dd5859e26790a61ea478efba10f062337
 ```
 
 ## 3. A teammate clones, pulls, and verifies — bit-for-bit
@@ -298,17 +299,17 @@ Pushed github.com__acme__billing@7cb6176f855de5cc187cd6bc2a49f82517ba7eda
 $ git clone -q "file://$WORK/billing" "$WORK/billing-teammate" && cd "$WORK/billing-teammate"
 $ cce sync init --remote "file://$WORK/cache.git" --no-lfs --repo-id github.com__acme__billing
 $ cce sync pull
-Pulled github.com__acme__billing@7cb6176f855de5cc187cd6bc2a49f82517ba7eda
+Pulled github.com__acme__billing@71400cd6d8c1211475e034aedf6d79f18a54e977
   chunks   : 3
-  checksum : 30dcfecbea2cee6b4d5339e1dc6157a42a629635b9059c76c5236304d58a40e4
+  checksum : 7deb21139c1fac4a74db5ab9dc936b4dd5859e26790a61ea478efba10f062337
   store    : ./.cce/index.json
   tree     : matches — pulled index used as-is
 $ cce sync verify
-verify OK: github.com__acme__billing@7cb6176f855de5cc187cd6bc2a49f82517ba7eda
-  checksum : 30dcfecbea2cee6b4d5339e1dc6157a42a629635b9059c76c5236304d58a40e4
+verify OK: github.com__acme__billing@71400cd6d8c1211475e034aedf6d79f18a54e977
+  checksum : 7deb21139c1fac4a74db5ab9dc936b4dd5859e26790a61ea478efba10f062337
 ```
 
-The pull checksum `30dcfecb…` is **identical** to the push checksum — content
+The pull checksum `7deb2113…` is **identical** to the push checksum — content
 addressability proven end-to-end. Search then runs fully offline over the pulled index:
 
 ```console
@@ -319,27 +320,39 @@ $ cce search "authenticate user password" --no-metrics --top-k 2
     def charge(user, amount):
 ```
 
-## 4. Sync freshness is observable on the dashboard and in MCP
+## 4. Sync freshness — where each fact lives
 
-After a pull, `index_status` and the dashboard's **index-freshness** panel report the
-index **source (pulled), its sha, remote-latest, and behind-remote**:
+A `cce sync pull` records a `sync-pull` **index event** in the log, so the dashboard's
+**index-freshness** panel shows the pulled provenance **purely from the log — no
+network call** (`index_freshness` is exactly `{indexes, source, sha, indexed_ts}`):
 
 ```console
+$ curl -s http://127.0.0.1:8787/api/metrics | jq '.index_freshness'
+{
+  "indexes": 1,
+  "source": "sync-pull",
+  "sha": "71400cd6d8c1211475e034aedf6d79f18a54e977",
+  "indexed_ts": "2026-07-05T14:46:22Z"
+}
+```
+
+The **live behind-remote comparison** belongs in `cce sync status` and MCP
+`index_status` (which *do* consult the remote), never on the dashboard:
+
+```console
+$ cce sync status
+remote        : file://$WORK/cache.git
+git-LFS       : off
+repo_id       : github.com__acme__billing
+local cache   : 71400cd6d8c1211475e034aedf6d79f18a54e977 (7deb21139c1f)
+remote latest : 71400cd6d8c1211475e034aedf6d79f18a54e977 (ref main)
+working tree  : 71400cd6d8c1211475e034aedf6d79f18a54e977
 $ printf '%s\n' '{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"index_status"}}' | cce mcp --dir .
 Index status
   ...
-  source  : pulled via cce sync (sha 7cb6176f855d)
-  remote latest: 7cb6176f855d
+  source  : pulled via cce sync (sha 71400cd6d8c1)
+  remote latest: 71400cd6d8c1
   behind remote: no
-$ curl -s http://127.0.0.1:8787/api/metrics | jq '.index_freshness'
-{
-  "indexes": 0,
-  "source": "pulled",
-  "sha": "7cb6176f855de5cc187cd6bc2a49f82517ba7eda",
-  "indexed_ts": null,
-  "remote_latest": "7cb6176f855de5cc187cd6bc2a49f82517ba7eda",
-  "behind_remote": false
-}
 ```
 
 (The `cce init --remote <url>` plug-and-play flow wraps the same `cce sync pull

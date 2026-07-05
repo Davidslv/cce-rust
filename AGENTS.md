@@ -32,10 +32,12 @@ Everywhere else stays deterministic. In metrics, the clock and id source are
 **injected** so tests pin them; the aggregator is a **pure function** of
 `(events, now, price)` with no ambient time. Keep it that way. The metrics schema
 grows **only additively** — the reader tolerates absent/unknown fields (v2.4.1 added
-`search.source`, `index.{sha,source,sensitive_skipped}`, and the `usage_by_source` /
+`search.source`, `index.{sha,source,sensitive_skipped}`, and the `by_source` /
 `secret_safety` / `index_freshness` aggregate sections), so older logs still parse and
-both engines stay in parity. The live `remote_latest`/`behind_remote` are layered onto
-`index_freshness` at the dashboard edge (offline-safe), never inside the pure aggregator.
+both engines stay in parity. Every `/api/metrics` panel is a **pure function of the
+log**, so the **dashboard makes zero network calls** — `index_freshness` carries no
+`remote_latest`/`behind_remote`; a live behind-remote comparison lives only in
+`cce sync status` and MCP `index_status`.
 
 ## The gates that must stay green
 

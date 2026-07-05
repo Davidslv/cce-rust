@@ -361,7 +361,7 @@ pub fn federated_metrics_json(
     let rollup = aggregate(&all_events, now_secs, price);
     let mut val = serde_json::to_value(&rollup).unwrap_or(serde_json::Value::Null);
 
-    let by_package: Vec<PackageRollup> = members
+    let mut by_package: Vec<PackageRollup> = members
         .iter()
         .map(|m| {
             let log = read_log(&m.metrics_path);
@@ -375,6 +375,8 @@ pub fn federated_metrics_json(
             }
         })
         .collect();
+    // Deterministic, cross-engine-identical ordering: sort by package name.
+    by_package.sort_by(|a, b| a.package.cmp(&b.package));
 
     if let Some(obj) = val.as_object_mut() {
         obj.insert("by_package".to_string(), serde_json::to_value(&by_package).unwrap_or_default());
@@ -564,7 +566,7 @@ mod tests {
         let billing = by.iter().find(|p| p["package"] == "billing").unwrap();
         assert_eq!(billing["tokens_saved"], 3000);
         // The roll-up carries the v2.4.1 agent-vs-human split (all CLI here).
-        assert_eq!(json["usage_by_source"]["cli"]["searches"], 2);
-        assert_eq!(json["usage_by_source"]["mcp"]["searches"], 0);
+        assert_eq!(json["by_source"]["cli"]["searches"], 2);
+        assert_eq!(json["by_source"]["mcp"]["searches"], 0);
     }
 }
