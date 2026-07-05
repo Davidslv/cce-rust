@@ -33,6 +33,7 @@ pub mod aggregator;
 pub mod dashboard;
 pub mod workspace;
 pub mod federation;
+pub mod sync;
 
 pub use chunker::Chunk;
 pub use retriever::SearchResult;

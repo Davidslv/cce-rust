@@ -42,6 +42,12 @@ responsibilities header.
 | `src/retriever.rs` | The hybrid pipeline (SPEC §6) | `search`, `rank_core`, `expand_graph`, `is_code_lookup`, `SearchResult` |
 | `src/workspace.rs` | Member detection, manifest, cross-member edges (SPEC-V2.2 §2–5) | `Manifest`, `Member`, `detect_members`, `build_graph`, `deps_from_*`, `WorkspaceGraph` |
 | `src/federation.rs` | Federated indexing/search/stats/dashboard over members (SPEC-V2.2 §4–7) | `federated_search`, `combined_index`, `load_member_stores`, `workspace_stats`, `federated_metrics_json` |
+| `src/sync/mod.rs` | CCE Sync identity helpers — content address, `repo_id`, pack-set id, sync home (SPEC-SYNC §2–4) | `content_address`, `normalize_repo_id`, `pack_set_id`, `cce_version_minor`, `sync_home` |
+| `src/sync/artifact.rs` | Byte-exact portable interchange artifact + checksum + base64 f64 embeddings (SPEC-SYNC §2) | `Artifact`, `Manifest`, `encode_embedding`, `from_index`, `from_bytes`, `into_index` |
+| `src/sync/config.rs` | The `sync.*` config (opt-in; absent ⇒ pure local) (SPEC-SYNC §8) | `SyncConfig`, `Retention`, `load`, `save` |
+| `src/sync/git.rs` | Thin `git` CLI wrappers: HEAD sha, branch, dirty, commit date, origin (SPEC-SYNC §4) | `head_sha`, `current_branch`, `is_dirty`, `commit_date`, `origin_url` |
+| `src/sync/remote.rs` | The `SyncRemote` trait + git backend (working clone, put/get, LFS, race-retry) (SPEC-SYNC §4) | `SyncRemote`, `GitRemote` |
+| `src/sync/commands.rs` | `cce sync init/push/pull/status/verify` orchestration + `--workspace` fan-out (SPEC-SYNC §5) | `cmd_init`, `cmd_push`, `cmd_pull`, `cmd_status`, `cmd_verify` |
 | `src/walker.rs` | Filesystem walk + ignore rules + Layer-1 sensitive-file skip (SPEC §7.1, SPEC-V2.1 §2) | `walk` |
 | `src/sensitive.rs` | Layer-1 sensitive-file policy: is a basename secret material? (SPEC-V2.1 §1) | `is_sensitive` |
 | `src/redactor.rs` | Layer-2 secret redaction over indexed content (SPEC-V2.1 §1) | `redact` |
@@ -51,7 +57,7 @@ responsibilities header.
 | `src/metrics.rs` | Persisted metrics event log; injected clock/id source (DASH §2) | `MetricsWriter`, `read_log`, `parse_log`, `Clock`, `IdSource`, `parse_iso` |
 | `src/aggregator.rs` | Pure aggregate: totals, north-stars, series, deltas (DASH §4) | `aggregate`, `Aggregate`, `direction` |
 | `src/dashboard.rs` | Loopback-only, read-only, self-contained web server (DASH §6, SPEC-V2.2 §7) | `run`, `serve`, `route`, `run_workspace`, `route_workspace` |
-| `src/main.rs` | CLI (SPEC §9, DASH §5, SPEC-V2.2 §9) | clap command tree |
+| `src/main.rs` | CLI (SPEC §9, DASH §5, SPEC-V2.2 §9, SPEC-SYNC §5) | clap command tree |
 
 The metrics/dashboard modules (`DASH` = [`DASHBOARD-SPEC.md`](../DASHBOARD-SPEC.md),
 v1.1) are the one part of the system that uses real wall-clock time; the clock and

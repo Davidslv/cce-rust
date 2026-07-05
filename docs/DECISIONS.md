@@ -303,3 +303,79 @@ manifest is emitted by a small canonical writer so the exact bytes are under our
 control (and match across languages); `serde_yaml = "=0.9.34"` parses hand-written
 manifests back. Emitting via `serde_yaml` was avoided because its formatting is not
 guaranteed stable across versions or identical to another language's YAML library.
+
+## CCE Sync (v2.3.0, SPEC-SYNC)
+
+**The interchange artifact is a hand-built canonical stream, not serde's default.**
+SPEC-SYNC §2 requires byte-identical output across the Ruby and Rust engines. The
+artifact is assembled explicitly: the manifest line, then one object per chunk
+(sorted by `(file_path, start_line, chunk_id)`), then the graph line, each an
+LF-terminated compact JSON object. Sorted keys come free from `serde_json`'s default
+`Map` (a `BTreeMap`) plus `to_string` (no whitespace); we do NOT enable the
+`preserve_order` feature. This makes the whole stream a pure function of its content.
+
+**Embeddings are base64 of little-endian `f64` bytes, never decimals.** Float→string
+formatting differs across languages and libraries, so serializing the 256-d vector as
+decimals would break byte-identity even though the vectors are bit-equal (the hash
+embedder is deterministic). Encoding the raw IEEE-754 bytes (`f64::to_le_bytes`) as
+standard RFC-4648 base64 sidesteps formatting entirely. `base64 = "=0.22.1"` is
+pinned; the standard alphabet + padding is identical across engines.
+
+**`built_at`/`built_by` are deterministic, so the whole file — not just the checksum
+— is reproducible.** SPEC-SYNC §1/§10 require the artifact for `repo@sha` to be
+bit-for-bit identical across builders and engines. A wall-clock `built_at` or a
+per-user/per-engine `built_by` would break that. So `built_by` is the neutral
+constant `"cce"` and `built_at` is the **committer date of `sha`** (read from git via
+`%cI`), which is fixed for a given commit and identical across engines. The checksum
+is computed over the manifest with only the `checksum` field omitted (the spec's
+literal rule); because every other field is deterministic, the checksum is stable.
+
+**The checksummed pre-image omits only `checksum`; the written line 1 includes it.**
+`checksum` is SHA-256 over the stream whose manifest line has no `checksum` key; the
+value is then inserted to produce the file's actual line 1. `verify`/`from_bytes`
+reconstruct the pre-image (drop `checksum`, re-serialize) and recompute — a standard
+sign-then-embed pattern. `from_bytes` rejects any stream whose recomputed checksum
+disagrees.
+
+**The graph line carries `file_tokens` alongside `file_imports` for lossless
+round-trip.** SPEC-SYNC §2 lists chunks + import graph + manifest, and separately
+demands a *lossless* export→import. The dashboard's baseline-tokens counterfactual
+(DASH §3) needs each file's whole-file token count, which cannot be recomputed from
+chunks after import. It is fully deterministic (`max(1, bytes/4)`, a SPEC §3
+constant both engines share), so including it keeps the round-trip lossless without
+threatening cross-language identity. Documented as a build-spec refinement.
+
+**`file_tokens`/`built_at` etc. — a build-spec refinement of the design spec.**
+SPEC-SYNC §2 says "a build spec per implementation will refine the exact wire/format
+details." The exact field names (`id` for the chunk id; `language` kept for lossless
+stats), key ordering, the graph envelope, and the deterministic provenance are those
+refinements. The committed golden checksum
+(`artifact.rs::golden_checksum_for_base_fixture`) is the shared anchor the Ruby
+engine must reproduce; a diff there is a breaking-format decision, not a test to fix.
+
+**A per-branch ref pointer implements `latest`; content is addressed by sha.**
+Distinct shas are distinct files, so they never conflict in content. To resolve
+"latest main," `push` also writes `…/<repo_id>/refs/<branch>` = sha in the same
+commit, and `pull --latest` reads it. Only ref advancement can race; the git backend
+handles it with fetch-rebase-retry (proven by a two-clone race test).
+
+**`git` is invoked via `std::process`, not a git library.** The remote is "just a
+git repo," and shelling out keeps CCE dependency-light (a locked value of the
+project) and uses the user's real git credentials/transport for free. Commits carry
+a fixed identity (`-c user.name/email`) so they work in a bare CI/test environment.
+
+**git-LFS is default-on but never required by the core.** `sync init` writes the
+`*.cce` LFS `.gitattributes` and runs `git lfs install` when LFS is on. But the
+whole test suite exercises artifact/push/pull/verify over **plain git** so it needs
+no `git-lfs` binary; LFS lives behind one smoke test that SKIPS gracefully when
+`git-lfs` is absent (SPEC-SYNC §11).
+
+**The working-clone home is `$CCE_HOME/sync` (or `~/.cce/sync`), overridable for
+tests.** Hermetic tests point `CCE_HOME` at a temp dir so a working clone never
+touches the real `~/.cce`. Because `CCE_HOME` is process-global and Cargo runs tests
+in parallel threads, the sync tests serialize env access through one shared mutex.
+
+**The branch-overlay for WIP is deferred (v1 fallback = full local index).** If the
+working tree differs from the pulled sha, `pull` says so and the user runs a normal
+`cce index`. The incremental "reindex only changed files on top of the pulled base"
+is a documented fast-follow, out of scope for v1 (SPEC-SYNC §7/§12).

@@ -61,6 +61,22 @@ not — do makes the real attack surface clear.
   search/dashboard only ever reads those per-member stores and logs. `cce
   dashboard --workspace` keeps the loopback-only, read-only, self-contained
   posture and simply federates each member's metrics log.
+- **CCE Sync (v2.3) shares the index over git; access control is git's, and
+  redaction runs before any push.** `cce sync` is **opt-in** — absent a configured
+  `sync.remote`, nothing is ever transmitted and every command is unchanged. When
+  configured, the cache is a git repository and **CCE adds no RBAC of its own**:
+  whoever can pull the Sync git repo can read every cache in it, so the Sync repo's
+  read access **MUST** equal the intended audience of every repo cached in it — use
+  **one Sync repo per access boundary** and point different projects at different
+  `sync.remote`s. The pushed artifact is built from the local store, which is
+  already **secret-safe by default** (Layers 1 & 2 above run at index time, before
+  export) — but it still contains proprietary source snippets, so the git gate
+  matters. `push` refuses a **non-hash** index (only the deterministic embedder is
+  shareable) and a **dirty working tree** (a cache is content-addressed by commit).
+  Transport/auth/credentials are entirely git's (SSH/HTTPS); CI should use a token
+  scoped to **write the *cache* repo only**, never the source. `cce sync verify`
+  lets a puller re-index locally and confirm the artifact's checksum, so a cache
+  never has to be trusted blindly.
 - **The dashboard server (v1.1) is loopback-only, read-only, and
   self-contained.** `cce dashboard` binds **`127.0.0.1` only**, so it is not
   reachable from other hosts. Every endpoint is **read-only** — nothing it serves

@@ -1,8 +1,8 @@
 [package]
 name = "cce"
-version = "2.2.0"
+version = "2.3.0"
 edition = "2021"
-description = "Code Context Engine — Rust implementation (SPEC v1.0 + Dashboard v1.1 + Language Packs v2.0 + Secret Protection v2.1 + Workspace Mode v2.2)"
+description = "Code Context Engine — Rust implementation (SPEC v1.0 + Dashboard v1.1 + Language Packs v2.0 + Secret Protection v2.1 + Workspace Mode v2.2 + CCE Sync v2.3)"
 license = "MIT"
 
 [[bin]]
@@ -35,6 +35,10 @@ regex = "=1.12.4"
 # YAML parsing for the workspace manifest (SPEC-V2.2 §2), pinned. Reading only —
 # the manifest is emitted by a hand-rolled canonical writer for byte-determinism.
 serde_yaml = "=0.9.34"
+# Standard RFC-4648 base64 for the CCE Sync artifact's embedding encoding
+# (SPEC-SYNC §2: base64 of 256 little-endian IEEE-754 f64 bytes), pinned. The
+# standard alphabet + padding guarantees byte-identical output across engines.
+base64 = "=0.22.1"
 
 [profile.release]
 opt-level = 3
