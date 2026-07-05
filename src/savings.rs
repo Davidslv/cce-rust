@@ -7,8 +7,9 @@
 //!
 //! **What it is / does:** Defines `Bucket` (`saved_tokens`/`baseline_tokens`), the
 //! fixed seven-bucket `SavingsBuckets` carried on a search event, and the
-//! `SavingsByLayer` aggregate. Only the `retrieval` bucket is populated in Stage ①
-//! (Layer 1); the other six are present-and-zero, ready for later stages to fill.
+//! `SavingsByLayer` aggregate. A search event populates the `retrieval` (Layer 1),
+//! `chunk_compression` (Layer 2), and `grammar` (Layer 3) buckets; the other four are
+//! present-and-zero, harness-measured, ready for later stages to fill.
 //! Every field is a named struct member serialized in declaration order, so the
 //! JSON is byte-deterministic (no hash-iteration order) and cce-ruby can reconcile.
 //!
@@ -95,6 +96,34 @@ impl SavingsBuckets {
                 saved_tokens: chunk_saved,
                 baseline_tokens: chunk_baseline,
             },
+            ..Default::default()
+        }
+    }
+
+    /// A ledger with the `retrieval` (Layer 1), `chunk_compression` (Layer 2), AND
+    /// `grammar` (Layer 3) buckets populated (Stage ③); the other four present-and-zero.
+    /// A search event records this so `cce savings` and the dashboard attribute each
+    /// layer's saving separately — retrieval saves vs whole files, chunk compression vs
+    /// full chunk bodies, and grammar vs a pinned verbose result-grammar baseline.
+    #[allow(clippy::too_many_arguments)]
+    pub fn layers_1_2_3(
+        retrieval_saved: u64,
+        retrieval_baseline: u64,
+        chunk_saved: u64,
+        chunk_baseline: u64,
+        grammar_saved: u64,
+        grammar_baseline: u64,
+    ) -> SavingsBuckets {
+        SavingsBuckets {
+            retrieval: Bucket {
+                saved_tokens: retrieval_saved,
+                baseline_tokens: retrieval_baseline,
+            },
+            chunk_compression: Bucket {
+                saved_tokens: chunk_saved,
+                baseline_tokens: chunk_baseline,
+            },
+            grammar: Bucket { saved_tokens: grammar_saved, baseline_tokens: grammar_baseline },
             ..Default::default()
         }
     }
@@ -249,6 +278,20 @@ mod tests {
         // Every other bucket is present-and-zero.
         assert_eq!(s.chunk_compression, Bucket::default());
         assert_eq!(s.progressive_disclosure, Bucket::default());
+    }
+
+    #[test]
+    fn layers_1_2_3_populates_grammar_and_sum_reflects_it() {
+        // Stage ③: retrieval + chunk_compression + grammar populated; the other four
+        // present-and-zero. `sum_by_layer` must surface a non-zero `grammar` bucket.
+        let ev = SavingsBuckets::layers_1_2_3(100, 400, 30, 90, 77, 134);
+        assert_eq!(ev.grammar, Bucket { saved_tokens: 77, baseline_tokens: 134 });
+        assert_eq!(ev.chunk_compression, Bucket { saved_tokens: 30, baseline_tokens: 90 });
+        assert_eq!(ev.output, Bucket::default());
+        let roll = sum_by_layer([&ev, &ev].into_iter());
+        assert_eq!(roll.grammar, Bucket { saved_tokens: 154, baseline_tokens: 268 });
+        // The grammar saving flows into the grand total alongside the others.
+        assert_eq!(roll.total.saved_tokens, (100 + 30 + 77) * 2);
     }
 
     #[test]

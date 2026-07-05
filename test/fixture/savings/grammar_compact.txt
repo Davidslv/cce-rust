@@ -1,0 +1,3 @@
+ 1. [0.912345] src/auth.py:10-24 (function/function_definition) #039f8bd5b80a698e
+ 2. [0.500000] billing · lib/charge.rb:3-7 (method/method) #61707be0deb092a1
+ 3. [0.048000] app/models/user.rb:1-2 (class/class) #aaaabbbbccccdddd

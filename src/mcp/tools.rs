@@ -1028,22 +1028,21 @@ fn format_rows(
     let mut used = 0usize;
     let mut truncated = false;
     for (i, row) in rows.iter().enumerate() {
-        let pkg = match row.package {
-            Some(p) => format!("{p} · "),
-            None => String::new(),
-        };
-        out.push_str(&format!(
-            "{:>2}. [{}] {}{}:{}-{} ({}/{}) #{}\n",
-            row.rank,
-            format6(row.score),
-            pkg,
-            row.file_path,
-            row.start,
-            row.end,
-            row.chunk_type,
-            row.kind,
-            row.chunk_id
-        ));
+        // The result-header grammar is owned by `crate::grammar` (Layer 3): one
+        // byte-pinned compact line per result. Rendering from it here guarantees the
+        // bytes served match the bytes the `grammar` savings bucket is measured on.
+        out.push_str(&crate::grammar::compact_line(&crate::grammar::GrammarRow {
+            rank: row.rank,
+            score6: format6(row.score),
+            package: row.package.map(str::to_string),
+            file_path: row.file_path.to_string(),
+            start: row.start,
+            end: row.end,
+            chunk_type: row.chunk_type.to_string(),
+            kind: row.kind.to_string(),
+            chunk_id: row.chunk_id.to_string(),
+        }));
+        out.push('\n');
         // Serve the body at the requested detail (L2). The store keeps the full body;
         // this is a serialization-time transform only. `expand_chunk` recovers it.
         let served = compress(&registry, row.file_path, row.content, detail);
@@ -1393,6 +1392,122 @@ mod tests {
         assert!(s.contains("… (+2 lines)"), "got: {s}");
         assert!(!s.contains("return digest"), "compact leaked the elided body: {s}");
         assert!(s.contains("expand_chunk(chunk_id"), "got: {s}");
+    }
+
+    #[test]
+    fn format_rows_full_result_grammar_is_byte_pinned() {
+        // The whole context_search result grammar (Layer 3): dense header line, the
+        // body (served verbatim at Full), one blank-line separator, then the query_id +
+        // feedback lines. No prose scaffolding, fixed order. Byte-pinned; cce-ruby
+        // reconciles to exactly these bytes.
+        let rows = vec![Row {
+            rank: 1,
+            score: 0.5,
+            package: None,
+            chunk_id: "cafef00dcafef00d",
+            file_path: "auth.py",
+            start: 1,
+            end: 3,
+            chunk_type: "function",
+            kind: "function_definition",
+            content: "def hash_password(pw):\n    return pw\n",
+        }];
+        let s = format_rows(&rows, Some("id0000000000"), None, 5, DetailLevel::Full);
+        let golden =
+            " 1. [0.500000] auth.py:1-3 (function/function_definition) #cafef00dcafef00d\n\
+             def hash_password(pw):\n    return pw\n\n\
+             query_id: id0000000000\n\
+             Rate this with record_feedback (query_id=\"id0000000000\", helpful=true|false).\n";
+        assert_eq!(s, golden);
+    }
+
+    #[test]
+    fn format_rows_compact_footer_grammar_is_byte_pinned() {
+        // At compact detail the grammar adds exactly one pinned expansion-hint line
+        // between the results and the query_id block; the body itself is L2-compressed
+        // (golden'd separately), so it is sourced from `compress` here, not hard-coded.
+        let content =
+            "def hash_password(pw):\n    salt = gen()\n    digest = h(pw)\n    return digest";
+        let rows = vec![Row {
+            rank: 1,
+            score: 0.5,
+            package: None,
+            chunk_id: "cafef00dcafef00d",
+            file_path: "auth.py",
+            start: 1,
+            end: 4,
+            chunk_type: "function",
+            kind: "function_definition",
+            content,
+        }];
+        let s = format_rows(&rows, Some("id0000000000"), None, 5, DetailLevel::Compact);
+        let body = compress(&Registry::default(), "auth.py", content, DetailLevel::Compact);
+        let golden = format!(
+            " 1. [0.500000] auth.py:1-4 (function/function_definition) #cafef00dcafef00d\n\
+             {body}\n\n\
+             Bodies shown compact. expand_chunk(chunk_id, scope=body|file|neighbors) for more; \
+             related_context(chunk_id) for import-graph neighbours.\n\
+             query_id: id0000000000\n\
+             Rate this with record_feedback (query_id=\"id0000000000\", helpful=true|false).\n"
+        );
+        assert_eq!(s, golden);
+    }
+
+    #[test]
+    fn render_group_result_grammar_is_byte_pinned() {
+        // The expand_chunk(file|neighbors) / related_context group grammar: a title,
+        // then per chunk a `file:start-end (type/kind) #id` header + body. Byte-pinned.
+        let c = Chunk {
+            chunk_id: "aaaa000000000000".to_string(),
+            file_path: "auth.py".to_string(),
+            start_line: 1,
+            end_line: 2,
+            chunk_type: "function".to_string(),
+            kind: "function_definition".to_string(),
+            language: "python".to_string(),
+            content: "def a():\n    return 1".to_string(),
+            token_count: 5,
+            embedding: vec![],
+        };
+        let blocks = vec![(&c, "def a():\n    return 1".to_string())];
+        let out = render_group("neighbours of auth.py — 1 chunk(s):", &blocks);
+        let golden = "neighbours of auth.py — 1 chunk(s):\n\n\
+             auth.py:1-2 (function/function_definition) #aaaa000000000000\n\
+             def a():\n    return 1\n";
+        assert_eq!(out, golden);
+        // chunk_header alone is the pinned one-line header.
+        assert_eq!(
+            chunk_header(&c),
+            "auth.py:1-2 (function/function_definition) #aaaa000000000000"
+        );
+    }
+
+    #[test]
+    fn format_recall_result_grammar_is_byte_pinned() {
+        // The session_recall grammar: a count line, then per hit a
+        // `rank. [score] #id area=… tags=…` header + the (redacted) text, then a single
+        // pinned reuse note. Byte-pinned.
+        let hits = vec![RecallHit {
+            rank: 1,
+            id: "deadbeefdeadbeef".to_string(),
+            text: "use bcrypt for hashing".to_string(),
+            tags: vec!["security".to_string()],
+            area: Some("auth".to_string()),
+            score: 0.5,
+        }];
+        let out = format_recall(&hits, 3);
+        let golden = "Recalled 1 of 3 remembered decision(s):\n\n\
+             \x201. [0.500000] #deadbeefdeadbeef area=auth tags=security\n\
+             use bcrypt for hashing\n\n\
+             These are validated decisions you MAY reuse — apply only what fits; \
+             they are not auto-injected.\n";
+        assert_eq!(out, golden);
+        // The empty-recall grammar is a single pinned line, no scaffolding.
+        assert_eq!(
+            format_recall(&[], 3),
+            "No confident memory match (3 remembered decision(s) searched). \
+             Nothing recalled — proceed without memory."
+        );
     }
 
     #[test]

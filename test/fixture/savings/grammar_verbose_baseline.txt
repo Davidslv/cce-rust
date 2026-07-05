@@ -1,0 +1,27 @@
+Result 1:
+  relevance score: 0.912345
+  file path: src/auth.py
+  start line: 10
+  end line: 24
+  chunk type: function
+  chunk kind: function_definition
+  chunk id: 039f8bd5b80a698e
+
+Result 2:
+  relevance score: 0.500000
+  package: billing
+  file path: lib/charge.rb
+  start line: 3
+  end line: 7
+  chunk type: method
+  chunk kind: method
+  chunk id: 61707be0deb092a1
+
+Result 3:
+  relevance score: 0.048000
+  file path: app/models/user.rb
+  start line: 1
+  end line: 2
+  chunk type: class
+  chunk kind: class
+  chunk id: aaaabbbbccccdddd
