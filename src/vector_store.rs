@@ -41,6 +41,7 @@ mod tests {
             start_line: 1,
             end_line: 1,
             chunk_type: "function".into(),
+            kind: "function_definition".into(),
             language: "python".into(),
             content: String::new(),
             token_count: 1,

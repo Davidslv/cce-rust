@@ -32,6 +32,8 @@ pub struct SearchResult {
     pub start_line: usize,
     pub end_line: usize,
     pub chunk_type: String,
+    /// Exact tree-sitter node type of the chunk (SPEC-V2 §3), surfaced to callers.
+    pub kind: String,
     pub score: f64,
     pub content: String,
 }
@@ -253,6 +255,7 @@ fn result_from(chunk: &Chunk, score: f64) -> SearchResult {
         start_line: chunk.start_line,
         end_line: chunk.end_line,
         chunk_type: chunk.chunk_type.clone(),
+        kind: chunk.kind.clone(),
         score,
         content: chunk.content.clone(),
     }
@@ -318,7 +321,7 @@ mod tests {
 
     fn fixture_index() -> Index {
         let e = HashEmbedder;
-        let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/test/fixture"));
+        let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/test/fixture/base"));
         Index::build_from_dir(&dir, &e).0
     }
 

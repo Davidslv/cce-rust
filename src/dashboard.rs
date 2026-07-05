@@ -338,7 +338,10 @@ mod tests {
     use std::path::PathBuf;
 
     fn fixture_metrics() -> PathBuf {
-        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/test/fixture/metrics_sample.jsonl"))
+        PathBuf::from(concat!(
+            env!("CARGO_MANIFEST_DIR"),
+            "/test/fixture/base/metrics_sample.jsonl"
+        ))
     }
 
     #[test]

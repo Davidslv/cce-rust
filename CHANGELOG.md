@@ -7,6 +7,56 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.0.0] - 2026-07-05
+
+Pluggable **language packs**, built test-first from [`SPEC-V2.md`](SPEC-V2.md).
+Language support is factored out of the core into self-contained packs, four new
+languages ship, and every chunk gains a `kind` field. **This is a breaking
+release**: the conformance output shape changes and the supported-language set
+changes.
+
+### Added
+
+- **Language-pack architecture** — a `LanguagePack` trait (`src/packs/`) plus a
+  registry resolve files to packs by extension. The core chunker/importer
+  (`src/chunker.rs`) references **no language by name**; a guard test enforces it.
+  Adding a language is one pack file + registration + validation — no core edits.
+- **Four new languages**: **Ruby**, **Rust**, **TypeScript**, and **C** packs,
+  joining the converted **Python** and **JavaScript** packs (six total). New
+  grammar crates pinned in `Cargo.toml` (`tree-sitter-ruby`, `-rust`,
+  `-typescript`, `-c`), ABI-compatible with the pinned `tree-sitter` core.
+- **`kind` field on every chunk** — the exact tree-sitter node type (e.g.
+  `struct_specifier`, `trait_item`, `interface_declaration`, `method`), carried
+  through persistence, `search` (human + `--json`), `stats` (a by-kind
+  breakdown), and conformance. `kind` is not part of `chunk_id`.
+- **Three-layer pack validators** (`src/packs/validators.rs`): structural lint,
+  grammar-binding lint with "did you mean" node-kind suggestions, and a
+  behavioural self-test (min function/class counts, kinds present, and
+  `extract_imports == expected` exactly). Surfaced by **`cce packs`** /
+  **`cce packs --validate`**, a CI test gate over every pack, and cheap fail-fast
+  startup checks.
+- **Sample corpus** at `test/fixture/samples/` (seven files) — both the pack
+  self-tests and the cross-language conformance corpus.
+- **Per-language benchmarks** — `cce bench --lang ruby|rust|typescript|c` with the
+  labeled query sets from SPEC-V2 §8; measured numbers for Ruby (sinatra), Rust
+  (hyperfine), TypeScript (zustand), and C (jq) in [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
+- New guide [`docs/adding-a-language.md`](docs/adding-a-language.md); README,
+  architecture, how-to, getting-started, `llms.txt`, and `AGENTS.md` swept of the
+  Python/JavaScript-only framing.
+- Test suite grows to 129 tests at 94.76% line coverage (`cargo llvm-cov`).
+
+### Changed (breaking)
+
+- **Conformance output shape** — `cce conformance` now targets
+  `test/fixture/samples`, tags `spec_version` `"2.0"`, adds `kind` to every chunk
+  object, and drops the query section (the chunk array is the equivalence gate).
+- **Supported-language set** — six AST-aware packs instead of two.
+- **Module-fallback line count** — the fallback chunk's `end_line` is now
+  `(number of "\n" bytes) + 1` (a trailing newline counts its line), closing the
+  one v1 cross-language divergence. This changes fallback `chunk_id`s.
+- The base v1 fixture moved to `test/fixture/base/` so the samples corpus is
+  independent.
+
 ## [1.1.0] - 2026-07-05
 
 Dashboard & observability, built test-first from
@@ -69,6 +119,7 @@ Context Engine, built solely from [`SPEC.md`](SPEC.md) (SPEC v1.0).
 - Project documentation: `SPEC.md`, `docs/architecture.md`, `docs/getting-started.md`,
   `docs/how-to.md`, `docs/DECISIONS.md`, `docs/TDD.md`, `docs/BENCHMARKS.md`.
 
-[Unreleased]: https://github.com/davidslv/cce-rust/compare/v1.1.0...HEAD
+[Unreleased]: https://github.com/davidslv/cce-rust/compare/v2.0.0...HEAD
+[2.0.0]: https://github.com/davidslv/cce-rust/compare/v1.1.0...v2.0.0
 [1.1.0]: https://github.com/davidslv/cce-rust/compare/v1.0.0...v1.1.0
 [1.0.0]: https://github.com/davidslv/cce-rust/releases/tag/v1.0.0

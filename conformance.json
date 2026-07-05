@@ -1,175 +1,195 @@
 {
-  "spec_version": "1.0",
+  "spec_version": "2.0",
   "impl_language": "rust",
   "chunks": [
     {
-      "file_path": "README.md",
+      "file_path": "c.c",
+      "start_line": 3,
+      "end_line": 5,
+      "chunk_type": "class",
+      "kind": "struct_specifier",
+      "chunk_id": "ebd4df588b8ce225",
+      "token_count": 7
+    },
+    {
+      "file_path": "c.c",
+      "start_line": 7,
+      "end_line": 7,
+      "chunk_type": "class",
+      "kind": "struct_specifier",
+      "chunk_id": "2e676e753a19fde1",
+      "token_count": 2
+    },
+    {
+      "file_path": "c.c",
+      "start_line": 7,
+      "end_line": 9,
+      "chunk_type": "function",
+      "kind": "function_definition",
+      "chunk_id": "bd2d22d0219c51fc",
+      "token_count": 13
+    },
+    {
+      "file_path": "javascript.js",
+      "start_line": 3,
+      "end_line": 5,
+      "chunk_type": "function",
+      "kind": "function_declaration",
+      "chunk_id": "f4489b3ebdbda008",
+      "token_count": 15
+    },
+    {
+      "file_path": "javascript.js",
+      "start_line": 7,
+      "end_line": 11,
+      "chunk_type": "class",
+      "kind": "class_declaration",
+      "chunk_id": "7a9ab68a9b7e83ca",
+      "token_count": 14
+    },
+    {
+      "file_path": "javascript.js",
+      "start_line": 8,
+      "end_line": 10,
+      "chunk_type": "function",
+      "kind": "method_definition",
+      "chunk_id": "9db72353b886e6ab",
+      "token_count": 10
+    },
+    {
+      "file_path": "notes.md",
       "start_line": 1,
-      "end_line": 2,
+      "end_line": 3,
       "chunk_type": "module",
-      "chunk_id": "00166d3be9bb5925",
+      "kind": "module",
+      "chunk_id": "43bceef453598295",
       "token_count": 11
     },
     {
-      "file_path": "auth.py",
+      "file_path": "python.py",
       "start_line": 3,
       "end_line": 4,
       "chunk_type": "function",
-      "chunk_id": "e3539a6cc87df405",
-      "token_count": 21
-    },
-    {
-      "file_path": "auth.py",
-      "start_line": 6,
-      "end_line": 7,
-      "chunk_type": "function",
-      "chunk_id": "1eb146037ad13f91",
-      "token_count": 20
-    },
-    {
-      "file_path": "auth.py",
-      "start_line": 9,
-      "end_line": 11,
-      "chunk_type": "class",
-      "chunk_id": "fcc7617773d8f44d",
-      "token_count": 23
-    },
-    {
-      "file_path": "auth.py",
-      "start_line": 10,
-      "end_line": 11,
-      "chunk_type": "function",
-      "chunk_id": "1f7fa885bdd90499",
+      "kind": "function_definition",
+      "chunk_id": "be153275c6843f6d",
       "token_count": 16
     },
     {
-      "file_path": "payments.py",
-      "start_line": 3,
-      "end_line": 4,
-      "chunk_type": "function",
-      "chunk_id": "eb1b9a4f766376e6",
-      "token_count": 26
-    },
-    {
-      "file_path": "payments.py",
+      "file_path": "python.py",
       "start_line": 6,
-      "end_line": 7,
+      "end_line": 8,
+      "chunk_type": "class",
+      "kind": "class_definition",
+      "chunk_id": "a6b1b4c6f840bd31",
+      "token_count": 16
+    },
+    {
+      "file_path": "python.py",
+      "start_line": 7,
+      "end_line": 8,
       "chunk_type": "function",
-      "chunk_id": "0246f0f6eead83ee",
-      "token_count": 22
-    }
-  ],
-  "queries": [
-    {
-      "query": "hash password",
-      "top_k": 5,
-      "graph_enabled": false,
-      "results": [
-        {
-          "rank": 1,
-          "chunk_id": "e3539a6cc87df405",
-          "file_path": "auth.py",
-          "score": "0.878300"
-        },
-        {
-          "rank": 2,
-          "chunk_id": "1eb146037ad13f91",
-          "file_path": "auth.py",
-          "score": "0.876031"
-        },
-        {
-          "rank": 3,
-          "chunk_id": "00166d3be9bb5925",
-          "file_path": "README.md",
-          "score": "0.488935"
-        },
-        {
-          "rank": 4,
-          "chunk_id": "0246f0f6eead83ee",
-          "file_path": "payments.py",
-          "score": "0.485063"
-        },
-        {
-          "rank": 5,
-          "chunk_id": "1f7fa885bdd90499",
-          "file_path": "auth.py",
-          "score": "0.481312"
-        }
-      ]
+      "kind": "function_definition",
+      "chunk_id": "ecbe3170743462d4",
+      "token_count": 11
     },
     {
-      "query": "process payment amount",
-      "top_k": 5,
-      "graph_enabled": false,
-      "results": [
-        {
-          "rank": 1,
-          "chunk_id": "eb1b9a4f766376e6",
-          "file_path": "payments.py",
-          "score": "0.870145"
-        },
-        {
-          "rank": 2,
-          "chunk_id": "00166d3be9bb5925",
-          "file_path": "README.md",
-          "score": "0.849078"
-        },
-        {
-          "rank": 3,
-          "chunk_id": "0246f0f6eead83ee",
-          "file_path": "payments.py",
-          "score": "0.566935"
-        },
-        {
-          "rank": 4,
-          "chunk_id": "1eb146037ad13f91",
-          "file_path": "auth.py",
-          "score": "0.483095"
-        },
-        {
-          "rank": 5,
-          "chunk_id": "1f7fa885bdd90499",
-          "file_path": "auth.py",
-          "score": "0.479375"
-        }
-      ]
+      "file_path": "ruby.rb",
+      "start_line": 3,
+      "end_line": 5,
+      "chunk_type": "function",
+      "kind": "method",
+      "chunk_id": "d834029f4cbe3888",
+      "token_count": 11
     },
     {
-      "query": "create session user",
-      "top_k": 5,
-      "graph_enabled": false,
-      "results": [
-        {
-          "rank": 1,
-          "chunk_id": "1f7fa885bdd90499",
-          "file_path": "auth.py",
-          "score": "0.849056"
-        },
-        {
-          "rank": 2,
-          "chunk_id": "fcc7617773d8f44d",
-          "file_path": "auth.py",
-          "score": "0.838629"
-        },
-        {
-          "rank": 3,
-          "chunk_id": "1eb146037ad13f91",
-          "file_path": "auth.py",
-          "score": "0.538733"
-        },
-        {
-          "rank": 4,
-          "chunk_id": "00166d3be9bb5925",
-          "file_path": "README.md",
-          "score": "0.485063"
-        },
-        {
-          "rank": 5,
-          "chunk_id": "0246f0f6eead83ee",
-          "file_path": "payments.py",
-          "score": "0.481312"
-        }
-      ]
+      "file_path": "ruby.rb",
+      "start_line": 7,
+      "end_line": 11,
+      "chunk_type": "class",
+      "kind": "class",
+      "chunk_id": "5843ab577fefbd05",
+      "token_count": 18
+    },
+    {
+      "file_path": "ruby.rb",
+      "start_line": 8,
+      "end_line": 10,
+      "chunk_type": "function",
+      "kind": "method",
+      "chunk_id": "69dc8697dc5b3397",
+      "token_count": 13
+    },
+    {
+      "file_path": "rust.rs",
+      "start_line": 3,
+      "end_line": 5,
+      "chunk_type": "function",
+      "kind": "function_item",
+      "chunk_id": "57ccc3b7778f6eb5",
+      "token_count": 16
+    },
+    {
+      "file_path": "rust.rs",
+      "start_line": 7,
+      "end_line": 9,
+      "chunk_type": "class",
+      "kind": "struct_item",
+      "chunk_id": "fb85f1570be695fd",
+      "token_count": 13
+    },
+    {
+      "file_path": "rust.rs",
+      "start_line": 11,
+      "end_line": 15,
+      "chunk_type": "class",
+      "kind": "impl_item",
+      "chunk_id": "bc67a7b411040508",
+      "token_count": 18
+    },
+    {
+      "file_path": "rust.rs",
+      "start_line": 12,
+      "end_line": 14,
+      "chunk_type": "function",
+      "kind": "function_item",
+      "chunk_id": "36ce4add58213d5c",
+      "token_count": 13
+    },
+    {
+      "file_path": "typescript.ts",
+      "start_line": 3,
+      "end_line": 5,
+      "chunk_type": "function",
+      "kind": "function_declaration",
+      "chunk_id": "66da5aa8411dca94",
+      "token_count": 17
+    },
+    {
+      "file_path": "typescript.ts",
+      "start_line": 7,
+      "end_line": 9,
+      "chunk_type": "class",
+      "kind": "interface_declaration",
+      "chunk_id": "d01f3257cc9cbe88",
+      "token_count": 9
+    },
+    {
+      "file_path": "typescript.ts",
+      "start_line": 11,
+      "end_line": 15,
+      "chunk_type": "class",
+      "kind": "class_declaration",
+      "chunk_id": "45c58c3454407492",
+      "token_count": 19
+    },
+    {
+      "file_path": "typescript.ts",
+      "start_line": 12,
+      "end_line": 14,
+      "chunk_type": "function",
+      "kind": "method_definition",
+      "chunk_id": "4bb316f09f9cb1cf",
+      "token_count": 14
     }
   ]
 }

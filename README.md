@@ -7,6 +7,11 @@ embeds every chunk, and stores a vector + keyword index on disk as JSON. Queries
 are answered with hybrid **vector + BM25** retrieval fused by Reciprocal Rank
 Fusion.
 
+Since **v2.0** language support is a set of pluggable **language packs**: the
+core engine holds zero language-specific knowledge, and six packs ship in the box
+— **Python, JavaScript, Ruby, Rust, TypeScript, and C** (see
+[Supported languages](#supported-languages)).
+
 ```
 index a directory → walk → AST-chunk → embed → store (vectors + BM25 + import graph)
 search a query    → vector + BM25 + RRF fusion → confidence blend → path penalty
@@ -21,6 +26,8 @@ implementation. It is an experiment in whether a precise spec can act as the
 program. A sibling implementation in Ruby was built from the *identical* spec and
 lives at **[davidslv/cce-ruby](https://github.com/davidslv/cce-ruby)** — the two
 are conformance-compatible on the same corpus (see [Conformance](#conformance)).
+**v2.0** evolved both implementations, from [`SPEC-V2.md`](SPEC-V2.md), into the
+pluggable language-pack architecture — again test-first and independently.
 
 The write-up of the experiment:
 [**"The spec was the program"**](https://davidslv.uk/2026/07/05/the-spec-was-the-program.html).
@@ -28,6 +35,13 @@ The write-up of the experiment:
 - Repository: <https://github.com/davidslv/cce-rust>
 - Ruby sibling: <https://github.com/davidslv/cce-ruby>
 - Author / sole maintainer: **David Silva** ([@davidslv](https://github.com/davidslv), <https://davidslv.uk>)
+
+## Walkthrough
+
+![CCE walkthrough — language packs, index, validate, search, stats](docs/walkthrough.gif)
+
+▶ **Interactive version:** open [`docs/presentation/index.html`](docs/presentation/index.html)
+in a browser — a self-contained, autoplaying terminal cast (no dependencies, no network).
 
 ## Installation & environment setup
 
@@ -74,7 +88,7 @@ cargo test                # confirm a green build
 
 ```bash
 cargo install --path .    # installs `cce` into ~/.cargo/bin
-cce --version             # cce 1.1.0
+cce --version             # cce 2.0.0
 ```
 
 ### Optional: the semantic embedder (Ollama)
@@ -141,6 +155,7 @@ $ cce search "cosine similarity ranking" --dir ./src --top-k 3 --no-graph --json
     {
       "chunk_id": "2d5d9159a130943e",
       "chunk_type": "module",
+      "kind": "module",
       "end_line": 75,
       "file_path": "vector_store.rs",
       "rank": 1,
@@ -162,62 +177,103 @@ Search flags: `--dir <dir>` (resolves `<dir>/.cce`) or `--store <path>`,
 
 ### A worked example (AST chunking)
 
-Python and JavaScript files are chunked by function/class. Index the bundled
-fixture and search it:
+Every supported language is chunked into its functions/classes. Index the bundled
+multi-language sample corpus and search it — results carry both the coarse
+`chunk_type` and the exact tree-sitter node `kind`:
 
 ```bash
-$ cce index test/fixture --store /tmp/fix.cce
-Indexed test/fixture
-  files indexed : 3
+$ cce index test/fixture/samples --store /tmp/s.cce
+Indexed test/fixture/samples
+  files indexed : 7
   files skipped : 0
-  total chunks  : 7
+  total chunks  : 21
   embedder      : hash
 
-$ cce search "hash a password" --store /tmp/fix.cce --top-k 3 --no-graph
- 1. [0.868519] auth.py:3-4 (function)
-    def hash_password(password):
- 2. [0.866667] auth.py:6-7 (function)
-    def verify_password(password, digest):
- 3. [0.568935] README.md:1-2 (module)
-    # Demo
+$ cce search "build the index store" --store /tmp/s.cce --top-k 3 --no-graph
+ 1. [0.79xxxx] rust.rs:3-5 (function/function_item)
+    pub fn build_index() -> HashMap<String, u32> {
+ 2. [0.71xxxx] rust.rs:7-9 (class/struct_item)
+    pub struct Store {
+ 3. [0.65xxxx] rust.rs:11-15 (class/impl_item)
+    impl Store {
 ```
 
 ### Statistics
 
 ```bash
-$ cce stats --store /tmp/fix.cce
-Store: /tmp/fix.cce
-  chunks         : 7
-  files          : 3
-  avg token/chunk: 19.9
-  store size     : 9820 bytes
+$ cce stats --store /tmp/s.cce
+Store: /tmp/s.cce
+  chunks         : 21
+  files          : 7
+  avg token/chunk: ...
   by language:
+    c           : 3
+    javascript  : 3
     plaintext   : 1
-    python      : 6
+    python      : 3
+    ruby        : 3
+    rust        : 4
+    typescript  : 4
+  by kind:
+    class_declaration   : 1
+    function_definition : 2
+    impl_item           : 1
+    module              : 1
+    struct_item         : 1
+    ...
 ```
+
+### Language packs
+
+List the registered packs, or run the three-layer validators over every pack:
+
+```bash
+$ cce packs
+Registered language packs (6):
+  python       .py                      1 fn / 1 class types · grammar: ... node kinds
+  javascript   .js,.jsx,.mjs,.cjs       4 fn / 1 class types · grammar: ... node kinds
+  ruby         .rb                      2 fn / 2 class types · grammar: ... node kinds
+  rust         .rs                      1 fn / 5 class types · grammar: ... node kinds
+  typescript   .ts,.tsx                 4 fn / 3 class types · grammar: ... node kinds
+  c            .c,.h                    1 fn / 3 class types · grammar: ... node kinds
+
+$ cce packs --validate
+[pack:python] ok
+...
+all 6 packs passed validation
+```
+
+Adding a language is: add one pack file, register it, and pass validation — no
+core edits. See [`docs/adding-a-language.md`](docs/adding-a-language.md).
 
 ### Benchmark
 
-Runs the pipeline over a checked-out repository and writes
-[`docs/BENCHMARKS.md`](docs/BENCHMARKS.md):
+Indexes a checked-out repository **whole** (exactly as `cce index`) and runs one
+language's labeled query set, writing [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md):
 
 ```bash
-$ cce bench /path/to/flask --name "pallets/flask@3.0.3"
-Benchmark complete (pallets/flask@3.0.3, commit c12a5d8...):
-  files/chunks : 82/1579
-  index        : 0.109s (14535.1 chunks/s)
-  latency      : p50 0.604ms  p95 0.662ms
-  recall@5/@10 : 90.0% / 100.0%
-  token savings: 90.0%
+$ cce bench /path/to/sinatra --lang ruby --name "sinatra/sinatra@v4.1.1"
+Benchmark complete (sinatra/sinatra@v4.1.1, ruby, commit 7b50a1b...):
+  files/chunks : 287/1337
+  index        : 0.167s (7990.0 chunks/s)
+  latency      : p50 0.429ms  p95 0.549ms
+  recall@5/@10 : 90.0% / 90.0%
+  token savings: 72.6%
 ```
+
+`--lang` selects only the query set and label — the whole repo is indexed either
+way, so recall and token-savings match the Ruby sibling exactly. The four active
+languages benchmarked are Ruby (sinatra), Rust (hyperfine), TypeScript (zustand),
+and C (jq) — see [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md).
 
 ### Conformance
 
-Emits the cross-implementation conformance file — byte-identical across runs and
-designed to match the Ruby sibling on the same fixture:
+Emits the cross-implementation conformance file over the seven-file sample corpus
+— byte-identical across runs and designed to match the Ruby sibling. Each chunk
+carries its `kind` (v2 shape):
 
 ```bash
-$ cce conformance test/fixture -o conformance.json
+$ cce conformance test/fixture/samples -o conformance.json
 wrote conformance.json
 ```
 
@@ -232,6 +288,8 @@ dashboard visualizes two north-stars — **token/cost savings** and **retrieval
 quality** — each trended current-vs-prior with an ↑ improving / ↓ degrading / →
 flat indicator, plus a recent-searches table. (The base engine and
 `conformance.json` are untouched by any of this.)
+
+![CCE dashboard — token/cost savings and retrieval quality, trended](docs/dashboard.png)
 
 ```bash
 # 1. Index and search as usual — events are recorded automatically.
@@ -260,10 +318,35 @@ per 1M input tokens for the $-saved estimate, default 3.00), `--no-open`.
 See [`docs/dashboard.md`](docs/dashboard.md) for the pipeline, event schema, and
 the exact aggregation formulas.
 
+## Supported languages
+
+Language support is a set of pluggable **language packs** (SPEC-V2). The core
+chunker/importer references no language by name; each pack is one self-contained
+file declaring its extensions, grammar, function/class node types, and import
+rule, and each is guarded by three validator layers (`cce packs --validate`).
+
+| Pack | Extensions | Chunks | Imports from |
+|---|---|---|---|
+| `python` | `.py` | functions, classes | `import`, `from … import` |
+| `javascript` | `.js`, `.jsx`, `.mjs`, `.cjs` | functions, methods, arrows, classes | `import … from "x"` |
+| `ruby` | `.rb` | methods, classes, modules | `require`, `require_relative` |
+| `rust` | `.rs` | fns; struct/enum/trait/impl/union | `use` (first segment) |
+| `typescript` | `.ts`, `.tsx` | functions, methods, class/interface/enum | `import … from "x"` |
+| `c` | `.c`, `.h` | functions; struct/union/enum | `#include <…>` / `"…"` |
+
+Any file no pack claims (or that a pack parses to zero symbols) becomes a single
+whole-file `module` fallback chunk. Every chunk records the exact tree-sitter
+node type in a `kind` field alongside the coarse `chunk_type`
+(`function`/`class`/`module`). Adding a language is a one-file change —
+[`docs/adding-a-language.md`](docs/adding-a-language.md).
+
 ## What's inside
 
-- **AST-aware chunking** via tree-sitter for Python and JavaScript; a whole-file
-  `module` fallback for every other language.
+- **AST-aware chunking** via tree-sitter through six pluggable language packs
+  (Python, JavaScript, Ruby, Rust, TypeScript, C); a whole-file `module` fallback
+  for every other language.
+- **Pack validators** — structural, grammar-binding ("did you mean" node-kind
+  suggestions), and behavioural self-test — surfaced by `cce packs --validate`.
 - A **deterministic hashing embedder** (FNV-1a, SPEC §5.1), exact brute-force
   cosine, Lucene-form **BM25**, **Reciprocal Rank Fusion**, a confidence blend,
   a test/doc path penalty, a per-file diversity cap, and import-graph expansion —
@@ -272,30 +355,33 @@ the exact aggregation formulas.
   store in a fresh process.
 - **Determinism** everywhere: scores are rounded to 6 decimals
   (round-half-away-from-zero) and ties break by `chunk_id` ascending (SPEC §5.3),
-  so `cce conformance test/fixture` is byte-identical across runs.
+  so `cce conformance test/fixture/samples` is byte-identical across runs.
 
 ## Tests & coverage
 
 ```bash
-cargo test                                                  # 113 tests
+cargo test                                                  # 129 tests
 cargo clippy --all-targets --all-features -- -D warnings    # lint gate
 cargo fmt --check                                           # format gate
 ```
 
-The suite is **113 tests** (112 hermetic + 1 `#[ignore]` Ollama integration test)
-and measures **95.44% line coverage** via `cargo llvm-cov`. The default suite is
+The suite is **129 passing tests** (+1 `#[ignore]` Ollama integration test) and
+measures **94.76% line coverage** via `cargo llvm-cov`. The default suite is
 fully deterministic and makes no network calls — including the metrics subsystem,
 whose clock and id source are injected and whose dashboard tests bind an
-ephemeral loopback port.
+ephemeral loopback port. A CI test gate runs the three-layer validators over every
+language pack, and a guard test asserts the core chunker names no language.
 
 ## Documentation
 
 | Doc | What it covers |
 |---|---|
-| [`SPEC.md`](SPEC.md) | The normative specification (v1.0) — the single source of truth |
+| [`SPEC.md`](SPEC.md) | The normative base specification (v1.0) |
 | [`DASHBOARD-SPEC.md`](DASHBOARD-SPEC.md) | The dashboard & observability addendum (v1.1) |
+| [`SPEC-V2.md`](SPEC-V2.md) | The language-packs evolution spec (v2.0) |
 | [`docs/getting-started.md`](docs/getting-started.md) | Install → first index + search |
-| [`docs/architecture.md`](docs/architecture.md) | Design goals, pipeline, rationale, and where it strains |
+| [`docs/adding-a-language.md`](docs/adding-a-language.md) | Step-by-step guide to adding a language pack |
+| [`docs/architecture.md`](docs/architecture.md) | Design goals, pipeline, language packs, and where it strains |
 | [`docs/dashboard.md`](docs/dashboard.md) | Metrics pipeline, event schema, aggregation formulas |
 | [`docs/how-to.md`](docs/how-to.md) | Task recipes: index, search, feedback, dashboard, bench, conformance |
 | [`docs/DECISIONS.md`](docs/DECISIONS.md) | How each spec ambiguity was resolved |

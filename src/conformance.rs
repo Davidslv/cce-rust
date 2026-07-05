@@ -1,28 +1,28 @@
-//! # conformance — cross-implementation equivalence output
+//! # conformance — cross-implementation equivalence output (v2)
 //!
-//! **Why this file exists:** SPEC §8 makes `conformance.json` a hard acceptance
-//! gate: two implementations must produce identical chunk and query results on a
-//! fixed fixture. This module owns that exact output format.
+//! **Why this file exists:** SPEC-V2 §7 keeps `conformance.json` as a hard
+//! acceptance gate: two implementations must produce byte-identical chunk arrays
+//! on the shared `samples/` corpus. This module owns that exact output format.
 //!
-//! **What it is / does:** Indexes a fixture directory (hash embedder), lists all
-//! chunks sorted by `(file_path, start_line, chunk_id)`, runs the three SPEC §8.2
-//! queries with `top_k = 5` and graph disabled, and serializes the SPEC §8.3
-//! JSON with fields in the exact documented order and scores as fixed 6-decimal
-//! strings.
+//! **What it is / does:** Indexes a fixture directory (hash embedder, graph
+//! disabled), lists every chunk sorted by `(file_path, start_line, chunk_id)`,
+//! and serializes each as `{file_path, start_line, end_line, chunk_type, kind,
+//! chunk_id, token_count}`. The `kind` field is new in v2. The base query section
+//! is dropped: the chunk section is the equivalence gate, and the samples are a
+//! multi-language corpus for which the old Python-specific queries do not apply.
 //!
 //! **Responsibilities:**
-//! - Own the `conformance.json` schema (struct field order == spec order).
+//! - Own the v2 `conformance.json` schema (struct field order == spec order).
 //! - Guarantee determinism: same input -> byte-identical output every run.
-//! - It does NOT include graph expansion (queries run with it disabled).
+//! - It does NOT run retrieval or graph expansion.
 
-use crate::config::SPEC_VERSION;
-use crate::embedder::{format6, HashEmbedder};
-use crate::retriever::search;
+use crate::config::CONFORMANCE_SPEC_VERSION;
+use crate::embedder::HashEmbedder;
 use crate::store::Index;
 use serde::Serialize;
 use std::path::Path;
 
-// Struct field order below MUST match the SPEC §8.3 example byte-for-byte.
+// Struct field order below MUST match SPEC-V2 §7 byte-for-byte.
 
 #[derive(Serialize)]
 struct ChunkOut {
@@ -30,24 +30,9 @@ struct ChunkOut {
     start_line: usize,
     end_line: usize,
     chunk_type: String,
+    kind: String,
     chunk_id: String,
     token_count: usize,
-}
-
-#[derive(Serialize)]
-struct ResultOut {
-    rank: usize,
-    chunk_id: String,
-    file_path: String,
-    score: String,
-}
-
-#[derive(Serialize)]
-struct QueryOut {
-    query: String,
-    top_k: usize,
-    graph_enabled: bool,
-    results: Vec<ResultOut>,
 }
 
 #[derive(Serialize)]
@@ -55,18 +40,13 @@ struct Conformance {
     spec_version: String,
     impl_language: String,
     chunks: Vec<ChunkOut>,
-    queries: Vec<QueryOut>,
 }
 
-/// The three SPEC §8.2 conformance queries.
-const QUERIES: [&str; 3] = ["hash password", "process payment amount", "create session user"];
-
-/// Build the conformance JSON string for a fixture directory. Deterministic.
+/// Build the v2 conformance JSON string for a fixture directory. Deterministic.
 pub fn generate(fixture_dir: &Path) -> String {
     let embedder = HashEmbedder;
     let (index, _) = Index::build_from_dir(fixture_dir, &embedder);
 
-    // chunks sorted by (file_path, start_line, chunk_id)
     let mut chunks: Vec<ChunkOut> = index
         .chunks
         .iter()
@@ -75,6 +55,7 @@ pub fn generate(fixture_dir: &Path) -> String {
             start_line: c.start_line,
             end_line: c.end_line,
             chunk_type: c.chunk_type.clone(),
+            kind: c.kind.clone(),
             chunk_id: c.chunk_id.clone(),
             token_count: c.token_count,
         })
@@ -86,28 +67,10 @@ pub fn generate(fixture_dir: &Path) -> String {
             .then(a.chunk_id.cmp(&b.chunk_id))
     });
 
-    let top_k = 5; // SPEC §8.2
-    let queries: Vec<QueryOut> = QUERIES
-        .iter()
-        .map(|q| {
-            let results = search(&index, &embedder, q, top_k, false)
-                .into_iter()
-                .map(|r| ResultOut {
-                    rank: r.rank,
-                    chunk_id: r.chunk_id,
-                    file_path: r.file_path,
-                    score: format6(r.score),
-                })
-                .collect();
-            QueryOut { query: (*q).to_string(), top_k, graph_enabled: false, results }
-        })
-        .collect();
-
     let out = Conformance {
-        spec_version: SPEC_VERSION.to_string(),
+        spec_version: CONFORMANCE_SPEC_VERSION.to_string(),
         impl_language: "rust".to_string(),
         chunks,
-        queries,
     };
     // Pretty, deterministic (serde serializes struct fields in declaration order).
     serde_json::to_string_pretty(&out).expect("serialize conformance")
@@ -118,37 +81,54 @@ mod tests {
     use super::*;
     use std::path::PathBuf;
 
-    fn fixture() -> PathBuf {
-        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/test/fixture"))
+    fn samples() -> PathBuf {
+        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/test/fixture/samples"))
     }
 
     #[test]
     fn deterministic_output() {
-        let a = generate(&fixture());
-        let b = generate(&fixture());
+        let a = generate(&samples());
+        let b = generate(&samples());
         assert_eq!(a, b);
     }
 
     #[test]
-    fn has_seven_chunks_and_three_queries() {
-        let json = generate(&fixture());
+    fn emits_v2_shape_with_kind() {
+        let json = generate(&samples());
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        assert_eq!(v["chunks"].as_array().unwrap().len(), 7);
-        assert_eq!(v["queries"].as_array().unwrap().len(), 3);
-        assert_eq!(v["spec_version"], "1.0");
+        assert_eq!(v["spec_version"], "2.0");
         assert_eq!(v["impl_language"], "rust");
+        // No queries section in v2.
+        assert!(v.get("queries").is_none());
+        let chunks = v["chunks"].as_array().unwrap();
+        // Seven samples across six languages plus one fallback (see §6/§7).
+        assert_eq!(chunks.len(), 21);
+        // Every chunk carries a non-empty kind; the fallback's kind is "module".
+        assert!(chunks.iter().all(|c| !c["kind"].as_str().unwrap().is_empty()));
+        let notes = chunks.iter().find(|c| c["file_path"] == "notes.md").unwrap();
+        assert_eq!(notes["kind"], "module");
+        assert_eq!(notes["chunk_type"], "module");
+        assert_eq!(notes["start_line"], 1);
+        assert_eq!(notes["end_line"], 3);
     }
 
     #[test]
-    fn chunks_sorted_and_scores_are_6dp_strings() {
-        let json = generate(&fixture());
+    fn chunks_sorted_by_path_line_id() {
+        let json = generate(&samples());
         let v: serde_json::Value = serde_json::from_str(&json).unwrap();
-        let q1 = &v["queries"][0];
-        assert_eq!(q1["query"], "hash password");
-        assert_eq!(q1["graph_enabled"], false);
-        let score = q1["results"][0]["score"].as_str().unwrap();
-        assert_eq!(score.split('.').nth(1).unwrap().len(), 6);
-        // Q1 top-1 from auth.py
-        assert_eq!(q1["results"][0]["file_path"], "auth.py");
+        let chunks = v["chunks"].as_array().unwrap();
+        let keyed: Vec<(String, u64, String)> = chunks
+            .iter()
+            .map(|c| {
+                (
+                    c["file_path"].as_str().unwrap().to_string(),
+                    c["start_line"].as_u64().unwrap(),
+                    c["chunk_id"].as_str().unwrap().to_string(),
+                )
+            })
+            .collect();
+        let mut sorted = keyed.clone();
+        sorted.sort();
+        assert_eq!(keyed, sorted);
     }
 }

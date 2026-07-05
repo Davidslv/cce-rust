@@ -38,14 +38,14 @@ sudo apt-get update && sudo apt-get install -y build-essential
 git clone https://github.com/davidslv/cce-rust
 cd cce-rust
 cargo build --release     # binary at target/release/cce
-cargo test                # 113 tests — confirms a green build
+cargo test                # 129 tests — confirms a green build
 ```
 
 Optionally put the binary on your PATH:
 
 ```bash
 cargo install --path .    # installs `cce` into ~/.cargo/bin
-cce --version             # cce 1.1.0
+cce --version             # cce 2.0.0
 ```
 
 The rest of this guide writes `cce`; if you did not install it, use
@@ -53,39 +53,42 @@ The rest of this guide writes `cce`; if you did not install it, use
 
 ## 3. Your first index
 
-The repo ships a tiny Python fixture. Index it to a scratch store:
+The repo ships a tiny multi-language sample corpus (one file per pack). Index it
+to a scratch store:
 
 ```bash
-$ cce index test/fixture --store /tmp/fix.cce
-Indexed test/fixture
-  files indexed : 3
+$ cce index test/fixture/samples --store /tmp/s.cce
+Indexed test/fixture/samples
+  files indexed : 7
   files skipped : 0
-  total chunks  : 7
+  total chunks  : 21
   embedder      : hash
-  store         : /tmp/fix.cce
-  elapsed       : 0.001s
+  store         : /tmp/s.cce
+  elapsed       : 0.002s
 ```
 
-Python (and JavaScript) files are chunked per function/class by tree-sitter;
-everything else becomes a single whole-file `module` chunk.
+Files in a supported language (Python, JavaScript, Ruby, Rust, TypeScript, C) are
+chunked per function/class by tree-sitter through **language packs**; everything
+else becomes a single whole-file `module` chunk. Run `cce packs` to see the packs.
 
 ## 4. Your first search
 
-`search` reopens the store in a fresh process — no re-embedding:
+`search` reopens the store in a fresh process — no re-embedding. Each result shows
+the coarse `chunk_type` and the exact node `kind`:
 
 ```bash
-$ cce search "hash a password" --store /tmp/fix.cce --top-k 3 --no-graph
- 1. [0.868519] auth.py:3-4 (function)
-    def hash_password(password):
- 2. [0.866667] auth.py:6-7 (function)
-    def verify_password(password, digest):
- 3. [0.568935] README.md:1-2 (module)
-    # Demo
+$ cce search "build the index store" --store /tmp/s.cce --top-k 3 --no-graph
+ 1. [0.79xxxx] rust.rs:3-5 (function/function_item)
+    pub fn build_index() -> HashMap<String, u32> {
+ 2. [0.71xxxx] rust.rs:7-9 (class/struct_item)
+    pub struct Store {
+ 3. [0.65xxxx] rust.rs:11-15 (class/impl_item)
+    impl Store {
 ```
 
 That is the whole loop: **index a directory, then search it.** The top hit is the
-`hash_password` function — exactly the snippet you would feed to a model instead
-of the whole file.
+`build_index` function — exactly the snippet you would feed to a model instead of
+the whole file.
 
 ## 5. Try it on your own code
 
@@ -117,5 +120,7 @@ never fails because of it.
 ## Where to next
 
 - [`how-to.md`](how-to.md) — task recipes for every command.
+- [`adding-a-language.md`](adding-a-language.md) — add a language pack in one file.
 - [`architecture.md`](architecture.md) — how the pipeline is built and why.
-- [`../SPEC.md`](../SPEC.md) — the authoritative behaviour reference.
+- [`../SPEC.md`](../SPEC.md) + [`../SPEC-V2.md`](../SPEC-V2.md) — the authoritative
+  behaviour reference (base engine + language packs).

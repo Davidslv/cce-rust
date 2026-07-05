@@ -158,3 +158,60 @@ config file is out of scope for v1.1 and would be a separate change.
 `delta_top_score` are computed from the 6-decimal-rounded current/prior means, so
 both language implementations reach an identical value and direction from the same
 inputs (no last-ULP divergence). This matches the §4.1 anchor exactly.
+
+## v2.0 — language packs (SPEC-V2)
+
+**Only named AST nodes become chunks.** SPEC-V2 §1 says "for every node whose type
+is in `function_types`/`class_types` emit a chunk". Some grammars name a
+definition node the same string as its keyword token — e.g. tree-sitter-ruby's
+`class` definition node and the anonymous `class` keyword both report
+`node.kind() == "class"`. Emitting for every matching node would double-count the
+class (one chunk for the keyword token at its single line). The chunker therefore
+guards on `node.is_named()`, so only real AST nodes are candidates. This is
+correct for every pack (all function/class definition nodes are named) and keeps
+counts sane. Ruby needs it; the others are unaffected.
+
+**A class node's references are emitted too (structural, not semantic).** A pack
+declares node *types*, not predicates. So a C `struct Node *n` parameter — a
+bodyless `struct_specifier` reference — is emitted as a class chunk just like the
+`struct Node { … }` definition. This keeps packs declarative and identical across
+languages; the cost is a few noisy reference chunks. Both implementations follow
+the same rule, so conformance stays byte-identical.
+
+**Conformance v2 drops the query section.** SPEC-V2 §7 permits keeping or dropping
+the base query section and makes the chunk array the equivalence gate. We drop it:
+the samples are a multi-language corpus for which the old Python-specific queries
+(`"hash password"`, …) are meaningless, and the orchestrator diffs the chunk
+arrays. `spec_version` is `"2.0"`, and each chunk gains `kind`.
+
+**`spec_version` for conformance is a dedicated constant.** The persisted index
+tag stays `SPEC_VERSION = "1.0"` (internal, not cross-checked); conformance emits
+`CONFORMANCE_SPEC_VERSION = "2.0"` so both implementations agree on the v2 gate.
+
+**The base v1 fixture moved to `test/fixture/base/`.** SPEC-V2 §6 places the
+samples under `test/fixture/samples/`. Since the walker recurses, leaving the v1
+fixture (`auth.py`, `payments.py`, `README.md`, `metrics_sample.jsonl`) at
+`test/fixture/` would fold the samples into every base-fixture test. Relocating the
+v1 fixture into a sibling `base/` keeps the two corpora independent; file paths
+inside each stay root-relative and unchanged.
+
+**Import extraction is per-pack and NOT part of conformance.** Imports feed only
+the graph and each pack's own `expected.imports` self-test; they are absent from
+`conformance.json`. So import rules need not agree byte-for-byte across languages,
+only satisfy each pack's sample. Rust's optional `mod name;` import is therefore
+omitted (the sample does not need it), keeping the rule to the first `use`-path
+segment.
+
+**`kind` on the dashboard.** SPEC-V2 §3 lists the dashboard among `kind`'s
+surfaces. The dashboard aggregates query-level *metrics events*, which carry no
+per-chunk data, so there is no natural per-chunk `kind` to show without changing
+the event schema and its cross-language §4.1 anchor. `kind` is therefore surfaced
+where chunks are surfaced — `search` (human + `--json`), `stats` (by-kind
+breakdown), and conformance — and carried through persistence; the dashboard is
+left byte-stable. Recorded here as the resolution of that ambiguity.
+
+**Grammar crate versions.** July-2026 latest that share the pinned `tree-sitter`
+core's `tree-sitter-language` 0.1.x ABI: `tree-sitter-ruby 0.23.1`,
+`tree-sitter-rust 0.24.2`, `tree-sitter-typescript 0.23.2`, `tree-sitter-c 0.24.2`
+(TypeScript exposes `LANGUAGE_TYPESCRIPT`; the pack binds that, not the TSX
+variant). All pinned with `=` in `Cargo.toml`.

@@ -8,14 +8,23 @@ summary.
 
 `cce` is a local CLI that indexes a code repository (tree-sitter AST chunking →
 embedding → JSON vector + BM25 index) and answers queries with hybrid retrieval.
-It is a **clean-room, test-first implementation of [`SPEC.md`](SPEC.md) v1.0**
-plus the **Dashboard & observability addendum
-[`DASHBOARD-SPEC.md`](DASHBOARD-SPEC.md) (v1.1)**. Both specs are the single
-source of truth for behaviour — treat them as the constitution. A sibling Ruby
-implementation ([davidslv/cce-ruby](https://github.com/davidslv/cce-ruby)) is
+It is a **test-first implementation of [`SPEC.md`](SPEC.md) v1.0**, the **Dashboard
+addendum [`DASHBOARD-SPEC.md`](DASHBOARD-SPEC.md) (v1.1)**, and the **v2.0
+language-packs evolution [`SPEC-V2.md`](SPEC-V2.md)**. All three specs are the
+single source of truth for behaviour — treat them as the constitution. A sibling
+Ruby implementation ([davidslv/cce-ruby](https://github.com/davidslv/cce-ruby)) is
 built from the identical specs, and the two must stay conformance-compatible —
-including the dashboard aggregator's §4.1 anchor, which is the cross-language
-equivalence gate for the metrics feature.
+including the dashboard aggregator's §4.1 anchor and the v2 chunk conformance over
+`test/fixture/samples`.
+
+**Language support is pluggable packs (SPEC-V2).** The core chunker/importer
+(`src/chunker.rs`) references **no language by name** — a guard test enforces this
+(`tests/language_packs.rs`). Each language is one file under `src/packs/`
+implementing the `LanguagePack` trait, registered in `default_registry()`, and
+guarded by three validator layers (`cce packs --validate`). To add a language,
+follow [`docs/adding-a-language.md`](docs/adding-a-language.md); do **not** add
+language-specific code or comments to the core. Every chunk carries a `kind` (the
+exact tree-sitter node type) alongside the coarse `chunk_type`.
 
 **The metrics/dashboard subsystem is the one place wall-clock time and unique
 IDs are allowed** (`src/metrics.rs`, `src/aggregator.rs`, `src/dashboard.rs`).
@@ -52,14 +61,17 @@ Tests must be **deterministic and hermetic** — no network, no wall-clock, no
 ambient filesystem state. The only network-touching test (Ollama) is `#[ignore]`.
 The metrics tests inject a fixed clock/id source, and the dashboard's socket test
 binds an **ephemeral loopback port** and serves a bounded number of connections.
-Keep coverage at or above the baseline (**113 tests, 95.44% line coverage** via
-`cargo llvm-cov`); a change that lowers coverage should add tests.
+Keep coverage at or above the baseline (**129 tests, 94.76% line coverage** via
+`cargo llvm-cov`); a change that lowers coverage should add tests. The CI test
+gate also runs the three-layer validators over every language pack.
 
 ## Spec conformance must not drift
 
-`cce conformance test/fixture` produces a byte-stable
-[`conformance.json`](conformance.json) that is designed to match the Ruby
-sibling. **Do not change this output as a side effect.** If a change legitimately
+`cce conformance test/fixture/samples` produces a byte-stable
+[`conformance.json`](conformance.json) (v2 shape: each chunk carries `kind`, no
+queries section) that is designed to match the Ruby sibling on the byte-identical
+samples. **Do not change this output as a side effect** — and do not edit the
+`test/fixture/samples/` files (the cross-language gate depends on byte equality). If a change legitimately
 alters it, that is a deliberate, spec-level act: justify it against `SPEC.md`,
 call it out explicitly in the PR, and note that the Ruby sibling may need a
 matching change. Preserve the determinism rules (6-decimal
@@ -71,6 +83,9 @@ scores are compared, sorted, or emitted.
 - [`SPEC.md`](SPEC.md) — normative base-engine behaviour reference (authoritative).
 - [`DASHBOARD-SPEC.md`](DASHBOARD-SPEC.md) — normative dashboard/observability
   addendum (v1.1); wins over `SPEC.md` for the metrics feature only.
+- [`SPEC-V2.md`](SPEC-V2.md) — the v2.0 language-packs evolution (packs, registry,
+  validators, `kind`, conformance shape); wins over `SPEC.md` for chunking/packs.
+- [`docs/adding-a-language.md`](docs/adding-a-language.md) — how to add a pack.
 - [`docs/architecture.md`](docs/architecture.md) — module map, pipeline, design
   rationale, and where the design strains.
 - [`docs/dashboard.md`](docs/dashboard.md) — metrics pipeline, event schema, and

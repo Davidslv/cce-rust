@@ -1,26 +1,35 @@
-//! # chunker — tree-sitter AST chunking, chunk IDs, and import extraction
+//! # chunker — generic AST chunking, chunk IDs, and import extraction
 //!
-//! **Why this file exists:** Searching whole files is wasteful; SPEC §4.2 wants
-//! each file split into the functions/classes it defines so retrieval returns
-//! precise snippets. This module turns a file's bytes into `Chunk`s and pulls
-//! the import edges used by the graph.
+//! **Why this file exists:** Searching whole files is wasteful; the engine splits
+//! each file into the functions/classes it defines so retrieval returns precise
+//! snippets. In v2 this module holds **zero** language-specific knowledge: it asks
+//! a `LanguagePack` (resolved from the registry) which node types are functions
+//! and classes, and how to extract imports. Adding a language never touches this
+//! file (SPEC-V2 §1).
 //!
-//! **What it is / does:** Resolves a file's language by extension, parses Python
-//! and JavaScript with tree-sitter, walks the tree depth-first emitting a chunk
-//! for every function/class node (nested included), falls back to a whole-file
-//! `module` chunk otherwise, computes the exact cross-language `chunk_id`
-//! (SPEC §4.3) and `token_count` (SPEC §4.4), and extracts import module names.
+//! **What it is / does:** Resolves a file to its pack via the registry, parses
+//! with the pack's grammar, walks the tree depth-first emitting a chunk for every
+//! node whose type is in the pack's function/class sets (nested included), records
+//! each chunk's exact node-type `kind` (SPEC-V2 §3), falls back to a whole-file
+//! `module` chunk otherwise, and computes the cross-language `chunk_id` and
+//! `token_count`. Import extraction is delegated to the pack.
 //!
 //! **Responsibilities:**
-//! - Own `Chunk`, language resolution, the tree walk, the fallback rule.
-//! - Own `chunk_id` and `token_count` (byte-exact).
-//! - Own import extraction; failures return `[]` and never crash indexing.
-//! - It does NOT embed, rank, or persist.
+//! - Own `Chunk`, the generic tree walk, and the fallback rule (SPEC-V2 §4).
+//! - Own `chunk_id` and `token_count` (byte-exact) and the `kind` field.
+//! - It does NOT know any language by name — the packs do.
 
 use crate::config::CHARS_PER_TOKEN;
+use crate::packs::{LanguagePack, Registry};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::HashMap;
 use tree_sitter::{Node, Parser};
+
+/// The language string used for a fallback chunk that no pack claimed.
+const PLAINTEXT: &str = "plaintext";
+/// The `chunk_type`/`kind` of the whole-file fallback chunk.
+const MODULE: &str = "module";
 
 /// A single indexed unit: a function, class, or whole-file `module` fallback.
 #[derive(Debug, Clone, Serialize, Deserialize, PartialEq)]
@@ -29,7 +38,12 @@ pub struct Chunk {
     pub file_path: String,
     pub start_line: usize,
     pub end_line: usize,
+    /// Coarse taxonomy: `"function"`, `"class"`, or `"module"` (SPEC-V2 §3).
     pub chunk_type: String,
+    /// Exact tree-sitter node type that produced this chunk; `"module"` for the
+    /// fallback (SPEC-V2 §3). Not part of `chunk_id`.
+    #[serde(default)]
+    pub kind: String,
     pub language: String,
     pub content: String,
     pub token_count: usize,
@@ -42,50 +56,17 @@ pub struct Chunk {
 #[derive(Debug, Clone)]
 pub struct FileChunks {
     pub chunks: Vec<Chunk>,
-    /// Deduplicated, first-seen-order import module names (first dotted component).
+    /// Deduplicated, first-seen-order import names (delegated to the pack).
     pub imports: Vec<String>,
 }
 
-/// The languages we parse with tree-sitter.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-enum Lang {
-    Python,
-    JavaScript,
-}
-
-impl Lang {
-    fn as_str(self) -> &'static str {
-        match self {
-            Lang::Python => "python",
-            Lang::JavaScript => "javascript",
-        }
-    }
-}
-
-/// Resolve language from a file path's extension (SPEC §4.2).
-fn resolve_language(path: &str) -> Option<Lang> {
-    let ext = path.rsplit('.').next().unwrap_or("");
-    match ext {
-        "py" => Some(Lang::Python),
-        "js" | "jsx" | "mjs" | "cjs" => Some(Lang::JavaScript),
-        _ => None,
-    }
-}
-
-/// The language string used for a fallback chunk: resolved language or plaintext.
-fn fallback_language(path: &str) -> String {
-    match resolve_language(path) {
-        Some(l) => l.as_str().to_string(),
-        None => "plaintext".to_string(),
-    }
-}
-
-/// token_count(content) = max(1, floor(byte_length / CHARS_PER_TOKEN)) (SPEC §4.4).
+/// token_count(content) = max(1, floor(byte_length / CHARS_PER_TOKEN)).
 pub fn token_count(content: &str) -> usize {
     (content.len() / CHARS_PER_TOKEN).max(1)
 }
 
-/// Compute the exact, cross-language chunk id (SPEC §4.3).
+/// Compute the exact, cross-language chunk id (base SPEC §4.3). Unchanged in v2:
+/// the `kind` field is deliberately NOT part of the id.
 pub fn chunk_id(
     file_path: &str,
     start_line: usize,
@@ -109,28 +90,13 @@ fn hex_lower(bytes: &[u8]) -> String {
     s
 }
 
-/// Node types that are functions / classes, per language (SPEC §4.2).
-fn is_function_type(lang: Lang, kind: &str) -> bool {
-    match lang {
-        Lang::Python => kind == "function_definition",
-        Lang::JavaScript => matches!(
-            kind,
-            "function_declaration" | "method_definition" | "arrow_function" | "function_expression"
-        ),
-    }
-}
-
-fn is_class_type(lang: Lang, kind: &str) -> bool {
-    match lang {
-        Lang::Python => kind == "class_definition",
-        Lang::JavaScript => kind == "class_declaration",
-    }
-}
-
-/// Holds reusable tree-sitter parsers so indexing does not re-create them per file.
+/// Holds the pack registry and a reusable tree-sitter parser per pack so indexing
+/// does not re-create them per file. Constructing a `Chunker` loads every pack's
+/// grammar, which is the cheap fail-fast startup check (SPEC-V2 §5): an unloadable
+/// grammar panics here with a clear message rather than silently mis-chunking.
 pub struct Chunker {
-    py: Parser,
-    js: Parser,
+    registry: Registry,
+    parsers: HashMap<&'static str, Parser>,
 }
 
 impl Default for Chunker {
@@ -141,63 +107,116 @@ impl Default for Chunker {
 
 impl Chunker {
     pub fn new() -> Self {
-        let mut py = Parser::new();
-        py.set_language(&tree_sitter_python::LANGUAGE.into()).expect("load python grammar");
-        let mut js = Parser::new();
-        js.set_language(&tree_sitter_javascript::LANGUAGE.into()).expect("load javascript grammar");
-        Chunker { py, js }
+        Self::with_registry(Registry::default())
+    }
+
+    /// Build a chunker over a specific registry (used by tests and validators).
+    pub fn with_registry(registry: Registry) -> Self {
+        let mut parsers = HashMap::new();
+        for pack in registry.all() {
+            let mut parser = Parser::new();
+            parser
+                .set_language(&pack.grammar())
+                .unwrap_or_else(|e| panic!("[pack:{}] grammar failed to load: {e}", pack.name()));
+            parsers.insert(pack.name(), parser);
+        }
+        Chunker { registry, parsers }
     }
 
     /// Chunk one file's content. `file_path` must already be root-relative with
     /// `/` separators. Never panics on parse failure — returns a fallback chunk.
     pub fn chunk_file(&mut self, file_path: &str, content: &str) -> FileChunks {
-        let lang = resolve_language(file_path);
-        let src = content.as_bytes();
-
-        let parsed = match lang {
-            Some(Lang::Python) => self.py.parse(content, None).map(|t| (t, Lang::Python)),
-            Some(Lang::JavaScript) => self.js.parse(content, None).map(|t| (t, Lang::JavaScript)),
-            None => None,
+        // Resolve the pack (immutable borrow of the registry) and its parser
+        // (mutable borrow of the disjoint parsers map).
+        let Some(pack) = self.registry.pack_for(file_path) else {
+            return FileChunks {
+                chunks: vec![fallback_chunk(file_path, content, PLAINTEXT)],
+                imports: Vec::new(),
+            };
         };
-
-        if let Some((tree, l)) = parsed {
-            let root = tree.root_node();
-            let mut chunks = Vec::new();
-            collect_chunks(root, src, file_path, l, &mut chunks);
-            let imports = extract_imports(root, src, l);
-            if chunks.is_empty() {
-                return FileChunks { chunks: vec![fallback_chunk(file_path, content)], imports };
-            }
-            return FileChunks { chunks, imports };
-        }
-
-        // Unparsed / other / parse-failure: single fallback chunk, no imports.
-        FileChunks { chunks: vec![fallback_chunk(file_path, content)], imports: Vec::new() }
+        let parser = self.parsers.get_mut(pack.name()).expect("parser for every registered pack");
+        parse_and_collect(parser, pack, file_path, content)
     }
 }
 
-/// Build a whole-file fallback `module` chunk (SPEC §4.2).
-fn fallback_chunk(file_path: &str, content: &str) -> Chunk {
-    let end_line = content.lines().count().max(1);
+/// Chunk `content` with an explicit pack, creating a throwaway parser. Used by the
+/// pack validators' behavioural self-test (SPEC-V2 §5 Layer 3).
+pub fn chunk_with_pack(pack: &dyn LanguagePack, file_path: &str, content: &str) -> FileChunks {
+    let mut parser = Parser::new();
+    parser
+        .set_language(&pack.grammar())
+        .unwrap_or_else(|e| panic!("[pack:{}] grammar failed to load: {e}", pack.name()));
+    parse_and_collect(&mut parser, pack, file_path, content)
+}
+
+/// Parse with `parser`, collect chunks against `pack`'s node-type sets, and ask
+/// the pack for imports. Falls back to a whole-file `module` chunk when parsing
+/// fails or yields no function/class chunks.
+fn parse_and_collect(
+    parser: &mut Parser,
+    pack: &dyn LanguagePack,
+    file_path: &str,
+    content: &str,
+) -> FileChunks {
+    let src = content.as_bytes();
+    match parser.parse(content, None) {
+        Some(tree) => {
+            let root = tree.root_node();
+            let mut chunks = Vec::new();
+            collect_chunks(root, src, file_path, pack, &mut chunks);
+            let imports = pack.extract_imports(root, src);
+            if chunks.is_empty() {
+                FileChunks {
+                    chunks: vec![fallback_chunk(file_path, content, pack.name())],
+                    imports,
+                }
+            } else {
+                FileChunks { chunks, imports }
+            }
+        }
+        None => FileChunks {
+            chunks: vec![fallback_chunk(file_path, content, pack.name())],
+            imports: Vec::new(),
+        },
+    }
+}
+
+/// Build a whole-file fallback `module` chunk (SPEC-V2 §4). The line-count rule is
+/// normative: `end_line = (number of "\n" bytes in the content) + 1`.
+fn fallback_chunk(file_path: &str, content: &str, language: &str) -> Chunk {
+    let end_line = content.bytes().filter(|&b| b == b'\n').count() + 1;
     let bytes = content.as_bytes();
     Chunk {
         chunk_id: chunk_id(file_path, 1, end_line, bytes),
         file_path: file_path.to_string(),
         start_line: 1,
         end_line,
-        chunk_type: "module".to_string(),
-        language: fallback_language(file_path),
+        chunk_type: MODULE.to_string(),
+        kind: MODULE.to_string(),
+        language: language.to_string(),
         content: content.to_string(),
         token_count: token_count(content),
         embedding: Vec::new(),
     }
 }
 
-/// Depth-first pre-order walk: emit a chunk for every function/class node.
-fn collect_chunks(node: Node, src: &[u8], file_path: &str, lang: Lang, out: &mut Vec<Chunk>) {
+/// Depth-first pre-order walk: emit a chunk for every node whose type is in the
+/// pack's function/class sets. `kind` is the exact node type (SPEC-V2 §3).
+fn collect_chunks(
+    node: Node,
+    src: &[u8],
+    file_path: &str,
+    pack: &dyn LanguagePack,
+    out: &mut Vec<Chunk>,
+) {
     let kind = node.kind();
-    let is_fn = is_function_type(lang, kind);
-    let is_cls = is_class_type(lang, kind);
+    // Only named AST nodes are chunk candidates. Some grammars name a definition
+    // node the same string as its keyword token (e.g. Ruby's `class` node vs the
+    // anonymous `class` keyword); the `is_named` guard excludes the keyword token
+    // so a class/method is not double-counted.
+    let named = node.is_named();
+    let is_fn = named && pack.function_types().contains(&kind);
+    let is_cls = named && pack.class_types().contains(&kind);
     if is_fn || is_cls {
         let start = node.start_byte();
         let end = node.end_byte();
@@ -212,7 +231,8 @@ fn collect_chunks(node: Node, src: &[u8], file_path: &str, lang: Lang, out: &mut
             start_line,
             end_line,
             chunk_type: chunk_type.to_string(),
-            language: lang.as_str().to_string(),
+            kind: kind.to_string(),
+            language: pack.name().to_string(),
             content,
             token_count: token_count(&String::from_utf8_lossy(content_bytes)),
             embedding: Vec::new(),
@@ -220,100 +240,7 @@ fn collect_chunks(node: Node, src: &[u8], file_path: &str, lang: Lang, out: &mut
     }
     let mut cursor = node.walk();
     for child in node.children(&mut cursor) {
-        collect_chunks(child, src, file_path, lang, out);
-    }
-}
-
-/// Node text as a string slice from source bytes.
-fn node_text<'a>(node: Node, src: &'a [u8]) -> &'a str {
-    std::str::from_utf8(&src[node.start_byte()..node.end_byte()]).unwrap_or("")
-}
-
-/// First non-empty dotted component of a module path (e.g. `os.path` -> `os`).
-fn first_component(module: &str) -> Option<String> {
-    module.split('.').find(|s| !s.is_empty()).map(|s| s.to_string())
-}
-
-/// First path segment of a JS specifier, ignoring `.`/`..` (e.g. `./auth` -> `auth`).
-fn first_js_segment(spec: &str) -> Option<String> {
-    spec.split('/').find(|s| !s.is_empty() && *s != "." && *s != "..").map(|s| s.to_string())
-}
-
-/// Extract import module names (SPEC §4.2). Never panics; on trouble returns [].
-/// Preserves first-seen order and deduplicates.
-fn extract_imports(root: Node, src: &[u8], lang: Lang) -> Vec<String> {
-    let mut out: Vec<String> = Vec::new();
-    let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
-    walk_imports(root, src, lang, &mut out, &mut seen);
-    out
-}
-
-fn push_import(
-    name: Option<String>,
-    out: &mut Vec<String>,
-    seen: &mut std::collections::HashSet<String>,
-) {
-    if let Some(n) = name {
-        if !n.is_empty() && seen.insert(n.clone()) {
-            out.push(n);
-        }
-    }
-}
-
-/// Recursive DFS pre-order collecting import module names in document order.
-fn walk_imports(
-    node: Node,
-    src: &[u8],
-    lang: Lang,
-    out: &mut Vec<String>,
-    seen: &mut std::collections::HashSet<String>,
-) {
-    match lang {
-        Lang::Python => {
-            if node.kind() == "import_statement" {
-                let mut c = node.walk();
-                for child in node.children(&mut c) {
-                    match child.kind() {
-                        "dotted_name" => {
-                            push_import(first_component(node_text(child, src)), out, seen)
-                        }
-                        "aliased_import" => {
-                            if let Some(name) = child.child(0) {
-                                push_import(first_component(node_text(name, src)), out, seen)
-                            }
-                        }
-                        _ => {}
-                    }
-                }
-            } else if node.kind() == "import_from_statement" {
-                if let Some(mn) = node.child_by_field_name("module_name") {
-                    push_import(first_component(node_text(mn, src)), out, seen);
-                }
-            }
-        }
-        Lang::JavaScript => {
-            if node.kind() == "import_statement" {
-                if let Some(source) = node.child_by_field_name("source") {
-                    let mut frag: Option<String> = None;
-                    let mut sc = source.walk();
-                    for ch in source.children(&mut sc) {
-                        if ch.kind() == "string_fragment" {
-                            frag = Some(node_text(ch, src).to_string());
-                        }
-                    }
-                    let spec = frag.unwrap_or_else(|| {
-                        node_text(source, src)
-                            .trim_matches(|c| c == '\'' || c == '"' || c == '`')
-                            .to_string()
-                    });
-                    push_import(first_js_segment(&spec), out, seen);
-                }
-            }
-        }
-    }
-    let mut c = node.walk();
-    for child in node.children(&mut c) {
-        walk_imports(child, src, lang, out, seen);
+        collect_chunks(child, src, file_path, pack, out);
     }
 }
 
@@ -348,76 +275,21 @@ mod tests {
     }
 
     #[test]
-    fn python_fixture_chunks() {
+    fn fallback_line_count_counts_trailing_newline() {
+        // SPEC-V2 §4: end_line = number of "\n" bytes + 1; a trailing newline
+        // still counts its line. "a\nb\n" has two newlines -> end_line 3.
         let mut ck = Chunker::new();
-        let src =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/test/fixture/auth.py"))
-                .unwrap();
-        let fc = ck.chunk_file("auth.py", &src);
-        // hash_password (fn), verify_password (fn), SessionManager (class), create_session (fn)
-        assert_eq!(fc.chunks.len(), 4);
-        let types: Vec<&str> = fc.chunks.iter().map(|c| c.chunk_type.as_str()).collect();
-        assert_eq!(types, vec!["function", "function", "class", "function"]);
-        assert!(fc.chunks.iter().all(|c| c.language == "python"));
-    }
-
-    #[test]
-    fn payments_fixture_chunks_and_import() {
-        let mut ck = Chunker::new();
-        let src = std::fs::read_to_string(concat!(
-            env!("CARGO_MANIFEST_DIR"),
-            "/test/fixture/payments.py"
-        ))
-        .unwrap();
-        let fc = ck.chunk_file("payments.py", &src);
-        assert_eq!(fc.chunks.len(), 2);
-        assert_eq!(fc.imports, vec!["auth"]);
-    }
-
-    #[test]
-    fn readme_fallback_module_chunk() {
-        let mut ck = Chunker::new();
-        let src =
-            std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/test/fixture/README.md"))
-                .unwrap();
-        let fc = ck.chunk_file("README.md", &src);
+        let fc = ck.chunk_file("notes.md", "a\nb\n");
         assert_eq!(fc.chunks.len(), 1);
         assert_eq!(fc.chunks[0].chunk_type, "module");
-        assert_eq!(fc.chunks[0].language, "plaintext");
+        assert_eq!(fc.chunks[0].kind, "module");
         assert_eq!(fc.chunks[0].start_line, 1);
-        assert_eq!(fc.chunks[0].end_line, 2);
+        assert_eq!(fc.chunks[0].end_line, 3);
+        assert_eq!(fc.chunks[0].language, "plaintext");
     }
 
     #[test]
-    fn python_import_first_component() {
-        let mut ck = Chunker::new();
-        let fc = ck.chunk_file("m.py", "import os.path\nfrom pkg.sub import x\nimport hashlib\n");
-        assert_eq!(fc.imports, vec!["os", "pkg", "hashlib"]);
-    }
-
-    #[test]
-    fn js_imports_segments() {
-        let mut ck = Chunker::new();
-        let fc = ck.chunk_file(
-            "m.js",
-            "import a from 'react';\nimport b from './auth';\nfunction q(){}\n",
-        );
-        assert_eq!(fc.imports, vec!["react", "auth"]);
-        // function_declaration chunk present
-        assert!(fc.chunks.iter().any(|c| c.chunk_type == "function"));
-    }
-
-    #[test]
-    fn js_class_and_method_and_arrow() {
-        let mut ck = Chunker::new();
-        let fc = ck.chunk_file("m.js", "class Foo { bar() { return 1; } }\nconst g = () => 2;\n");
-        let types: Vec<&str> = fc.chunks.iter().map(|c| c.chunk_type.as_str()).collect();
-        assert!(types.contains(&"class"));
-        assert!(types.iter().filter(|t| **t == "function").count() >= 2);
-    }
-
-    #[test]
-    fn parse_failure_or_other_ext_is_fallback() {
+    fn no_pack_file_is_plaintext_fallback_without_imports() {
         let mut ck = Chunker::new();
         let fc = ck.chunk_file("data.txt", "just some text\nmore text\n");
         assert_eq!(fc.chunks.len(), 1);
@@ -427,7 +299,20 @@ mod tests {
     }
 
     #[test]
-    fn python_no_symbols_is_fallback_with_python_language() {
+    fn parsed_chunk_carries_exact_node_kind() {
+        // A Python function/class file: kinds are the exact tree-sitter node types.
+        let mut ck = Chunker::new();
+        let fc = ck.chunk_file("m.py", "def f():\n    pass\n\nclass C:\n    pass\n");
+        let kinds: Vec<&str> = fc.chunks.iter().map(|c| c.kind.as_str()).collect();
+        assert!(kinds.contains(&"function_definition"));
+        assert!(kinds.contains(&"class_definition"));
+        // chunk_type stays coarse.
+        assert!(fc.chunks.iter().any(|c| c.chunk_type == "function"));
+        assert!(fc.chunks.iter().any(|c| c.chunk_type == "class"));
+    }
+
+    #[test]
+    fn parsed_file_with_no_symbols_falls_back_to_pack_language() {
         let mut ck = Chunker::new();
         let fc = ck.chunk_file("s.py", "x = 1\ny = 2\n");
         assert_eq!(fc.chunks.len(), 1);

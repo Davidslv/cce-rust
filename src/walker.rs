@@ -18,7 +18,7 @@
 //! Note (dashboard, SPEC v1.1): files with a `.jsonl` extension are skipped.
 //! `.jsonl` is a runtime data/log format (the metrics event log lives in
 //! `metrics.jsonl`), never source to be chunked. Skipping it keeps the metrics
-//! sample fixture (`test/fixture/metrics_sample.jsonl`) out of the conformance
+//! sample fixture (`test/fixture/base/metrics_sample.jsonl`) out of the conformance
 //! corpus, so `conformance.json` stays byte-identical. See docs/DECISIONS.md.
 
 use crate::config::MAX_FILE_SIZE;

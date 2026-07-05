@@ -21,7 +21,11 @@ fn bin() -> &'static str {
 }
 
 fn fixture() -> PathBuf {
-    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/test/fixture"))
+    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/test/fixture/base"))
+}
+
+fn samples() -> PathBuf {
+    PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/test/fixture/samples"))
 }
 
 #[test]
@@ -85,7 +89,7 @@ fn conformance_is_deterministic() {
     for out in [&out1, &out2] {
         let r = Command::new(bin())
             .args(["conformance"])
-            .arg(fixture())
+            .arg(samples())
             .arg("-o")
             .arg(out)
             .output()
@@ -97,10 +101,36 @@ fn conformance_is_deterministic() {
     let b = std::fs::read(&out2).unwrap();
     assert_eq!(a, b, "conformance.json must be byte-identical across runs");
 
+    // v2 shape (SPEC-V2 §7): spec_version 2.0, per-chunk `kind`, no queries.
     let v: serde_json::Value = serde_json::from_slice(&a).unwrap();
     assert_eq!(v["impl_language"], "rust");
-    assert_eq!(v["chunks"].as_array().unwrap().len(), 7);
-    assert_eq!(v["queries"].as_array().unwrap().len(), 3);
+    assert_eq!(v["spec_version"], "2.0");
+    assert!(v.get("queries").is_none());
+    let chunks = v["chunks"].as_array().unwrap();
+    assert_eq!(chunks.len(), 21);
+    assert!(chunks.iter().all(|c| !c["kind"].as_str().unwrap().is_empty()));
+}
+
+#[test]
+fn packs_lists_the_six_registered_packs() {
+    let out = Command::new(bin()).args(["packs"]).output().unwrap();
+    assert!(out.status.success());
+    let s = String::from_utf8_lossy(&out.stdout);
+    for name in ["python", "javascript", "ruby", "rust", "typescript", "c"] {
+        assert!(s.contains(name), "expected {name} in packs output: {s}");
+    }
+}
+
+#[test]
+fn packs_validate_passes_for_all_packs() {
+    let out = Command::new(bin()).args(["packs", "--validate"]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "packs --validate failed: {}",
+        String::from_utf8_lossy(&out.stdout)
+    );
+    let s = String::from_utf8_lossy(&out.stdout);
+    assert!(s.contains("passed validation"), "got: {s}");
 }
 
 #[test]
