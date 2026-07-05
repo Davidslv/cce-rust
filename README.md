@@ -12,7 +12,11 @@ core engine holds zero language-specific knowledge, and six packs ship in the bo
 — **Python, JavaScript, Ruby, Rust, TypeScript, and C** (see
 [Supported languages](#supported-languages)). Since **v2.2** it can also treat a
 directory of related codebases as one searchable **workspace** while each member
-stays isolated (see [Workspaces / ecosystems](#workspaces--ecosystems)).
+stays isolated (see [Workspaces / ecosystems](#workspaces--ecosystems)). Since
+**v2.5** it ships the **[Savings Layers](#token-savings--honestly)** — compact-by-
+default retrieval with expand-on-demand, output/grammar/memory/summarization
+layers, nine agent-facing MCP tools, and a `cce savings` ledger that reports token
+savings **honestly** (vs a full-file baseline, not your real end-to-end agent cost).
 
 ```
 index a directory → walk → AST-chunk → embed → store (vectors + BM25 + import graph)
@@ -98,7 +102,7 @@ cargo test                # confirm a green build
 
 ```bash
 cargo install --path .    # installs `cce` into ~/.cargo/bin
-cce --version             # cce 2.4.1
+cce --version             # cce 2.5.5
 ```
 
 ### Optional: the semantic embedder (Ollama)
@@ -546,13 +550,26 @@ and a marker-bounded block in `CLAUDE.md` telling the agent to **prefer
 `context_search` over Read/Grep**. Re-running `cce init` is safe — it merges, never
 duplicating a server entry or the block.
 
-**Three tools** (identical names, schemas, and output in the Ruby and Rust engines):
+**Nine tools** (identical names, schemas, and output in the Ruby and Rust engines),
+in a fixed order. The three v2.4 tools plus the six v2.5 [Savings
+Layers](#token-savings--honestly) tools — the core loop is **find → expand →
+widen**: `context_search` returns **compact** chunks by default (each with a
+`chunk_id`); `expand_chunk` reads a full body only when you need it:
 
 | Tool | What it does |
 |---|---|
-| `context_search` | Ranked code chunks (`file:line + kind`) for a natural-language query, over the same hybrid vector + BM25 index as `cce search`. Logs a `search` metrics event and returns a `query_id`. Args: `query` (required), `top_k` (8), `package`, `no_graph`, `max_tokens`. |
+| `context_search` | Ranked, **compact** code chunks (`file:line + kind + #chunk_id`) for a query, over the same hybrid vector + BM25 index as `cce search`. Logs a `search` event, returns a `query_id`. Args: `query` (required), `top_k` (8), `package`, `no_graph`, `max_tokens`, `detail` (signature\|compact\|full). |
 | `index_status` | Whether the project is indexed, per-language/per-kind counts, and — if CCE Sync is configured — the source (local vs pulled), sha, and whether it is behind the remote. |
 | `record_feedback` | Rate a prior result (`query_id`, `helpful`, optional `note`); appends a `feedback` event so the dashboard's quality signal reflects agent use. |
+| `expand_chunk` | Read the **full** body / file / neighbours of a returned chunk by `chunk_id` (`scope`: body\|file\|neighbors). `body` recovers the exact full bytes. |
+| `related_context` | Import-graph neighbours (imports **and** consumers) of a chunk, as compact entries, on demand. |
+| `set_output_compression` | Dial THIS session's own answer terseness (`off`\|`lite`\|`standard`\|`max`); a session preference, not a CLAUDE.md rewrite. |
+| `record_decision` | Remember a **validated** decision — secret-scrubbed, content-addressed, local-only (`.cce/memory.jsonl`, never pushed by Sync). |
+| `session_recall` | Precision-filtered hybrid search over remembered decisions; returns high-confidence entries you choose to use, never an auto-injected blob. |
+| `summarize_context` | A **deterministic, structured** digest of the session so far (files/chunks/queries/decisions) — not an LLM summary. |
+
+See [`docs/mcp.md`](docs/mcp.md) for every input schema and worked output, and
+[`docs/savings.md`](docs/savings.md) for the layers behind them.
 
 **How to confirm the agent used it.** Two independent signals: the tool call is
 visible in Claude Code's tool-call log, and every `context_search` is a `search`
@@ -567,6 +584,60 @@ configured, MCP works fully on the local index, offline. See
 [`docs/mcp.md`](docs/mcp.md) for the tool schemas, the workspace (`--workspace`)
 flow, and the sync-freshness details.
 
+## Token savings — honestly
+
+Retrieval alone (returning chunks instead of files) does **not** reliably beat a
+modern agent's own grep-and-read. The real savings come from **seven layers**, and
+CCE reports them honestly. Since **v2.5** it ships all seven plus a measurement
+ledger (full detail in [`docs/savings.md`](docs/savings.md)):
+
+| # | Layer | What it does |
+|---|---|---|
+| L1 | **Retrieval** | Return ranked chunks, not whole files. |
+| L2 | **Chunk compression** | AST-driven **compact** chunks — signature + doc + first line — the default; `detail: signature\|compact\|full`. |
+| L3 | **Grammar** | Byte-pinned, filler-free result grammar; self-measured. |
+| L4 | **Output compression** | A leveled `CLAUDE.md` block steers terse replies (`output.level`: off\|lite\|standard\|max, default standard); `set_output_compression` at runtime. |
+| L5 | **Memory** | `record_decision` / `session_recall` — validated-only, precision-filtered, local, secret-scrubbed, never pushed by Sync. |
+| L6 | **Turn summarization** | `summarize_context` — a deterministic structured session digest (not an LLM summary). |
+| L7 | **Progressive disclosure** | `expand_chunk` / `related_context` — compact by default, **expand on demand**. |
+
+**Compact by default, expand on demand.** `context_search` serves compact chunks
+each carrying a `chunk_id`; the agent calls `expand_chunk(chunk_id)` for a full body
+only when it needs one. `expand_chunk(scope=body)` recovers the exact bytes, so
+compression never loses information.
+
+**`cce savings` — the ledger.** Every `search` event records its per-layer token
+deltas; `cce savings` sums them into the seven buckets and prints an **offline**
+dollar estimate (embedded pricing, no network):
+
+```bash
+$ cce savings --dir ./src
+CCE savings ledger  (vs full-file baseline — not your real end-to-end agent cost)
+  ...
+  layer                       saved_tokens   baseline_tokens
+  retrieval                             56               404
+  chunk_compression                     82               348
+  grammar                              150               266
+  ...
+  total                                288              1018
+  estimated $ saved: $0.00  (default-model input rate)
+  This is the internal "vs full-file" figure, NOT your real agent cost.
+  For the real end-to-end delta, run the A/B eval harness: see eval/README.md.
+```
+
+**The honest framing (read this).** Every figure is measured **vs a full-file
+baseline** — the tokens you'd spend reading the *whole file(s)* the chunks came
+from. That is **not** your real end-to-end agent cost, because a modern agent
+greps and reads slices rather than whole files. There is **no "94%" headline
+without that asterisk.** Real-world value is **workload-dependent**: biggest on
+**large codebases with many cross-file queries and long sessions**, smallest on a
+single-file locate where you already know the path. To measure the number that
+actually matters — the real end-to-end delta of running your agent with CCE off vs
+on — use the in-repo **A/B eval harness** (`cce eval`, correctness-gated and
+cost-primary; see [`eval/README.md`](eval/README.md)), the honest counterpart to
+the internal ledger. The token counter (`cce.tokens/v1` = `max(1, floor(bytes/4))`)
+is a deterministic **estimator**, not a model tokenizer.
+
 ## Offline-first (verified)
 
 **CCE is local-first: every core workflow runs with no network and no remote.**
@@ -580,7 +651,8 @@ real offline cold-start run in [`docs/VERIFIED.md`](docs/VERIFIED.md):
 | `cce stats` | ✅ fully offline | reads the local store |
 | `cce dashboard` | ✅ fully offline | loopback-only, read-only; inlines all CSS/JS/SVG; **every panel is purely log-derived, so it makes zero network calls** (behind-remote is answered by `cce sync status`) |
 | `cce workspace` / `--workspace` | ✅ fully offline | detection, federated index/search/stats/dashboard |
-| `cce mcp` | ✅ fully offline | serves the **local** index to the agent; auto-pull is a soft dependency that no-ops with no remote |
+| `cce mcp` | ✅ fully offline | serves the **local** index (nine tools) to the agent; auto-pull is a soft dependency that no-ops with no remote |
+| `cce savings` / `cce eval` | ✅ fully offline | log-derived ledger + A/B aggregation; embedded pricing, no network |
 | `cce feedback` / `cce conformance` / `cce packs` / `cce bench` | ✅ fully offline | pure local operations |
 
 The **only** things that ever touch the network are, explicitly:
@@ -672,13 +744,13 @@ node type in a `kind` field alongside the coarse `chunk_type`
 ## Tests & coverage
 
 ```bash
-cargo test                                                  # 301 tests
+cargo test                                                  # 416 tests
 cargo clippy --all-targets --all-features -- -D warnings    # lint gate
 cargo fmt --check                                           # format gate
 ```
 
-The suite is **301 passing tests** (+1 `#[ignore]` Ollama integration test) and
-measures **93.6% line coverage** via `cargo llvm-cov`. The default suite is
+The suite is **416 passing tests** (+1 `#[ignore]` Ollama integration test) and
+measures **93.9% line coverage** via `cargo llvm-cov`. The default suite is
 fully deterministic and makes no network calls — including the metrics subsystem,
 whose clock and id source are injected and whose dashboard tests bind an
 ephemeral loopback port. A CI test gate runs the three-layer validators over every
@@ -695,8 +767,10 @@ language pack, and a guard test asserts the core chunker names no language.
 | [`SPEC-V2.2.md`](SPEC-V2.2.md) | The workspace-mode evolution spec (v2.2) |
 | [`SPEC-SYNC.md`](SPEC-SYNC.md) | The CCE Sync design spec (v2.3) |
 | [`SPEC-MCP.md`](SPEC-MCP.md) | The CCE MCP design spec (v2.4) |
+| [`SPEC-V2.5-SAVINGS.md`](SPEC-V2.5-SAVINGS.md) | The Savings Layers spec (v2.5) — the seven layers, the ledger, the nine tools |
 | [`docs/sync.md`](docs/sync.md) | CCE Sync: model, artifact format, content address, permissions, troubleshooting |
-| [`docs/mcp.md`](docs/mcp.md) | CCE MCP: the server, the three tools, `cce init`, sync freshness, and how to confirm agent use |
+| [`docs/mcp.md`](docs/mcp.md) | CCE MCP: the server, the **nine tools**, `cce init`, sync freshness, and how to confirm agent use |
+| [`docs/savings.md`](docs/savings.md) | The seven Savings Layers, the ledger, `cce savings`, the token estimator, and the `cce eval` A/B harness |
 | [`docs/VERIFIED.md`](docs/VERIFIED.md) | Offline + online cold-start verification transcripts (index/search/stats/dashboard/workspace/MCP offline; Sync online) |
 | [`docs/ci/cce-sync.yml`](docs/ci/cce-sync.yml) | Ready-to-copy GitHub Actions cache-push workflow |
 | [`docs/getting-started.md`](docs/getting-started.md) | Install → first index + search |

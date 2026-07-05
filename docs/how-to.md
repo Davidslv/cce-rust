@@ -125,6 +125,35 @@ cce bench /path/to/sinatra --lang ruby --name "sinatra/sinatra@v4.1.1"
   (zustand), and C (jq); Python/JavaScript stay validated packs but ship no
   labeled corpus.
 
+## Read the savings ledger
+
+```bash
+cce savings --dir ./my-project          # the seven-bucket ledger + $ estimate
+cce savings --dir ./my-project --json   # the same shape as /api/metrics.savings_by_layer
+```
+
+- Aggregates the per-layer token deltas recorded on every `search` event into the
+  seven buckets (`retrieval`, `chunk_compression`, `grammar`, `output`, `memory`,
+  `turn_summarization`, `progressive_disclosure`) plus a `total`. Purely log-derived,
+  **offline** (embedded pricing in `src/pricing.json`; edit it to change the rate).
+- The figures are **"vs full-file baseline — not your real end-to-end agent cost."**
+  For the real delta, run the A/B eval harness below. See [`savings.md`](savings.md).
+- Note: `cce search` (CLI) serves full bodies, so its `chunk_compression` bucket is
+  zero; the compact chunks (and that bucket) come from the agent-facing
+  `context_search` MCP tool. See [`mcp.md`](mcp.md).
+
+## Run the real-world A/B eval harness
+
+```bash
+cce eval eval/runs.example.jsonl --questions eval/questions.jsonl        # canned demo
+cce eval eval/runs.example.jsonl --questions eval/questions.jsonl --json
+```
+
+- Aggregates recorded agent runs (off vs on) into a **correctness-gated,
+  cost-primary, paired** report — the honest counterpart to `cce savings`. It does
+  **not** call a model; drive a live agent with `eval/run.sh`. See
+  [`eval/README.md`](../eval/README.md).
+
 ## Regenerate the conformance file
 
 ```bash

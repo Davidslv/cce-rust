@@ -10,9 +10,15 @@
 > (SPEC-SYNC — an offline-first, content-addressed git cache for the index, with a
 > byte-exact cross-language artifact), and v2.4 CCE MCP (SPEC-MCP — a Model Context
 > Protocol server so an agent uses CCE as a native `context_search` tool, plus
-> `cce init` to wire an editor up plug-and-play), and the v2.4.1 consolidation (a
+> `cce init` to wire an editor up plug-and-play), the v2.4.1 consolidation (a
 > refreshed dashboard — agent-vs-human, per-package, index-freshness, and
-> secret-safety panels — plus a verified, offline-first documentation sweep); six packs ship
+> secret-safety panels — plus a verified, offline-first documentation sweep), and
+> the v2.5 Savings Layers (SPEC-V2.5-SAVINGS — compact-by-default AST chunk
+> compression with expand-on-demand, output/grammar compression, local secret-safe
+> memory, deterministic turn summarization, a seven-bucket `cce savings` ledger and
+> `cce eval` A/B harness, exposed as nine cross-language MCP tools; savings are
+> reported honestly, vs a full-file baseline, not the real end-to-end agent cost);
+> six packs ship
 > (Python, JavaScript, Ruby, Rust, TypeScript, C) and every chunk records the
 > exact tree-sitter node type in a `kind` field. A sibling Ruby
 > implementation was built from the identical specs. MIT licensed, © 2026 David
@@ -29,10 +35,12 @@
 - [SPEC-V2.1.md](SPEC-V2.1.md): The secret-protection evolution spec (v2.1) — sensitive-file skip + secret redaction.
 - [SPEC-V2.2.md](SPEC-V2.2.md): The workspace-mode evolution spec (v2.2) — detection, manifest, federation, cross-member edges.
 - [SPEC-SYNC.md](SPEC-SYNC.md): The CCE Sync design spec (v2.3) — content-addressed cache, artifact format, remotes, offline-first.
-- [SPEC-MCP.md](SPEC-MCP.md): The CCE MCP design spec (v2.4) — the stdio MCP server, the three tools, `cce init`, sync freshness.
+- [SPEC-MCP.md](SPEC-MCP.md): The CCE MCP design spec (v2.4) — the stdio MCP server, the first three tools, `cce init`, sync freshness.
+- [SPEC-V2.5-SAVINGS.md](SPEC-V2.5-SAVINGS.md): The Savings Layers spec (v2.5) — the seven layers, the token estimator, the ledger, and the six new MCP tools.
 - [Workspace](docs/workspace.md): Workspace model, `workspace.yml`, detection rules, federation semantics, where it strains.
 - [Sync](docs/sync.md): CCE Sync model, artifact format, content address, permissions, troubleshooting.
-- [MCP](docs/mcp.md): CCE MCP — the server, the three tools, `cce init`, sync freshness, and how to confirm agent use.
+- [MCP](docs/mcp.md): CCE MCP — the server, the **nine tools**, `cce init`, sync freshness, and how to confirm agent use.
+- [Savings](docs/savings.md): The seven Savings Layers, the `cce.tokens/v1` estimator, `cce savings`, the `cce eval` A/B harness, and the honest "vs full-file baseline" framing.
 - [Verified](docs/VERIFIED.md): Offline + online cold-start verification transcripts (index/search/stats/dashboard/workspace/MCP offline; CCE Sync online).
 - [Getting started](docs/getting-started.md): Newcomer path from install to first successful index + search.
 - [Adding a language](docs/adding-a-language.md): Step-by-step guide to adding a language pack, with a worked example.
@@ -40,15 +48,15 @@
 - [Architecture](docs/architecture.md): Design goals, module map, pipeline, the language-pack architecture, and where the design strains.
 - [Dashboard](docs/dashboard.md): The metrics pipeline (log → aggregator → API → page), event schema, and aggregation formulas.
 - [Decisions](docs/DECISIONS.md): How each ambiguity in the spec was resolved, with rationale.
-- [TDD log](docs/TDD.md): The red → green build order and coverage (129 tests, 94.76% line coverage).
+- [TDD log](docs/TDD.md): The red → green build order and coverage (416 tests, ~93.9% line coverage).
 - [Benchmarks](docs/BENCHMARKS.md): Measured index/latency/recall numbers per language (Ruby/Rust/TypeScript/C) on real corpora.
 
 ## Source (key files)
 
 - [src/lib.rs](src/lib.rs): Crate root; module tree and public surface.
-- [src/main.rs](src/main.rs): CLI (clap) — index, search, packs, feedback, dashboard, stats, bench, conformance, workspace, sync, mcp, init.
-- [src/config.rs](src/config.rs): Normative constants (SPEC §3, DASHBOARD-SPEC §1) and runtime config.
-- [src/tokenizer.rs](src/tokenizer.rs): The shared byte-exact tokenizer (SPEC §4.1).
+- [src/main.rs](src/main.rs): CLI (clap) — index, search, packs, feedback, dashboard, stats, bench, conformance, workspace, sync, mcp, init, savings, eval.
+- [src/config.rs](src/config.rs): Normative constants (SPEC §3, DASHBOARD-SPEC §1) and runtime config, incl. the v2.5 retrieval/output/memory/summarization/savings config.
+- [src/tokenizer.rs](src/tokenizer.rs): The shared byte-exact tokenizer (SPEC §4.1) and the `cce.tokens/v1` savings estimator, `max(1, floor(bytes/4))` (SPEC-V2.5 §4).
 - [src/chunker.rs](src/chunker.rs): Generic tree-sitter chunking, chunk IDs, the `kind` field (SPEC §4.2–4.4, SPEC-V2 §3–4) — references no language.
 - [src/packs/mod.rs](src/packs/mod.rs): The `LanguagePack` trait and the pack `Registry` (SPEC-V2 §1).
 - [src/packs/](src/packs/): One pack per language (python, javascript, ruby, rust, typescript, c) and the three-layer `validators` (SPEC-V2 §2, §5).
@@ -61,7 +69,10 @@
 - [src/dashboard.rs](src/dashboard.rs): The loopback-only, read-only, self-contained dashboard web server; serves the refreshed v2.4.1 panels, all purely log-derived so it makes zero network calls (DASHBOARD-SPEC §6).
 - [src/federation.rs](src/federation.rs): Federated indexing/search/stats/dashboard over workspace members (SPEC-V2.2 §4–7).
 - [src/sync/](src/sync/): CCE Sync — identity helpers, byte-exact artifact, `sync.*` config, git wrappers, the `SyncRemote` git backend, and `init/push/pull/status/verify` (SPEC-SYNC).
-- [src/mcp/](src/mcp/): CCE MCP — JSON-RPC 2.0 framing (`protocol`), the stdio dispatch loop (`server`), the three tools (`tools`), and `cce init` (`init`) (SPEC-MCP).
+- [src/mcp/](src/mcp/): CCE MCP — JSON-RPC 2.0 framing (`protocol`), the stdio dispatch loop + per-session ledger (`server`), the **nine tools** (`tools`), and `cce init` (`init`) (SPEC-MCP, SPEC-V2.5 §6).
+- [src/compress.rs](src/compress.rs), [src/grammar.rs](src/grammar.rs): L2 AST chunk compression (`signature`/`compact`/`full`) and the L3 byte-pinned result grammar (SPEC-V2.5 §2).
+- [src/memory.rs](src/memory.rs), [src/session.rs](src/session.rs): L5 local secret-scrubbed decision memory + precision recall, and the L6 deterministic per-session digest (SPEC-V2.5 §2).
+- [src/savings.rs](src/savings.rs), [src/pricing.rs](src/pricing.rs), [src/eval.rs](src/eval.rs): the seven-bucket ledger + honesty note, the embedded offline pricing table, and the correctness-gated cost-primary A/B eval aggregator (SPEC-V2.5 §3/§7).
 
 ## Project
 

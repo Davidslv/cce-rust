@@ -14,11 +14,16 @@ abstract: >-
   Protocol server so an agent uses CCE as a native tool, plus `cce init`), and the
   v2.4.1 consolidation (a refreshed dashboard — agent-vs-human, per-package,
   index-freshness, and secret-safety panels — plus a verified, offline-first
-  documentation sweep), and the v2.5.0 Savings Layers (AST-driven chunk
-  compression to signatures + members, progressive disclosure via expand_chunk /
-  related_context, and a seven-bucket savings ledger with an in-repo eval harness).
+  documentation sweep), and the v2.5 Savings Layers (v2.5.0–v2.5.4): AST-driven
+  chunk compression to signatures + members (compact by default), progressive
+  disclosure via expand_chunk / related_context, leveled output compression,
+  local-only secret-scrubbed memory (record_decision / session_recall),
+  deterministic turn summarization (summarize_context), byte-pinned grammar
+  compression, and a seven-bucket savings ledger (`cce savings`) with an in-repo
+  A/B eval harness, surfaced through nine cross-language MCP tools. v2.5.5 is a
+  verified documentation sweep of the complete track.
 type: software
-version: 2.5.4
+version: 2.5.5
 date-released: "2026-07-05"
 license: MIT
 repository-code: "https://github.com/davidslv/cce-rust"

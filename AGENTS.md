@@ -68,7 +68,7 @@ Tests must be **deterministic and hermetic** — no network, no wall-clock, no
 ambient filesystem state. The only network-touching test (Ollama) is `#[ignore]`.
 The metrics tests inject a fixed clock/id source, and the dashboard's socket test
 binds an **ephemeral loopback port** and serves a bounded number of connections.
-Keep coverage at or above the baseline (**301 tests, ~93.6% line coverage** via
+Keep coverage at or above the baseline (**416 tests, ~93.9% line coverage** via
 `cargo llvm-cov`); a change that lowers coverage should add tests. The CI test
 gate also runs the three-layer validators over every language pack.
 
@@ -93,13 +93,21 @@ scores are compared, sorted, or emitted.
 - [`SPEC-V2.md`](SPEC-V2.md) — the v2.0 language-packs evolution (packs, registry,
   validators, `kind`, conformance shape); wins over `SPEC.md` for chunking/packs.
 - [`SPEC-V2.1.md`](SPEC-V2.1.md) · [`SPEC-V2.2.md`](SPEC-V2.2.md) ·
-  [`SPEC-SYNC.md`](SPEC-SYNC.md) · [`SPEC-MCP.md`](SPEC-MCP.md) — the secret-protection
-  (v2.1), workspace (v2.2), CCE Sync (v2.3), and CCE MCP (v2.4) evolution specs; each
-  wins over `SPEC.md` for its feature. `cce mcp`/`cce init` and the three MCP tools
-  (`context_search`, `index_status`, `record_feedback`) live in `src/mcp/`; their
-  names/schemas/output are a **cross-language contract** with the Ruby engine — do not
-  drift them.
-- [`docs/mcp.md`](docs/mcp.md) · [`docs/sync.md`](docs/sync.md) — the MCP and Sync
+  [`SPEC-SYNC.md`](SPEC-SYNC.md) · [`SPEC-MCP.md`](SPEC-MCP.md) ·
+  [`SPEC-V2.5-SAVINGS.md`](SPEC-V2.5-SAVINGS.md) — the secret-protection (v2.1),
+  workspace (v2.2), CCE Sync (v2.3), CCE MCP (v2.4), and Savings Layers (v2.5)
+  evolution specs; each wins over `SPEC.md` for its feature. `cce mcp`/`cce init` and
+  the **nine MCP tools** (`context_search`, `index_status`, `record_feedback`,
+  `expand_chunk`, `related_context`, `set_output_compression`, `record_decision`,
+  `session_recall`, `summarize_context`, in that fixed `tools/list` order) live in
+  `src/mcp/`; their names/schemas/output and the byte-pinned descriptions are a
+  **cross-language contract** with the Ruby engine — do not drift them. The v2.5
+  transforms (compact chunks, output/grammar/memory/summary blocks, the ledger) are
+  deterministic and byte-pinned; cce-rust is the reference the Ruby engine catches up
+  to. `SYNC_FORMAT_VERSION` stays `2.3` (decoupled from the app version); v2.5 does
+  not change `conformance.json` or the Sync artifact.
+- [`docs/mcp.md`](docs/mcp.md) · [`docs/savings.md`](docs/savings.md) ·
+  [`docs/sync.md`](docs/sync.md) — the MCP (nine tools), Savings Layers, and Sync
   user docs; [`docs/VERIFIED.md`](docs/VERIFIED.md) is the cold-start transcript.
 - [`docs/adding-a-language.md`](docs/adding-a-language.md) — how to add a pack.
 - [`docs/architecture.md`](docs/architecture.md) — module map, pipeline, design

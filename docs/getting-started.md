@@ -38,14 +38,14 @@ sudo apt-get update && sudo apt-get install -y build-essential
 git clone https://github.com/davidslv/cce-rust
 cd cce-rust
 cargo build --release     # binary at target/release/cce
-cargo test                # 301 tests — confirms a green build
+cargo test                # 416 tests — confirms a green build
 ```
 
 Optionally put the binary on your PATH:
 
 ```bash
 cargo install --path .    # installs `cce` into ~/.cargo/bin
-cce --version             # cce 2.0.0
+cce --version             # cce 2.5.5
 ```
 
 The rest of this guide writes `cce`; if you did not install it, use
@@ -120,6 +120,9 @@ never fails because of it.
 ## Where to next
 
 - [`how-to.md`](how-to.md) — task recipes for every command.
+- [`mcp.md`](mcp.md) — wire CCE into an agent (Claude Code) as nine MCP tools.
+- [`savings.md`](savings.md) — the seven Savings Layers, `cce savings`, and the
+  honest "vs full-file baseline" framing.
 - [`adding-a-language.md`](adding-a-language.md) — add a language pack in one file.
 - [`architecture.md`](architecture.md) — how the pipeline is built and why.
 - [`../SPEC.md`](../SPEC.md) + [`../SPEC-V2.md`](../SPEC-V2.md) — the authoritative

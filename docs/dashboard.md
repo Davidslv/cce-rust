@@ -61,11 +61,17 @@ second precision), and `id` (12 lowercase-hex chars, unique per event).
  "empty":false,             // result_count == 0
  "low_confidence":false,    // result_count > 0 AND top_score < 0.30
  "latency_ms":5.0,          // captured; no dedicated panel
- "source":"cli"}            // v2.4.1: "cli" (cce search) or "mcp" (agent context_search)
+ "source":"cli",            // v2.4.1: "cli" (cce search) or "mcp" (agent context_search)
+ "savings":{                // v2.5: per-layer token deltas → the savings_by_layer ledger
+   "retrieval":{"saved_tokens":900,"baseline_tokens":1000},
+   "chunk_compression":{"saved_tokens":0,"baseline_tokens":0},
+   "grammar":{"saved_tokens":40,"baseline_tokens":60}, "...":"…other buckets…"}}
 ```
 
 `source` (added additively in v2.4.1) powers the agent-vs-human panel. Older logs
-without it read back as `"cli"`.
+without it read back as `"cli"`. `savings` (added additively in v2.5) carries the
+per-layer token deltas that feed `savings_by_layer` / `cce savings`; a search with
+no `savings` object contributes zero to every bucket.
 
 `baseline_tokens` is the "read the whole file" counterfactual. To make it
 accurate, `cce index` now persists each indexed file's **whole-file token count**
@@ -138,6 +144,9 @@ north_star{ savings{current, prior, delta_ratio, direction},
             quality{current, prior, delta_top_score, direction} },
 by_source{ cli{searches, tokens_saved, mean_savings_ratio, mean_top_score},
            mcp{searches, tokens_saved, mean_savings_ratio, mean_top_score} },
+savings_by_layer{ retrieval{saved_tokens, baseline_tokens}, chunk_compression{…},
+                  grammar{…}, output{…}, memory{…}, turn_summarization{…},
+                  progressive_disclosure{…}, total{…}, note },   // v2.5 seven-bucket ledger
 secret_safety{ sensitive_skipped, index_runs },
 index_freshness{ indexes, source, sha, indexed_ts },     // PURELY log-derived — no network call
 series{ daily:[ {date, searches, tokens_saved, mean_savings_ratio,
@@ -173,6 +182,21 @@ the capabilities that landed since, all fed from the additive schema above:
 **pure functions of the log**, so — like the §4.1 anchor — the Ruby and Rust engines
 produce identical numbers from the same log, and the dashboard request path touches no
 network.
+
+### v2.5 — the `savings_by_layer` panel
+
+The [Savings Layers](savings.md) (v2.5) add one more purely log-derived section:
+**`savings_by_layer`**, the seven-bucket ledger — `retrieval`, `chunk_compression`,
+`grammar`, `output`, `memory`, `turn_summarization`, `progressive_disclosure`, plus a
+`total` and a `note`, each bucket `{saved_tokens, baseline_tokens}`. It sums the
+`savings` object carried on each `search` event (added additively — a pre-v2.5
+search with no `savings` contributes zero, so older logs still parse). This is the
+**same shape** the CLI prints via `cce savings --json`. Like every other panel it is
+a pure function of the log, so the dashboard stays offline and cross-engine identical.
+It carries the standard honesty `note` — *"vs full-file baseline — not your real
+end-to-end agent cost"* — because these are the internal figures, not the real
+end-to-end delta (for that, run the `cce eval` A/B harness; see
+[`savings.md`](savings.md)).
 
 `recent_searches[*].feedback` is resolved by matching `feedback.target_id` to the
 search `id` (latest wins) → `helpful` / `not_helpful` / `none`. A day with

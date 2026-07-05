@@ -30,7 +30,7 @@ responsibilities header.
 | File | Concern | Key items |
 |---|---|---|
 | `src/config.rs` | Normative constants (SPEC §3) + runtime config | `EMBED_DIM`, `RRF_K`, weights, `EmbedderKind` |
-| `src/tokenizer.rs` | The one shared byte-exact tokenizer (SPEC §4.1) | `tokenize` |
+| `src/tokenizer.rs` | The shared byte-exact tokenizer (SPEC §4.1) + the `cce.tokens/v1` savings estimator (SPEC-V2.5 §4) | `tokenize`, `estimate_tokens`, `TOKEN_ESTIMATOR_ID` |
 | `src/embedder.rs` | Hashing embedder, cosine, rounding, Ollama (SPEC §5, §11) | `fnv1a64`, `HashEmbedder`, `OllamaEmbedder`, `cosine`, `round6`, `score_key`, `format6`, `Embedder` trait |
 | `src/chunker.rs` | Generic tree-sitter chunking, chunk IDs, `kind` (SPEC §4.2–4.4, SPEC-V2 §3–4) | `Chunk`, `Chunker`, `chunk_id`, `token_count`, `chunk_with_pack` |
 | `src/packs/mod.rs` | The `LanguagePack` trait + `Registry` (SPEC-V2 §1) | `LanguagePack`, `PackExpected`, `Registry`, `default_registry` |
@@ -49,9 +49,16 @@ responsibilities header.
 | `src/sync/remote.rs` | The `SyncRemote` trait + git backend (working clone, put/get, LFS, race-retry) (SPEC-SYNC §4) | `SyncRemote`, `GitRemote` |
 | `src/sync/commands.rs` | `cce sync init/push/pull/status/verify` orchestration + `--workspace` fan-out; MCP freshness (SPEC-SYNC §5, SPEC-MCP) | `cmd_init`, `cmd_push`, `cmd_pull`, `cmd_status`, `cmd_verify`, `freshness` |
 | `src/mcp/protocol.rs` | JSON-RPC 2.0 framing for the MCP stdio transport (SPEC-MCP) | `parse_request`, `success`, `error`, `Request` |
-| `src/mcp/server.rs` | The `cce mcp` stdio dispatch loop + store/metrics resolution + sync-warm (SPEC-MCP) | `McpServer`, `run`, `serve`, `handle_line`, `warm_via_sync` |
-| `src/mcp/tools.rs` | The three MCP tools with their exact cross-language schemas (SPEC-MCP) | `tool_definitions`, `context_search`, `index_status`, `record_feedback` |
-| `src/mcp/init.rs` | `cce init`: ensure an index, merge `.mcp.json` + `CLAUDE.md` (SPEC-MCP) | `run`, `InitOptions` |
+| `src/mcp/server.rs` | The `cce mcp` stdio dispatch loop + store/metrics resolution + sync-warm + per-session ledger & output level (SPEC-MCP, SPEC-V2.5) | `McpServer`, `run`, `serve`, `handle_line`, `warm_via_sync`, `session_digest` |
+| `src/mcp/tools.rs` | The **nine** MCP tools with their exact cross-language schemas (SPEC-MCP, SPEC-V2.5 §6) | `tool_definitions`, `context_search`, `expand_chunk`, `related_context`, `set_output_compression`, `record_decision`, `session_recall`, `summarize_context`, … |
+| `src/mcp/init.rs` | `cce init`: ensure an index, merge `.mcp.json` + a leveled `CLAUDE.md` block (SPEC-MCP, SPEC-V2.5 §2 L4) | `run`, `InitOptions` |
+| `src/compress.rs` | AST-driven chunk compression to `signature`/`compact`/`full` (SPEC-V2.5 §2 L2) | `compress`, `DetailLevel` |
+| `src/grammar.rs` | Byte-pinned compact result grammar; self-measured (SPEC-V2.5 §2 L3) | `compact_line`, `GrammarRow` |
+| `src/memory.rs` | Local-only, secret-scrubbed decision store + precision recall (SPEC-V2.5 §2 L5) | `record`, `recall`, `load_entries`, `memory_path` |
+| `src/session.rs` | The per-session ledger digest — deterministic, structured, not an LLM summary (SPEC-V2.5 §2 L6) | `SessionLedger`, `digest`, `SummaryScope`, `short_label` |
+| `src/savings.rs` | The seven-bucket ledger roll-up + the honesty note (SPEC-V2.5 §3) | `sum_by_layer`, `SavingsByLayer`, `SAVINGS_NOTE` |
+| `src/pricing.rs` / `src/pricing.json` | Embedded, offline model pricing for the `$` estimate (SPEC-V2.5 §3) | `PriceTable`, `dollars_saved`, `builtin` |
+| `src/eval.rs` | The real-world A/B harness aggregator — correctness-gated, cost-primary, paired (SPEC-V2.5 §7) | `evaluate_files`, `ArmSummary` |
 | `src/walker.rs` | Filesystem walk + ignore rules + Layer-1 sensitive-file skip (SPEC §7.1, SPEC-V2.1 §2) | `walk` |
 | `src/sensitive.rs` | Layer-1 sensitive-file policy: is a basename secret material? (SPEC-V2.1 §1) | `is_sensitive` |
 | `src/redactor.rs` | Layer-2 secret redaction over indexed content (SPEC-V2.1 §1) | `redact` |
@@ -61,7 +68,7 @@ responsibilities header.
 | `src/metrics.rs` | Persisted metrics event log; injected clock/id source (DASH §2) | `MetricsWriter`, `read_log`, `parse_log`, `Clock`, `IdSource`, `parse_iso` |
 | `src/aggregator.rs` | Pure aggregate: totals, north-stars, series, deltas (DASH §4) | `aggregate`, `Aggregate`, `direction` |
 | `src/dashboard.rs` | Loopback-only, read-only, self-contained web server (DASH §6, SPEC-V2.2 §7) | `run`, `serve`, `route`, `run_workspace`, `route_workspace` |
-| `src/main.rs` | CLI (SPEC §9, DASH §5, SPEC-V2.2 §9, SPEC-SYNC §5, SPEC-MCP) | clap command tree |
+| `src/main.rs` | CLI (SPEC §9, DASH §5, SPEC-V2.2 §9, SPEC-SYNC §5, SPEC-MCP, SPEC-V2.5 §3/§7) | clap command tree — incl. `cce savings`, `cce eval` |
 
 The metrics/dashboard modules (`DASH` = [`DASHBOARD-SPEC.md`](../DASHBOARD-SPEC.md),
 v1.1) are the one part of the system that uses real wall-clock time; the clock and
