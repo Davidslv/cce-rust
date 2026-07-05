@@ -76,6 +76,15 @@ top_k) as compact entries with ids, which you CHOOSE to use — it is never an a
 Returning nothing when there is no confident match is normal and correct; proceed without it \
 rather than forcing a weak memory into context.";
 
+const SUMMARIZE_CONTEXT_DESC: &str = "Get a compact, deterministic digest of what THIS session \
+has done so far — the files and chunks you have touched, the queries you have run, and the \
+decisions you have recorded — so you can compress a long session's history into a few lines \
+instead of re-sending the raw transcript. It is a STRUCTURED digest built from the server's \
+per-session ledger, NOT an LLM-written summary: the same sequence of tool calls always yields the \
+same bytes. Optional `scope` narrows it: \"all\" (default), \"files\" (the files AND chunks \
+touched), \"queries\", or \"decisions\". Long lists are bounded with a `… (+N more)` marker. An \
+unknown `scope` returns a short, actionable error, never a crash.";
+
 /// Write a tiny self-contained Python repo into `dir`.
 fn write_tiny_repo(dir: &Path) {
     std::fs::write(dir.join("auth.py"), "def hash_password(pw):\n    return pw + 'salt'\n")
@@ -143,7 +152,7 @@ fn handshake_list_and_search_over_a_fixture_index_logs_metrics() {
     assert_eq!(init["result"]["serverInfo"]["name"], "cce");
     assert!(init["result"]["capabilities"]["tools"].is_object());
 
-    // tools/list — exactly the eight tools, in fixed order, with the schemas.
+    // tools/list — exactly the nine tools, in fixed order, with the schemas.
     let list = by_id(&resps, 2);
     let tools = list["result"]["tools"].as_array().unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -157,7 +166,8 @@ fn handshake_list_and_search_over_a_fixture_index_logs_metrics() {
             "related_context",
             "set_output_compression",
             "record_decision",
-            "session_recall"
+            "session_recall",
+            "summarize_context"
         ]
     );
     assert_eq!(tools[0]["inputSchema"]["required"], serde_json::json!(["query"]));
@@ -195,6 +205,16 @@ fn handshake_list_and_search_over_a_fixture_index_logs_metrics() {
     assert_eq!(tools[7]["description"].as_str().unwrap(), SESSION_RECALL_DESC);
     assert_eq!(tools[7]["inputSchema"]["required"], serde_json::json!(["query"]));
     assert_eq!(tools[7]["inputSchema"]["properties"]["top_k"]["default"], 5);
+    // The Layer-6 turn-summarization tool carries its byte-pinned description + schema:
+    // an optional `scope` enum defaulting to "all", and NO required inputs.
+    assert_eq!(tools[8]["name"].as_str().unwrap(), "summarize_context");
+    assert_eq!(tools[8]["description"].as_str().unwrap(), SUMMARIZE_CONTEXT_DESC);
+    assert!(tools[8]["inputSchema"].get("required").is_none());
+    assert_eq!(
+        tools[8]["inputSchema"]["properties"]["scope"]["enum"],
+        serde_json::json!(["all", "files", "queries", "decisions"])
+    );
+    assert_eq!(tools[8]["inputSchema"]["properties"]["scope"]["default"], "all");
 
     // context_search
     let search = by_id(&resps, 3);
@@ -448,6 +468,87 @@ fn cce_init_writes_valid_idempotent_mcp_json_and_claude_md() {
     let resps = responses(&out);
     let text = by_id(&resps, 1)["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("auth.py"), "got: {text}");
+}
+
+#[test]
+fn summarize_context_digest_is_byte_pinned_for_a_fixed_session_and_scopes_slice() {
+    // SPEC-V2.5 §2 Layer 6: over a REAL `cce mcp` process, a fixed sequence of tool
+    // calls (two searches + an expand + a decision) produces a digest whose bytes are
+    // EXACTLY the pinned golden — proving the per-session ledger accumulates in order
+    // and the digest is deterministic given the call sequence. The whole session runs
+    // in ONE process so the in-memory ledger persists across the calls.
+    let tmp = tempfile::tempdir().unwrap();
+    write_tiny_repo(tmp.path());
+    index_dir(tmp.path());
+    let dir = tmp.path().to_string_lossy().to_string();
+
+    // Content-addressed chunk ids of the tiny repo (stable across runs).
+    let auth_id = "039f8bd5b80a698e";
+    let input = format!(
+        concat!(
+            "{{\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"context_search\",\"arguments\":{{\"query\":\"hash password\",\"no_graph\":true}}}}}}\n",
+            "{{\"id\":2,\"method\":\"tools/call\",\"params\":{{\"name\":\"context_search\",\"arguments\":{{\"query\":\"process payment amount\",\"no_graph\":true}}}}}}\n",
+            "{{\"id\":3,\"method\":\"tools/call\",\"params\":{{\"name\":\"expand_chunk\",\"arguments\":{{\"chunk_id\":\"{}\",\"scope\":\"body\"}}}}}}\n",
+            "{{\"id\":4,\"method\":\"tools/call\",\"params\":{{\"name\":\"record_decision\",\"arguments\":{{\"text\":\"store password hashes with bcrypt\",\"area\":\"auth\"}}}}}}\n",
+            "{{\"id\":5,\"method\":\"tools/call\",\"params\":{{\"name\":\"summarize_context\",\"arguments\":{{}}}}}}\n",
+            "{{\"id\":6,\"method\":\"tools/call\",\"params\":{{\"name\":\"summarize_context\",\"arguments\":{{\"scope\":\"files\"}}}}}}\n",
+            "{{\"id\":7,\"method\":\"tools/call\",\"params\":{{\"name\":\"summarize_context\",\"arguments\":{{\"scope\":\"bogus\"}}}}}}\n"
+        ),
+        auth_id
+    );
+    let out = drive(&["mcp", "--dir", &dir], &input, &[]);
+    let resps = responses(&out);
+
+    // scope=all: the full digest, byte-for-byte.
+    let digest = by_id(&resps, 5)["result"]["content"][0]["text"].as_str().unwrap();
+    let golden = "CCE session digest\n\
+         files (2):\n- auth.py\n- payments.py\n\
+         chunks (2):\n- 039f8bd5b80a698e\n- 61707be0deb092a1\n\
+         queries (2):\n- hash password\n- process payment amount\n\
+         decisions (1):\n- #03774d8fa782583c store password hashes with bcrypt";
+    assert_eq!(digest, golden);
+    assert_eq!(by_id(&resps, 5)["result"]["isError"], false);
+
+    // scope=files: only the files + chunks slice.
+    let files = by_id(&resps, 6)["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(
+        files,
+        "CCE session digest\n\
+         files (2):\n- auth.py\n- payments.py\n\
+         chunks (2):\n- 039f8bd5b80a698e\n- 61707be0deb092a1"
+    );
+
+    // An unknown scope is an actionable tool-level error, not a crash.
+    let bad = by_id(&resps, 7);
+    assert_eq!(bad["result"]["isError"], true);
+    assert!(bad["result"]["content"][0]["text"].as_str().unwrap().contains("unknown scope"));
+
+    // Determinism: re-running the identical session yields identical digest bytes.
+    let out2 = drive(&["mcp", "--dir", &dir], &input, &[]);
+    let resps2 = responses(&out2);
+    let digest2 = by_id(&resps2, 5)["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(digest2, golden);
+}
+
+#[test]
+fn summarize_context_does_not_leak_across_a_fresh_server_process() {
+    // The ledger is per-process: a second `cce mcp` invocation starts empty even after
+    // a prior session recorded activity against the same project.
+    let tmp = tempfile::tempdir().unwrap();
+    write_tiny_repo(tmp.path());
+    index_dir(tmp.path());
+    let dir = tmp.path().to_string_lossy().to_string();
+
+    // Session A: run a search, then close the process.
+    let a = "{\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"context_search\",\"arguments\":{\"query\":\"hash password\"}}}\n";
+    drive(&["mcp", "--dir", &dir], a, &[]);
+
+    // Session B: a brand-new process summarizes to the pinned EMPTY body.
+    let b = "{\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"summarize_context\"}}\n";
+    let out = drive(&["mcp", "--dir", &dir], b, &[]);
+    let resps = responses(&out);
+    let text = by_id(&resps, 1)["result"]["content"][0]["text"].as_str().unwrap();
+    assert_eq!(text, "CCE session digest\n(nothing recorded this session yet)");
 }
 
 // --- CCE Sync soft dependency (behind a local bare git remote) ---

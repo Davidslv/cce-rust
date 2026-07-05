@@ -18,7 +18,7 @@ abstract: >-
   compression to signatures + members, progressive disclosure via expand_chunk /
   related_context, and a seven-bucket savings ledger with an in-repo eval harness).
 type: software
-version: 2.5.2
+version: 2.5.3
 date-released: "2026-07-05"
 license: MIT
 repository-code: "https://github.com/davidslv/cce-rust"

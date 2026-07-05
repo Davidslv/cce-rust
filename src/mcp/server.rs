@@ -18,15 +18,17 @@
 //! - It is READ-ONLY over the store and never blocks or errors on a missing index,
 //!   an absent remote, or an offline network.
 
-use crate::config::{OutputConfig, OutputLevel, METRICS_FILE};
+use crate::config::{OutputConfig, OutputLevel, SummarizationConfig, METRICS_FILE};
 use crate::mcp::protocol::{self, Request};
 use crate::mcp::tools;
 use crate::mcp::{MCP_PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION};
+use crate::session::{SessionLedger, SummaryScope};
 use crate::store::{default_metrics_path, default_store_path};
 use crate::sync::commands::{cmd_pull, PullTarget};
 use crate::sync::config::SyncConfig;
+use crate::tokenizer::estimate_tokens;
 use serde_json::{json, Value};
-use std::cell::Cell;
+use std::cell::{Cell, RefCell};
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 
@@ -44,6 +46,21 @@ pub struct McpServer {
     /// resets when the server restarts. `Cell` because the stdio loop is
     /// single-threaded and every handler takes `&self`.
     output_level: Cell<OutputLevel>,
+    /// L6 per-session ledger (SPEC-V2.5 §2 Layer 6): an order-preserving,
+    /// wall-clock-free record of THIS session's context_search / expand_chunk /
+    /// related_context / record_decision calls, which `summarize_context` renders into
+    /// a deterministic digest. In-memory only — a fresh server starts empty, so it
+    /// never leaks across sessions. `RefCell` (not `Cell`) because it grows in place.
+    ledger: RefCell<SessionLedger>,
+    /// L6 auto-trigger threshold (SPEC-V2.5 §5, `summarization.auto_tokens`). Seeded
+    /// from the project's `.cce/config`; `None` ⇒ manual only (the default). Never
+    /// drives a model call — only the deterministic, offline [`Self::auto_summarize_due`]
+    /// signal derived from `served_tokens`.
+    auto_tokens: Option<u64>,
+    /// Running total of tokens THIS session has served to the agent, counted with the
+    /// one `cce.tokens/v1` estimator over every tool's returned text (SPEC-V2.5 §4).
+    /// Deterministic given the call sequence; backs the auto-summarize threshold.
+    served_tokens: Cell<u64>,
 }
 
 impl McpServer {
@@ -52,7 +69,16 @@ impl McpServer {
     pub fn new(dir: Option<PathBuf>, store: Option<PathBuf>, workspace: bool) -> Self {
         let root = dir.clone().unwrap_or_else(|| PathBuf::from("."));
         let output_level = Cell::new(OutputConfig::load(&root).level);
-        McpServer { dir, store, workspace, output_level }
+        let auto_tokens = SummarizationConfig::load(&root).auto_tokens;
+        McpServer {
+            dir,
+            store,
+            workspace,
+            output_level,
+            ledger: RefCell::new(SessionLedger::new()),
+            auto_tokens,
+            served_tokens: Cell::new(0),
+        }
     }
 
     /// Whether this session federates over a workspace.
@@ -69,6 +95,65 @@ impl McpServer {
     /// the `set_output_compression` tool). Does NOT rewrite CLAUDE.md.
     pub fn set_output_level(&self, level: OutputLevel) {
         self.output_level.set(level);
+    }
+
+    // --- L6 turn summarization (SPEC-V2.5 §2 Layer 6) ---
+
+    /// Record a `context_search` in the session ledger (its query + the ids/paths it
+    /// returned). Order-preserving; no wall-clock.
+    pub fn record_search(&self, query: &str, chunk_ids: &[String], file_paths: &[String]) {
+        self.ledger.borrow_mut().record_search(query, chunk_ids, file_paths);
+    }
+
+    /// Record an `expand_chunk` (chunk_id + scope) in the session ledger.
+    pub fn record_expand(&self, chunk_id: &str, scope: &str) {
+        self.ledger.borrow_mut().record_expand(chunk_id, scope);
+    }
+
+    /// Record a `related_context` (chunk_id) in the session ledger.
+    pub fn record_related(&self, chunk_id: &str) {
+        self.ledger.borrow_mut().record_related(chunk_id);
+    }
+
+    /// Record a `record_decision` (id + a short, already-redacted label) in the ledger.
+    pub fn record_decision_event(&self, id: &str, label: &str) {
+        self.ledger.borrow_mut().record_decision(id, label);
+    }
+
+    /// The byte-pinned session digest for `scope` (what `summarize_context` returns).
+    pub fn session_digest(&self, scope: SummaryScope) -> String {
+        self.ledger.borrow().digest(scope)
+    }
+
+    /// The number of tool calls recorded in the session ledger so far.
+    pub fn ledger_len(&self) -> usize {
+        self.ledger.borrow().len()
+    }
+
+    /// Add `text`'s `cce.tokens/v1` estimate to the running served-token total. Called
+    /// for every tool's returned text so the auto-summarize threshold is exact.
+    pub fn note_served_tokens(&self, text: &str) {
+        self.served_tokens.set(self.served_tokens.get() + estimate_tokens(text));
+    }
+
+    /// The running total of tokens served to the agent this session (`cce.tokens/v1`).
+    pub fn served_tokens(&self) -> u64 {
+        self.served_tokens.get()
+    }
+
+    /// The configured L6 auto-trigger threshold (`summarization.auto_tokens`); `None`
+    /// ⇒ manual only.
+    pub fn auto_tokens(&self) -> Option<u64> {
+        self.auto_tokens
+    }
+
+    /// Whether the session's served-token total has crossed the configured
+    /// `summarization.auto_tokens` threshold — a deterministic, OFFLINE signal (no
+    /// model call, no wall-clock). `None` threshold ⇒ never due (manual only). v1 does
+    /// not auto-invoke `summarize_context` or auto-inject a digest; this predicate is
+    /// exposed for the harness and Ruby's later catch-up.
+    pub fn auto_summarize_due(&self) -> bool {
+        self.auto_tokens.is_some_and(|t| self.served_tokens() >= t)
     }
 
     /// The project root (for sync + workspace + default metrics): `--dir` or cwd.
@@ -208,10 +293,14 @@ impl McpServer {
             "set_output_compression" => tools::set_output_compression(self, &args),
             "record_decision" => tools::record_decision(self, &args),
             "session_recall" => tools::session_recall(self, &args),
+            "summarize_context" => tools::summarize_context(self, &args),
             other => {
                 return Ok(unknown_tool_result(other));
             }
         };
+        // L6: account every served tool result against the session's returned-token
+        // total (SPEC-V2.5 §4/§2 Layer 6), the offline signal behind auto_summarize_due.
+        self.note_served_tokens(&output.text);
         Ok(output.to_content())
     }
 }
@@ -276,7 +365,7 @@ mod tests {
     }
 
     #[test]
-    fn tools_list_returns_the_eight_tools_in_fixed_order() {
+    fn tools_list_returns_the_nine_tools_in_fixed_order() {
         let tmp = tempfile::tempdir().unwrap();
         let s = server_for(tmp.path());
         let resp = s.handle_line(r#"{"id":2,"method":"tools/list"}"#).unwrap();
@@ -297,7 +386,8 @@ mod tests {
                 "related_context",
                 "set_output_compression",
                 "record_decision",
-                "session_recall"
+                "session_recall",
+                "summarize_context"
             ]
         );
     }
@@ -349,6 +439,115 @@ mod tests {
         assert_eq!(v["result"]["isError"], false);
         assert!(v["result"]["content"][0]["text"].as_str().unwrap().contains("max"));
         assert_eq!(s.output_level(), OutputLevel::Max);
+    }
+
+    #[test]
+    fn session_ledger_accumulates_in_order_and_summarize_context_digests_it() {
+        let tmp = tempfile::tempdir().unwrap();
+        index_fixture(tmp.path());
+        let s = server_for(tmp.path());
+        // Two searches, an expand, a decision — then summarize.
+        s.handle_line(
+            r#"{"id":1,"method":"tools/call","params":{"name":"context_search","arguments":{"query":"hash password","no_graph":true}}}"#,
+        )
+        .unwrap();
+        s.handle_line(
+            r#"{"id":2,"method":"tools/call","params":{"name":"context_search","arguments":{"query":"validate token","no_graph":true}}}"#,
+        )
+        .unwrap();
+        s.handle_line(
+            r#"{"id":3,"method":"tools/call","params":{"name":"record_decision","arguments":{"text":"store password hashes with bcrypt"}}}"#,
+        )
+        .unwrap();
+        // The ledger accumulated the 3 context-touching calls in order (the decision
+        // records one event; the two searches record one each).
+        assert!(s.ledger_len() >= 3);
+
+        let resp = s
+            .handle_line(
+                r#"{"id":4,"method":"tools/call","params":{"name":"summarize_context","arguments":{}}}"#,
+            )
+            .unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["result"]["isError"], false);
+        let text = v["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.starts_with("CCE session digest"));
+        assert!(text.contains("queries (2):"));
+        assert!(text.contains("- hash password"));
+        assert!(text.contains("- validate token"));
+        assert!(text.contains("decisions (1):"));
+        assert!(text.contains("store password hashes with bcrypt"));
+    }
+
+    #[test]
+    fn a_fresh_server_has_an_empty_ledger_so_it_does_not_leak_across_sessions() {
+        let tmp = tempfile::tempdir().unwrap();
+        index_fixture(tmp.path());
+        // First "session": record activity.
+        let s1 = server_for(tmp.path());
+        s1.handle_line(
+            r#"{"id":1,"method":"tools/call","params":{"name":"context_search","arguments":{"query":"hash password"}}}"#,
+        )
+        .unwrap();
+        assert!(s1.ledger_len() >= 1);
+
+        // A brand-new server (a fresh session/process) starts empty and summarizes to
+        // the pinned empty body — the previous session's ledger did not leak.
+        let s2 = server_for(tmp.path());
+        assert_eq!(s2.ledger_len(), 0);
+        let resp = s2
+            .handle_line(r#"{"id":1,"method":"tools/call","params":{"name":"summarize_context"}}"#)
+            .unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(
+            v["result"]["content"][0]["text"].as_str().unwrap(),
+            "CCE session digest\n(nothing recorded this session yet)"
+        );
+    }
+
+    #[test]
+    fn summarize_context_unknown_scope_is_an_actionable_error_not_a_crash() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = server_for(tmp.path());
+        let resp = s
+            .handle_line(
+                r#"{"id":1,"method":"tools/call","params":{"name":"summarize_context","arguments":{"scope":"everything"}}}"#,
+            )
+            .unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["result"]["isError"], true);
+        assert!(v["result"]["content"][0]["text"].as_str().unwrap().contains("unknown scope"));
+    }
+
+    #[test]
+    fn served_tokens_and_auto_summarize_due_track_the_config_threshold() {
+        let tmp = tempfile::tempdir().unwrap();
+        index_fixture(tmp.path());
+        // Default config ⇒ manual only ⇒ never due, whatever is served.
+        let s = server_for(tmp.path());
+        assert_eq!(s.auto_tokens(), None);
+        s.handle_line(
+            r#"{"id":1,"method":"tools/call","params":{"name":"context_search","arguments":{"query":"hash password"}}}"#,
+        )
+        .unwrap();
+        assert!(s.served_tokens() > 0, "a served search must count tokens");
+        assert!(!s.auto_summarize_due(), "manual-only config is never auto-due");
+
+        // A tiny threshold ⇒ due after the first served result.
+        std::fs::create_dir_all(tmp.path().join(".cce")).unwrap();
+        std::fs::write(
+            tmp.path().join(".cce").join("config"),
+            "summarization:\n  auto_tokens: 1\n",
+        )
+        .unwrap();
+        let s2 = server_for(tmp.path());
+        assert_eq!(s2.auto_tokens(), Some(1));
+        assert!(!s2.auto_summarize_due(), "nothing served yet");
+        s2.handle_line(
+            r#"{"id":1,"method":"tools/call","params":{"name":"context_search","arguments":{"query":"hash password"}}}"#,
+        )
+        .unwrap();
+        assert!(s2.auto_summarize_due(), "served-token total crossed the threshold");
     }
 
     #[test]
