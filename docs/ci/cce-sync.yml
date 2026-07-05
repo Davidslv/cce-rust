@@ -1,0 +1,67 @@
+# Ready-to-copy GitHub Actions workflow (SPEC-SYNC §7/§10.5).
+#
+# Indexes `main` with the deterministic hash embedder on every merge and pushes the
+# content-addressed cache, so teammates can `cce sync pull --latest` for an instant,
+# byte-identical base index.
+#
+# Copy this to `.github/workflows/cce-sync.yml` in your SOURCE repo and set the
+# `CCE_SYNC_TOKEN` secret (see the credential note at the bottom).
+name: cce-sync
+
+on:
+  push:
+    branches: [main]
+
+# Serialize pushes so the cache ref advances cleanly (the client also
+# fetch-rebase-retries, so this is belt-and-braces, not required).
+concurrency:
+  group: cce-sync-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  index-and-push:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # Full history so `built_at` (the commit date of the sha) is available.
+          fetch-depth: 0
+
+      - name: Install git-LFS
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y git-lfs
+          git lfs install
+
+      - name: Install the cce binary
+        run: cargo install --git https://github.com/davidslv/cce-rust --tag v2.3.0
+
+      - name: Configure git identity for the cache working clone
+        run: |
+          git config --global user.name  "cce-ci"
+          git config --global user.email "cce-ci@users.noreply.github.com"
+
+      - name: Index main with the hash embedder
+        run: cce index .
+
+      - name: Push the cache
+        env:
+          # A deploy key or fine-grained PAT with WRITE access to the CACHE repo
+          # (acme/cce-cache), NOT the source repo. See the note below.
+          CCE_SYNC_TOKEN: ${{ secrets.CCE_SYNC_TOKEN }}
+        run: |
+          cce sync init \
+            --remote "https://x-access-token:${CCE_SYNC_TOKEN}@github.com/acme/cce-cache.git"
+          cce sync push
+
+# ---------------------------------------------------------------------------
+# Credential note
+# ---------------------------------------------------------------------------
+# `CCE_SYNC_TOKEN` must grant WRITE access to the *cache* repository only
+# (e.g. acme/cce-cache), never the source repo. Prefer a fine-grained PAT or a
+# deploy key scoped to that single repository.
+#
+# Read access to the cache repo == the audience allowed to pull any cache in it:
+# put one cache repo per access boundary (SPEC-SYNC §6). Developers need only READ
+# to `cce sync pull`; members with write may also push — content-addressing makes
+# concurrent pushes safe.

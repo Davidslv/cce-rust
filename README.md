@@ -62,7 +62,11 @@ source "$HOME/.cargo/env"
 # 2. A C toolchain for the tree-sitter grammars
 xcode-select --install    # Xcode Command Line Tools (clang, make)
 
-# 3. Build and test
+# 3. git + git-LFS (only needed for CCE Sync; see below)
+brew install git git-lfs
+git lfs install
+
+# 4. Build and test
 git clone https://github.com/davidslv/cce-rust
 cd cce-rust
 cargo build --release     # binary at target/release/cce
@@ -79,7 +83,11 @@ source "$HOME/.cargo/env"
 # 2. A C toolchain for the tree-sitter grammars
 sudo apt-get update && sudo apt-get install -y build-essential
 
-# 3. Build and test
+# 3. git + git-LFS (only needed for CCE Sync; see below)
+sudo apt-get install -y git git-lfs
+git lfs install
+
+# 4. Build and test
 git clone https://github.com/davidslv/cce-rust
 cd cce-rust
 cargo build --release     # binary at target/release/cce
@@ -90,7 +98,7 @@ cargo test                # confirm a green build
 
 ```bash
 cargo install --path .    # installs `cce` into ~/.cargo/bin
-cce --version             # cce 2.0.0
+cce --version             # cce 2.3.0
 ```
 
 ### Optional: the semantic embedder (Ollama)
@@ -417,6 +425,82 @@ Absent `--workspace`, every command behaves exactly as before. See
 [`docs/workspace.md`](docs/workspace.md) for the model, manifest format, detection
 rules, federation semantics, and where the approach strains.
 
+## CCE Sync — a distributed, offline-first cache (v2.3)
+
+**Model: git remotes for the index.** Your local `.cce/` is authoritative; an
+optional git-backed remote is a *content-addressed cache* you push to and pull
+from. Because the index is deterministic (hash embedder), a cache for `repo@sha` is
+**byte-identical** no matter who — or which language engine — built it. Sync is
+**purely additive**: every existing command works with no remote, and a failed
+push/pull never breaks local work.
+
+Prerequisites: `git`, and `git-lfs` if you keep LFS on (the default) — see
+[Installation](#installation--environment-setup). Only the **hash** embedder is
+shareable; `cce sync push` refuses a non-hash index or a dirty working tree.
+
+End-to-end walkthrough (real captured output; a bare `file://` repo stands in for
+your cache repo — swap in an SSH/HTTPS URL for real use). The concrete commit `<sha>`
+and absolute paths vary by environment; the **checksums and chunk counts are the
+stable, reproducible values**.
+
+```console
+# 0. one-time: a cache repo (normally a real, empty git repo you can push to)
+$ git init --bare -b main /srv/cache.git
+
+# 1. configure the remote for your project (writes .cce/config, sets up the clone)
+$ cce sync init --remote file:///srv/cache.git --repo-id github.com__acme__billing
+Configured sync remote: file:///srv/cache.git
+  git-LFS       : enabled (*.cce)
+  repo_id       : github.com__acme__billing
+  working clone : ~/.cce/sync/507cf2021d44e3f3
+  config        : ./.cce/config
+
+# 2. push the index for the committed HEAD (or let CI do it — see below)
+$ cce sync push
+Pushed github.com__acme__billing@7b9dec7dcbe86ca35b2b4ddeb8386d0595e3362f
+  key      : hash/2.3/github.com__acme__billing/7b9dec7dcbe86ca35b2b4ddeb8386d0595e3362f.cce
+  checksum : 18ca676d989dee00af072ad269c60e28af64441483613954132c530c4fb4ff05
+
+# 3. a teammate (fresh clone at the same sha) pulls it — instantly
+$ cce sync pull
+Pulled github.com__acme__billing@7b9dec7dcbe86ca35b2b4ddeb8386d0595e3362f
+  chunks   : 2
+  checksum : 18ca676d989dee00af072ad269c60e28af64441483613954132c530c4fb4ff05
+  store    : ./.cce/index.json
+  tree     : matches — pulled index used as-is
+
+# 4. (optional) paranoid re-check: re-index locally, confirm the checksum
+$ cce sync verify
+verify OK: github.com__acme__billing@7b9dec7dcbe86ca35b2b4ddeb8386d0595e3362f
+  checksum : 18ca676d989dee00af072ad269c60e28af64441483613954132c530c4fb4ff05
+
+# 5. search the pulled index — no local reindex needed
+$ cce search "authenticate user password" --no-metrics
+ 1. [0.920470] src/auth.py:1-3 (function/function_definition)
+    def login(user, password):
+ 2. [0.875340] src/pay.py:3-6 (function/function_definition)
+    def charge(user, amount):
+```
+
+The pull checksum equals the push checksum, bit-for-bit — that is content
+addressing. `cce sync status` shows the remote, the local cache sha, the remote
+`--latest` pointer, and whether your working tree matches. `cce sync pull --latest`
+grabs the newest sha CI pushed for `main`.
+
+**CI (GitHub Actions):** index `main` and push on every merge with the ready-to-copy
+[`docs/ci/cce-sync.yml`](docs/ci/cce-sync.yml). The token it uses needs **write**
+access to the *cache* repo only; developers need only **read** to pull.
+
+**Offline-first, always:** with no remote (or an unreachable one), `cce index`,
+`cce search`, and `cce sync status` still work — `status` just reports the
+local-only state. `--workspace` push/pull iterate the members, each keyed by its own
+`repo_id@sha`.
+
+See [`docs/sync.md`](docs/sync.md) for the artifact format (byte-exact,
+cross-language), the content-address scheme, permissions guidance, and
+troubleshooting; and [`docs/VERIFIED.md`](docs/VERIFIED.md) for the full cold-start
+transcript.
+
 ## Supported languages
 
 Language support is a set of pluggable **language packs** (SPEC-V2). The core
@@ -480,6 +564,10 @@ language pack, and a guard test asserts the core chunker names no language.
 | [`SPEC-V2.md`](SPEC-V2.md) | The language-packs evolution spec (v2.0) |
 | [`SPEC-V2.1.md`](SPEC-V2.1.md) | The secret-protection evolution spec (v2.1) |
 | [`SPEC-V2.2.md`](SPEC-V2.2.md) | The workspace-mode evolution spec (v2.2) |
+| [`SPEC-SYNC.md`](SPEC-SYNC.md) | The CCE Sync design spec (v2.3) |
+| [`docs/sync.md`](docs/sync.md) | CCE Sync: model, artifact format, content address, permissions, troubleshooting |
+| [`docs/VERIFIED.md`](docs/VERIFIED.md) | CCE Sync cold-start verification transcript |
+| [`docs/ci/cce-sync.yml`](docs/ci/cce-sync.yml) | Ready-to-copy GitHub Actions cache-push workflow |
 | [`docs/getting-started.md`](docs/getting-started.md) | Install → first index + search |
 | [`docs/adding-a-language.md`](docs/adding-a-language.md) | Step-by-step guide to adding a language pack |
 | [`docs/architecture.md`](docs/architecture.md) | Design goals, pipeline, language packs, and where it strains |

@@ -303,3 +303,101 @@ manifest is emitted by a small canonical writer so the exact bytes are under our
 control (and match across languages); `serde_yaml = "=0.9.34"` parses hand-written
 manifests back. Emitting via `serde_yaml` was avoided because its formatting is not
 guaranteed stable across versions or identical to another language's YAML library.
+
+## CCE Sync (v2.3.0, SPEC-SYNC + SPEC-SYNC-RECONCILE)
+
+The two engines first diverged on the interchange artifact, so
+[`SPEC-SYNC-RECONCILE.md`](../SPEC-SYNC-RECONCILE.md) pinned a single canonical
+format. The decisions below reflect that reconciled format.
+
+**The interchange artifact is a hand-built canonical stream, not serde's default.**
+Cross-engine byte-identity (SPEC-SYNC §10) is a hard requirement. The artifact is
+assembled explicitly: the manifest line, one object per chunk (sorted by
+`(file_path, start_line, id)`), then the graph line — each an **LF-terminated**
+compact JSON object, **including the last line**. Sorted keys come free from
+`serde_json`'s default `Map` (a `BTreeMap`) plus `to_string` (no whitespace); the
+`preserve_order` feature is deliberately not enabled. The stream is a pure function
+of its content.
+
+**Provenance is REMOVED entirely — no `built_at`, no `built_by`.** An earlier draft
+carried a git-derived `built_at` and a neutral `built_by`; the reconciliation
+dropped both. Any provenance risks non-reproducibility and there is no need for it —
+the checksum plus `(repo_id, sha)` already identify the artifact. Removing it makes
+the manifest exactly `{cce_version, checksum, chunk_count, embedder, file_tokens,
+pack_set_id, repo_id, sha}` (sorted), which both engines produce identically.
+
+**The checksum covers the whole stream with `checksum:""`.** `checksum` =
+lowercase-hex SHA-256 over the entire canonical stream serialized with the
+manifest's `checksum` field set to the empty string; the real hex is then written
+in. Verify sets `checksum` to `""`, re-hashes, and compares. This is simpler than
+the earlier "omit the field" rule and identical across engines (there is no
+provenance to special-case). Independently reproduced with a standalone Python
+SHA-256 over the emitted bytes.
+
+**Embeddings are standard base64 (with padding) of little-endian `f64` bytes, never
+decimals.** Float→string formatting differs across languages, so serializing the
+256-d vector as decimals would break byte-identity even though the vectors are
+bit-equal (the hash embedder is deterministic). Encoding the raw IEEE-754 bytes
+(`f64::to_le_bytes`) as RFC-4648 base64 **with padding** sidesteps formatting
+entirely. `base64 = "=0.22.1"` is pinned; the standard alphabet + padding is
+identical across engines (2048 bytes → 2732 base64 chars).
+
+**`file_tokens` lives in the MANIFEST (not the graph line).** The dashboard's
+baseline-tokens counterfactual (DASH §3) needs each file's whole-file token count,
+which cannot be recomputed from chunks after import. It is fully deterministic
+(`max(1, bytes/4)`, a SPEC §3 constant both engines share). The canonical format
+places it in the manifest as a sorted-key `{path: int}` object, keeping the
+export→import round-trip lossless.
+
+**The graph line is `{"edges":[…],"nodes":[…]}` over the RESOLVED imports (base SPEC
+§6.7).** `nodes` are every indexed file (`{"id": path}`, sorted by id — derived from
+`file_tokens`' keys); `edges` are the **resolved** `file → file` edges
+(`{"source", "target", "type":"import"}`, sorted by `(source, target, type)`): an
+edge `A → B` exists only when a module imported by `A` resolves — by the same
+stem-matching the retriever's graph expansion uses — to a corpus file `B`. External /
+unresolved imports (`os`, `fs`, `std`, …) produce **no** edge, so `samples` yields
+`edges:[]`. On import, `file_imports` is reconstructed by mapping each resolved
+`target` back to a module name (its file stem) and grouping by `source`; re-`build`ing
+the graph over those stems reproduces the identical file→file edges, so
+search-expansion behaviour is preserved (the dropped external imports never produced
+a hop). An earlier draft emitted the raw `file → module` edges; the reconciliation
+pinned resolved file→file to match Ruby byte-for-byte.
+
+**`pack_set_id` is the literal sorted, comma-joined pack names.** Not a hash: the
+reconciled format uses the string `c,javascript,python,ruby,rust,typescript`
+verbatim, so it is human-legible and trivially identical across engines (both
+register the same six packs).
+
+**A per-branch ref pointer implements `latest`; content is addressed by sha.**
+Distinct shas are distinct files, so they never conflict in content. To resolve
+"latest main," `push` also writes `…/<repo_id>/refs/<branch>` = sha in the same
+commit, and `pull --latest` reads it. Only ref advancement can race; the git backend
+handles it with fetch-rebase-retry (proven by a two-clone race test).
+
+**`git` is invoked via `std::process`, not a git library.** The remote is "just a
+git repo," and shelling out keeps CCE dependency-light and uses the user's real git
+credentials/transport for free. Commits carry a fixed identity (`-c user.name/email`)
+so they work in a bare CI/test environment.
+
+**git-LFS is default-on but never required by the core.** `sync init` writes the
+`*.cce` LFS `.gitattributes` and runs `git lfs install` when LFS is on. But the
+whole test suite exercises artifact/push/pull/verify over **plain git**, so it needs
+no `git-lfs` binary; LFS lives behind one smoke test that SKIPS gracefully when
+`git-lfs` is absent (SPEC-SYNC §11).
+
+**The working-clone home is `$CCE_HOME/sync` (or `~/.cce/sync`), overridable for
+tests.** Hermetic tests point `CCE_HOME` at a temp dir so a working clone never
+touches the real `~/.cce`. Because `CCE_HOME` is process-global and Cargo runs tests
+in parallel threads, the sync tests serialize env access through one shared mutex.
+
+**The shared golden is on `test/fixture/samples` with a forced identity.** The
+cross-engine anchor indexes `samples` and builds the artifact with
+`repo_id = "cce/demo"`, `sha = "0"*40`. The test asserts the checksum
+(`581cbd0ff682a38d7d1250f3eec44f4ce456bdd660d4cb29aaaadd9e95072f48`, confirmed equal
+to Ruby's) and writes the raw bytes to `/tmp/cce_artifact_rust.cce` so the
+orchestrator can `diff` it against Ruby byte-for-byte.
+
+**The branch-overlay for WIP is deferred (v1 fallback = full local index).** If the
+working tree differs from the pulled sha, `pull` says so and the user runs a normal
+`cce index`. The incremental "reindex only changed files on top of the pulled base"
+is a documented fast-follow, out of scope for v1 (SPEC-SYNC §7/§12).

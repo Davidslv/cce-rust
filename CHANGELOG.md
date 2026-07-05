@@ -7,6 +7,61 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.3.0] - 2026-07-05
+
+**CCE Sync** — a distributed, offline-first cache for the index: *git remotes for
+the index*. Your local `.cce/` stays authoritative; an optional git-backed remote
+is a **content-addressed cache** you push to and pull from. Because the index is
+deterministic (hash embedder), a cache for `repo@sha` is byte-identical no matter
+who — or which language engine — built it. Built test-first from
+[`SPEC-SYNC.md`](SPEC-SYNC.md). **Additive minor release**: absent a configured
+remote, every command behaves exactly as before and single-repo `conformance.json`
+remains byte-identical.
+
+### Added
+
+- **Portable interchange artifact** (`src/sync/artifact.rs`) — a canonical,
+  byte-exact, cross-language format (reconciled to the single spec in
+  [`SPEC-SYNC-RECONCILE.md`](SPEC-SYNC-RECONCILE.md)): a UTF-8 stream with an LF
+  after every line — the manifest line, one sorted-key compact-JSON object per chunk
+  (sorted by `(file_path, start_line, id)`), then the graph line
+  `{"edges":[…],"nodes":[…]}`. Embeddings are **standard base64 (with padding) of
+  256 little-endian IEEE-754 `f64` bytes** (not decimals), so the bytes match across
+  Ruby and Rust. **No provenance** (`built_at`/`built_by` removed) so the artifact is
+  reproducible; `file_tokens` lives in the manifest; `pack_set_id` is the literal
+  `c,javascript,python,ruby,rust,typescript`. `checksum` = lowercase-hex SHA-256
+  over the whole stream serialized with `checksum` set to `""`. A committed **shared
+  golden checksum** on `test/fixture/samples` anchors the format cross-language.
+- **Content address** (`src/sync/mod.rs`) —
+  `<embedder>/<cce_ver>/<repo_id>/<sha>.cce`; `repo_id` = normalized git origin
+  (`host__org__repo`) or a `sync.repo_id` override. Only the `hash` embedder is
+  shareable.
+- **Git remote backend** (`src/sync/remote.rs`) — a `SyncRemote` trait with a
+  `GitRemote` impl: a local working clone under `~/.cce/sync/<remote-id>/`,
+  `put` = write at the content path + commit + push (fetch-rebase-retry on a ref
+  race), `get` = fetch + read. `*.cce` blobs use **git-LFS** by default; the core
+  path works over plain git (no `git-lfs` binary required for the tests).
+- **CLI** (`src/sync/commands.rs`, `src/main.rs`) — `cce sync init`, `push`,
+  `pull`, `status`, `verify`. `push` refuses a dirty tree or a non-hash index;
+  `pull` installs the artifact into `.cce/` and never overwrites a different sha
+  without `--force`; `pull --latest` follows a per-branch ref pointer; `verify`
+  re-indexes locally and confirms the pulled checksum. All are **workspace-aware**
+  (`--workspace`), each member keyed by its own `repo_id@sha`.
+- **Config** (`src/sync/config.rs`) — `sync.remote`, `sync.lfs` (default true),
+  `sync.repo_id`, `sync.auto_pull`, `sync.retention` under `<root>/.cce/config`
+  (global `~/.cce/config.yml` fallback). Absent ⇒ pure local CCE.
+- **Docs** — a README "CCE Sync" section with a verified end-to-end walkthrough,
+  macOS/Ubuntu install incl. `git lfs install`, a ready-to-copy CI workflow
+  ([`docs/ci/cce-sync.yml`](docs/ci/cce-sync.yml)), [`docs/sync.md`](docs/sync.md)
+  (model, artifact format, content address, permissions, troubleshooting), and
+  [`docs/VERIFIED.md`](docs/VERIFIED.md) (the cold-start transcript).
+
+### Guarantees
+
+- **Offline-first (normative).** No remote ⇒ every command behaves as today. A
+  configured-but-unreachable remote ⇒ `sync` fails gracefully; all non-sync
+  commands are unaffected. A failed push/pull never breaks local indexing or search.
+
 ## [2.2.0] - 2026-07-05
 
 **Workspace mode** — CCE now understands an *ecosystem* of related codebases (e.g.

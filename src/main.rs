@@ -25,6 +25,7 @@ use cce::federation::{
 use cce::metrics::{HexIdSource, IdSource, IndexRecord, MetricsWriter, SearchRecord, SystemClock};
 use cce::retriever::{search, SearchResult};
 use cce::store::{default_store_path, Index};
+use cce::sync::commands as sync_cmd;
 use cce::workspace::{build_graph, build_manifest, Manifest, WorkspaceGraph};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
@@ -144,6 +145,11 @@ enum Command {
         #[command(subcommand)]
         cmd: WorkspaceCmd,
     },
+    /// Push/pull the index to/from a content-addressed git cache (SPEC-SYNC §5).
+    Sync {
+        #[command(subcommand)]
+        cmd: SyncCmd,
+    },
     /// Benchmark the pipeline on a real repository for one language (SPEC-V2 §8).
     Bench {
         repo_dir: PathBuf,
@@ -172,6 +178,75 @@ enum Command {
         /// Run the three validator layers over every pack; exit non-zero on failure.
         #[arg(long)]
         validate: bool,
+    },
+}
+
+/// Subcommands of `cce sync` (SPEC-SYNC §5). All are workspace-aware and
+/// offline-first: a missing/unreachable remote never breaks local commands.
+#[derive(Subcommand)]
+enum SyncCmd {
+    /// Configure the remote + local clone and (optionally) enable git-LFS.
+    Init {
+        /// The cache git repository URL (SSH or HTTPS or file://).
+        #[arg(long)]
+        remote: String,
+        /// Route `*.cce` blobs through git-LFS (recommended; needs `git-lfs`).
+        #[arg(long)]
+        lfs: bool,
+        /// Disable git-LFS explicitly (overrides `--lfs`).
+        #[arg(long)]
+        no_lfs: bool,
+        /// Override the derived `repo_id` (else the normalized git origin).
+        #[arg(long)]
+        repo_id: Option<String>,
+        /// Project/workspace root (default: current directory).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// Ensure a hash-index for HEAD/sha, export the artifact, and put it on the remote.
+    Push {
+        /// The commit to push (default: HEAD). The working tree must be clean.
+        #[arg(long)]
+        commit: Option<String>,
+        /// Push every workspace member, each keyed by its own repo_id@sha.
+        #[arg(long)]
+        workspace: bool,
+        /// Project/workspace root (default: current directory).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// Fetch the cache for a sha and install it into `.cce/`.
+    Pull {
+        /// The commit to pull (default: HEAD).
+        #[arg(long)]
+        commit: Option<String>,
+        /// Pull the remote's latest pushed sha for the default ref.
+        #[arg(long, conflicts_with = "commit")]
+        latest: bool,
+        /// Overwrite a local cache for a different sha (SPEC-SYNC §9.4).
+        #[arg(long)]
+        force: bool,
+        /// Pull every workspace member from its own cache.
+        #[arg(long)]
+        workspace: bool,
+        /// Project/workspace root (default: current directory).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// Show the remote, local cache sha, remote latest, and working-tree match.
+    Status {
+        /// Project/workspace root (default: current directory).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// Re-index locally and confirm the pulled artifact's checksum.
+    Verify {
+        /// The commit to verify (default: the pulled cache's sha, else HEAD).
+        #[arg(long)]
+        commit: Option<String>,
+        /// Project/workspace root (default: current directory).
+        #[arg(long)]
+        dir: Option<PathBuf>,
     },
 }
 
@@ -245,6 +320,7 @@ fn main() -> ExitCode {
             WorkspaceCmd::Init { dir, force } => cmd_workspace_init(dir, force),
             WorkspaceCmd::List { dir } => cmd_workspace_list(dir),
         },
+        Command::Sync { cmd } => cmd_sync(cmd),
         Command::Bench { repo_dir, queries, store, commit, name, lang } => {
             cmd_bench(&repo_dir, queries, store, commit, &name, &lang)
         }
@@ -867,6 +943,60 @@ fn cmd_dashboard_workspace(
     let price = price.unwrap_or(DEFAULT_INPUT_PRICE_PER_MILLION);
     cce::dashboard::run_workspace(members, price, port)
         .map_err(|e| format!("dashboard failed: {e}"))
+}
+
+/// `cce sync …` (SPEC-SYNC §5): dispatch the sync subcommands. Each returns a
+/// human-readable report on success; the report is printed as-is. Offline-first —
+/// a remote failure returns a clear `Err` and never corrupts local state.
+fn cmd_sync(cmd: SyncCmd) -> Result<(), String> {
+    match cmd {
+        SyncCmd::Init { remote, lfs, no_lfs, repo_id, dir } => {
+            // git-LFS is on by default (SPEC-SYNC §8); `--no-lfs` opts out. The
+            // `--lfs` flag is the documented affirmative (default-on already).
+            let _ = lfs;
+            let use_lfs = !no_lfs;
+            let root = sync_root(dir);
+            let report = sync_cmd::cmd_init(&root, &remote, use_lfs, repo_id)?;
+            print!("{report}");
+            Ok(())
+        }
+        SyncCmd::Push { commit, workspace, dir } => {
+            let root = sync_root(dir);
+            let report = sync_cmd::cmd_push(&root, commit, workspace)?;
+            print!("{report}");
+            Ok(())
+        }
+        SyncCmd::Pull { commit, latest, force, workspace, dir } => {
+            let root = sync_root(dir);
+            let target = if latest {
+                sync_cmd::PullTarget::Latest
+            } else if let Some(sha) = commit {
+                sync_cmd::PullTarget::Commit(sha)
+            } else {
+                sync_cmd::PullTarget::Head
+            };
+            let report = sync_cmd::cmd_pull(&root, target, force, workspace)?;
+            print!("{report}");
+            Ok(())
+        }
+        SyncCmd::Status { dir } => {
+            let root = sync_root(dir);
+            let report = sync_cmd::cmd_status(&root)?;
+            print!("{report}");
+            Ok(())
+        }
+        SyncCmd::Verify { commit, dir } => {
+            let root = sync_root(dir);
+            let report = sync_cmd::cmd_verify(&root, commit)?;
+            print!("{report}");
+            Ok(())
+        }
+    }
+}
+
+/// The sync command root: the given `--dir`, or the current directory.
+fn sync_root(dir: Option<PathBuf>) -> PathBuf {
+    dir.unwrap_or_else(|| PathBuf::from("."))
 }
 
 /// `cce packs` / `cce packs --validate` (SPEC-V2 §5): list registered packs, or

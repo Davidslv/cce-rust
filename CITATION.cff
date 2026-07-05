@@ -7,10 +7,12 @@ abstract: >-
   Ruby, Rust, TypeScript, C), embedding chunks, and storing a vector + keyword
   index on disk as JSON, then answers queries with hybrid vector + BM25 retrieval.
   Built test-first from SPEC v1.0, the Dashboard addendum (v1.1), the v2.0
-  language-packs evolution, v2.1 secret protection, and v2.2 workspace mode
-  (federating a multi-codebase ecosystem while each member stays isolated).
+  language-packs evolution, v2.1 secret protection, v2.2 workspace mode
+  (federating a multi-codebase ecosystem while each member stays isolated), and
+  v2.3 CCE Sync (an offline-first, content-addressed git cache for the index, with a
+  byte-exact cross-language interchange artifact).
 type: software
-version: 2.2.0
+version: 2.3.0
 date-released: "2026-07-05"
 license: MIT
 repository-code: "https://github.com/davidslv/cce-rust"
@@ -30,3 +32,5 @@ keywords:
   - language-packs
   - workspaces
   - monorepo
+  - content-addressed-cache
+  - offline-first
