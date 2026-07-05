@@ -501,3 +501,88 @@ index events' skip counts (the only source of that datum), so it needs the addit
 `index.sensitive_skipped` field. `by_package` (workspace only) is an array of objects,
 each with a `package` field, **sorted by package** for deterministic cross-engine order,
 and gains `mean_top_score` so the per-member panel shows quality, not just savings.
+
+## v2.5 — the Savings Layers (SPEC-V2.5-SAVINGS)
+
+**Compact is the default, and expand-on-demand is what makes that safe.** Retrieval
+alone does not reliably beat a modern agent's grep-and-read, so `context_search`
+serves **compact** chunks by default (`retrieval.detail: compact`) — a signature +
+doc + first body line + an elision marker — and every result carries a `chunk_id`.
+The agent reads a full body only by calling `expand_chunk(chunk_id, scope=body)`,
+which round-trips the exact `detail:full` bytes. The store always keeps the full
+body; compaction is a **serialization-time transform only**, so nothing is lost.
+This is the guiding thesis (*all necessary context, no unnecessary context*) made
+concrete: default to less, expand on demand.
+
+**The structural-compact fix (a real regression, then its cure).** The **first**
+compact format truncated a chunk to its first *N* physical lines. In practice that
+often cut a signature mid-declaration or dropped the member an agent was looking
+for, and the agent's rational response was to **re-issue `context_search`** for the
+same target — which *cost more tokens than serving the body would have*. Compression
+that triggers a re-search is a net loss. The cure was to make compact **structural**,
+not line-count-based: driven by the language pack's AST rules — a container renders
+its header + doc + **member signatures** (for Ruby including the `has_many` /
+`belongs_to` / `validates` DSL declarations), a leaf renders signature + doc + first
+non-trivial line. And the tool descriptions were pinned with an **expand-first rule**
+(“do NOT re-issue `context_search` for a target you already found; call
+`expand_chunk`”). Compact must carry enough structure that the agent expands rather
+than re-searches — that is the property being defended.
+
+**Memory is validated-only and precision-recalled — anti-pollution over volume.** A
+naive "save every answer and replay it" memory *lowers* quality: a wrong answer
+re-injected makes the next answer worse, not cheaper. So `record_decision` is an
+**explicit** call for a **validated** decision only — never an auto-capture of raw
+model output — and `session_recall` is **precision-filtered** (score ≥ 0.30 **and** a
+shared query token, small `top_k`) and returns entries the agent *chooses* to use,
+never an auto-injected blob. Returning nothing on a weak match is the correct
+behaviour. Memory that lowers answer quality is a bug even if it lowers tokens. The
+store is local-only `.cce/memory.jsonl`, secret-redacted before write, and **never
+pushed by Sync** (it is conversational, not reproducible).
+
+**Session digests are deterministic and structured — not an LLM summary.**
+`summarize_context` renders the server's per-session ledger (files/chunks touched,
+queries issued, decisions recorded — deduped, sorted, bounded with `… (+N more)`)
+into a byte-deterministic digest. It is explicitly **not** an LLM-written summary:
+the same sequence of tool calls always yields the same bytes, so it needs no model
+and no network, stays testable with golden bytes, and cannot itself hallucinate. The
+backing ledger is in-memory and **wall-clock-free** (order-preserving, no
+timestamps), so determinism holds regardless of timing.
+
+**Grammar savings are self-measured against a pinned verbose baseline.** Unlike the
+output layer (measured against an `off` control in the eval harness), the `grammar`
+bucket is computed inside the engine: the byte-pinned compact result grammar vs a
+pinned *verbose* v2.4-style format, both counted with `cce.tokens/v1`. Because the
+compact grammar is the single source of the bytes actually served (the result header
+is rendered from `grammar::compact_line`), the measured saving is exactly the saving
+delivered — no drift between what is reported and what is served.
+
+**The token counter is a deterministic estimator, labelled as such.** All savings
+use one cross-language counter, `cce.tokens/v1` = `max(1, floor(bytes / 4))`, pinned
+byte-exactly so Ruby and Rust agree on every count. It is an **estimator**, not a
+model tokenizer, and every surface that reports savings says so, alongside the
+"vs full-file baseline — not your real end-to-end agent cost" note. The real
+end-to-end number is a separate, deliberately different measurement: the `cce eval`
+A/B harness (correctness-gated so cheap non-answers never count; cost-primary,
+including sub-agents).
+
+**`SYNC_FORMAT_VERSION` stays `2.3`, decoupled from the app version.** v2.5 is
+additive — it changes neither the chunk `conformance.json` nor the CCE Sync artifact
+format — so the artifact-format version stays `2.3` and the content address stays
+`hash/2.3/…`. Bumping the crate to 2.5.x does not invalidate existing caches or
+diverge from Ruby; the app version and the interchange-format version are two
+separate numbers on purpose (the same discipline as the v2.4.1 consolidation).
+
+**Rust-first; cce-ruby reconciles later.** This track ships on **cce-rust** as the
+reference implementation. Every transform is deterministic and byte-pinned, so the
+golden bytes authored here become the target for cce-ruby's later catch-up — the
+cross-language byte-identity is *deferred, not abandoned*. cce-ruby stays at 2.4.1
+with the spec filed as backlog.
+
+## v2.5.5 — documentation sweep
+
+**A docs-only consolidation, verified cold.** Like the v2.4.1 sweep, v2.5.5 changes
+no engine behaviour: it brings every doc current to the complete v2.5 track (the
+seven layers, the nine MCP tools, `cce savings`, the honest framing) and re-verifies
+the documented commands from a cold start (recorded in [`VERIFIED.md`](VERIFIED.md)).
+`conformance.json` and the Sync artifact are byte-identical; only the app version
+moves, to 2.5.5.

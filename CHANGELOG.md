@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.5] - 2026-07-05
+
+### Documentation
+- **v2.5 documentation sweep** — brought every doc current to the complete Savings
+  Layers track (v2.5.0–v2.5.4), verified from a cold start. No engine behaviour
+  change; `conformance.json` and the Sync artifact are byte-identical.
+  - `README.md`: a "Token savings — honestly" section covering the seven Savings
+    Layers, compact-by-default retrieval with expand-on-demand, `cce savings`, and
+    the honest "vs full-file baseline — not your real end-to-end agent cost"
+    framing; the MCP section now lists all **nine** tools.
+  - `docs/savings.md` (new): the seven layers, the ledger, `cce savings`, the
+    `cce.tokens/v1` estimator caveat, and the `cce eval` A/B harness.
+  - `docs/mcp.md`: documents all **nine** MCP tools with input schemas and the
+    find → expand → widen relationships, memory, summarization, and output
+    compression.
+  - `docs/architecture.md`, `docs/how-it-works.md`, `docs/getting-started.md`,
+    `docs/how-to.md`, `docs/dashboard.md`: compact-by-default retrieval,
+    `expand_chunk`, memory, and the `savings_by_layer` panel where relevant.
+  - `docs/DECISIONS.md`: the key v2.5 decisions (compact-by-default and the
+    structural-compact fix, memory anti-pollution, deterministic structured
+    digests, grammar self-measurement, `SYNC_FORMAT_VERSION` decoupling, Rust-first
+    sequencing).
+  - `docs/VERIFIED.md`: a fresh cold-start transcript exercising `cce index` → the
+    nine-tool `cce mcp` session (compact `context_search`, `expand_chunk`,
+    `record_decision`/`session_recall`, `summarize_context`) → `cce savings`.
+  - `llms.txt`, `AGENTS.md`, `CITATION.cff`: the full v2.5 surface.
+
 ## [2.5.4] - 2026-07-05
 
 ### Added

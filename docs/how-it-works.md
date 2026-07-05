@@ -99,6 +99,14 @@ not distracted by code it did not need.
 3. **It serves the snippet, not the file.** That single substitution is the
    entire ~94% saving.
 
+> **Read "~94%" honestly.** It is measured **vs reading whole files** — not your
+> real end-to-end agent cost, because a modern agent greps and reads slices, not
+> whole files. Retrieval alone does not reliably beat that; the durable wins come
+> from **seven [Savings Layers](savings.md)** — compact-by-default chunks,
+> expand-on-demand, output/grammar/memory/summarization — measured by the
+> `cce savings` ledger and the honest `cce eval` A/B harness. No "94%" without the
+> asterisk.
+
 ---
 
 ## 3. What this build adds around that core
@@ -115,6 +123,10 @@ not distracted by code it did not need.
                         Savings 82.9% ^improving   Quality 0.797 ^improving
 
   Two engines     --- Ruby & Rust, byte-identical retrieval; Rust ~40x faster/query
+
+  Savings Layers  --- v2.5: compact-by-default chunks + expand-on-demand, output/
+                      grammar/memory/summarization, nine agent MCP tools, and a
+                      `cce savings` ledger reported honestly (vs full-file baseline)
 ```
 
 Why it is genuinely beneficial, concretely:
