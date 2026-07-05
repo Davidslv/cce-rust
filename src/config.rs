@@ -237,6 +237,57 @@ impl OutputConfig {
     }
 }
 
+// --- Memory recall / L5 (SPEC-V2.5 §2 Layer 5, §5) ---
+
+/// The default for `memory.enabled` (SPEC-V2.5 §5): memory recall is ON by default.
+/// Absent config / absent block / absent key all resolve to this.
+pub const DEFAULT_MEMORY_ENABLED: bool = true;
+
+/// The `memory.*` runtime configuration (SPEC-V2.5 §5). Only `enabled` is defined:
+/// when false, the `record_decision`/`session_recall` tools become explicit no-ops.
+/// Absent block / absent key / bad YAML all fall back to the default (enabled).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct MemoryConfig {
+    pub enabled: bool,
+}
+
+impl Default for MemoryConfig {
+    fn default() -> Self {
+        MemoryConfig { enabled: DEFAULT_MEMORY_ENABLED }
+    }
+}
+
+impl MemoryConfig {
+    /// Parse from the `.cce/config` YAML text. Tolerant: no `memory:` block, an
+    /// absent `enabled`, or unparseable YAML all fall back to the default.
+    pub fn from_yaml(text: &str) -> MemoryConfig {
+        #[derive(serde::Deserialize)]
+        struct RawMemory {
+            enabled: Option<bool>,
+        }
+        #[derive(serde::Deserialize)]
+        struct RawRoot {
+            memory: Option<RawMemory>,
+        }
+        let mut cfg = MemoryConfig::default();
+        if let Ok(raw) = serde_yaml::from_str::<RawRoot>(text) {
+            if let Some(e) = raw.memory.and_then(|m| m.enabled) {
+                cfg.enabled = e;
+            }
+        }
+        cfg
+    }
+
+    /// Load the memory config for `root`: the per-project `.cce/config` if it exists
+    /// and parses, else the default. Offline, read-only.
+    pub fn load(root: &std::path::Path) -> MemoryConfig {
+        std::fs::read_to_string(root.join(".cce").join("config"))
+            .ok()
+            .map(|t| MemoryConfig::from_yaml(&t))
+            .unwrap_or_default()
+    }
+}
+
 /// Selects the embedding backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbedderKind {
@@ -381,5 +432,33 @@ mod tests {
         std::fs::create_dir_all(&cce).unwrap();
         std::fs::write(cce.join("config"), "output:\n  level: max\n").unwrap();
         assert_eq!(OutputConfig::load(tmp.path()).level, OutputLevel::Max);
+    }
+
+    #[test]
+    fn memory_default_is_enabled() {
+        assert!(MemoryConfig::default().enabled);
+        assert_eq!(MemoryConfig::default().enabled, DEFAULT_MEMORY_ENABLED);
+    }
+
+    #[test]
+    fn memory_config_reads_enabled_and_tolerates_junk() {
+        assert!(!MemoryConfig::from_yaml("memory:\n  enabled: false\n").enabled);
+        assert!(MemoryConfig::from_yaml("memory:\n  enabled: true\n").enabled);
+        // Absent block, absent key, and bad YAML all fall back to the default (true).
+        assert!(MemoryConfig::from_yaml("sync:\n  lfs: true\n").enabled);
+        assert!(MemoryConfig::from_yaml("memory: {}\n").enabled);
+        assert!(MemoryConfig::from_yaml("not: yaml: [").enabled);
+    }
+
+    #[test]
+    fn memory_config_load_from_disk_and_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Absent ⇒ default (enabled).
+        assert!(MemoryConfig::load(tmp.path()).enabled);
+        // Present ⇒ honoured.
+        let cce = tmp.path().join(".cce");
+        std::fs::create_dir_all(&cce).unwrap();
+        std::fs::write(cce.join("config"), "memory:\n  enabled: false\n").unwrap();
+        assert!(!MemoryConfig::load(tmp.path()).enabled);
     }
 }

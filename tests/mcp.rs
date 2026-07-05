@@ -61,6 +61,21 @@ as minimal diffs only). Use it to dial verbosity down when you want terse diffs,
 when you want full explanations — mid-session, without editing CLAUDE.md. It sets a session \
 preference only; it does not rewrite CLAUDE.md and resets when the server restarts.";
 
+const RECORD_DECISION_DESC: &str = "Remember a VALIDATED decision for future sessions — an \
+explicit, deliberate note you or the user have confirmed is correct (an architecture choice, a \
+convention, a resolved trade-off), so it need not be re-derived later. The text is secret-redacted \
+before storage, content-addressed, and de-duplicated: recording the same decision twice is a \
+no-op that returns the same id. Do NOT record raw model output, guesses, or unverified answers — \
+memory that replays a bad answer POLLUTES future context. Optional `tags` and an `area` help \
+recall. Returns the decision's id; retrieve later with `session_recall`.";
+
+const SESSION_RECALL_DESC: &str = "Search THIS project's remembered decisions (recorded with \
+`record_decision`) for ones relevant to `query`, so you don't re-derive what was already settled. \
+Hybrid vector + BM25 search, PRECISION-FILTERED: it returns only high-confidence matches (a small \
+top_k) as compact entries with ids, which you CHOOSE to use — it is never an auto-injected blob. \
+Returning nothing when there is no confident match is normal and correct; proceed without it \
+rather than forcing a weak memory into context.";
+
 /// Write a tiny self-contained Python repo into `dir`.
 fn write_tiny_repo(dir: &Path) {
     std::fs::write(dir.join("auth.py"), "def hash_password(pw):\n    return pw + 'salt'\n")
@@ -128,7 +143,7 @@ fn handshake_list_and_search_over_a_fixture_index_logs_metrics() {
     assert_eq!(init["result"]["serverInfo"]["name"], "cce");
     assert!(init["result"]["capabilities"]["tools"].is_object());
 
-    // tools/list — exactly the six tools, in fixed order, with the schemas.
+    // tools/list — exactly the eight tools, in fixed order, with the schemas.
     let list = by_id(&resps, 2);
     let tools = list["result"]["tools"].as_array().unwrap();
     let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
@@ -140,7 +155,9 @@ fn handshake_list_and_search_over_a_fixture_index_logs_metrics() {
             "record_feedback",
             "expand_chunk",
             "related_context",
-            "set_output_compression"
+            "set_output_compression",
+            "record_decision",
+            "session_recall"
         ]
     );
     assert_eq!(tools[0]["inputSchema"]["required"], serde_json::json!(["query"]));
@@ -169,6 +186,15 @@ fn handshake_list_and_search_over_a_fixture_index_logs_metrics() {
         tools[5]["inputSchema"]["properties"]["level"]["enum"],
         serde_json::json!(["off", "lite", "standard", "max"])
     );
+    // The Layer-5 memory tools carry their byte-pinned descriptions + schemas.
+    assert_eq!(tools[6]["name"].as_str().unwrap(), "record_decision");
+    assert_eq!(tools[6]["description"].as_str().unwrap(), RECORD_DECISION_DESC);
+    assert_eq!(tools[6]["inputSchema"]["required"], serde_json::json!(["text"]));
+    assert_eq!(tools[6]["inputSchema"]["properties"]["tags"]["type"], "array");
+    assert_eq!(tools[7]["name"].as_str().unwrap(), "session_recall");
+    assert_eq!(tools[7]["description"].as_str().unwrap(), SESSION_RECALL_DESC);
+    assert_eq!(tools[7]["inputSchema"]["required"], serde_json::json!(["query"]));
+    assert_eq!(tools[7]["inputSchema"]["properties"]["top_k"]["default"], 5);
 
     // context_search
     let search = by_id(&resps, 3);
@@ -540,4 +566,46 @@ fn mcp_works_with_no_sync_configured_at_all() {
     let resps = responses(&out);
     let text = by_id(&resps, 1)["result"]["content"][0]["text"].as_str().unwrap();
     assert!(text.contains("no sync remote configured"), "got: {text}");
+}
+
+#[test]
+fn memory_record_and_recall_over_a_real_process_and_redacts_secrets() {
+    // SPEC-V2.5 §2 Layer 5: record_decision → session_recall over a real `cce mcp`
+    // process. A secret in the decision text is redacted before it reaches the store,
+    // and recall returns the (redacted) decision by meaning. Memory is a SEPARATE,
+    // local-only store (`.cce/memory.jsonl`) — never the code index, never Sync.
+    let tmp = tempfile::tempdir().unwrap();
+    // Assemble a secret literal at runtime so no contiguous secret is committed.
+    let aws = format!("{}{}", "AKIA", "IOSFODNN7EXAMPLE");
+    let input = format!(
+        concat!(
+            "{{\"id\":1,\"method\":\"tools/call\",\"params\":{{\"name\":\"record_decision\",\"arguments\":{{\"text\":\"rotate the deploy key AWS = \\\"{}\\\" every quarter\",\"area\":\"secops\",\"tags\":[\"security\"]}}}}}}\n",
+            "{{\"id\":2,\"method\":\"tools/call\",\"params\":{{\"name\":\"session_recall\",\"arguments\":{{\"query\":\"rotate deploy key quarter\"}}}}}}\n"
+        ),
+        aws
+    );
+    let out = drive(&["mcp", "--dir", &tmp.path().to_string_lossy()], &input, &[]);
+    let resps = responses(&out);
+
+    // record_decision returned an id and did not error.
+    let rec = by_id(&resps, 1);
+    assert_eq!(rec["result"]["isError"], false);
+    let rec_text = rec["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(rec_text.contains("Recorded decision #"), "got: {rec_text}");
+
+    // session_recall found the decision by meaning, and shows the REDACTED marker.
+    let rc = by_id(&resps, 2);
+    let rc_text = rc["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(rc_text.contains("Recalled 1 of 1"), "got: {rc_text}");
+    assert!(rc_text.contains("[REDACTED:AWS_ACCESS_KEY]"), "got: {rc_text}");
+    assert!(!rc_text.contains(&aws), "recall leaked the secret: {rc_text}");
+
+    // The on-disk memory store carries no secret, and is NOT the code index.
+    let mem = tmp.path().join(".cce").join("memory.jsonl");
+    assert!(mem.exists(), "memory store not written");
+    let raw = std::fs::read_to_string(&mem).unwrap();
+    assert!(raw.contains("[REDACTED:AWS_ACCESS_KEY]"));
+    assert!(!raw.contains(&aws), "memory store leaked the secret");
+    // No search/index event — memory tools do not touch the metrics ledger.
+    assert!(!tmp.path().join(".cce").join("index.json").exists());
 }
