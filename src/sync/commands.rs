@@ -91,10 +91,20 @@ fn open_remote(cfg: &SyncConfig) -> Result<GitRemote, String> {
     GitRemote::open(url, cfg.lfs)
 }
 
-/// Build (or reuse) a hash-embedder index for `root`'s working tree. If a store
-/// already exists it must be a hash index (SPEC-SYNC §1 refusal); otherwise we build
-/// a fresh hash index so the export is always shareable.
-fn ensure_hash_index(root: &Path) -> Result<Index, String> {
+/// Build a fresh hash-embedder index for `root`'s working tree, for export at `sha`.
+///
+/// **Content-address invariant (SPEC-SYNC §1/§3):** the cache is keyed by sha and the
+/// invariant is `artifact == build(sha)`. Push therefore MUST rebuild from the current
+/// source tree and export THAT — it must **never** re-export a pre-existing
+/// `.cce/index.json`. That file may be stale, foreign, or (after `cce sync pull`) a
+/// cache built by an older or sibling engine; re-publishing its bytes under the sha key
+/// would launder a non-`build(sha)` index into the content-addressed cache and make
+/// `cce sync verify` (which correctly rebuilds) fail against it.
+///
+/// If a store already exists we still read it to enforce the non-hash refusal
+/// (SPEC-SYNC §1: only the deterministic hash embedder produces shareable caches), but
+/// we never reuse its bytes — we always rebuild.
+fn ensure_hash_index(root: &Path, sha: &str) -> Result<Index, String> {
     let store = default_store_path(root);
     if store.exists() {
         let idx =
@@ -106,8 +116,10 @@ fn ensure_hash_index(root: &Path) -> Result<Index, String> {
                 idx.embedder_name
             ));
         }
-        return Ok(idx);
     }
+    // Always rebuild from the working tree so the export is exactly build(sha), never a
+    // stale/foreign/pulled index.json. Use the same build path `cce index`/verify use.
+    eprintln!("rebuilding index for {sha}");
     let (idx, _) = Index::build_protected(root, &HashEmbedder, |_| true, true);
     Ok(idx)
 }
@@ -182,7 +194,7 @@ fn push_one(
     repo_id: &str,
     sha: &str,
 ) -> Result<(String, String), String> {
-    let index = ensure_hash_index(root)?;
+    let index = ensure_hash_index(root, sha)?;
     let meta = ManifestMeta { repo_id: repo_id.to_string(), sha: sha.to_string() };
     let artifact = Artifact::from_index(&index, meta);
     let bytes = artifact.to_bytes();
@@ -907,6 +919,137 @@ mod tests {
         let _home = set_home();
         let err = cmd_init(Path::new("/no/such/dir/here"), "file:///x", false, None).unwrap_err();
         assert!(err.contains("not a directory"), "got: {err}");
+        std::env::remove_var("CCE_HOME");
+    }
+
+    /// Regression (fix/sync-push-rebuild): push must REBUILD the index from the
+    /// working tree and export `build(sha)`, never re-export a pre-existing (stale or
+    /// foreign) `.cce/index.json`. We plant an index whose bytes differ from a real
+    /// build and assert the *published* artifact's checksum equals a fresh rebuild's,
+    /// not the planted file's.
+    #[test]
+    fn push_rebuilds_and_ignores_a_stale_planted_index() {
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let src = source_repo();
+        init_cfg(src.path(), &url);
+        let sha = git::head_sha(src.path()).unwrap();
+        let repo_id = "example.com__acme__demo";
+        let ver = SYNC_FORMAT_VERSION.to_string();
+
+        // The correct artifact checksum: a fresh build of the working tree.
+        let (fresh, _) = Index::build_protected(src.path(), &HashEmbedder, |_| true, true);
+        let fresh_checksum = Artifact::from_index(
+            &fresh,
+            ManifestMeta { repo_id: repo_id.to_string(), sha: sha.clone() },
+        )
+        .manifest
+        .checksum;
+
+        // Plant a FOREIGN/stale index.json whose bytes differ from a real build
+        // (mutate a chunk's content so its content-address checksum differs), but keep
+        // it a *hash* index so the non-hash refusal does not short-circuit the push.
+        // (The deterministic hash build reproduces `fresh` exactly, so this is a
+        // faithful copy with one chunk perturbed.)
+        let (mut foreign, _) = Index::build_protected(src.path(), &HashEmbedder, |_| true, true);
+        assert!(!foreign.chunks.is_empty());
+        foreign.chunks[0].content.push_str("\n# stale foreign bytes from an older engine\n");
+        let planted_checksum = Artifact::from_index(
+            &foreign,
+            ManifestMeta { repo_id: repo_id.to_string(), sha: sha.clone() },
+        )
+        .manifest
+        .checksum;
+        assert_ne!(planted_checksum, fresh_checksum, "planted bytes must differ from build(sha)");
+        assert_eq!(foreign.embedder_name, HASH_EMBEDDER);
+        foreign.save(&default_store_path(src.path())).unwrap();
+
+        // Push: must rebuild from the tree, NOT re-export the planted file.
+        let report = cmd_push(src.path(), None, false).unwrap();
+
+        // The PUBLISHED artifact's checksum equals a fresh rebuild, not the planted file.
+        let key = content_address(HASH_EMBEDDER, &ver, repo_id, &sha);
+        let bytes = GitRemote::open(&url, false).unwrap().get(&key).unwrap();
+        let published = Artifact::from_bytes(&bytes).unwrap().manifest.checksum;
+        assert_eq!(
+            published, fresh_checksum,
+            "push must publish build(sha), not the planted index"
+        );
+        assert_ne!(published, planted_checksum, "push must NOT launder the stale planted bytes");
+        assert!(
+            report.contains(&fresh_checksum),
+            "report should show the rebuilt checksum: {report}"
+        );
+        std::env::remove_var("CCE_HOME");
+    }
+
+    /// Regression: the reproduction from the bug report — a consumer `pull`s a stale
+    /// cache (built by an older engine, bytes ≠ build(sha)), then `push`es. Push must
+    /// republish `build(sha)`; a fresh consumer that then `pull`s the republished
+    /// artifact must `verify` GREEN. Proves pull → push → verify is laundering-proof.
+    #[test]
+    fn pull_then_push_then_verify_is_green_after_stale_cache() {
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let src = source_repo();
+        init_cfg(src.path(), &url);
+        let sha = git::head_sha(src.path()).unwrap();
+        let repo_id = "example.com__acme__demo";
+        let ver = SYNC_FORMAT_VERSION.to_string();
+        let key = content_address(HASH_EMBEDDER, &ver, repo_id, &sha);
+        let pointer = pointer_address(HASH_EMBEDDER, &ver, repo_id, crate::sync::DEFAULT_REF);
+
+        // The correct build(sha) checksum.
+        let (fresh, _) = Index::build_protected(src.path(), &HashEmbedder, |_| true, true);
+        let correct = Artifact::from_index(
+            &fresh,
+            ManifestMeta { repo_id: repo_id.to_string(), sha: sha.clone() },
+        )
+        .manifest
+        .checksum;
+
+        // Seed the remote with a STALE artifact under the sha key (simulating a cache
+        // built by an older/sibling engine: bytes that differ from build(sha)). The
+        // deterministic hash build reproduces `fresh`; we perturb one chunk.
+        let (mut stale_idx, _) = Index::build_protected(src.path(), &HashEmbedder, |_| true, true);
+        stale_idx.chunks[0].content.push_str("\n# stale cache from an older cce version\n");
+        let stale_artifact = Artifact::from_index(
+            &stale_idx,
+            ManifestMeta { repo_id: repo_id.to_string(), sha: sha.clone() },
+        );
+        let stale_checksum = stale_artifact.manifest.checksum.clone();
+        assert_ne!(stale_checksum, correct);
+        GitRemote::open(&url, false)
+            .unwrap()
+            .put_many(&[
+                (key.clone(), stale_artifact.to_bytes()),
+                (pointer, format!("{sha}\n").into_bytes()),
+            ])
+            .unwrap();
+
+        // Consumer B pulls the stale cache (installs the stale index + marker)...
+        let b = source_repo_clone(&src);
+        init_cfg(b.path(), &url);
+        let pulled = cmd_pull(b.path(), PullTarget::Head, false, false).unwrap();
+        assert!(pulled.contains(&stale_checksum), "B pulled the stale cache: {pulled}");
+        // ...then B pushes: must REBUILD and republish build(sha), not the stale file.
+        cmd_push(b.path(), None, false).unwrap();
+
+        // The remote now holds build(sha), not the stale bytes.
+        let republished =
+            Artifact::from_bytes(&GitRemote::open(&url, false).unwrap().get(&key).unwrap())
+                .unwrap()
+                .manifest
+                .checksum;
+        assert_eq!(republished, correct, "push must republish build(sha)");
+        assert_ne!(republished, stale_checksum, "the stale bytes must not survive a push");
+
+        // A fresh consumer C pulls the republished artifact → verify is GREEN.
+        let c = source_repo_clone(&src);
+        init_cfg(c.path(), &url);
+        cmd_pull(c.path(), PullTarget::Head, false, false).unwrap();
+        let out = cmd_verify(c.path(), None).unwrap();
+        assert!(out.contains("verify OK"), "pull→push→verify must be green: {out}");
         std::env::remove_var("CCE_HOME");
     }
 
