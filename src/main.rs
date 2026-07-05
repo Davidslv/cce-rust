@@ -45,6 +45,10 @@ enum Command {
         /// Do not append an index event to the metrics log.
         #[arg(long)]
         no_metrics: bool,
+        /// Disable secret protection (SPEC-V2.1): index sensitive files and store
+        /// content verbatim. Off by default — protection is on unless you pass this.
+        #[arg(long)]
+        allow_secrets: bool,
     },
     /// Search a persisted index.
     Search {
@@ -138,8 +142,8 @@ enum Command {
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Index { dir, store, embedder, no_metrics } => {
-            cmd_index(&dir, store, &embedder, !no_metrics)
+        Command::Index { dir, store, embedder, no_metrics, allow_secrets } => {
+            cmd_index(&dir, store, &embedder, !no_metrics, allow_secrets)
         }
         Command::Search { query, dir, store, top_k, no_graph, json, no_metrics } => {
             cmd_search(&query, dir, store, top_k, no_graph, json, !no_metrics)
@@ -224,6 +228,7 @@ fn cmd_index(
     store: Option<PathBuf>,
     embedder: &str,
     metrics_enabled: bool,
+    allow_secrets: bool,
 ) -> Result<(), String> {
     if !dir.is_dir() {
         return Err(format!("not a directory: {}", dir.display()));
@@ -232,8 +237,18 @@ fn cmd_index(
     let emb = build_embedder(kind);
     let store_path = store.unwrap_or_else(|| default_store_path(dir));
 
+    // SPEC-V2.1: protection is on unless --allow-secrets is passed. Warn loudly
+    // when a run opts out, since sensitive files and raw secrets will be stored.
+    let protect_secrets = !allow_secrets;
+    if allow_secrets {
+        eprintln!(
+            "warning: --allow-secrets set — secret protection is DISABLED; sensitive files \
+             will be indexed and secrets stored verbatim"
+        );
+    }
+
     let start = std::time::Instant::now();
-    let (index, stats) = Index::build_from_dir(dir, emb.as_ref());
+    let (index, stats) = Index::build_protected(dir, emb.as_ref(), |_| true, protect_secrets);
     index.save(&store_path).map_err(|e| e.to_string())?;
     let elapsed = start.elapsed().as_secs_f64();
 
@@ -253,12 +268,13 @@ fn cmd_index(
     });
 
     println!("Indexed {}", dir.display());
-    println!("  files indexed : {}", stats.files_indexed);
-    println!("  files skipped : {}", stats.files_skipped);
-    println!("  total chunks  : {}", stats.total_chunks);
-    println!("  embedder      : {}", index.embedder_name);
-    println!("  store         : {}", store_path.display());
-    println!("  elapsed       : {elapsed:.3}s");
+    println!("  files indexed     : {}", stats.files_indexed);
+    println!("  files skipped     : {}", stats.files_skipped);
+    println!("  sensitive skipped : {}", stats.sensitive_skipped);
+    println!("  total chunks      : {}", stats.total_chunks);
+    println!("  embedder          : {}", index.embedder_name);
+    println!("  store             : {}", store_path.display());
+    println!("  elapsed           : {elapsed:.3}s");
     Ok(())
 }
 

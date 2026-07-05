@@ -33,8 +33,11 @@ const IGNORE_DIRS: [&str; 8] =
 pub struct WalkResult {
     /// `(relative_path, content)` for each indexable file.
     pub files: Vec<(String, String)>,
-    /// Number of files that existed but were skipped (size / non-UTF-8).
+    /// Number of files that existed but were skipped (size / non-UTF-8 / `.jsonl`).
     pub skipped: usize,
+    /// Number of files skipped by the Layer-1 sensitive-file policy (SPEC-V2.1
+    /// §2) — tallied separately from `skipped` and never read.
+    pub sensitive_skipped: usize,
 }
 
 /// Should this directory be pruned? True for ignore-listed names and any dotdir.
@@ -51,9 +54,15 @@ fn is_ignored_dir(entry: &DirEntry) -> bool {
 }
 
 /// Walk `root`, applying SPEC §7.1 ignore rules. Returns eligible files.
-pub fn walk(root: &Path) -> WalkResult {
+///
+/// When `protect_secrets` is true (the secure default), files whose basename is
+/// sensitive (SPEC-V2.1 §1) are never read and are tallied in `sensitive_skipped`
+/// instead. With `--allow-secrets` the caller passes false and those files are
+/// walked like any other.
+pub fn walk(root: &Path, protect_secrets: bool) -> WalkResult {
     let mut files = Vec::new();
     let mut skipped = 0usize;
+    let mut sensitive_skipped = 0usize;
 
     let walker = WalkDir::new(root).into_iter().filter_entry(|e| !is_ignored_dir(e));
 
@@ -62,6 +71,15 @@ pub fn walk(root: &Path) -> WalkResult {
             continue;
         }
         let path = entry.path();
+        // Layer 1 (SPEC-V2.1 §2): never even read a sensitive file. Tested on the
+        // basename alone, before the size/read below, and counted separately.
+        if protect_secrets {
+            let basename = entry.file_name().to_string_lossy();
+            if crate::sensitive::is_sensitive(&basename) {
+                sensitive_skipped += 1;
+                continue;
+            }
+        }
         // Skip runtime data logs (`.jsonl`); they are never source. Keeps the
         // metrics sample fixture out of the conformance corpus (SPEC v1.1).
         if path.extension().and_then(|e| e.to_str()) == Some("jsonl") {
@@ -105,7 +123,7 @@ pub fn walk(root: &Path) -> WalkResult {
 
     // Deterministic order regardless of filesystem traversal order.
     files.sort_by(|a, b| a.0.cmp(&b.0));
-    WalkResult { files, skipped }
+    WalkResult { files, skipped, sensitive_skipped }
 }
 
 #[cfg(test)]
@@ -131,7 +149,7 @@ mod tests {
         // non-utf8 file
         fs::write(root.join("bin.dat"), vec![0xff, 0xfe, 0x00]).unwrap();
 
-        let res = walk(root);
+        let res = walk(root, true);
         let paths: Vec<&str> = res.files.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(paths, vec!["keep.py"]);
         // big.py + bin.dat skipped
@@ -148,9 +166,46 @@ mod tests {
         fs::write(root.join("keep.py"), "def f():\n    pass\n").unwrap();
         fs::write(root.join("metrics_sample.jsonl"), "{\"event\":\"search\"}\n").unwrap();
 
-        let res = walk(root);
+        let res = walk(root, true);
         let paths: Vec<&str> = res.files.iter().map(|(p, _)| p.as_str()).collect();
         assert_eq!(paths, vec!["keep.py"]);
         assert!(res.skipped >= 1);
+    }
+
+    #[test]
+    fn sensitive_files_are_skipped_and_tallied_separately() {
+        // SPEC-V2.1 §2 Layer 1: `.env` / `id_rsa` / `*.pem` are never read and are
+        // counted in `sensitive_skipped`, distinct from the size/UTF-8 `skipped`.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("keep.py"), "def f():\n    pass\n").unwrap();
+        fs::write(root.join(".env"), "SECRET=live\n").unwrap();
+        // Body is never read (Layer 1 skips by basename); the marker is split so
+        // this source carries no contiguous "PRIVATE KEY" literal.
+        fs::write(root.join("id_rsa"), concat!("-----BEGIN OPENSSH PRIVATE ", "KEY-----\n"))
+            .unwrap();
+        fs::write(root.join("server.pem"), "-----BEGIN CERTIFICATE-----\n").unwrap();
+        fs::write(root.join(".env.example"), "SECRET=your-secret\n").unwrap();
+
+        let res = walk(root, true);
+        let paths: Vec<&str> = res.files.iter().map(|(p, _)| p.as_str()).collect();
+        // The safe template IS indexed; the three sensitive files are not.
+        assert_eq!(paths, vec![".env.example", "keep.py"]);
+        assert_eq!(res.sensitive_skipped, 3);
+    }
+
+    #[test]
+    fn allow_secrets_disables_layer_one() {
+        // With protection off, sensitive files are walked like any other file.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join(".env"), "SECRET=live\n").unwrap();
+        fs::write(root.join("id_rsa"), "key\n").unwrap();
+
+        let res = walk(root, false);
+        let mut paths: Vec<&str> = res.files.iter().map(|(p, _)| p.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(paths, vec![".env", "id_rsa"]);
+        assert_eq!(res.sensitive_skipped, 0);
     }
 }

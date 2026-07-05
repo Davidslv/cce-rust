@@ -9,7 +9,7 @@ abstract: >-
   Built test-first from SPEC v1.0, the Dashboard addendum (v1.1), and the v2.0
   language-packs evolution.
 type: software
-version: 2.0.0
+version: 2.1.0
 date-released: "2026-07-05"
 license: MIT
 repository-code: "https://github.com/davidslv/cce-rust"
