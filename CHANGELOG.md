@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.4] - 2026-07-05
+
+### Added
+- **Grammar compression (L3)** — the MCP read-tool result grammars are byte-pinned to a compact,
+  filler-free format (`context_search`, `expand_chunk`, `related_context`, `session_recall`,
+  `summarize_context`), and the `grammar` savings bucket is self-measured (compact vs a pinned
+  verbose baseline, via `cce.tokens/v1`). Completes the **seven-bucket savings ledger**. Additive;
+  `conformance.json` and the Sync artifact unchanged. **This completes the v2.5 Savings Layers track.**
+
 ## [2.5.3] - 2026-07-05
 
 ### Added
