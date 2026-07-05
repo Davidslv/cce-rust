@@ -14,9 +14,11 @@ abstract: >-
   Protocol server so an agent uses CCE as a native tool, plus `cce init`), and the
   v2.4.1 consolidation (a refreshed dashboard — agent-vs-human, per-package,
   index-freshness, and secret-safety panels — plus a verified, offline-first
-  documentation sweep).
+  documentation sweep), and the v2.5.0 Savings Layers (AST-driven chunk
+  compression to signatures + members, progressive disclosure via expand_chunk /
+  related_context, and a seven-bucket savings ledger with an in-repo eval harness).
 type: software
-version: 2.4.1
+version: 2.5.0
 date-released: "2026-07-05"
 license: MIT
 repository-code: "https://github.com/davidslv/cce-rust"

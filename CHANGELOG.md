@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.0] - 2026-07-05
+
+The first **Savings Layers** — retrieval returns compact chunks by default, with progressive
+disclosure to recover detail on demand, and a seven-bucket savings ledger + eval harness that
+make token savings measurable and honest.
+
+### Added
+- **Chunk compression (L2)** — `context_search` gains `detail: signature | compact | full`
+  (default `compact`). AST-driven, per language pack: a container chunk renders as its header +
+  doc + the signature lines of its direct members (methods, and Ruby model DSL such as
+  `has_many`/`belongs_to`/`validates`); a leaf chunk as its signature + doc. **Retrieval-time
+  only** — the index, `conformance.json`, and the Sync artifact are byte-for-byte unchanged.
+- **Progressive disclosure (L7)** — new MCP tools `expand_chunk` (recover the full body / file
+  slice / graph-neighbours of a chunk by `chunk_id`) and `related_context` (import-graph
+  neighbours — imports **and** consumers). `tools/list` is now five tools.
+- **Savings ledger** — a seven-bucket `savings` object on search events, a `savings_by_layer`
+  panel on `/api/metrics`, and a `cce savings` command with an embedded offline price table.
+  Every surface is labelled *"vs full-file baseline — not your real end-to-end agent cost."*
+- **Deterministic token counter** `cce.tokens/v1` (`max(1, floor(bytes/4))`) and an in-repo A/B
+  **eval harness** (`cce eval`) — correctness-gated, cost-primary.
+
+### Notes
+- Tool descriptions carry explicit trigger conditions and steer the agent to `expand_chunk`
+  instead of re-searching (measured on a real ecosystem to matter).
+- Rust-first: all new formats are byte-pinned so cce-ruby can reconcile to them in a later track.
+- `SYNC_FORMAT_VERSION` stays `2.3` (decoupled from the app version); the Sync golden is unchanged.
+
 ## [2.4.1] - 2026-07-05
 
 The **closing consolidation of the v2.4 milestone**: a refreshed dashboard that
