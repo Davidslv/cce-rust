@@ -48,45 +48,57 @@ on top of the pulled base — is a documented fast-follow, out of scope for v1.)
 
 Ruby stores in SQLite, Rust in JSON, so the cache is **neither** native store — it
 is a canonical, deterministic interchange artifact both engines export and import.
-It is a UTF-8, LF-terminated, newline-delimited stream:
+It is a UTF-8 stream with an **LF after every line, including the last**:
 
 ```
-line 1        the manifest JSON
+line 1        the manifest JSON (includes file_tokens)
 lines 2..N+1  one JSON object per chunk, N = chunk_count,
-              sorted by (file_path, start_line, chunk_id)
-line N+2      the graph JSON: { "file_imports": {...}, "file_tokens": {...} }
+              sorted by (file_path, start_line, id)
+line N+2      the graph JSON: { "edges": [...], "nodes": [...] }
 ```
 
 - **Sorted keys, compact separators.** Every object is serialized with keys in
   ascending order and no insignificant whitespace (`,` and `:` only).
-- **Embeddings are not decimals.** A 256-d vector is encoded as **base64 of its 256
-  little-endian IEEE-754 `f64` bytes**, so the bytes are identical across languages
-  regardless of float→string formatting.
-- **Checksum.** `checksum` = lowercase-hex SHA-256 over the canonical stream with
-  the manifest's `checksum` field omitted.
-- **Deterministic provenance.** `built_by` is the neutral constant `"cce"`;
-  `built_at` is the **commit date of `sha`** (read from git, identical across
-  engines). So the whole artifact — not just the checksum — is byte-identical for a
-  given `repo@sha`.
+- **Embeddings are not decimals.** A 256-d vector is encoded as **standard base64
+  (with padding) of its 256 little-endian IEEE-754 `f64` bytes**, so the bytes are
+  identical across languages regardless of float→string formatting.
+- **No provenance.** There is **no** `built_at` and **no** `built_by` — provenance
+  is what made the file non-reproducible, so it is removed. The whole artifact,
+  not just the checksum, is byte-identical for a given `repo@sha`.
+- **Checksum.** `checksum` = lowercase-hex SHA-256 over the **entire** canonical
+  stream serialized with the manifest's `checksum` value set to the empty string
+  `""`; the real hex is then written into the field. Verify = set `checksum` to
+  `""`, re-hash, compare.
 
-Manifest fields (sorted): `built_at, built_by, cce_version, checksum, chunk_count,
-embedder, pack_set_id, repo_id, sha`.
+Manifest fields (sorted): `cce_version` (`"2.3"`), `checksum`, `chunk_count`,
+`embedder` (`"hash"`), `file_tokens` (sorted-key `{path: int}`), `pack_set_id`,
+`repo_id`, `sha`.
 
 Chunk fields (sorted): `chunk_type, content, embedding, end_line, file_path, id,
 kind, language, start_line, token_count`.
 
-A committed **golden checksum** anchors the format cross-language
-(`src/sync/artifact.rs::golden_checksum_for_base_fixture`): the `test/fixture/base`
-corpus exported with `repo_id=example.com__acme__demo`,
-`sha=0000…0000`, `built_at=2026-01-01T00:00:00+00:00` yields
+Graph line: `{"edges":[…],"nodes":[…]}` — `nodes` are every indexed file
+(`{"id": path}`, sorted by `id`); `edges` are the raw `file → imported-module`
+relationships (`{"source", "target", "type":"import"}`, sorted by
+`(source, target, type)`). Serializing the raw imports keeps `file_imports`
+losslessly reconstructable on import.
+
+`pack_set_id` = the sorted, comma-joined lowercase pack names —
+`c,javascript,python,ruby,rust,typescript`.
+
+A committed **shared golden** anchors the format cross-language
+(`src/sync/artifact.rs::shared_golden_checksum_for_samples`): the
+`test/fixture/samples` corpus exported with `repo_id=cce/demo`, `sha=0000…0000`
+yields
 
 ```
-48d8066cec52668fef75811bcd9cbd6c3e6ed5bcabe8bbbfef5f667463db61ee   (7 chunks)
+028fa30ba1424e4fa119a5ab00bebc98f057088720bb3da2cdfc06c391733ca3   (21 chunks)
 ```
 
-The Ruby engine, exporting the same fixture with the same identity, must produce
-this exact checksum. If this value ever changes, the wire format changed — treat it
-as a breaking-format decision, not a test to "fix."
+That test also writes the raw bytes to `/tmp/cce_artifact_rust.cce`. The Ruby
+engine, exporting the same fixture with the same identity, must produce this exact
+checksum and a byte-identical file. If this value ever changes, the wire format
+changed — treat it as a breaking-format decision, not a test to "fix."
 
 ---
 

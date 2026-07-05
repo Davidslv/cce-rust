@@ -304,54 +304,65 @@ control (and match across languages); `serde_yaml = "=0.9.34"` parses hand-writt
 manifests back. Emitting via `serde_yaml` was avoided because its formatting is not
 guaranteed stable across versions or identical to another language's YAML library.
 
-## CCE Sync (v2.3.0, SPEC-SYNC)
+## CCE Sync (v2.3.0, SPEC-SYNC + SPEC-SYNC-RECONCILE)
+
+The two engines first diverged on the interchange artifact, so
+[`SPEC-SYNC-RECONCILE.md`](../SPEC-SYNC-RECONCILE.md) pinned a single canonical
+format. The decisions below reflect that reconciled format.
 
 **The interchange artifact is a hand-built canonical stream, not serde's default.**
-SPEC-SYNC §2 requires byte-identical output across the Ruby and Rust engines. The
-artifact is assembled explicitly: the manifest line, then one object per chunk
-(sorted by `(file_path, start_line, chunk_id)`), then the graph line, each an
-LF-terminated compact JSON object. Sorted keys come free from `serde_json`'s default
-`Map` (a `BTreeMap`) plus `to_string` (no whitespace); we do NOT enable the
-`preserve_order` feature. This makes the whole stream a pure function of its content.
+Cross-engine byte-identity (SPEC-SYNC §10) is a hard requirement. The artifact is
+assembled explicitly: the manifest line, one object per chunk (sorted by
+`(file_path, start_line, id)`), then the graph line — each an **LF-terminated**
+compact JSON object, **including the last line**. Sorted keys come free from
+`serde_json`'s default `Map` (a `BTreeMap`) plus `to_string` (no whitespace); the
+`preserve_order` feature is deliberately not enabled. The stream is a pure function
+of its content.
 
-**Embeddings are base64 of little-endian `f64` bytes, never decimals.** Float→string
-formatting differs across languages and libraries, so serializing the 256-d vector as
-decimals would break byte-identity even though the vectors are bit-equal (the hash
-embedder is deterministic). Encoding the raw IEEE-754 bytes (`f64::to_le_bytes`) as
-standard RFC-4648 base64 sidesteps formatting entirely. `base64 = "=0.22.1"` is
-pinned; the standard alphabet + padding is identical across engines.
+**Provenance is REMOVED entirely — no `built_at`, no `built_by`.** An earlier draft
+carried a git-derived `built_at` and a neutral `built_by`; the reconciliation
+dropped both. Any provenance risks non-reproducibility and there is no need for it —
+the checksum plus `(repo_id, sha)` already identify the artifact. Removing it makes
+the manifest exactly `{cce_version, checksum, chunk_count, embedder, file_tokens,
+pack_set_id, repo_id, sha}` (sorted), which both engines produce identically.
 
-**`built_at`/`built_by` are deterministic, so the whole file — not just the checksum
-— is reproducible.** SPEC-SYNC §1/§10 require the artifact for `repo@sha` to be
-bit-for-bit identical across builders and engines. A wall-clock `built_at` or a
-per-user/per-engine `built_by` would break that. So `built_by` is the neutral
-constant `"cce"` and `built_at` is the **committer date of `sha`** (read from git via
-`%cI`), which is fixed for a given commit and identical across engines. The checksum
-is computed over the manifest with only the `checksum` field omitted (the spec's
-literal rule); because every other field is deterministic, the checksum is stable.
+**The checksum covers the whole stream with `checksum:""`.** `checksum` =
+lowercase-hex SHA-256 over the entire canonical stream serialized with the
+manifest's `checksum` field set to the empty string; the real hex is then written
+in. Verify sets `checksum` to `""`, re-hashes, and compares. This is simpler than
+the earlier "omit the field" rule and identical across engines (there is no
+provenance to special-case). Independently reproduced with a standalone Python
+SHA-256 over the emitted bytes.
 
-**The checksummed pre-image omits only `checksum`; the written line 1 includes it.**
-`checksum` is SHA-256 over the stream whose manifest line has no `checksum` key; the
-value is then inserted to produce the file's actual line 1. `verify`/`from_bytes`
-reconstruct the pre-image (drop `checksum`, re-serialize) and recompute — a standard
-sign-then-embed pattern. `from_bytes` rejects any stream whose recomputed checksum
-disagrees.
+**Embeddings are standard base64 (with padding) of little-endian `f64` bytes, never
+decimals.** Float→string formatting differs across languages, so serializing the
+256-d vector as decimals would break byte-identity even though the vectors are
+bit-equal (the hash embedder is deterministic). Encoding the raw IEEE-754 bytes
+(`f64::to_le_bytes`) as RFC-4648 base64 **with padding** sidesteps formatting
+entirely. `base64 = "=0.22.1"` is pinned; the standard alphabet + padding is
+identical across engines (2048 bytes → 2732 base64 chars).
 
-**The graph line carries `file_tokens` alongside `file_imports` for lossless
-round-trip.** SPEC-SYNC §2 lists chunks + import graph + manifest, and separately
-demands a *lossless* export→import. The dashboard's baseline-tokens counterfactual
-(DASH §3) needs each file's whole-file token count, which cannot be recomputed from
-chunks after import. It is fully deterministic (`max(1, bytes/4)`, a SPEC §3
-constant both engines share), so including it keeps the round-trip lossless without
-threatening cross-language identity. Documented as a build-spec refinement.
+**`file_tokens` lives in the MANIFEST (not the graph line).** The dashboard's
+baseline-tokens counterfactual (DASH §3) needs each file's whole-file token count,
+which cannot be recomputed from chunks after import. It is fully deterministic
+(`max(1, bytes/4)`, a SPEC §3 constant both engines share). The canonical format
+places it in the manifest as a sorted-key `{path: int}` object, keeping the
+export→import round-trip lossless.
 
-**`file_tokens`/`built_at` etc. — a build-spec refinement of the design spec.**
-SPEC-SYNC §2 says "a build spec per implementation will refine the exact wire/format
-details." The exact field names (`id` for the chunk id; `language` kept for lossless
-stats), key ordering, the graph envelope, and the deterministic provenance are those
-refinements. The committed golden checksum
-(`artifact.rs::golden_checksum_for_base_fixture`) is the shared anchor the Ruby
-engine must reproduce; a diff there is a breaking-format decision, not a test to fix.
+**The graph line is `{"edges":[…],"nodes":[…]}` over the RAW imports.** `nodes` are
+every indexed file (`{"id": path}`, sorted by id — derived from `file_tokens`'
+keys); `edges` are the raw `file → imported-module` pairs from `file_imports`
+(`{"source", "target", "type":"import"}`, sorted by `(source, target, type)`).
+Serializing the raw module names (not the resolved file→file edges the retriever
+builds) means `file_imports` reconstructs losslessly on import by grouping edges by
+`source`. For a fixture like `samples`, whose imports (`os`, `fs`, `std`, …) do not
+resolve to sibling files, the edges are still recorded — the graph captures the
+declared imports, and resolution happens at query time as before.
+
+**`pack_set_id` is the literal sorted, comma-joined pack names.** Not a hash: the
+reconciled format uses the string `c,javascript,python,ruby,rust,typescript`
+verbatim, so it is human-legible and trivially identical across engines (both
+register the same six packs).
 
 **A per-branch ref pointer implements `latest`; content is addressed by sha.**
 Distinct shas are distinct files, so they never conflict in content. To resolve
@@ -360,13 +371,13 @@ commit, and `pull --latest` reads it. Only ref advancement can race; the git bac
 handles it with fetch-rebase-retry (proven by a two-clone race test).
 
 **`git` is invoked via `std::process`, not a git library.** The remote is "just a
-git repo," and shelling out keeps CCE dependency-light (a locked value of the
-project) and uses the user's real git credentials/transport for free. Commits carry
-a fixed identity (`-c user.name/email`) so they work in a bare CI/test environment.
+git repo," and shelling out keeps CCE dependency-light and uses the user's real git
+credentials/transport for free. Commits carry a fixed identity (`-c user.name/email`)
+so they work in a bare CI/test environment.
 
 **git-LFS is default-on but never required by the core.** `sync init` writes the
 `*.cce` LFS `.gitattributes` and runs `git lfs install` when LFS is on. But the
-whole test suite exercises artifact/push/pull/verify over **plain git** so it needs
+whole test suite exercises artifact/push/pull/verify over **plain git**, so it needs
 no `git-lfs` binary; LFS lives behind one smoke test that SKIPS gracefully when
 `git-lfs` is absent (SPEC-SYNC §11).
 
@@ -374,6 +385,13 @@ no `git-lfs` binary; LFS lives behind one smoke test that SKIPS gracefully when
 tests.** Hermetic tests point `CCE_HOME` at a temp dir so a working clone never
 touches the real `~/.cce`. Because `CCE_HOME` is process-global and Cargo runs tests
 in parallel threads, the sync tests serialize env access through one shared mutex.
+
+**The shared golden is on `test/fixture/samples` with a forced identity.** The
+cross-engine anchor indexes `samples` and builds the artifact with
+`repo_id = "cce/demo"`, `sha = "0"*40`. The test asserts the checksum
+(`028fa30ba1424e4fa119a5ab00bebc98f057088720bb3da2cdfc06c391733ca3`) and writes the
+raw bytes to `/tmp/cce_artifact_rust.cce` so the orchestrator can `diff` it against
+Ruby byte-for-byte.
 
 **The branch-overlay for WIP is deferred (v1 fallback = full local index).** If the
 working tree differs from the pulled sha, `pull` says so and the user runs a normal

@@ -103,8 +103,9 @@ fn status_line_is_cce(line: &str) -> bool {
     path == ".cce" || path.starts_with(".cce/")
 }
 
-/// The committer date of `sha` (RFC 3339 strict, `%cI`), which is deterministic per
-/// commit and identical across engines — so it makes a stable `built_at`.
+/// The committer date of `sha` (RFC 3339 strict, `%cI`), deterministic per commit.
+/// (Retained as a general git helper; the reconciled artifact carries no
+/// provenance, so it is no longer part of the manifest.)
 pub fn commit_date(dir: &Path, sha: &str) -> Option<String> {
     run(dir, &["show", "-s", "--format=%cI", sha]).ok().filter(|s| !s.is_empty())
 }

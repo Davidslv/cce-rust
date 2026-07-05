@@ -16,6 +16,15 @@ and its output matches the docs.
   touched `~/.cce`. Absolute paths and the commit `<sha>` below are
   environment-specific; the **checksums and chunk counts are the real, stable
   values** a Ruby or CI build of the same `repo@sha` must reproduce.
+- **Format:** the artifact is the reconciled v2.3 canonical format
+  (`SPEC-SYNC-RECONCILE.md`) — no provenance (`built_at`/`built_by` removed),
+  `file_tokens` in the manifest, graph line `{"edges":[…],"nodes":[…]}`,
+  `pack_set_id = c,javascript,python,ruby,rust,typescript`, checksum over the whole
+  stream with `checksum:""`. The shared golden checksum on `test/fixture/samples`
+  (`repo_id=cce/demo`, `sha=0…0`, 21 chunks) is
+  `028fa30ba1424e4fa119a5ab00bebc98f057088720bb3da2cdfc06c391733ca3`, and the raw
+  bytes are emitted to `/tmp/cce_artifact_rust.cce` for a byte-for-byte diff against
+  Ruby.
 
 The commands are copy-pasteable verbatim. Only the absolute scratch path (shown here
 as `$WORK`) and the concrete commit sha differ per environment.
@@ -42,7 +51,7 @@ $ git init --bare -q -b main "$WORK/cache.git"
 ```console
 $ cd "$WORK/billing" && git init -q -b main && git add -A && git commit -q -m "initial billing service"
 $ git rev-parse --short HEAD
-80d79ee
+7b9dec7
 ```
 
 ## 3. `cce sync init`
@@ -60,9 +69,9 @@ Configured sync remote: file://$WORK/cache.git
 
 ```console
 $ cce sync push
-Pushed github.com__acme__billing@80d79ee63b613038fd6400f8f95f669c176189cd
-  key      : hash/2.3/github.com__acme__billing/80d79ee63b613038fd6400f8f95f669c176189cd.cce
-  checksum : 8c254d9aff0c7b0817dec173279c4995af3e721bc6ff5f1496272f9bd7ffdcba
+Pushed github.com__acme__billing@7b9dec7dcbe86ca35b2b4ddeb8386d0595e3362f
+  key      : hash/2.3/github.com__acme__billing/7b9dec7dcbe86ca35b2b4ddeb8386d0595e3362f.cce
+  checksum : 18ca676d989dee00af072ad269c60e28af64441483613954132c530c4fb4ff05
 ```
 
 ## 5. `cce sync status`
@@ -73,8 +82,8 @@ remote        : file://$WORK/cache.git
 git-LFS       : off
 repo_id       : github.com__acme__billing
 local cache   : (none pulled yet)
-remote latest : 80d79ee63b613038fd6400f8f95f669c176189cd (ref main)
-working tree  : 80d79ee63b613038fd6400f8f95f669c176189cd
+remote latest : 7b9dec7dcbe86ca35b2b4ddeb8386d0595e3362f (ref main)
+working tree  : 7b9dec7dcbe86ca35b2b4ddeb8386d0595e3362f
 ```
 
 ## 6–7. A teammate clones and configures
@@ -90,22 +99,22 @@ Configured sync remote: file://$WORK/cache.git
 
 ```console
 $ cce sync pull
-Pulled github.com__acme__billing@80d79ee63b613038fd6400f8f95f669c176189cd
+Pulled github.com__acme__billing@7b9dec7dcbe86ca35b2b4ddeb8386d0595e3362f
   chunks   : 2
-  checksum : 8c254d9aff0c7b0817dec173279c4995af3e721bc6ff5f1496272f9bd7ffdcba
+  checksum : 18ca676d989dee00af072ad269c60e28af64441483613954132c530c4fb4ff05
   store    : ./.cce/index.json
   tree     : matches — pulled index used as-is
 ```
 
-The pull checksum `8c254d9a…` is **identical** to the push checksum in step 4 —
+The pull checksum `18ca676d…` is **identical** to the push checksum in step 4 —
 content-addressability proven end-to-end.
 
 ## 9. `cce sync verify` and `cce search` over the pulled index
 
 ```console
 $ cce sync verify
-verify OK: github.com__acme__billing@80d79ee63b613038fd6400f8f95f669c176189cd
-  checksum : 8c254d9aff0c7b0817dec173279c4995af3e721bc6ff5f1496272f9bd7ffdcba
+verify OK: github.com__acme__billing@7b9dec7dcbe86ca35b2b4ddeb8386d0595e3362f
+  checksum : 18ca676d989dee00af072ad269c60e28af64441483613954132c530c4fb4ff05
 
 $ cce search "authenticate user password" --no-metrics
  1. [0.920470] src/auth.py:1-3 (function/function_definition)

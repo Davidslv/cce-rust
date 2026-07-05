@@ -183,8 +183,7 @@ fn push_one(
     sha: &str,
 ) -> Result<(String, String), String> {
     let index = ensure_hash_index(root)?;
-    let built_at = git::commit_date(root, sha).unwrap_or_default();
-    let meta = ManifestMeta { repo_id: repo_id.to_string(), sha: sha.to_string(), built_at };
+    let meta = ManifestMeta { repo_id: repo_id.to_string(), sha: sha.to_string() };
     let artifact = Artifact::from_index(&index, meta);
     let bytes = artifact.to_bytes();
     let ver = cce_version_minor();
@@ -441,8 +440,7 @@ pub fn cmd_verify(root: &Path, commit: Option<String>) -> Result<String, String>
 
     // Rebuild locally from the working tree and export at the same identity.
     let (index, _) = Index::build_protected(root, &HashEmbedder, |_| true, true);
-    let built_at = git::commit_date(root, &sha).unwrap_or_default();
-    let meta = ManifestMeta { repo_id: repo_id.clone(), sha: sha.clone(), built_at };
+    let meta = ManifestMeta { repo_id: repo_id.clone(), sha: sha.clone() };
     let rebuilt = Artifact::from_index(&index, meta);
     let actual = rebuilt.manifest.checksum;
 

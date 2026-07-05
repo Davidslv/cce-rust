@@ -21,14 +21,17 @@ remains byte-identical.
 ### Added
 
 - **Portable interchange artifact** (`src/sync/artifact.rs`) — a canonical,
-  byte-exact, cross-language format: a UTF-8, LF-terminated stream of the manifest
-  line, one sorted-key compact-JSON object per chunk (sorted by `(file_path,
-  start_line, chunk_id)`), then the graph. Embeddings are **base64 of 256
-  little-endian IEEE-754 `f64` bytes** (not decimals), so the bytes match across
-  Ruby and Rust. `checksum` = lowercase-hex SHA-256 over the canonical bytes with
-  the `checksum` field omitted; `built_at` is the commit date of the sha and
-  `built_by` the neutral constant `"cce"`, so the whole artifact is reproducible.
-  A committed **golden checksum** anchors the format cross-language.
+  byte-exact, cross-language format (reconciled to the single spec in
+  [`SPEC-SYNC-RECONCILE.md`](SPEC-SYNC-RECONCILE.md)): a UTF-8 stream with an LF
+  after every line — the manifest line, one sorted-key compact-JSON object per chunk
+  (sorted by `(file_path, start_line, id)`), then the graph line
+  `{"edges":[…],"nodes":[…]}`. Embeddings are **standard base64 (with padding) of
+  256 little-endian IEEE-754 `f64` bytes** (not decimals), so the bytes match across
+  Ruby and Rust. **No provenance** (`built_at`/`built_by` removed) so the artifact is
+  reproducible; `file_tokens` lives in the manifest; `pack_set_id` is the literal
+  `c,javascript,python,ruby,rust,typescript`. `checksum` = lowercase-hex SHA-256
+  over the whole stream serialized with `checksum` set to `""`. A committed **shared
+  golden checksum** on `test/fixture/samples` anchors the format cross-language.
 - **Content address** (`src/sync/mod.rs`) —
   `<embedder>/<cce_ver>/<repo_id>/<sha>.cce`; `repo_id` = normalized git origin
   (`host__org__repo`) or a `sync.repo_id` override. Only the `hash` embedder is

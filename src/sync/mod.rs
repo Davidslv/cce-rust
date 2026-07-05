@@ -54,16 +54,16 @@ pub fn cce_version_minor() -> String {
     format!("{major}.{minor}")
 }
 
-/// A deterministic id for the active pack set (SPEC-SYNC §2 manifest). It is the
-/// first 12 hex chars of SHA-256 over the sorted, comma-joined pack names, so both
-/// engines — which register the same language packs — produce the same value.
+/// A deterministic id for the active pack set (SPEC-SYNC §2 manifest, reconciled):
+/// the **sorted, comma-joined lowercase pack names** verbatim (e.g.
+/// `c,javascript,python,ruby,rust,typescript`). Both engines register the same
+/// language packs, so both produce the same string.
 pub fn pack_set_id() -> String {
     let registry = crate::packs::default_registry();
-    let mut names: Vec<&str> = registry.all().iter().map(|p| p.name()).collect();
+    let mut names: Vec<String> =
+        registry.all().iter().map(|p| p.name().to_ascii_lowercase()).collect();
     names.sort_unstable();
-    let joined = names.join(",");
-    let digest = Sha256::digest(joined.as_bytes());
-    hex_lower(&digest)[..12].to_string()
+    names.join(",")
 }
 
 /// Normalize a git origin URL (or an already-normalized id) into a filesystem- and
@@ -181,12 +181,9 @@ mod tests {
     }
 
     #[test]
-    fn pack_set_id_is_stable_and_short() {
-        let a = pack_set_id();
-        let b = pack_set_id();
-        assert_eq!(a, b);
-        assert_eq!(a.len(), 12);
-        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+    fn pack_set_id_is_the_sorted_comma_joined_pack_names() {
+        // The canonical reconciled value: sorted, comma-joined, lowercase.
+        assert_eq!(pack_set_id(), "c,javascript,python,ruby,rust,typescript");
     }
 
     #[test]

@@ -457,22 +457,22 @@ Configured sync remote: file:///srv/cache.git
 
 # 2. push the index for the committed HEAD (or let CI do it — see below)
 $ cce sync push
-Pushed github.com__acme__billing@80d79ee63b613038fd6400f8f95f669c176189cd
-  key      : hash/2.3/github.com__acme__billing/80d79ee63b613038fd6400f8f95f669c176189cd.cce
-  checksum : 8c254d9aff0c7b0817dec173279c4995af3e721bc6ff5f1496272f9bd7ffdcba
+Pushed github.com__acme__billing@7b9dec7dcbe86ca35b2b4ddeb8386d0595e3362f
+  key      : hash/2.3/github.com__acme__billing/7b9dec7dcbe86ca35b2b4ddeb8386d0595e3362f.cce
+  checksum : 18ca676d989dee00af072ad269c60e28af64441483613954132c530c4fb4ff05
 
 # 3. a teammate (fresh clone at the same sha) pulls it — instantly
 $ cce sync pull
-Pulled github.com__acme__billing@80d79ee63b613038fd6400f8f95f669c176189cd
+Pulled github.com__acme__billing@7b9dec7dcbe86ca35b2b4ddeb8386d0595e3362f
   chunks   : 2
-  checksum : 8c254d9aff0c7b0817dec173279c4995af3e721bc6ff5f1496272f9bd7ffdcba
+  checksum : 18ca676d989dee00af072ad269c60e28af64441483613954132c530c4fb4ff05
   store    : ./.cce/index.json
   tree     : matches — pulled index used as-is
 
 # 4. (optional) paranoid re-check: re-index locally, confirm the checksum
 $ cce sync verify
-verify OK: github.com__acme__billing@80d79ee63b613038fd6400f8f95f669c176189cd
-  checksum : 8c254d9aff0c7b0817dec173279c4995af3e721bc6ff5f1496272f9bd7ffdcba
+verify OK: github.com__acme__billing@7b9dec7dcbe86ca35b2b4ddeb8386d0595e3362f
+  checksum : 18ca676d989dee00af072ad269c60e28af64441483613954132c530c4fb4ff05
 
 # 5. search the pulled index — no local reindex needed
 $ cce search "authenticate user password" --no-metrics
