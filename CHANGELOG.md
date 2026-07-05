@@ -7,6 +7,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.5.1] - 2026-07-05
+
+### Added
+- **Output compression (L4)** — `cce init` writes a leveled output-rules block into `CLAUDE.md`
+  (`output.level`: `off | lite | standard | max`, default **standard**): terser answers and
+  changed-lines-only code edits. New MCP tool **`set_output_compression`** dials the level for the
+  running session (in-memory; does not rewrite `CLAUDE.md`). `tools/list` is now six tools.
+  Additive; `conformance.json` and the Sync artifact are byte-for-byte unchanged.
+
 ## [2.5.0] - 2026-07-05
 
 The first **Savings Layers** — retrieval returns compact chunks by default, with progressive
