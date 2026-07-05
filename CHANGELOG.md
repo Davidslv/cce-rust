@@ -7,6 +7,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.2] - 2026-07-06
+
+### Fixed
+- **`cce sync push` now always rebuilds the index from the working tree** before exporting, instead of
+  re-exporting an existing `.cce/index.json`. A just-pulled or otherwise stale/foreign index could be
+  republished verbatim under the content-address sha key, violating `artifact == build(sha)` and making
+  `cce sync verify` fail. `pull`/`verify` unchanged; the Sync artifact format is byte-identical.
+
 ## [2.6.1] - 2026-07-06
 
 ### Added
