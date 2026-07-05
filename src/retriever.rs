@@ -117,12 +117,7 @@ pub fn search(
 /// ranks. Exposed so federated search (SPEC-V2.2 §6) can run the identical
 /// pipeline over the union of members' chunks and then apply its own expansion.
 /// `qvec` is the pre-embedded query vector (so callers embed once).
-pub fn rank_core(
-    index: &Index,
-    qvec: &[f64],
-    query: &str,
-    top_k: usize,
-) -> Vec<SearchResult> {
+pub fn rank_core(index: &Index, qvec: &[f64], query: &str, top_k: usize) -> Vec<SearchResult> {
     let chunks = &index.chunks;
     let query_tokens = tokenize(query);
     if query_tokens.is_empty() || chunks.is_empty() {

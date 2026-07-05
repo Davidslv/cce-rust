@@ -22,9 +22,7 @@
 //!   (that is `workspace`).
 
 use crate::aggregator::aggregate;
-use crate::config::{
-    GRAPH_BONUS_CHUNK_SCALE, GRAPH_BONUS_MEMBER_CHUNKS, GRAPH_MAX_BONUS_MEMBERS,
-};
+use crate::config::{GRAPH_BONUS_CHUNK_SCALE, GRAPH_BONUS_MEMBER_CHUNKS, GRAPH_MAX_BONUS_MEMBERS};
 use crate::embedder::{cosine, round6, score_key, Embedder};
 use crate::graph_store::Graph;
 use crate::metrics::read_log;
@@ -89,9 +87,7 @@ pub fn load_member_stores(
         Some(names) => {
             let mut out = Vec::new();
             for n in names {
-                let m = manifest
-                    .member(n)
-                    .ok_or_else(|| format!("unknown member/package: {n}"))?;
+                let m = manifest.member(n).ok_or_else(|| format!("unknown member/package: {n}"))?;
                 out.push(m);
             }
             out
@@ -128,8 +124,10 @@ pub fn combined_index(members: &[MemberStore]) -> Index {
     let mut file_imports: BTreeMap<String, Vec<String>> = BTreeMap::new();
     let mut file_tokens: BTreeMap<String, usize> = BTreeMap::new();
     let mut union_pairs: Vec<(String, String)> = Vec::new();
-    let embedder_name =
-        members.first().map(|m| m.index.embedder_name.clone()).unwrap_or_else(|| "hash".to_string());
+    let embedder_name = members
+        .first()
+        .map(|m| m.index.embedder_name.clone())
+        .unwrap_or_else(|| "hash".to_string());
 
     for m in members {
         for c in &m.index.chunks {
@@ -186,11 +184,7 @@ pub fn federated_search(
         cross_member_expand(&combined, graph, &qvec, &core_members, &mut results);
     }
 
-    results
-        .into_iter()
-        .enumerate()
-        .map(|(i, r)| fed_result(i + 1, r, &package_of))
-        .collect()
+    results.into_iter().enumerate().map(|(i, r)| fed_result(i + 1, r, &package_of)).collect()
 }
 
 /// The distinct members of the top (≤3) results, order-preserving.
@@ -217,10 +211,8 @@ fn cross_member_expand(
     results: &mut Vec<SearchResult>,
 ) {
     // Members already represented in the result set are not re-pulled.
-    let mut represented: BTreeSet<String> = results
-        .iter()
-        .map(|r| denamespace(&r.file_path).0.to_string())
-        .collect();
+    let mut represented: BTreeSet<String> =
+        results.iter().map(|r| denamespace(&r.file_path).0.to_string()).collect();
     let mut existing: BTreeSet<(String, usize, usize)> =
         results.iter().map(|r| (r.file_path.clone(), r.start_line, r.end_line)).collect();
 
@@ -529,5 +521,42 @@ mod tests {
         assert!(stats.iter().all(|s| s.chunks >= 1));
         let total: usize = stats.iter().map(|s| s.chunks).sum();
         assert!(total >= 3);
+    }
+
+    #[test]
+    fn federated_dashboard_rolls_up_and_breaks_down_by_package() {
+        // Two members, each with one search event; the roll-up totals both while
+        // by_package attributes each member's numbers to its package.
+        let tmp = tempfile::tempdir().unwrap();
+        let mk = |name: &str, ts: &str, tokens: u64, ratio: f64| {
+            let dir = tmp.path().join(name).join(".cce");
+            std::fs::create_dir_all(&dir).unwrap();
+            let line = format!(
+                "{{\"schema\":\"cce.metrics/v1\",\"event\":\"search\",\"ts\":\"{ts}\",\"id\":\"{name}00000000\",\"query\":\"q\",\"result_count\":1,\"tokens_saved\":{tokens},\"savings_ratio\":{ratio},\"top_score\":0.9,\"empty\":false,\"low_confidence\":false}}\n"
+            );
+            std::fs::write(dir.join("metrics.jsonl"), line).unwrap();
+            MemberMetrics {
+                name: name.to_string(),
+                package: name.to_string(),
+                metrics_path: dir.join("metrics.jsonl"),
+            }
+        };
+        let members = vec![
+            mk("app", "2026-07-04T10:00:00Z", 1000, 0.5),
+            mk("billing", "2026-07-04T11:00:00Z", 3000, 0.75),
+        ];
+        let now = crate::metrics::parse_iso("2026-07-05T00:00:00Z").unwrap();
+        let json = federated_metrics_json(&members, now, 3.00);
+        // Roll-up totals span both members.
+        assert_eq!(json["totals"]["searches"], 2);
+        assert_eq!(json["totals"]["tokens_saved"], 4000);
+        // by_package attributes per member.
+        let by = json["by_package"].as_array().unwrap();
+        assert_eq!(by.len(), 2);
+        let app = by.iter().find(|p| p["package"] == "app").unwrap();
+        assert_eq!(app["searches"], 1);
+        assert_eq!(app["tokens_saved"], 1000);
+        let billing = by.iter().find(|p| p["package"] == "billing").unwrap();
+        assert_eq!(billing["tokens_saved"], 3000);
     }
 }

@@ -19,9 +19,13 @@ use cce::config::{
     LOW_CONFIDENCE_THRESHOLD, METRICS_FILE,
 };
 use cce::embedder::{format6, Embedder, HashEmbedder, OllamaEmbedder};
-use cce::metrics::{HexIdSource, IndexRecord, MetricsWriter, SearchRecord, SystemClock};
+use cce::federation::{
+    federated_search, load_member_stores, member_metrics, workspace_stats, FedResult,
+};
+use cce::metrics::{HexIdSource, IdSource, IndexRecord, MetricsWriter, SearchRecord, SystemClock};
 use cce::retriever::{search, SearchResult};
 use cce::store::{default_store_path, Index};
+use cce::workspace::{build_graph, build_manifest, Manifest, WorkspaceGraph};
 use clap::{Parser, Subcommand};
 use std::path::{Path, PathBuf};
 use std::process::ExitCode;
@@ -35,9 +39,10 @@ struct Cli {
 
 #[derive(Subcommand)]
 enum Command {
-    /// Walk, chunk, embed and persist a directory.
+    /// Walk, chunk, embed and persist a directory (or every workspace member).
     Index {
-        dir: PathBuf,
+        /// Directory to index (single-repo). Optional only with `--workspace`.
+        dir: Option<PathBuf>,
         #[arg(long)]
         store: Option<PathBuf>,
         #[arg(long, default_value = "hash")]
@@ -49,10 +54,17 @@ enum Command {
         /// content verbatim. Off by default — protection is on unless you pass this.
         #[arg(long)]
         allow_secrets: bool,
+        /// Federated index: index every member of the workspace at `[<dir>]` into
+        /// its own store, then build the cross-member graph (SPEC-V2.2 §4).
+        #[arg(long)]
+        workspace: bool,
     },
-    /// Search a persisted index.
+    /// Search a persisted index (or the workspace federation).
     Search {
         query: String,
+        /// Workspace root (positional, with `--workspace`; defaults to `.`).
+        #[arg(value_name = "DIR")]
+        ws_dir: Option<PathBuf>,
         #[arg(long)]
         dir: Option<PathBuf>,
         #[arg(long)]
@@ -66,6 +78,12 @@ enum Command {
         /// Do not append a search event to the metrics log.
         #[arg(long)]
         no_metrics: bool,
+        /// Federated search over the workspace at `[<dir>]` (SPEC-V2.2 §6).
+        #[arg(long)]
+        workspace: bool,
+        /// Scope a workspace search to these members (comma-separated names).
+        #[arg(long)]
+        package: Option<String>,
     },
     /// Rate a past search result helpful or not (DASHBOARD-SPEC §5).
     Feedback {
@@ -86,6 +104,9 @@ enum Command {
     },
     /// Serve the local, read-only metrics dashboard (DASHBOARD-SPEC §6).
     Dashboard {
+        /// Workspace root (positional, with `--workspace`; defaults to `.`).
+        #[arg(value_name = "DIR")]
+        ws_dir: Option<PathBuf>,
         #[arg(long)]
         dir: Option<PathBuf>,
         #[arg(long)]
@@ -100,13 +121,28 @@ enum Command {
         /// Suppress any browser-open behavior (this build only prints the URL).
         #[arg(long)]
         no_open: bool,
+        /// Federate every workspace member's metrics into one dashboard with a
+        /// per-package breakdown (SPEC-V2.2 §7).
+        #[arg(long)]
+        workspace: bool,
     },
-    /// Print statistics about a persisted index.
+    /// Print statistics about a persisted index (or the workspace).
     Stats {
+        /// Workspace root (positional, with `--workspace`; defaults to `.`).
+        #[arg(value_name = "DIR")]
+        ws_dir: Option<PathBuf>,
         #[arg(long)]
         store: Option<PathBuf>,
         #[arg(long)]
         dir: Option<PathBuf>,
+        /// Per-member workspace stats + totals + cross-member edges (SPEC-V2.2 §7).
+        #[arg(long)]
+        workspace: bool,
+    },
+    /// Manage a multi-codebase workspace (SPEC-V2.2 §3/§9).
+    Workspace {
+        #[command(subcommand)]
+        cmd: WorkspaceCmd,
     },
     /// Benchmark the pipeline on a real repository for one language (SPEC-V2 §8).
     Bench {
@@ -139,22 +175,76 @@ enum Command {
     },
 }
 
+/// Subcommands of `cce workspace` (SPEC-V2.2 §3/§9).
+#[derive(Subcommand)]
+enum WorkspaceCmd {
+    /// Detect members and write `<dir>/.cce/workspace.yml` (SPEC-V2.2 §3).
+    Init {
+        /// Workspace root (default: current directory).
+        dir: Option<PathBuf>,
+        /// Overwrite an existing manifest.
+        #[arg(long)]
+        force: bool,
+    },
+    /// Print the members and the detected cross-member edges (SPEC-V2.2 §3/§5).
+    List {
+        /// Workspace root (default: current directory).
+        dir: Option<PathBuf>,
+    },
+}
+
 fn main() -> ExitCode {
     let cli = Cli::parse();
     let result = match cli.command {
-        Command::Index { dir, store, embedder, no_metrics, allow_secrets } => {
-            cmd_index(&dir, store, &embedder, !no_metrics, allow_secrets)
+        Command::Index { dir, store, embedder, no_metrics, allow_secrets, workspace } => {
+            if workspace {
+                cmd_index_workspace(dir, &embedder, !no_metrics, allow_secrets)
+            } else {
+                match dir {
+                    Some(d) => cmd_index(&d, store, &embedder, !no_metrics, allow_secrets),
+                    None => Err("index requires a directory (or pass --workspace)".to_string()),
+                }
+            }
         }
-        Command::Search { query, dir, store, top_k, no_graph, json, no_metrics } => {
-            cmd_search(&query, dir, store, top_k, no_graph, json, !no_metrics)
+        Command::Search {
+            query,
+            ws_dir,
+            dir,
+            store,
+            top_k,
+            no_graph,
+            json,
+            no_metrics,
+            workspace,
+            package,
+        } => {
+            if workspace {
+                cmd_search_workspace(&query, ws_dir.or(dir), top_k, no_graph, json, package)
+            } else {
+                cmd_search(&query, dir, store, top_k, no_graph, json, !no_metrics)
+            }
         }
         Command::Feedback { query_id, helpful, not_helpful, note, dir, store, metrics } => {
             cmd_feedback(&query_id, helpful, not_helpful, &note, dir, store, metrics)
         }
-        Command::Dashboard { dir, store, metrics, port, price, no_open } => {
-            cmd_dashboard(dir, store, metrics, port, price, no_open)
+        Command::Dashboard { ws_dir, dir, store, metrics, port, price, no_open, workspace } => {
+            if workspace {
+                cmd_dashboard_workspace(ws_dir.or(dir), port, price)
+            } else {
+                cmd_dashboard(dir, store, metrics, port, price, no_open)
+            }
         }
-        Command::Stats { store, dir } => cmd_stats(store, dir),
+        Command::Stats { ws_dir, store, dir, workspace } => {
+            if workspace {
+                cmd_stats_workspace(ws_dir.or(dir))
+            } else {
+                cmd_stats(store, dir)
+            }
+        }
+        Command::Workspace { cmd } => match cmd {
+            WorkspaceCmd::Init { dir, force } => cmd_workspace_init(dir, force),
+            WorkspaceCmd::List { dir } => cmd_workspace_list(dir),
+        },
         Command::Bench { repo_dir, queries, store, commit, name, lang } => {
             cmd_bench(&repo_dir, queries, store, commit, &name, &lang)
         }
@@ -510,6 +600,273 @@ fn cmd_stats(store: Option<PathBuf>, dir: Option<PathBuf>) -> Result<(), String>
         println!("    {kind:<20}: {n}");
     }
     Ok(())
+}
+
+// --- Workspace mode (SPEC-V2.2 §3/§4/§6/§7/§9) ---
+
+/// The workspace root: the given dir, or the current directory.
+fn workspace_root(dir: Option<PathBuf>) -> PathBuf {
+    dir.unwrap_or_else(|| PathBuf::from("."))
+}
+
+/// `cce workspace init [<dir>] [--force]` (SPEC-V2.2 §3): detect members and
+/// write `<dir>/.cce/workspace.yml`, refusing to clobber an existing one.
+fn cmd_workspace_init(dir: Option<PathBuf>, force: bool) -> Result<(), String> {
+    let root = workspace_root(dir);
+    if !root.is_dir() {
+        return Err(format!("not a directory: {}", root.display()));
+    }
+    let path = cce::workspace::manifest_path(&root);
+    if path.exists() && !force {
+        return Err(format!("{} already exists — pass --force to overwrite", path.display()));
+    }
+    let manifest = build_manifest(&root);
+    if manifest.members.is_empty() {
+        return Err("no workspace members detected under this root".to_string());
+    }
+    manifest.save(&root).map_err(|e| format!("could not write manifest: {e}"))?;
+    println!("Wrote {}", path.display());
+    println!("workspace: {}", manifest.name);
+    println!("members ({}):", manifest.members.len());
+    for m in &manifest.members {
+        println!(
+            "  {:<16} {:<12} {} · package {}",
+            m.name,
+            m.member_type.as_str(),
+            m.path,
+            m.package
+        );
+    }
+    Ok(())
+}
+
+/// `cce workspace list [<dir>]` (SPEC-V2.2 §3/§5): print members + cross-member edges.
+fn cmd_workspace_list(dir: Option<PathBuf>) -> Result<(), String> {
+    let root = workspace_root(dir);
+    let manifest = Manifest::load(&root)?;
+    let graph = build_graph(&root, &manifest);
+    println!("workspace: {}", manifest.name);
+    println!("members ({}):", manifest.members.len());
+    for m in &manifest.members {
+        println!(
+            "  {:<16} {:<12} {} · package {}",
+            m.name,
+            m.member_type.as_str(),
+            m.path,
+            m.package
+        );
+    }
+    println!("edges ({}):", graph.edges.len());
+    for e in &graph.edges {
+        println!("  {} -> {}  (via {})", e.from, e.to, e.via);
+    }
+    Ok(())
+}
+
+/// `cce index --workspace [<dir>]` (SPEC-V2.2 §4): index each member into its own
+/// store (byte-identical to standalone), then build the cross-member graph.
+fn cmd_index_workspace(
+    dir: Option<PathBuf>,
+    embedder: &str,
+    metrics_enabled: bool,
+    allow_secrets: bool,
+) -> Result<(), String> {
+    let root = workspace_root(dir);
+    if !root.is_dir() {
+        return Err(format!("not a directory: {}", root.display()));
+    }
+    let manifest = Manifest::load(&root)?;
+    let kind = EmbedderKind::parse(embedder);
+    let emb = build_embedder(kind);
+    let protect_secrets = !allow_secrets;
+    if allow_secrets {
+        eprintln!("warning: --allow-secrets set — secret protection is DISABLED for every member");
+    }
+
+    let mut total_files = 0usize;
+    let mut total_chunks = 0usize;
+    println!("Indexing workspace: {}", manifest.name);
+    for m in &manifest.members {
+        let member_dir = root.join(&m.path);
+        let store_path = default_store_path(&member_dir);
+        let start = std::time::Instant::now();
+        let (index, stats) =
+            Index::build_protected(&member_dir, emb.as_ref(), |_| true, protect_secrets);
+        index.save(&store_path).map_err(|e| e.to_string())?;
+        let elapsed = start.elapsed().as_secs_f64();
+
+        // Per-member index event, beside the member's own store (fail-open).
+        let index_bytes = std::fs::metadata(&store_path).map(|md| md.len()).unwrap_or(0);
+        let clock = SystemClock;
+        let ids = HexIdSource::default();
+        let writer =
+            MetricsWriter::new(metrics_beside_store(&store_path), &clock, &ids, metrics_enabled);
+        writer.log_index(&IndexRecord {
+            files_indexed: stats.files_indexed,
+            chunks: stats.total_chunks,
+            index_bytes,
+            duration_ms: elapsed * 1000.0,
+            embedder: index.embedder_name.clone(),
+            full: true,
+        });
+
+        total_files += stats.files_indexed;
+        total_chunks += stats.total_chunks;
+        println!(
+            "  {:<16} files {:>4} · chunks {:>4} · {}",
+            m.name,
+            stats.files_indexed,
+            stats.total_chunks,
+            store_path.display()
+        );
+    }
+
+    let graph = build_graph(&root, &manifest);
+    graph.save(&root).map_err(|e| format!("could not write workspace graph: {e}"))?;
+
+    println!("workspace totals: files {total_files} · chunks {total_chunks}");
+    println!(
+        "cross-member edges ({}) → {}",
+        graph.edges.len(),
+        cce::workspace::graph_path(&root).display()
+    );
+    Ok(())
+}
+
+/// Parse a `--package a,b` scope into trimmed, non-empty member names.
+fn parse_scope(package: Option<String>) -> Option<Vec<String>> {
+    package.map(|p| p.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
+}
+
+/// `cce search "q" --workspace [<dir>]` (SPEC-V2.2 §6): federated retrieval.
+fn cmd_search_workspace(
+    query: &str,
+    dir: Option<PathBuf>,
+    top_k: Option<usize>,
+    no_graph: bool,
+    json: bool,
+    package: Option<String>,
+) -> Result<(), String> {
+    let root = workspace_root(dir);
+    let manifest = Manifest::load(&root)?;
+    let scope = parse_scope(package);
+    let members = load_member_stores(&root, &manifest, scope.as_deref())?;
+    let graph = WorkspaceGraph::load_or_empty(&root, &manifest);
+    let top_k = top_k.unwrap_or(cce::config::DEFAULT_TOP_K);
+
+    // Mirror single-repo embedder selection: if members were indexed with ollama,
+    // try it (falling back to hash), else hash.
+    let uses_ollama = members.iter().any(|m| m.index.embedder_name == "ollama");
+    let emb: Box<dyn Embedder> = if uses_ollama {
+        let oll = OllamaEmbedder::default();
+        if oll.healthy() {
+            Box::new(oll)
+        } else {
+            eprintln!("warning: workspace indexed with ollama but it is unreachable; using hash");
+            Box::new(HashEmbedder)
+        }
+    } else {
+        Box::new(HashEmbedder)
+    };
+
+    let results = federated_search(&members, &graph, emb.as_ref(), query, top_k, !no_graph);
+
+    if json {
+        // A query-id for the json shape (workspace search is read-only over member
+        // stores; the id is generated, not logged).
+        let query_id = HexIdSource::default().next_id();
+        print!("{}", fed_results_json(&results, &query_id));
+    } else {
+        print_fed_human(&results);
+    }
+    Ok(())
+}
+
+/// Human form (SPEC-V2.2 §6): `<score>  <package> · <file_path>:<a>-<b> (<type>/<kind>)`.
+fn print_fed_human(results: &[FedResult]) {
+    if results.is_empty() {
+        println!("(no results)");
+        return;
+    }
+    for r in results {
+        println!(
+            "{:>2}. [{}] {} · {}:{}-{} ({}/{})",
+            r.rank,
+            format6(r.score),
+            r.package,
+            r.file_path,
+            r.start_line,
+            r.end_line,
+            r.chunk_type,
+            r.kind
+        );
+    }
+}
+
+/// JSON form (SPEC-V2.2 §6): array of tagged results + a top-level `query_id`.
+fn fed_results_json(results: &[FedResult], query_id: &str) -> String {
+    let items: Vec<serde_json::Value> = results
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "rank": r.rank,
+                "package": r.package,
+                "chunk_id": r.chunk_id,
+                "file_path": r.file_path,
+                "start_line": r.start_line,
+                "end_line": r.end_line,
+                "chunk_type": r.chunk_type,
+                "kind": r.kind,
+                "score": format6(r.score),
+            })
+        })
+        .collect();
+    let body = serde_json::json!({ "query_id": query_id, "results": items });
+    serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string()) + "\n"
+}
+
+/// `cce stats --workspace [<dir>]` (SPEC-V2.2 §7): per-member + totals + edges.
+fn cmd_stats_workspace(dir: Option<PathBuf>) -> Result<(), String> {
+    let root = workspace_root(dir);
+    let manifest = Manifest::load(&root)?;
+    let members = load_member_stores(&root, &manifest, None)?;
+    let stats = workspace_stats(&members);
+    let graph = WorkspaceGraph::load_or_empty(&root, &manifest);
+
+    println!("workspace: {}", manifest.name);
+    let mut total_files = 0usize;
+    let mut total_chunks = 0usize;
+    for s in &stats {
+        total_files += s.files;
+        total_chunks += s.chunks;
+        println!("  {} (package {})", s.name, s.package);
+        println!("    files : {}", s.files);
+        println!("    chunks: {}", s.chunks);
+        for (kind, n) in &s.by_kind {
+            println!("      {kind:<18}: {n}");
+        }
+    }
+    println!("totals: files {total_files} · chunks {total_chunks}");
+    println!("edges ({}):", graph.edges.len());
+    for e in &graph.edges {
+        println!("  {} -> {}  (via {})", e.from, e.to, e.via);
+    }
+    Ok(())
+}
+
+/// `cce dashboard --workspace [<dir>]` (SPEC-V2.2 §7): federated roll-up dashboard.
+fn cmd_dashboard_workspace(
+    dir: Option<PathBuf>,
+    port: Option<u16>,
+    price: Option<f64>,
+) -> Result<(), String> {
+    let root = workspace_root(dir);
+    let manifest = Manifest::load(&root)?;
+    let members = member_metrics(&root, &manifest);
+    let port = port.unwrap_or(DEFAULT_DASHBOARD_PORT);
+    let price = price.unwrap_or(DEFAULT_INPUT_PRICE_PER_MILLION);
+    cce::dashboard::run_workspace(members, price, port)
+        .map_err(|e| format!("dashboard failed: {e}"))
 }
 
 /// `cce packs` / `cce packs --validate` (SPEC-V2 §5): list registered packs, or

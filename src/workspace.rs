@@ -129,9 +129,7 @@ fn find_gemspec(dir: &Path) -> Option<PathBuf> {
     if let Ok(entries) = std::fs::read_dir(dir) {
         for entry in entries.flatten() {
             let path = entry.path();
-            if path.is_file()
-                && path.extension().and_then(|e| e.to_str()) == Some("gemspec")
-            {
+            if path.is_file() && path.extension().and_then(|e| e.to_str()) == Some("gemspec") {
                 matches.push(path);
             }
         }
@@ -165,7 +163,11 @@ fn classify(dir: &Path) -> Option<(MemberType, String)> {
         let is_engine = dir.join("app").is_dir()
             || dir.join("config").join("routes.rb").is_file()
             || has_engine_rb(dir);
-        let member_type = if is_engine { MemberType::RubyEngine } else { MemberType::RubyGem };
+        let member_type = if is_engine {
+            MemberType::RubyEngine
+        } else {
+            MemberType::RubyGem
+        };
         let package = gem_name_from_gemspec(&gemspec).unwrap_or_else(|| gemspec_stem(&gemspec));
         return Some((member_type, package));
     }
@@ -291,13 +293,12 @@ pub fn detect_members(root: &Path) -> Vec<Member> {
     for d in detected {
         let count = used.entry(d.basename.clone()).or_insert(0);
         *count += 1;
-        let name = if *count == 1 { d.basename.clone() } else { format!("{}-{}", d.basename, count) };
-        members.push(Member {
-            name,
-            path: d.path,
-            member_type: d.member_type,
-            package: d.package,
-        });
+        let name = if *count == 1 {
+            d.basename.clone()
+        } else {
+            format!("{}-{}", d.basename, count)
+        };
+        members.push(Member { name, path: d.path, member_type: d.member_type, package: d.package });
     }
     members
 }
@@ -364,7 +365,8 @@ impl Manifest {
         fn default_version() -> u32 {
             1
         }
-        let raw: Raw = serde_yaml::from_str(text).map_err(|e| format!("invalid workspace.yml: {e}"))?;
+        let raw: Raw =
+            serde_yaml::from_str(text).map_err(|e| format!("invalid workspace.yml: {e}"))?;
         let mut members = Vec::with_capacity(raw.members.len());
         for rm in raw.members {
             let member_type = MemberType::parse(&rm.member_type)
@@ -380,10 +382,7 @@ impl Manifest {
     pub fn load(root: &Path) -> Result<Manifest, String> {
         let path = manifest_path(root);
         let text = std::fs::read_to_string(&path).map_err(|_| {
-            format!(
-                "no workspace manifest at {} — run `cce workspace init` first",
-                path.display()
-            )
+            format!("no workspace manifest at {} — run `cce workspace init` first", path.display())
         })?;
         Manifest::from_yaml(&text)
     }
@@ -537,11 +536,7 @@ fn member_declared_deps(root: &Path, member: &Member) -> Vec<DeclaredDep> {
 pub fn build_graph(root: &Path, manifest: &Manifest) -> WorkspaceGraph {
     // Resolve a declared dependency name to a member name (package or name match).
     let resolve = |dep: &str| -> Option<&str> {
-        manifest
-            .members
-            .iter()
-            .find(|m| m.package == dep || m.name == dep)
-            .map(|m| m.name.as_str())
+        manifest.members.iter().find(|m| m.package == dep || m.name == dep).map(|m| m.name.as_str())
     };
 
     let mut edges: BTreeSet<(String, String, String)> = BTreeSet::new();
@@ -558,10 +553,7 @@ pub fn build_graph(root: &Path, manifest: &Manifest) -> WorkspaceGraph {
 
     WorkspaceGraph {
         members: manifest.members.iter().map(|m| m.name.clone()).collect(),
-        edges: edges
-            .into_iter()
-            .map(|(from, to, via)| Edge { from, to, via })
-            .collect(),
+        edges: edges.into_iter().map(|(from, to, via)| Edge { from, to, via }).collect(),
     }
 }
 
@@ -604,8 +596,11 @@ impl WorkspaceGraph {
                 } else {
                     raw.members
                 };
-                let edges =
-                    raw.edges.into_iter().map(|e| Edge { from: e.from, to: e.to, via: e.via }).collect();
+                let edges = raw
+                    .edges
+                    .into_iter()
+                    .map(|e| Edge { from: e.from, to: e.to, via: e.via })
+                    .collect();
                 return WorkspaceGraph { members, edges };
             }
         }
@@ -683,8 +678,11 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path().join("pkg");
         std::fs::create_dir_all(d.join("lib")).unwrap();
-        std::fs::write(d.join("pkg.gemspec"), "Gem::Specification.new do |s|\n  s.name = 'pkg'\nend\n")
-            .unwrap();
+        std::fs::write(
+            d.join("pkg.gemspec"),
+            "Gem::Specification.new do |s|\n  s.name = 'pkg'\nend\n",
+        )
+        .unwrap();
         let members = detect_members(tmp.path());
         assert_eq!(members[0].member_type, MemberType::RubyGem);
         assert_eq!(members[0].package, "pkg");
@@ -748,11 +746,15 @@ mod tests {
             vec!["activesupport", "rack", "rspec"]
         );
         assert_eq!(
-            deps_from_gemfile("source \"https://rubygems.org\"\ngem \"billing\"\ngem 'rails', '~> 7'\ngemspec\n"),
+            deps_from_gemfile(
+                "source \"https://rubygems.org\"\ngem \"billing\"\ngem 'rails', '~> 7'\ngemspec\n"
+            ),
             vec!["billing", "rails"]
         );
         assert_eq!(
-            deps_from_package_json("{\"dependencies\":{\"left-pad\":\"1\"},\"devDependencies\":{\"jest\":\"2\"}}"),
+            deps_from_package_json(
+                "{\"dependencies\":{\"left-pad\":\"1\"},\"devDependencies\":{\"jest\":\"2\"}}"
+            ),
             vec!["left-pad", "jest"]
         );
     }
@@ -764,11 +766,10 @@ mod tests {
         let graph = build_graph(&root, &manifest);
         assert_eq!(graph.members, vec!["app", "billing", "web"]);
         assert_eq!(graph.edges.len(), 1);
-        assert_eq!(graph.edges[0], Edge {
-            from: "app".to_string(),
-            to: "billing".to_string(),
-            via: "gemfile".to_string(),
-        });
+        assert_eq!(
+            graph.edges[0],
+            Edge { from: "app".to_string(), to: "billing".to_string(), via: "gemfile".to_string() }
+        );
     }
 
     #[test]

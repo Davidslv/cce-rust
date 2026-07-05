@@ -104,14 +104,28 @@ pub fn handle_connection(
     metrics_path: &Path,
     price: f64,
 ) -> std::io::Result<()> {
+    handle_connection_with(stream_router(metrics_path, price), &mut stream)
+}
+
+/// A router closure resolving a request path to a response.
+fn stream_router<'a>(metrics_path: &'a Path, price: f64) -> impl Fn(&str) -> HttpResponse + 'a {
+    move |path: &str| route(path, metrics_path, price)
+}
+
+/// Read the request line from `stream`, route it via `router`, write the response.
+/// Shared by the single-repo and workspace (SPEC-V2.2 §7) dashboards.
+pub fn handle_connection_with(
+    router: impl Fn(&str) -> HttpResponse,
+    stream: &mut TcpStream,
+) -> std::io::Result<()> {
     let path = {
-        let mut reader = BufReader::new(&mut stream);
+        let mut reader = BufReader::new(&mut *stream);
         let mut line = String::new();
         reader.read_line(&mut line)?;
         // Request line: "METHOD SP PATH SP HTTP/x.y". We only serve GET/read-only.
         line.split_whitespace().nth(1).unwrap_or("/").to_string()
     };
-    let resp = route(&path, metrics_path, price);
+    let resp = router(&path);
     let header = format!(
         "HTTP/1.1 {} {}\r\nContent-Type: {}\r\nContent-Length: {}\r\nConnection: close\r\n\r\n",
         resp.status,
@@ -152,6 +166,78 @@ pub fn run(metrics_path: PathBuf, price: f64, port: u16) -> std::io::Result<()> 
     println!("metrics log : {}", metrics_path.display());
     println!("press Ctrl-C to stop.");
     serve(listener, metrics_path, price, None);
+    Ok(())
+}
+
+// --- Workspace dashboard (SPEC-V2.2 §7) ---
+
+/// Build the workspace `/api/metrics` JSON body: the §4 roll-up over every
+/// member's events plus a `by_package` breakdown (federation), computed fresh
+/// from the members' logs at request time, with a wall-clock `generated_ts`.
+pub fn workspace_metrics_body(members: &[crate::federation::MemberMetrics], price: f64) -> String {
+    let now = now_secs();
+    let mut val = crate::federation::federated_metrics_json(members, now, price);
+    if let Some(obj) = val.as_object_mut() {
+        obj.insert("generated_ts".to_string(), serde_json::Value::String(format_iso(now)));
+    }
+    serde_json::to_string_pretty(&val).unwrap_or_else(|_| "{}".to_string())
+}
+
+/// Route a request path for the workspace dashboard. Read-only.
+pub fn route_workspace(
+    path: &str,
+    members: &[crate::federation::MemberMetrics],
+    price: f64,
+) -> HttpResponse {
+    let clean = path.split('?').next().unwrap_or(path);
+    match clean {
+        "/" => HttpResponse {
+            status: 200,
+            content_type: "text/html; charset=utf-8",
+            body: PAGE_HTML.to_string(),
+        },
+        "/api/metrics" => HttpResponse {
+            status: 200,
+            content_type: "application/json",
+            body: workspace_metrics_body(members, price),
+        },
+        "/api/health" => {
+            let events: usize =
+                members.iter().map(|m| read_log(&m.metrics_path).event_count()).sum();
+            HttpResponse {
+                status: 200,
+                content_type: "application/json",
+                body: serde_json::json!({
+                    "status": "ok",
+                    "events": events,
+                    "members": members.len(),
+                })
+                .to_string(),
+            }
+        }
+        _ => HttpResponse {
+            status: 404,
+            content_type: "application/json",
+            body: serde_json::json!({"error": "not found"}).to_string(),
+        },
+    }
+}
+
+/// Bind `127.0.0.1:port` and serve the federated workspace dashboard forever.
+pub fn run_workspace(
+    members: Vec<crate::federation::MemberMetrics>,
+    price: f64,
+    port: u16,
+) -> std::io::Result<()> {
+    let listener = TcpListener::bind(("127.0.0.1", port))?;
+    let addr = listener.local_addr()?;
+    println!("cce workspace dashboard: serving http://{addr}/  (loopback only, read-only)");
+    println!("members : {}", members.len());
+    println!("press Ctrl-C to stop.");
+    for stream in listener.incoming().flatten() {
+        let mut stream = stream;
+        let _ = handle_connection_with(|p| route_workspace(p, &members, price), &mut stream);
+    }
     Ok(())
 }
 
@@ -370,6 +456,46 @@ mod tests {
         assert_eq!(v["status"], "ok");
         assert_eq!(v["events"], 7); // 1 index + 4 search + 2 feedback
         assert_eq!(v["skipped"], 0);
+    }
+
+    #[test]
+    fn workspace_routes_serve_rollup_health_and_page() {
+        // Two members, one search event each; the workspace routes must serve the
+        // shared page, a federated `/api/metrics` with `by_package`, a summed
+        // `/api/health`, and 404 for anything else (SPEC-V2.2 §7).
+        let tmp = tempfile::tempdir().unwrap();
+        let mut members = Vec::new();
+        for (name, tokens) in [("app", 1000u64), ("billing", 3000u64)] {
+            let p = tmp.path().join(format!("{name}.jsonl"));
+            std::fs::write(
+                &p,
+                format!(
+                    "{{\"schema\":\"cce.metrics/v1\",\"event\":\"search\",\"ts\":\"2026-07-04T10:00:00Z\",\"id\":\"{name}00000000\",\"query\":\"q\",\"result_count\":1,\"tokens_saved\":{tokens},\"savings_ratio\":0.5,\"top_score\":0.9,\"empty\":false,\"low_confidence\":false}}\n"
+                ),
+            )
+            .unwrap();
+            members.push(crate::federation::MemberMetrics {
+                name: name.to_string(),
+                package: name.to_string(),
+                metrics_path: p,
+            });
+        }
+
+        let page = route_workspace("/", &members, 3.00);
+        assert!(page.body.contains("<title>CCE Dashboard</title>"));
+
+        let health = route_workspace("/api/health", &members, 3.00);
+        let hv: serde_json::Value = serde_json::from_str(&health.body).unwrap();
+        assert_eq!(hv["events"], 2);
+        assert_eq!(hv["members"], 2);
+
+        let metrics = route_workspace("/api/metrics", &members, 3.00);
+        let mv: serde_json::Value = serde_json::from_str(&metrics.body).unwrap();
+        assert_eq!(mv["totals"]["tokens_saved"], 4000);
+        assert!(mv.get("generated_ts").is_some());
+        assert_eq!(mv["by_package"].as_array().unwrap().len(), 2);
+
+        assert_eq!(route_workspace("/nope", &members, 3.00).status, 404);
     }
 
     #[test]
