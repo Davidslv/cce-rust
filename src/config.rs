@@ -288,6 +288,61 @@ impl MemoryConfig {
     }
 }
 
+// --- Turn summarization / L6 (SPEC-V2.5 §2 Layer 6, §5) ---
+
+/// The default for `summarization.auto_tokens` (SPEC-V2.5 §5): `null` ⇒ MANUAL ONLY.
+/// Turn summarization has no auto-trigger unless the project sets a threshold; the
+/// server never calls a model and never auto-injects — it only exposes a deterministic
+/// "due" signal derived from the offline `cce.tokens/v1` served-token counter.
+pub const DEFAULT_SUMMARIZATION_AUTO_TOKENS: Option<u64> = None;
+
+/// The `summarization.*` runtime configuration (SPEC-V2.5 §5). Only `auto_tokens` is
+/// defined: the returned-token total (counted with `cce.tokens/v1`) above which the
+/// session MAY be summarized. `None` (config `null`, the default) means manual only.
+/// Absent block / absent key / bad YAML all fall back to the default.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct SummarizationConfig {
+    pub auto_tokens: Option<u64>,
+}
+
+impl Default for SummarizationConfig {
+    fn default() -> Self {
+        SummarizationConfig { auto_tokens: DEFAULT_SUMMARIZATION_AUTO_TOKENS }
+    }
+}
+
+impl SummarizationConfig {
+    /// Parse from the `.cce/config` YAML text. Tolerant: no `summarization:` block, an
+    /// absent/`null` `auto_tokens`, or unparseable YAML all fall back to the default
+    /// (`None` ⇒ manual only). A non-integer/negative value fails the parse ⇒ default.
+    pub fn from_yaml(text: &str) -> SummarizationConfig {
+        #[derive(serde::Deserialize)]
+        struct RawSummarization {
+            auto_tokens: Option<u64>,
+        }
+        #[derive(serde::Deserialize)]
+        struct RawRoot {
+            summarization: Option<RawSummarization>,
+        }
+        let mut cfg = SummarizationConfig::default();
+        if let Ok(raw) = serde_yaml::from_str::<RawRoot>(text) {
+            if let Some(s) = raw.summarization {
+                cfg.auto_tokens = s.auto_tokens;
+            }
+        }
+        cfg
+    }
+
+    /// Load the summarization config for `root`: the per-project `.cce/config` if it
+    /// exists and parses, else the default. Offline, read-only.
+    pub fn load(root: &std::path::Path) -> SummarizationConfig {
+        std::fs::read_to_string(root.join(".cce").join("config"))
+            .ok()
+            .map(|t| SummarizationConfig::from_yaml(&t))
+            .unwrap_or_default()
+    }
+}
+
 /// Selects the embedding backend.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum EmbedderKind {
@@ -460,5 +515,44 @@ mod tests {
         std::fs::create_dir_all(&cce).unwrap();
         std::fs::write(cce.join("config"), "memory:\n  enabled: false\n").unwrap();
         assert!(!MemoryConfig::load(tmp.path()).enabled);
+    }
+
+    #[test]
+    fn summarization_default_is_manual_only() {
+        assert_eq!(SummarizationConfig::default().auto_tokens, None);
+        assert_eq!(DEFAULT_SUMMARIZATION_AUTO_TOKENS, None);
+    }
+
+    #[test]
+    fn summarization_config_reads_auto_tokens_and_tolerates_junk() {
+        assert_eq!(
+            SummarizationConfig::from_yaml("summarization:\n  auto_tokens: 5000\n").auto_tokens,
+            Some(5000)
+        );
+        // Explicit null ⇒ manual only.
+        assert_eq!(
+            SummarizationConfig::from_yaml("summarization:\n  auto_tokens: null\n").auto_tokens,
+            None
+        );
+        // Absent block, absent key, a negative (invalid u64), and bad YAML all fall back.
+        assert_eq!(SummarizationConfig::from_yaml("sync:\n  lfs: true\n").auto_tokens, None);
+        assert_eq!(SummarizationConfig::from_yaml("summarization: {}\n").auto_tokens, None);
+        assert_eq!(
+            SummarizationConfig::from_yaml("summarization:\n  auto_tokens: -3\n").auto_tokens,
+            None
+        );
+        assert_eq!(SummarizationConfig::from_yaml("not: yaml: [").auto_tokens, None);
+    }
+
+    #[test]
+    fn summarization_config_load_from_disk_and_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        // Absent ⇒ default (manual only).
+        assert_eq!(SummarizationConfig::load(tmp.path()).auto_tokens, None);
+        // Present ⇒ honoured.
+        let cce = tmp.path().join(".cce");
+        std::fs::create_dir_all(&cce).unwrap();
+        std::fs::write(cce.join("config"), "summarization:\n  auto_tokens: 12000\n").unwrap();
+        assert_eq!(SummarizationConfig::load(tmp.path()).auto_tokens, Some(12000));
     }
 }

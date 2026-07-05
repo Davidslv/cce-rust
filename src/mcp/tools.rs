@@ -1,4 +1,4 @@
-//! # mcp::tools — the eight CCE MCP tools (SPEC-MCP §"Tools" + SPEC-V2.5 §6/§7)
+//! # mcp::tools — the nine CCE MCP tools (SPEC-MCP §"Tools" + SPEC-V2.5 §6/§7)
 //!
 //! **Why this file exists:** The tool contract — names, input schemas, and output
 //! shape — is the cross-language interface an agent binds to. It MUST be byte-for-
@@ -6,7 +6,7 @@
 //! whichever engine serves. This module owns that contract and each tool's
 //! read-only execution over the local index.
 //!
-//! **What it is / does:** Declares the eight tools and their handlers. The three v2.4
+//! **What it is / does:** Declares the nine tools and their handlers. The three v2.4
 //! tools — `context_search` (now serving L2-compressed bodies at a `detail` level +
 //! each result's `chunk_id`), `index_status`, `record_feedback` — plus the two
 //! Layer-7 progressive-disclosure tools: `expand_chunk` (body/file/neighbors; body
@@ -17,12 +17,20 @@
 //! VALIDATED decision to the local `.cce/memory.jsonl`) and `session_recall`
 //! (precision-filtered hybrid search over that memory). `context_search` logs an
 //! identical `search` metrics event carrying the retrieval + `chunk_compression`
-//! savings buckets (SPEC-V2.5 §2/§3).
+//! savings buckets (SPEC-V2.5 §2/§3) — plus the Layer-6 `summarize_context`, which
+//! renders the server's per-session ledger into a deterministic, bounded, STRUCTURED
+//! digest (files/chunks touched, queries issued, decisions recorded) so the agent can
+//! compress a long session's history instead of re-sending the raw transcript. The
+//! context-touching tools (`context_search`, `expand_chunk`, `related_context`,
+//! `record_decision`) each append an order-preserving, wall-clock-free entry to that
+//! ledger as they run.
 //!
 //! **Responsibilities:**
-//! - Own the eight tool schemas, output formatting, L2 serving, and `max_tokens`.
-//! - Reuse `retriever`/`federation`/`compress`/`metrics`/`memory`/`sync` — never
-//!   reimplement.
+//! - Own the nine tool schemas, output formatting, L2 serving, and `max_tokens`.
+//! - Reuse `retriever`/`federation`/`compress`/`metrics`/`memory`/`session`/`sync` —
+//!   never reimplement.
+//! - Feed the per-session ledger (`session`) as tools run; the digest itself is a pure
+//!   function computed there.
 //! - Handle a missing/empty index, a stale chunk_id, or disabled memory with a
 //!   friendly message.
 
@@ -37,6 +45,7 @@ use crate::memory::{self, RecallHit};
 use crate::metrics::{HexIdSource, MetricsWriter, SystemClock};
 use crate::packs::Registry;
 use crate::retriever::{build_search_record, search, SearchResult};
+use crate::session::{short_label, SummaryScope};
 use crate::store::Index;
 use crate::sync::commands::{freshness, IndexSource};
 use crate::workspace::{Manifest, WorkspaceGraph};
@@ -136,12 +145,26 @@ top_k) as compact entries with ids, which you CHOOSE to use — it is never an a
 Returning nothing when there is no confident match is normal and correct; proceed without it \
 rather than forcing a weak memory into context.";
 
-/// The eight tool definitions returned by `tools/list`, with the EXACT byte-pinned
+/// The `summarize_context` description (SPEC-V2.5 §2 Layer 6, §6): compress THIS
+/// session's history into a small, deterministic digest instead of re-sending the raw
+/// transcript. States plainly that it is a STRUCTURED digest of the server's per-session
+/// ledger — not an LLM prose summary — so the agent knows the same call sequence yields
+/// the same bytes. Byte-pinned; mirrored verbatim in the Ruby engine.
+const SUMMARIZE_CONTEXT_DESC: &str = "Get a compact, deterministic digest of what THIS session \
+has done so far — the files and chunks you have touched, the queries you have run, and the \
+decisions you have recorded — so you can compress a long session's history into a few lines \
+instead of re-sending the raw transcript. It is a STRUCTURED digest built from the server's \
+per-session ledger, NOT an LLM-written summary: the same sequence of tool calls always yields the \
+same bytes. Optional `scope` narrows it: \"all\" (default), \"files\" (the files AND chunks \
+touched), \"queries\", or \"decisions\". Long lists are bounded with a `… (+N more)` marker. An \
+unknown `scope` returns a short, actionable error, never a crash.";
+
+/// The nine tool definitions returned by `tools/list`, with the EXACT byte-pinned
 /// schemas of SPEC-MCP §"Tools" + SPEC-V2.5 §6. The order is stable and fixed:
 /// the three v2.4 tools first (context_search the headline), then the two Layer-7
 /// progressive-disclosure tools, then the Layer-4 `set_output_compression`, then the
-/// two Layer-5 memory tools appended in order (`record_decision`, `session_recall`).
-/// Mirrored verbatim for cce-ruby's catch-up.
+/// two Layer-5 memory tools (`record_decision`, `session_recall`), then the Layer-6
+/// `summarize_context` appended last. Mirrored verbatim for cce-ruby's catch-up.
 pub fn tool_definitions() -> Vec<Value> {
     vec![
         json!({
@@ -238,6 +261,16 @@ pub fn tool_definitions() -> Vec<Value> {
                 "required": ["query"]
             }
         }),
+        json!({
+            "name": "summarize_context",
+            "description": SUMMARIZE_CONTEXT_DESC,
+            "inputSchema": {
+                "type": "object",
+                "properties": {
+                    "scope": { "type": "string", "enum": ["all", "files", "queries", "decisions"], "default": "all", "description": "which slice of the session digest to return" }
+                }
+            }
+        }),
     ]
 }
 
@@ -299,6 +332,11 @@ fn context_search_single(
     let record =
         build_search_record(&index, &results, query, top_k, !no_graph, latency_ms, "mcp", detail);
     let query_id = write_search_event(&server.metrics_path(), &record);
+
+    // L6: record this search (query + the ids/paths it returned) in the session ledger.
+    let chunk_ids: Vec<String> = results.iter().map(|r| r.chunk_id.clone()).collect();
+    let file_paths: Vec<String> = results.iter().map(|r| r.file_path.clone()).collect();
+    server.record_search(query, &chunk_ids, &file_paths);
 
     let rows: Vec<Row> = results.iter().map(Row::from_single).collect();
     ToolOutput::ok(format_rows(&rows, query_id.as_deref(), max_tokens, index.chunks.len(), detail))
@@ -374,6 +412,13 @@ fn context_search_workspace(
         detail,
     );
     let query_id = write_search_event(&server.metrics_path(), &record);
+
+    // L6: record this search in the session ledger. File paths are member-prefixed
+    // (`member/path`) so two members' same-named files stay distinct in the digest.
+    let chunk_ids: Vec<String> = results.iter().map(|r| r.chunk_id.clone()).collect();
+    let file_paths: Vec<String> =
+        results.iter().map(|r| format!("{}/{}", r.member, r.file_path)).collect();
+    server.record_search(query, &chunk_ids, &file_paths);
 
     let total_chunks: usize = members.iter().map(|m| m.index.chunks.len()).sum();
     let rows: Vec<Row> = results.iter().map(Row::from_fed).collect();
@@ -653,6 +698,11 @@ pub fn record_decision(server: &McpServer, args: &Value) -> ToolOutput {
     let clock = SystemClock;
     match memory::record(&path, text, &tags, area, &clock) {
         Ok(outcome) => {
+            // L6: record the decision (id + a short, ALREADY-REDACTED label) in the
+            // session ledger. `outcome.entry.text` is the redacted store text, so the
+            // label is secret-safe. Recorded on both new and dedupe outcomes — the
+            // decision is part of THIS session's history either way.
+            server.record_decision_event(&outcome.entry.id, &short_label(&outcome.entry.text));
             let verb = if outcome.is_new { "Recorded" } else { "Already recorded" };
             ToolOutput::ok(format!(
                 "{verb} decision #{}. Retrieve it later with session_recall.",
@@ -717,6 +767,26 @@ fn format_recall(hits: &[RecallHit], total: usize) -> String {
          they are not auto-injected.\n",
     );
     out
+}
+
+// --- Layer 6: turn summarization (summarize_context) ---
+
+/// `summarize_context` (SPEC-V2.5 §2 Layer 6, §6): render the server's per-session
+/// ledger into a deterministic, bounded, STRUCTURED digest so the agent can compress a
+/// long session's history instead of re-sending the raw transcript. NOT an LLM summary
+/// — a pure function of the recorded call sequence (`session::SessionLedger::digest`).
+/// `scope` (default `all`) narrows to a slice; an unknown scope is an actionable
+/// tool-level error, never a crash. An absent/blank `scope` means `all`.
+pub fn summarize_context(server: &McpServer, args: &Value) -> ToolOutput {
+    let raw = args.get("scope").and_then(Value::as_str).unwrap_or("all").trim();
+    let raw = if raw.is_empty() { "all" } else { raw };
+    match SummaryScope::parse(raw) {
+        Some(scope) => ToolOutput::ok(server.session_digest(scope)),
+        None => ToolOutput::err(format!(
+            "summarize_context: unknown scope {raw:?}; use \"all\", \"files\", \"queries\", or \
+             \"decisions\"."
+        )),
+    }
 }
 
 // --- Layer 7: progressive disclosure (expand_chunk / related_context) ---
@@ -801,6 +871,9 @@ pub fn expand_chunk(server: &McpServer, args: &Value) -> ToolOutput {
             "expand_chunk: unknown scope {scope:?}; use \"body\", \"file\", or \"neighbors\"."
         ));
     }
+    // L6: record the well-formed expand call (even if the id later proves stale — the
+    // agent still made it) in the session ledger.
+    server.record_expand(chunk_id, scope);
     let index = match working_index(server) {
         Ok(i) => i,
         Err(msg) => return ToolOutput::ok(msg),
@@ -849,6 +922,8 @@ pub fn related_context(server: &McpServer, args: &Value) -> ToolOutput {
         .map(|n| n as usize)
         .filter(|n| *n > 0)
         .unwrap_or(MCP_DEFAULT_TOP_K);
+    // L6: record the well-formed related_context call in the session ledger.
+    server.record_related(chunk_id);
     let index = match working_index(server) {
         Ok(i) => i,
         Err(msg) => return ToolOutput::ok(msg),
@@ -1049,7 +1124,7 @@ mod tests {
     #[test]
     fn tool_definitions_match_the_spec_contract() {
         let defs = tool_definitions();
-        assert_eq!(defs.len(), 8);
+        assert_eq!(defs.len(), 9);
         assert_eq!(defs[0]["name"], "context_search");
         assert_eq!(defs[1]["name"], "index_status");
         assert_eq!(defs[2]["name"], "record_feedback");
@@ -1058,6 +1133,7 @@ mod tests {
         assert_eq!(defs[5]["name"], "set_output_compression");
         assert_eq!(defs[6]["name"], "record_decision");
         assert_eq!(defs[7]["name"], "session_recall");
+        assert_eq!(defs[8]["name"], "summarize_context");
 
         // context_search schema: required query, top_k default 8, no_graph default
         // false, and the new L2 `detail` enum (SPEC-V2.5 §6).
@@ -1115,6 +1191,44 @@ mod tests {
         assert_eq!(sr["required"], json!(["query"]));
         assert_eq!(sr["properties"]["top_k"]["default"], 5);
         assert!(SESSION_RECALL_DESC.contains("PRECISION-FILTERED"));
+
+        // summarize_context (L6): byte-pinned description + an optional `scope` enum of
+        // exactly the four slices, default "all", and NO required inputs (SPEC-V2.5 §2
+        // Layer 6, §6).
+        assert_eq!(defs[8]["description"], json!(SUMMARIZE_CONTEXT_DESC));
+        let sc = &defs[8]["inputSchema"];
+        assert!(sc.get("required").is_none(), "summarize_context has no required inputs");
+        assert_eq!(
+            sc["properties"]["scope"]["enum"],
+            json!(["all", "files", "queries", "decisions"])
+        );
+        assert_eq!(sc["properties"]["scope"]["default"], "all");
+        assert!(SUMMARIZE_CONTEXT_DESC.contains("NOT an LLM-written summary"));
+    }
+
+    #[test]
+    fn summarize_context_digests_the_session_and_rejects_bad_scope() {
+        let tmp = tempfile::tempdir().unwrap();
+        let server = McpServer::new(Some(tmp.path().to_path_buf()), None, false);
+        // A fresh session digests to the pinned empty body.
+        let empty = summarize_context(&server, &json!({}));
+        assert!(!empty.is_error);
+        assert_eq!(empty.text, "CCE session digest\n(nothing recorded this session yet)");
+
+        // Record a decision, then summarize just that slice.
+        record_decision(&server, &json!({ "text": "use RRF to fuse ranks" }));
+        let dec = summarize_context(&server, &json!({ "scope": "decisions" }));
+        assert!(!dec.is_error);
+        assert!(dec.text.starts_with("CCE session digest\ndecisions (1):\n- #"));
+        assert!(dec.text.contains("use RRF to fuse ranks"));
+
+        // A blank scope means `all`; an unknown scope is an actionable error.
+        let all = summarize_context(&server, &json!({ "scope": "  " }));
+        assert!(!all.is_error);
+        assert!(all.text.contains("decisions (1):"));
+        let bad = summarize_context(&server, &json!({ "scope": "everything" }));
+        assert!(bad.is_error);
+        assert!(bad.text.contains("unknown scope"), "got: {}", bad.text);
     }
 
     #[test]
