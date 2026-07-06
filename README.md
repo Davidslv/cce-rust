@@ -52,9 +52,28 @@ in a browser — a self-contained, autoplaying terminal cast (no dependencies, n
 ## Installation & environment setup
 
 `cce` is a single Rust binary. The tree-sitter crates compile their C grammars
-from source, so you need a stable Rust toolchain and a working C compiler.
-**There are no other system libraries** — the index is plain JSON on disk, so
-there is no database (no SQLite) to install.
+from source, so building it needs a stable Rust toolchain and a working C
+compiler. **There are no other system libraries** — the index is plain JSON on
+disk, so there is no database (no SQLite) to install.
+
+### Fastest: a prebuilt release binary (no toolchain needed)
+
+Every version is published on the [Releases page](https://github.com/davidslv/cce-rust/releases)
+as tarballs for macOS (Apple Silicon + Intel) and Linux (x86_64 + arm64), with a
+`SHA256SUMS` to verify. Grab the one for your platform:
+
+```bash
+# Example: macOS Apple Silicon (adjust the version + target for your machine)
+curl -LO https://github.com/davidslv/cce-rust/releases/latest/download/SHA256SUMS
+curl -LO "https://github.com/davidslv/cce-rust/releases/latest/download/cce-v$(curl -s https://api.github.com/repos/davidslv/cce-rust/releases/latest | grep -m1 tag_name | cut -d'"' -f4 | tr -d v)-aarch64-apple-darwin.tar.gz"
+shasum -a 256 --check --ignore-missing SHA256SUMS
+tar xzf cce-v*-aarch64-apple-darwin.tar.gz
+sudo mv cce-v*/cce /usr/local/bin/    # or anywhere on your PATH
+cce --version
+```
+
+git + git-LFS are still needed for CCE Sync (see below); everything else works
+with just the binary. To build from source instead:
 
 ### macOS
 
@@ -102,7 +121,7 @@ cargo test                # confirm a green build
 
 ```bash
 cargo install --path .    # installs `cce` into ~/.cargo/bin
-cce --version             # cce 2.5.5
+cce --version             # prints the version you built (see CHANGELOG.md)
 ```
 
 ### Optional: the semantic embedder (Ollama)

@@ -97,12 +97,9 @@ pub fn decode_embedding(s: &str) -> Result<Vec<f64>, String> {
     if bytes.len() % 8 != 0 {
         return Err(format!("embedding byte length {} is not a multiple of 8", bytes.len()));
     }
-    let mut out = Vec::with_capacity(bytes.len() / 8);
-    for chunk in bytes.chunks_exact(8) {
-        let arr: [u8; 8] = chunk.try_into().expect("chunks_exact(8) yields 8 bytes");
-        out.push(f64::from_le_bytes(arr));
-    }
-    Ok(out)
+    // The %8 check above guarantees an empty remainder.
+    let (chunks, _remainder) = bytes.as_chunks::<8>();
+    Ok(chunks.iter().map(|arr| f64::from_le_bytes(*arr)).collect())
 }
 
 /// Canonical JSON `Value` for one chunk (keys sorted by serde_json's `BTreeMap`).
