@@ -259,7 +259,8 @@ pub fn run_workspace(
     let root_ref = root_metrics.as_deref();
     for stream in listener.incoming().flatten() {
         let mut stream = stream;
-        let _ = handle_connection_with(|p| route_workspace(p, &members, root_ref, price), &mut stream);
+        let _ =
+            handle_connection_with(|p| route_workspace(p, &members, root_ref, price), &mut stream);
     }
     Ok(())
 }
@@ -615,7 +616,7 @@ mod tests {
         assert_eq!(mv["totals"]["searches"], 2);
         assert_eq!(mv["by_source"]["cli"]["searches"], 1);
         assert_eq!(mv["by_source"]["mcp"]["searches"], 1); // the agent search now shows
-        // by_package remains members-only.
+                                                           // by_package remains members-only.
         assert_eq!(mv["by_package"].as_array().unwrap().len(), 1);
     }
 
