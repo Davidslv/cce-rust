@@ -136,8 +136,17 @@ ollama pull nomic-embed-text
 ```
 
 `cce` talks to a local Ollama server over `localhost` HTTP only when you pass
-`--embedder ollama`. If Ollama is unreachable it prints a warning and falls back
-to the hash embedder, so indexing never fails because of it.
+`--embedder ollama` (override the endpoint/model with the `CCE_OLLAMA_URL` /
+`CCE_OLLAMA_MODEL` environment variables). Ollama failures are **loud, never
+silent** (#30): if Ollama is unreachable — or fails mid-index — `cce index
+--embedder ollama` aborts with a clear error and writes no store, so a store
+can never contain dead (empty) embeddings. The same applies at query time: an
+ollama-built index queried while Ollama is down makes `cce search` refuse with
+guidance (start Ollama, or re-index with the default hash embedder) rather than
+silently comparing vectors from two different embedding spaces; the MCP
+`context_search` tool instead degrades to keyword-only (BM25) results under an
+explicit `NOTICE:` line, so an agent session keeps working without hiding the
+degradation.
 
 ## Usage
 
@@ -677,7 +686,9 @@ real offline cold-start run in [`docs/VERIFIED.md`](docs/VERIFIED.md):
 The **only** things that ever touch the network are, explicitly:
 
 1. **The optional Ollama embedder** (`--embedder ollama`) — a `localhost` HTTP call;
-   unreachable ⇒ it warns and falls back to the offline hash embedder.
+   unreachable ⇒ indexing fails loud (no store written) and `cce search` on an
+   ollama-built index refuses with guidance (#30); the MCP `context_search`
+   degrades to BM25-only under an explicit notice.
 2. **`cce sync push` / `cce sync pull`** — the git cache transport. Everything else,
    including reading a *previously* pulled index, is offline.
 3. **Installing the binary** (`cargo install`, `git clone`) — a one-time step.
@@ -763,13 +774,13 @@ node type in a `kind` field alongside the coarse `chunk_type`
 ## Tests & coverage
 
 ```bash
-cargo test                                                  # 416 tests
+cargo test                                                  # 500 tests
 cargo clippy --all-targets --all-features -- -D warnings    # lint gate
 cargo fmt --check                                           # format gate
 ```
 
-The suite is **416 passing tests** (+1 `#[ignore]` Ollama integration test) and
-measures **93.9% line coverage** via `cargo llvm-cov`. The default suite is
+The suite is **500 passing tests** (+1 `#[ignore]` live-Ollama integration test)
+and measures **~94% line coverage** via `cargo llvm-cov`. The default suite is
 fully deterministic and makes no network calls — including the metrics subsystem,
 whose clock and id source are injected and whose dashboard tests bind an
 ephemeral loopback port. A CI test gate runs the three-layer validators over every

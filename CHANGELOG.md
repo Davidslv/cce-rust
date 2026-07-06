@@ -14,6 +14,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with this file's section as the notes plus a `SHA256SUMS`. Process documented in `RELEASING.md`;
   README gains a prebuilt-binary install path. (Repo infrastructure — the `cce` binary is unchanged.)
 
+## [2.6.6] - 2026-07-06
+
+### Fixed
+- **The Ollama embedder fails loud instead of degrading silently (#30).** Three compounding silent
+  failures in the opt-in `--embedder ollama` path are gone. (1) *Index time:* an embedding failure —
+  Ollama unreachable at start, or dying mid-index — now **aborts `cce index` with a clear error and
+  writes no store** (previously `embed_batch` swallowed errors into empty vectors, which were persisted
+  and scored cosine 0 forever, invisible to vector recall). There is deliberately **no fallback to the
+  hash embedder at index time** either: that would poison the store's declared embedder space just as
+  badly. (2) *Query time, CLI:* `cce search` (and `--workspace`) on an ollama-built store with Ollama
+  down now **errors with guidance** (start Ollama, or re-index with the default hash embedder) instead
+  of silently embedding the query with the hash backend — cosine across two unrelated vector spaces is
+  meaningless. (3) *Query time, MCP:* `context_search` follows the friendly-error pattern — it does not
+  crash the session, and now **degrades to keyword-only (BM25) results under a pinned `NOTICE:` line**,
+  so the agent keeps getting results while the degradation stays visible. The `Embedder` trait lost its
+  silent-empty-vector batch path (`embed_batch` → fallible `try_embed`/`try_embed_batch`), the endpoint
+  and model are overridable via `CCE_OLLAMA_URL`/`CCE_OLLAMA_MODEL` (which also keeps the new
+  failure-policy tests hermetic — a loopback HTTP stub, never a real server), and the docs that
+  described the silent fallback as a feature are rewritten. The default hash-embedder path, the
+  knowledge store (hash-only), `conformance.json`, and all goldens are **byte-identical**.
+
 ## [2.6.5] - 2026-07-06
 
 ### Fixed

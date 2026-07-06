@@ -177,10 +177,14 @@ ollama pull nomic-embed-text
 cce index ./my-project --embedder ollama
 ```
 
-- Talks to a local Ollama server over `localhost` HTTP only. No other command
-  makes network calls.
-- If Ollama is unreachable, `cce` prints a warning and falls back to the hash
-  embedder — indexing still succeeds.
+- Talks to a local Ollama server over `localhost` HTTP only (override with
+  `CCE_OLLAMA_URL` / `CCE_OLLAMA_MODEL`). No other command makes network calls.
+- Failures are loud, never silent (#30): if Ollama is unreachable — or fails
+  mid-index — `cce index --embedder ollama` aborts with a clear error and writes
+  no store. Searching an ollama-built index while Ollama is down errors with
+  guidance (start Ollama, or re-index with the default hash embedder); the MCP
+  `context_search` tool degrades to BM25-only results under an explicit
+  `NOTICE:` line instead.
 - Ollama vectors are model-dependent, so an Ollama-built index is **not** covered
   by the conformance guarantee.
 
