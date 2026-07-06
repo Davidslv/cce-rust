@@ -78,7 +78,9 @@ jobs:
         include:
           - os: macos-14
             target: aarch64-apple-darwin
-          - os: macos-13
+          # GitHub retired the Intel macOS runners (macos-13); cross-compile the
+          # Intel binary on Apple Silicon instead (clang handles -arch x86_64).
+          - os: macos-14
             target: x86_64-apple-darwin
           - os: ubuntu-latest
             target: x86_64-unknown-linux-gnu
