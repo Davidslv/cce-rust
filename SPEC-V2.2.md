@@ -176,12 +176,16 @@ score}`, `score` as a 6-decimal string; plus a top-level `query_id`.
 - `cce stats --workspace [<dir>]` — a per-member table (files, chunks, by-kind)
   plus workspace totals, and the cross-member edges.
 - `cce dashboard --workspace [<dir>]` — federate each member's
-  `<member>/.cce/metrics.jsonl` into one dashboard, **tagged by member**: the
-  existing north-stars (savings, quality) as a workspace roll-up **plus a
-  per-package breakdown** (savings & searches per member). The aggregator’s
-  input is the concatenation of members’ metrics events, each tagged with its
-  member; the API shape adds a `by_package` section. Loopback-only, read-only,
-  self-contained (unchanged posture).
+  `<member>/.cce/metrics.jsonl` **plus the workspace-root `<dir>/.cce/metrics.jsonl`**
+  into one dashboard: the existing north-stars (savings, quality) as a workspace
+  roll-up **plus a per-package breakdown** (savings & searches per member). The
+  aggregator's input for the roll-up is the concatenation of every member's metrics
+  events **and the workspace-root log** — the latter is where `cce mcp --workspace`
+  records federated (agent) searches (§ MCP), so agent usage appears in
+  `totals`/`recent_searches`/`by_source`. The root log is folded in once, guarded
+  against a member whose path is the root. The `by_package` section is built from the
+  members only: a federated search spans members, so it has no single-package bucket.
+  Loopback-only, read-only, self-contained (unchanged posture).
 
 Single-repo `dashboard`/`stats`/`search` (no `--workspace`) are unchanged.
 

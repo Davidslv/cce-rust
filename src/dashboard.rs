@@ -181,19 +181,25 @@ pub fn run(metrics_path: PathBuf, price: f64, port: u16) -> std::io::Result<()> 
 /// member's events plus a `by_package` breakdown (federation), computed fresh
 /// from the members' logs at request time, with a wall-clock `generated_ts`.
 /// **Zero network calls** — every panel is log-derived (see `metrics_body`).
-pub fn workspace_metrics_body(members: &[crate::federation::MemberMetrics], price: f64) -> String {
+pub fn workspace_metrics_body(
+    members: &[crate::federation::MemberMetrics],
+    root_metrics: Option<&Path>,
+    price: f64,
+) -> String {
     let now = now_secs();
-    let mut val = crate::federation::federated_metrics_json(members, now, price);
+    let mut val = crate::federation::federated_metrics_json(members, root_metrics, now, price);
     if let Some(obj) = val.as_object_mut() {
         obj.insert("generated_ts".to_string(), Value::String(format_iso(now)));
     }
     serde_json::to_string_pretty(&val).unwrap_or_else(|_| "{}".to_string())
 }
 
-/// Route a request path for the workspace dashboard. Read-only.
+/// Route a request path for the workspace dashboard. Read-only. `root_metrics` is
+/// the workspace-root log (`cce mcp --workspace` search events, issue #28).
 pub fn route_workspace(
     path: &str,
     members: &[crate::federation::MemberMetrics],
+    root_metrics: Option<&Path>,
     price: f64,
 ) -> HttpResponse {
     let clean = path.split('?').next().unwrap_or(path);
@@ -206,11 +212,17 @@ pub fn route_workspace(
         "/api/metrics" => HttpResponse {
             status: 200,
             content_type: "application/json",
-            body: workspace_metrics_body(members, price),
+            body: workspace_metrics_body(members, root_metrics, price),
         },
         "/api/health" => {
-            let events: usize =
+            let mut events: usize =
                 members.iter().map(|m| read_log(&m.metrics_path).event_count()).sum();
+            // Include the workspace-root log unless a member already points at it.
+            if let Some(root) = root_metrics {
+                if !members.iter().any(|m| m.metrics_path == root) {
+                    events += read_log(root).event_count();
+                }
+            }
             HttpResponse {
                 status: 200,
                 content_type: "application/json",
@@ -231,8 +243,11 @@ pub fn route_workspace(
 }
 
 /// Bind `127.0.0.1:port` and serve the federated workspace dashboard forever.
+/// `root_metrics` is the workspace-root `.cce/metrics.jsonl`, folded into the
+/// roll-up so `cce mcp --workspace` agent searches appear (issue #28).
 pub fn run_workspace(
     members: Vec<crate::federation::MemberMetrics>,
+    root_metrics: Option<PathBuf>,
     price: f64,
     port: u16,
 ) -> std::io::Result<()> {
@@ -241,9 +256,11 @@ pub fn run_workspace(
     println!("cce workspace dashboard: serving http://{addr}/  (loopback only, read-only)");
     println!("members : {}", members.len());
     println!("press Ctrl-C to stop.");
+    let root_ref = root_metrics.as_deref();
     for stream in listener.incoming().flatten() {
         let mut stream = stream;
-        let _ = handle_connection_with(|p| route_workspace(p, &members, price), &mut stream);
+        let _ =
+            handle_connection_with(|p| route_workspace(p, &members, root_ref, price), &mut stream);
     }
     Ok(())
 }
@@ -540,15 +557,15 @@ mod tests {
             });
         }
 
-        let page = route_workspace("/", &members, 3.00);
+        let page = route_workspace("/", &members, None, 3.00);
         assert!(page.body.contains("<title>CCE Dashboard</title>"));
 
-        let health = route_workspace("/api/health", &members, 3.00);
+        let health = route_workspace("/api/health", &members, None, 3.00);
         let hv: serde_json::Value = serde_json::from_str(&health.body).unwrap();
         assert_eq!(hv["events"], 2);
         assert_eq!(hv["members"], 2);
 
-        let metrics = route_workspace("/api/metrics", &members, 3.00);
+        let metrics = route_workspace("/api/metrics", &members, None, 3.00);
         let mv: serde_json::Value = serde_json::from_str(&metrics.body).unwrap();
         assert_eq!(mv["totals"]["tokens_saved"], 4000);
         assert!(mv.get("generated_ts").is_some());
@@ -563,7 +580,44 @@ mod tests {
         assert!(mv["index_freshness"].get("behind_remote").is_none());
         assert!(mv["index_freshness"].get("remote_latest").is_none());
 
-        assert_eq!(route_workspace("/nope", &members, 3.00).status, 404);
+        assert_eq!(route_workspace("/nope", &members, None, 3.00).status, 404);
+    }
+
+    #[test]
+    fn workspace_routes_include_the_root_log() {
+        // Issue #28: a `cce mcp --workspace` search lands in the workspace-root log.
+        // Both /api/metrics and /api/health must count it alongside the members.
+        let tmp = tempfile::tempdir().unwrap();
+        let member = tmp.path().join("app.jsonl");
+        std::fs::write(
+            &member,
+            "{\"schema\":\"cce.metrics/v1\",\"event\":\"search\",\"ts\":\"2026-07-04T10:00:00Z\",\"id\":\"app000000000\",\"query\":\"q\",\"result_count\":1,\"tokens_saved\":1000,\"savings_ratio\":0.5,\"top_score\":0.9,\"empty\":false,\"low_confidence\":false,\"source\":\"cli\"}\n",
+        )
+        .unwrap();
+        let members = vec![crate::federation::MemberMetrics {
+            name: "app".to_string(),
+            package: "app".to_string(),
+            metrics_path: member,
+        }];
+        let root = tmp.path().join("root.jsonl");
+        std::fs::write(
+            &root,
+            "{\"schema\":\"cce.metrics/v1\",\"event\":\"search\",\"ts\":\"2026-07-04T11:00:00Z\",\"id\":\"root00000000\",\"query\":\"q\",\"result_count\":1,\"tokens_saved\":500,\"savings_ratio\":0.5,\"top_score\":0.9,\"empty\":false,\"low_confidence\":false,\"source\":\"mcp\"}\n",
+        )
+        .unwrap();
+        let root_ref = Some(root.as_path());
+
+        let health = route_workspace("/api/health", &members, root_ref, 3.00);
+        let hv: serde_json::Value = serde_json::from_str(&health.body).unwrap();
+        assert_eq!(hv["events"], 2); // member(1) + root(1)
+
+        let metrics = route_workspace("/api/metrics", &members, root_ref, 3.00);
+        let mv: serde_json::Value = serde_json::from_str(&metrics.body).unwrap();
+        assert_eq!(mv["totals"]["searches"], 2);
+        assert_eq!(mv["by_source"]["cli"]["searches"], 1);
+        assert_eq!(mv["by_source"]["mcp"]["searches"], 1); // the agent search now shows
+                                                           // by_package remains members-only.
+        assert_eq!(mv["by_package"].as_array().unwrap().len(), 1);
     }
 
     #[test]
