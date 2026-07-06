@@ -164,7 +164,11 @@ The dashboard was built at v1.1 (savings + quality only). v2.4.1 adds four panel
 the capabilities that landed since, all fed from the additive schema above:
 
 - **Agent vs human usage** (`by_source`) — CLI searches vs MCP/agent searches: how much
-  your agent leans on CCE. A search's `source` other than `"mcp"` counts as `cli`.
+  your agent leans on CCE. A search's `source` other than `"mcp"` counts as `cli`. In a
+  workspace, `cce mcp --workspace` records its (federated) agent searches in the
+  workspace-root `.cce/metrics.jsonl`; `cce dashboard --workspace` folds that log into the
+  roll-up so those `mcp` searches appear here (they stay out of `by_package` — a federated
+  search spans members).
 - **Per-package breakdown** (`by_package`, workspace only) — an **array of objects**,
   each `{package, searches, tokens_saved, mean_savings_ratio, mean_top_score}`, sorted by
   `package`: savings, searches, and **quality** per member, i.e. where in the ecosystem

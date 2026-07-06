@@ -125,10 +125,14 @@ only cross-member links are the declared dependency edges.
 
 - `cce stats --workspace [<dir>]` — a per-member breakdown (files, chunks,
   by-kind) plus workspace totals and the cross-member edges.
-- `cce dashboard --workspace [<dir>]` — federates each member's
-  `<member>/.cce/metrics.jsonl` into one dashboard: the existing north-stars as a
-  workspace roll-up **plus a `by_package` section** (searches & tokens saved per
-  member). Loopback-only, read-only, and self-contained, exactly as the
+- `cce dashboard --workspace [<dir>]` — federates every member's
+  `<member>/.cce/metrics.jsonl` **and the workspace-root `<dir>/.cce/metrics.jsonl`**
+  (where `cce mcp --workspace` records agent searches) into one dashboard: the
+  existing north-stars as a workspace roll-up **plus a `by_package` section**
+  (searches & tokens saved per member). The root log feeds the roll-up
+  (`totals`/`recent_searches`/`by_source`) so agent usage shows up; those federated
+  searches span members, so they stay **out of `by_package`**, which remains
+  per-member. Loopback-only, read-only, and self-contained, exactly as the
   single-repo dashboard.
 
 ## Where this would strain
