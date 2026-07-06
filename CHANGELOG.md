@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.3] - 2026-07-06
+
+### Fixed
+- **The indexer now honors committed `.gitignore`** (#24). The walker uses ripgrep's `ignore` crate and
+  skips files ignored by the repo's committed `.gitignore`, restoring the sync invariant `artifact ==
+  build(sha)`. Machine-local ignore sources (`.git/info/exclude`, global `core.excludesfile`) and
+  `.gitignore` above the walk root are deliberately NOT honored, so artifacts stay builder-independent;
+  `.git/` and `.cce/` are always skipped. Previously a gitignored-but-present file (e.g. Next's
+  `next-env.d.ts`) polluted local indexes, false-failing `cce sync verify`.
+
+### Added
+- **`cce init` gitignores the cache** — appends `.cce/*` + `!.cce/workspace.yml` to the repo `.gitignore`
+  (git repos only; idempotent): the local index/cache is never committed, the shared `.cce/workspace.yml`
+  stays committable.
+
 ## [2.6.2] - 2026-07-06
 
 ### Fixed
