@@ -72,6 +72,22 @@ impl Index {
         file_tokens: BTreeMap<String, usize>,
         embedder_name: String,
     ) -> Index {
+        Index::assemble_inner(chunks, file_imports, file_tokens, embedder_name, true)
+    }
+
+    /// Assemble an index, choosing whether to build the (expensive) BM25 statistics.
+    /// `build_bm25 = false` leaves BM25 empty and builds only the import graph — used
+    /// by the federation loader, where each member's own BM25 is never scored (only the
+    /// assembled union's is), so building it per member re-tokenizes the whole corpus a
+    /// second time for nothing. The graph IS still built: `combined_index` unions each
+    /// member's intra-store graph (SPEC-V2.2 §6).
+    fn assemble_inner(
+        chunks: Vec<Chunk>,
+        file_imports: BTreeMap<String, Vec<String>>,
+        file_tokens: BTreeMap<String, usize>,
+        embedder_name: String,
+        build_bm25: bool,
+    ) -> Index {
         let files: Vec<String> = {
             let mut set: std::collections::BTreeSet<String> = std::collections::BTreeSet::new();
             for c in &chunks {
@@ -79,7 +95,11 @@ impl Index {
             }
             set.into_iter().collect()
         };
-        let bm25 = Bm25Index::build(&chunks);
+        let bm25 = if build_bm25 {
+            Bm25Index::build(&chunks)
+        } else {
+            Bm25Index::empty()
+        };
         let graph = Graph::build(&file_imports, &files);
         Index { chunks, file_imports, file_tokens, embedder_name, bm25, graph }
     }
@@ -203,6 +223,24 @@ impl Index {
         let data: IndexData = serde_json::from_str(&json)
             .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
         Ok(Index::assemble(data.chunks, data.file_imports, data.file_tokens, data.embedder))
+    }
+
+    /// Load an index but skip building BM25 (graph only). For the federation loader:
+    /// a member store's own BM25 is never scored — only the assembled union's is — so
+    /// building it per member re-tokenizes the whole corpus for nothing. The chunks,
+    /// imports, file-token counts, and import graph are identical to [`Index::load`];
+    /// only `bm25` differs (empty), and it is never read on this path.
+    pub fn load_without_bm25(path: &Path) -> io::Result<Index> {
+        let json = std::fs::read_to_string(path)?;
+        let data: IndexData = serde_json::from_str(&json)
+            .map_err(|e| io::Error::new(io::ErrorKind::InvalidData, e))?;
+        Ok(Index::assemble_inner(
+            data.chunks,
+            data.file_imports,
+            data.file_tokens,
+            data.embedder,
+            false,
+        ))
     }
 
     /// Distinct file paths in the corpus.

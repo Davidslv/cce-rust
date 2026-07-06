@@ -78,7 +78,9 @@ enum Command {
         /// Federated search over the workspace at `[<dir>]` (SPEC-V2.2 §6).
         #[arg(long)]
         workspace: bool,
-        /// Scope a workspace search to these members (comma-separated names).
+        /// Scope a workspace search to these members (comma-separated member names
+        /// or workspace.yml `package:` fields). Recommended for large workspaces: it
+        /// searches only the named members instead of the whole union (issue #26).
         #[arg(long)]
         package: Option<String>,
     },

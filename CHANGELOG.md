@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.4] - 2026-07-06
+
+### Changed
+- **Faster, correcter workspace federation (#26).** Member stores load **without** building per-member
+  BM25 (federation scores only the union's BM25), removing redundant work — full-workspace search is
+  ~1.3–2× faster (a real 38.6k-chunk workspace: 3.2s→2.4s CLI). **`--package` short-circuits** to load
+  only the scoped member(s) (2.08s→1.58s) and now resolves by member name **or** the `package:` field,
+  **erroring with the available list** on no match (previously matched member name only and returned
+  empty silently). The **MCP server caches the assembled union** per scope, so repeated
+  `context_search` no longer re-federates (warm call ≈ CLI). Perf/correctness only — **ranked results
+  are byte-identical** (regression-tested); keeps exact brute-force cosine (ANN deferred).
+
 ## [2.6.3] - 2026-07-06
 
 ### Fixed

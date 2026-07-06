@@ -37,6 +37,22 @@ pub struct Bm25Index {
 }
 
 impl Bm25Index {
+    /// An empty index (no documents). Used for the per-member stores loaded on the
+    /// federation path, whose BM25 is never queried — only the assembled *union*'s
+    /// BM25 is scored — so building each member's BM25 on load is pure wasted work
+    /// (it re-tokenizes the whole corpus a second time). Scoring an empty index
+    /// returns no candidates, which is exactly what a never-queried member wants.
+    pub fn empty() -> Bm25Index {
+        Bm25Index {
+            tf: Vec::new(),
+            doc_len: Vec::new(),
+            df: HashMap::new(),
+            avgdl: 0.0,
+            n: 0,
+            chunk_ids: Vec::new(),
+        }
+    }
+
     /// Build the index from chunks, tokenizing each chunk's content.
     pub fn build(chunks: &[Chunk]) -> Bm25Index {
         let mut tf = Vec::with_capacity(chunks.len());
