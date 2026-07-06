@@ -1,6 +1,6 @@
 [package]
 name = "cce"
-version = "2.6.2"
+version = "2.6.3"
 edition = "2021"
 description = "Code Context Engine — Rust implementation (SPEC v1.0 + Dashboard v1.1 + Language Packs v2.0 + Secret Protection v2.1 + Workspace Mode v2.2 + CCE Sync v2.3 + CCE MCP v2.4 + Dashboard refresh & docs sweep v2.4.1 + Savings Layers v2.5.0–v2.5.4: chunk/output/grammar compression, memory, turn summarization, progressive disclosure, the seven-bucket savings ledger and nine MCP tools + v2.5.5 documentation sweep)"
 license = "MIT"
@@ -26,6 +26,14 @@ tree-sitter-typescript = "=0.23.2"
 tree-sitter-c = "=0.24.2"
 sha2 = "=0.11.0"
 walkdir = "=2.5.0"
+# Gitignore-aware directory walking (ripgrep's crate; the de-facto standard),
+# pinned. Used by the indexer's walker so a committed `.gitignore` in the tree at a
+# sha is honored — keeping the CCE Sync content-address invariant `artifact ==
+# build(sha)` builder-independent (issue #24). Configured to honor ONLY committed
+# `.gitignore` files at/below the walk root and to ignore every machine-local
+# source (`.git/info/exclude`, global excludes, bare `.ignore`, parent ignores), so
+# two machines at the same sha still build byte-identical artifacts.
+ignore = "=0.4.23"
 clap = { version = "=4.6.1", features = ["derive"] }
 ureq = { version = "=3.3.0", features = ["json"] }
 serde = { version = "=1.0.228", features = ["derive"] }

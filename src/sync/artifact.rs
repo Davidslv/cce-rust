@@ -638,4 +638,39 @@ mod tests {
             "581cbd0ff682a38d7d1250f3eec44f4ce456bdd660d4cb29aaaadd9e95072f48"
         );
     }
+
+    /// Builder-independence, end to end (issue #24, generalised repro). Two builds
+    /// of the same tree at the same sha — one on a "dev machine" that has the
+    /// gitignored, auto-generated file on disk, one from a "clean CI checkout" that
+    /// does not — MUST yield the IDENTICAL artifact checksum. Before the walker
+    /// honored `.gitignore`, the dev build indexed the extra file and diverged,
+    /// which is exactly what made `cce sync verify` false-fail.
+    #[test]
+    fn artifact_checksum_is_independent_of_gitignored_files_on_disk() {
+        let build = |with_generated: bool| -> String {
+            let dir = tempfile::tempdir().unwrap();
+            let root = dir.path();
+            // A Next.js-style tree: the generated `next-env.d.ts` is git-ignored.
+            std::fs::write(root.join(".gitignore"), "next-env.d.ts\n").unwrap();
+            std::fs::write(
+                root.join("index.ts"),
+                "export function greet(name: string): string {\n  return `hi ${name}`;\n}\n",
+            )
+            .unwrap();
+            if with_generated {
+                std::fs::write(
+                    root.join("next-env.d.ts"),
+                    "/// <reference types=\"next\" />\n/// <reference types=\"next/image-types/global\" />\n",
+                )
+                .unwrap();
+            }
+            let (idx, _) = Index::build_from_dir(root, &HashEmbedder);
+            Artifact::from_index(&idx, meta()).manifest.checksum
+        };
+        assert_eq!(
+            build(true),
+            build(false),
+            "a gitignored file present on disk must not change the artifact checksum"
+        );
+    }
 }

@@ -103,6 +103,12 @@ pub fn run(opts: &InitOptions) -> Result<String, String> {
     // The CLAUDE.md block honours the configured L4 output level (SPEC-V2.5 §5).
     let output_level = OutputConfig::load(dir).level;
     let claude_path = write_claude_md(dir, output_level)?;
+    // Team-wide fix for issue #24: keep cce's own cache out of the tree so nobody
+    // commits their local artifacts (which would then be honored via `.gitignore`
+    // on other machines only if committed — but more importantly, they must never
+    // pollute the index). Committing `.cce/` to `.gitignore` is the canonical,
+    // machine-independent way to ensure that.
+    let gitignore_path = ensure_cce_gitignored(dir)?;
 
     let mode = if is_workspace { " (workspace)" } else { "" };
     let mut out = String::new();
@@ -110,6 +116,9 @@ pub fn run(opts: &InitOptions) -> Result<String, String> {
     out.push_str(&format!("  {index_line}\n"));
     out.push_str(&format!("  .mcp.json : {} (server \"cce\")\n", mcp_path.display()));
     out.push_str(&format!("  CLAUDE.md : {} (context_search guidance)\n", claude_path.display()));
+    if let Some(gi) = &gitignore_path {
+        out.push_str(&format!("  .gitignore: {} (ignores .cce/ cache)\n", gi.display()));
+    }
     out.push_str("\nNext steps:\n");
     out.push_str("  1. Restart your editor (Claude Code) so it loads .mcp.json.\n");
     out.push_str("  2. Ask a question about this codebase — the agent calls context_search.\n");
@@ -226,6 +235,59 @@ This project is indexed by CCE, exposed as MCP tools. Prefer them over reading o
 {output_section}\
 {CLAUDE_END}\n"
     )
+}
+
+/// The comment + rules appended to `.gitignore` for cce's own cache dir. A single
+/// self-contained block so the append is deterministic and easy to detect.
+///
+/// The "ignore contents, keep one file" pattern: `.cce/*` ignores everything cce
+/// writes locally (the index/cache) while `!.cce/workspace.yml` re-includes the
+/// SHARED workspace definition so it stays git-committable. Git cannot re-include a
+/// file whose parent DIRECTORY is ignored, so this must be `.cce/*` (ignore the
+/// dir's contents) and NOT `.cce/` (ignore the dir itself) — otherwise the negation
+/// would be inert and `.cce/workspace.yml` could never be committed.
+const GITIGNORE_BLOCK: &str =
+    "# cce local index/cache — never commit (but keep the shared workspace.yml)\n\
+     .cce/*\n\
+     !.cce/workspace.yml\n";
+
+/// Ensure the repo ignores cce's own local cache while keeping the shared
+/// `.cce/workspace.yml` committable. When `dir` is a git repo, add the `.cce/*` +
+/// `!.cce/workspace.yml` block to `<dir>/.gitignore` if not already present, and
+/// return the path; otherwise (not a git repo) do nothing and return `None`.
+///
+/// Idempotent: the block is not re-added when the file already contains `.cce/*`
+/// OR a pre-existing blanket `.cce` / `.cce/` line (an older layout is left as-is —
+/// migrating it is not required, just don't double-add). This is the team-wide,
+/// committed fix so no one commits their local cache and pollutes a content-
+/// addressed sync artifact (issue #24).
+fn ensure_cce_gitignored(dir: &Path) -> Result<Option<PathBuf>, String> {
+    // Only meaningful inside a git repository — the walker honors committed
+    // `.gitignore`, and a non-repo has no sha to be builder-independent against.
+    // `.git` is a directory in a normal checkout and a file in a worktree/submodule.
+    if !dir.join(".git").exists() {
+        return Ok(None);
+    }
+    let path = dir.join(".gitignore");
+    let existing = std::fs::read_to_string(&path).unwrap_or_default();
+    let already = existing
+        .lines()
+        .any(|l| matches!(l.trim(), ".cce/*" | ".cce" | ".cce/" | "/.cce" | "/.cce/"));
+    if already {
+        return Ok(Some(path));
+    }
+    let mut next = existing;
+    if next.is_empty() {
+        next.push_str(GITIGNORE_BLOCK);
+    } else {
+        if !next.ends_with('\n') {
+            next.push('\n');
+        }
+        next.push('\n');
+        next.push_str(GITIGNORE_BLOCK);
+    }
+    std::fs::write(&path, next).map_err(|e| e.to_string())?;
+    Ok(Some(path))
 }
 
 /// Write/merge the bounded CCE block into `<dir>/CLAUDE.md` (idempotent). If the
@@ -449,6 +511,102 @@ mod tests {
         assert!(claude.contains(CLAUDE_BEGIN));
         assert!(claude.contains("PREFER `context_search`"));
         assert!(!claude.contains("### Output compression"), "off must add no output rules");
+    }
+
+    #[test]
+    fn init_adds_cce_to_gitignore_in_a_git_repo_and_is_idempotent() {
+        // Issue #24 team-wide fix: `cce init` in a git repo writes the "ignore
+        // contents, keep one file" block so no one commits their local cache while
+        // the shared `.cce/workspace.yml` stays committable. Idempotent: a second
+        // run must not duplicate the block.
+        let tmp = tempfile::tempdir().unwrap();
+        write_tiny_repo(tmp.path());
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap(); // mark as a git repo
+
+        run(&opts(tmp.path())).unwrap();
+        let gi_path = tmp.path().join(".gitignore");
+        let gi1 = std::fs::read_to_string(&gi_path).unwrap();
+        assert!(gi1.lines().any(|l| l == ".cce/*"), "must ignore the cache contents (`.cce/*`)");
+        assert!(
+            gi1.lines().any(|l| l == "!.cce/workspace.yml"),
+            "must re-include the shared workspace.yml"
+        );
+
+        run(&opts(tmp.path())).unwrap();
+        let gi2 = std::fs::read_to_string(&gi_path).unwrap();
+        assert_eq!(gi1, gi2, ".gitignore must be idempotent across runs");
+        assert_eq!(gi2.matches(".cce/*").count(), 1, "must not duplicate the `.cce/*` rule");
+        assert_eq!(
+            gi2.matches("!.cce/workspace.yml").count(),
+            1,
+            "must not duplicate the workspace.yml re-include"
+        );
+    }
+
+    #[test]
+    fn init_gitignore_block_keeps_workspace_yml_committable_but_ignores_the_cache() {
+        // Behavioural proof against a REAL, hermetic git repo: the `.cce/*` +
+        // `!.cce/workspace.yml` block must let git commit the SHARED
+        // `.cce/workspace.yml` while still ignoring the local cache
+        // (`.cce/index.json`). Machine-local git config (which on some dev boxes
+        // itself excludes `.cce/`) is neutralised so the written `.gitignore` alone
+        // decides — the same reason `.cce/` blanket ignores broke workspace sync.
+        use std::process::Command;
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        let git = |args: &[&str]| {
+            Command::new("git")
+                .args(args)
+                .current_dir(root)
+                .env("GIT_CONFIG_GLOBAL", "/dev/null")
+                .env("GIT_CONFIG_SYSTEM", "/dev/null")
+                .output()
+                .expect("git runs")
+        };
+        assert!(git(&["init", "-q"]).status.success(), "git init");
+        write_tiny_repo(root);
+        run(&opts(root)).unwrap();
+
+        // `git check-ignore -q` exits 0 when the path IS ignored, non-0 when NOT.
+        std::fs::create_dir_all(root.join(".cce")).unwrap();
+        std::fs::write(root.join(".cce/workspace.yml"), "members: []\n").unwrap();
+        std::fs::write(root.join(".cce/index.json"), "{}\n").unwrap();
+
+        assert!(
+            !git(&["check-ignore", "-q", ".cce/workspace.yml"]).status.success(),
+            ".cce/workspace.yml must stay committable (NOT ignored)"
+        );
+        assert!(
+            git(&["check-ignore", "-q", ".cce/index.json"]).status.success(),
+            ".cce/index.json (local cache) MUST be ignored"
+        );
+    }
+
+    #[test]
+    fn init_preserves_existing_gitignore_and_does_not_duplicate() {
+        // An existing `.gitignore` is appended to, not clobbered; and if a blanket
+        // `.cce` rule already exists it is treated as handled — no block is added
+        // (migrating an older layout is not required, just don't double-add).
+        let tmp = tempfile::tempdir().unwrap();
+        write_tiny_repo(tmp.path());
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        std::fs::write(tmp.path().join(".gitignore"), "node_modules/\n.cce\n").unwrap();
+
+        run(&opts(tmp.path())).unwrap();
+        let gi = std::fs::read_to_string(tmp.path().join(".gitignore")).unwrap();
+        assert!(gi.contains("node_modules/"), "existing rules preserved");
+        // A blanket `.cce` was already present → no `.cce/*` block appended.
+        assert!(!gi.contains(".cce/*"), "must not add a new block when `.cce` already present");
+    }
+
+    #[test]
+    fn init_does_not_write_gitignore_outside_a_git_repo() {
+        // With no `.git`, there is no sha to be builder-independent against, so
+        // `cce init` must not create a `.gitignore`.
+        let tmp = tempfile::tempdir().unwrap();
+        write_tiny_repo(tmp.path());
+        run(&opts(tmp.path())).unwrap();
+        assert!(!tmp.path().join(".gitignore").exists(), "no .gitignore outside a git repo");
     }
 
     #[test]
