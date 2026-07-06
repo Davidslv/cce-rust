@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Automated, tag-driven releases.** Pushing a `vX.Y.Z` tag now re-runs every CI gate on the tagged
+  commit, verifies the tag matches `Cargo.toml` and that this file has a matching section, builds
+  release binaries for macOS (arm64/x86_64) and Linux (x86_64/arm64), and publishes a GitHub Release
+  with this file's section as the notes plus a `SHA256SUMS`. Process documented in `RELEASING.md`;
+  README gains a prebuilt-binary install path. (Repo infrastructure — the `cce` binary is unchanged.)
+
 ## [2.6.5] - 2026-07-06
 
 ### Fixed
