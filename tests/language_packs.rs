@@ -104,7 +104,7 @@ fn kind_survives_persistence_and_reaches_search() {
     // index → persist → load (fresh Index) → search, and the kind is carried the
     // whole way (SPEC-V2 §3).
     let e = HashEmbedder;
-    let (idx, _) = Index::build_from_dir(&samples_dir(), &e);
+    let (idx, _) = Index::build_from_dir(&samples_dir(), &e).unwrap();
     assert!(idx.chunks.iter().all(|c| !c.kind.is_empty()));
 
     let tmp = tempfile::tempdir().unwrap();

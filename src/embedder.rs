@@ -32,12 +32,26 @@ pub fn fnv1a64(bytes: &[u8]) -> u64 {
 
 /// The embedding backend interface. Backends must be interchangeable (SPEC §11).
 pub trait Embedder {
-    /// Embed a single text into an `EMBED_DIM` vector.
+    /// Embed a single text — the infallible query-time path. The deterministic
+    /// hash backend cannot fail; a fallible backend (Ollama) must make any
+    /// failure **visible** (it warns on stderr and returns an empty vector,
+    /// which contributes zero vector signal). The indexing path must never use
+    /// this method: it calls [`Embedder::try_embed`] and aborts on error, so a
+    /// store can never silently persist empty embeddings (issue #30).
     fn embed(&self, text: &str) -> Vec<f64>;
 
-    /// Embed a batch; default maps `embed` over the inputs.
-    fn embed_batch(&self, texts: &[String]) -> Vec<Vec<f64>> {
-        texts.iter().map(|t| self.embed(t)).collect()
+    /// Fallible single embed — the indexing path. Default wraps `embed`
+    /// (the hash backend cannot fail); fallible backends override it to
+    /// propagate the real error instead of degrading.
+    fn try_embed(&self, text: &str) -> Result<Vec<f64>, String> {
+        Ok(self.embed(text))
+    }
+
+    /// Fallible batch embed; default maps `try_embed` over the inputs. There is
+    /// deliberately NO infallible batch API: a batch failure must surface as an
+    /// `Err`, never as silently empty vectors (issue #30).
+    fn try_embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f64>>, String> {
+        texts.iter().map(|t| self.try_embed(t)).collect()
     }
 
     /// Human-readable backend name (for stats / reporting).
@@ -81,19 +95,56 @@ pub struct OllamaEmbedder {
 }
 
 impl Default for OllamaEmbedder {
+    /// Defaults to `http://localhost:11434` / `nomic-embed-text`; both are
+    /// overridable via the `CCE_OLLAMA_URL` and `CCE_OLLAMA_MODEL` environment
+    /// variables (also what keeps the Ollama failure tests hermetic).
     fn default() -> Self {
         OllamaEmbedder {
-            base_url: "http://localhost:11434".to_string(),
-            model: "nomic-embed-text".to_string(),
+            base_url: std::env::var("CCE_OLLAMA_URL")
+                .unwrap_or_else(|_| "http://localhost:11434".to_string()),
+            model: std::env::var("CCE_OLLAMA_MODEL")
+                .unwrap_or_else(|_| "nomic-embed-text".to_string()),
         }
     }
 }
 
 impl OllamaEmbedder {
-    /// Try to embed a batch of texts via `POST /api/embed`. Returns Err on any
-    /// network/protocol error so callers can fall back to the hash embedder.
-    pub fn try_embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f64>>, String> {
-        // Truncate to ~2000 chars; keep empties as empty strings (skipped below).
+    /// Health check: attempt to embed a trivial input.
+    pub fn healthy(&self) -> bool {
+        self.try_embed_batch(&["ping".to_string()]).is_ok()
+    }
+}
+
+impl Embedder for OllamaEmbedder {
+    /// Query-time embed. A failure here is made visible (a stderr warning) and
+    /// yields an empty vector — zero vector signal for this one query. The
+    /// indexing path never uses this: it calls `try_embed` and aborts (#30).
+    fn embed(&self, text: &str) -> Vec<f64> {
+        match self.try_embed(text) {
+            Ok(v) => v,
+            Err(e) => {
+                eprintln!("warning: {e}; vector recall disabled for this query");
+                Vec::new()
+            }
+        }
+    }
+
+    /// Fallible single embed via the batch endpoint. Empty text embeds to an
+    /// empty vector without a request (SPEC §11: skip empty inputs).
+    fn try_embed(&self, text: &str) -> Result<Vec<f64>, String> {
+        if text.is_empty() {
+            return Ok(Vec::new());
+        }
+        let mut out = self.try_embed_batch(&[text.to_string()])?;
+        out.pop().ok_or_else(|| "ollama returned no embedding".to_string())
+    }
+
+    /// Embed a batch of texts via `POST /api/embed`. Returns `Err` on any
+    /// network/protocol error, on a count mismatch, or if the server returns an
+    /// empty embedding for a non-empty input — it NEVER degrades to empty
+    /// vectors (issue #30); callers decide loudly what an error means.
+    fn try_embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f64>>, String> {
+        // Truncate to ~2000 chars; keep empties as empty strings (SPEC §11).
         let inputs: Vec<String> =
             texts.iter().map(|t| t.chars().take(2000).collect::<String>()).collect();
         let body = serde_json::json!({ "model": self.model, "input": inputs });
@@ -106,33 +157,25 @@ impl OllamaEmbedder {
             .get("embeddings")
             .and_then(|v| v.as_array())
             .ok_or_else(|| "ollama response missing .embeddings".to_string())?;
+        if embs.len() != texts.len() {
+            return Err(format!(
+                "ollama returned {} embedding(s) for {} input(s)",
+                embs.len(),
+                texts.len()
+            ));
+        }
         let mut out = Vec::with_capacity(embs.len());
-        for e in embs {
+        for (e, text) in embs.iter().zip(texts) {
             let vec: Vec<f64> = e
                 .as_array()
                 .map(|a| a.iter().filter_map(|x| x.as_f64()).collect())
                 .unwrap_or_default();
+            if vec.is_empty() && !text.is_empty() {
+                return Err("ollama returned an empty embedding for a non-empty input".to_string());
+            }
             out.push(vec);
         }
         Ok(out)
-    }
-
-    /// Health check: attempt to embed a trivial input.
-    pub fn healthy(&self) -> bool {
-        self.try_embed_batch(&["ping".to_string()]).is_ok()
-    }
-}
-
-impl Embedder for OllamaEmbedder {
-    fn embed(&self, text: &str) -> Vec<f64> {
-        if text.is_empty() {
-            return Vec::new();
-        }
-        self.try_embed_batch(&[text.to_string()]).ok().and_then(|mut v| v.pop()).unwrap_or_default()
-    }
-
-    fn embed_batch(&self, texts: &[String]) -> Vec<Vec<f64>> {
-        self.try_embed_batch(texts).unwrap_or_else(|_| texts.iter().map(|_| Vec::new()).collect())
     }
 
     fn name(&self) -> &'static str {
@@ -259,17 +302,19 @@ mod tests {
     }
 
     #[test]
-    fn hash_embed_batch_uses_default_trait_impl() {
-        // HashEmbedder does not override embed_batch, so this exercises the
-        // default trait method that maps `embed` over the inputs.
+    fn hash_try_embed_batch_uses_default_trait_impl() {
+        // HashEmbedder does not override try_embed/try_embed_batch, so this
+        // exercises the default trait methods that map `embed` over the inputs
+        // (infallible for the hash backend).
         let e = HashEmbedder;
-        let out = e.embed_batch(&["one".to_string(), "two".to_string()]);
+        let out = e.try_embed_batch(&["one".to_string(), "two".to_string()]).unwrap();
         assert_eq!(out.len(), 2);
         assert_eq!(out[0], e.embed("one"));
         assert_eq!(out[1], e.embed("two"));
+        assert_eq!(e.try_embed("one").unwrap(), e.embed("one"));
     }
 
-    // --- Ollama graceful-failure path (hermetic: no server, connection refused) ---
+    // --- Ollama loud-failure path (hermetic: no server, connection refused) ---
 
     /// An OllamaEmbedder pointed at a closed local port. Port 1 is never open,
     /// so every request is refused immediately — no real server is contacted.
@@ -304,18 +349,33 @@ mod tests {
     fn ollama_embed_empty_text_is_empty_without_request() {
         // Empty text returns early, so no request is attempted at all.
         assert!(unreachable_ollama().embed("").is_empty());
+        assert!(unreachable_ollama().try_embed("").unwrap().is_empty());
     }
 
     #[test]
-    fn ollama_embed_falls_back_to_empty_on_failure() {
-        assert!(unreachable_ollama().embed("nonempty").is_empty());
+    fn ollama_try_embed_propagates_the_error_not_an_empty_vector() {
+        // Issue #30: the indexing path uses try_embed, which must surface the
+        // failure as an Err — never a silently-empty embedding.
+        let err = unreachable_ollama().try_embed("nonempty").expect_err("closed port must fail");
+        assert!(err.contains("ollama request failed"), "unexpected error: {err}");
     }
 
     #[test]
-    fn ollama_embed_batch_falls_back_to_empty_vecs_on_failure() {
+    fn ollama_batch_failure_is_an_error_never_empty_vectors() {
+        // Issue #30: there is no infallible batch API left — a batch failure is
+        // an Err, so no caller can receive per-text empty vectors.
         let oll = unreachable_ollama();
-        let out = oll.embed_batch(&["a".to_string(), "b".to_string()]);
-        assert_eq!(out.len(), 2);
-        assert!(out.iter().all(|v| v.is_empty()));
+        let err = oll
+            .try_embed_batch(&["a".to_string(), "b".to_string()])
+            .expect_err("closed port must fail");
+        assert!(err.contains("ollama request failed"), "unexpected error: {err}");
+    }
+
+    #[test]
+    fn ollama_query_time_embed_is_empty_but_warned_on_failure() {
+        // The one remaining degradation point: the infallible query-time embed
+        // returns an empty vector (zero vector signal) and warns on stderr. It
+        // is unreachable from the indexing path, which aborts via try_embed.
+        assert!(unreachable_ollama().embed("nonempty").is_empty());
     }
 }

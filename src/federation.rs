@@ -266,6 +266,27 @@ pub fn federated_search_over(
     results.into_iter().enumerate().map(|(i, r)| fed_result(i + 1, r, &package_of)).collect()
 }
 
+/// Explicit keyword-only federated retrieval (issue #30): BM25 over the union
+/// corpus, member-tagged, no embeddings touched. The workspace twin of
+/// [`crate::retriever::bm25_only_search`], used when the members were indexed
+/// with a model-based embedder (Ollama) that is unavailable at query time —
+/// never cosine across two embedding spaces. No graph expansion (it is
+/// cosine-driven). `combined` MUST be `combined_index(members)`.
+pub fn federated_bm25_only_search(
+    combined: &Index,
+    members: &[MemberStore],
+    query: &str,
+    top_k: usize,
+) -> Vec<FedResult> {
+    let package_of: BTreeMap<String, String> =
+        members.iter().map(|m| (m.name.clone(), m.package.clone())).collect();
+    crate::retriever::bm25_only_search(combined, query, top_k)
+        .into_iter()
+        .enumerate()
+        .map(|(i, r)| fed_result(i + 1, r, &package_of))
+        .collect()
+}
+
 /// The distinct members of the top (≤3) results, order-preserving.
 fn top_result_members(results: &[SearchResult]) -> Vec<String> {
     let mut out: Vec<String> = Vec::new();
@@ -496,7 +517,7 @@ mod tests {
         let e = HashEmbedder;
         for m in &manifest.members {
             let member_dir = root.join(&m.path);
-            let (idx, _) = Index::build_from_dir(&member_dir, &e);
+            let (idx, _) = Index::build_from_dir(&member_dir, &e).unwrap();
             idx.save(&default_store_path(&member_dir)).unwrap();
         }
         let members = load_member_stores(root, &manifest, None).unwrap();
@@ -528,7 +549,7 @@ mod tests {
             let store = default_store_path(&member_dir);
             let federated_bytes = std::fs::read(&store).unwrap();
             // Standalone index of the same dir, written elsewhere.
-            let (idx, _) = Index::build_from_dir(&member_dir, &e);
+            let (idx, _) = Index::build_from_dir(&member_dir, &e).unwrap();
             let alt = tmp.path().join(format!("{}-standalone.json", m.name));
             idx.save(&alt).unwrap();
             let standalone_bytes = std::fs::read(&alt).unwrap();
@@ -620,7 +641,7 @@ mod tests {
         let e = HashEmbedder;
         for m in &manifest.members {
             let dir = tmp.path().join(&m.path);
-            let (idx, _) = Index::build_from_dir(&dir, &e);
+            let (idx, _) = Index::build_from_dir(&dir, &e).unwrap();
             idx.save(&default_store_path(&dir)).unwrap();
         }
         // Sanity: the member is named `store` but its package is `acme-store`.

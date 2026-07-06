@@ -167,7 +167,8 @@ pub fn run(repo_dir: &Path, commit: &str, corpus_name: &str, language: &str) -> 
     // becomes a fallback `module` chunk. No extension pre-filter, so both language
     // implementations index the identical file set.
     let t0 = Instant::now();
-    let (index, stats) = Index::build_from_dir(repo_dir, &embedder);
+    let (index, stats) =
+        Index::build_from_dir(repo_dir, &embedder).expect("hash embedder cannot fail");
     let index_seconds = t0.elapsed().as_secs_f64();
     let total_chunks = stats.total_chunks;
     let total_files = stats.files_indexed;

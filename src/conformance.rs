@@ -45,7 +45,8 @@ struct Conformance {
 /// Build the v2 conformance JSON string for a fixture directory. Deterministic.
 pub fn generate(fixture_dir: &Path) -> String {
     let embedder = HashEmbedder;
-    let (index, _) = Index::build_from_dir(fixture_dir, &embedder);
+    let (index, _) =
+        Index::build_from_dir(fixture_dir, &embedder).expect("hash embedder cannot fail");
 
     let mut chunks: Vec<ChunkOut> = index
         .chunks

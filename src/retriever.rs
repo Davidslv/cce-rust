@@ -216,6 +216,36 @@ pub fn search(
     results
 }
 
+/// Explicit keyword-only retrieval: rank by BM25 alone, no embeddings touched.
+///
+/// Used when a store was built with a model-based embedder (Ollama) that is
+/// unavailable at query time (issue #30): embedding the query with a different
+/// backend would cosine across two unrelated vector spaces, so instead the
+/// caller degrades EXPLICITLY to this BM25-only ranking (and says so). Scores
+/// are raw BM25 (not the §6 blended scale); ordering is deterministic (rounded
+/// score desc, `chunk_id` asc — the same tie rule as SPEC §6.6). No vector
+/// candidates, no confidence blend, no graph expansion.
+pub fn bm25_only_search(index: &Index, query: &str, top_k: usize) -> Vec<SearchResult> {
+    let query_tokens = tokenize(query);
+    if query_tokens.is_empty() || index.chunks.is_empty() {
+        return Vec::new();
+    }
+    let unique_q: Vec<String> = {
+        let mut seen = HashSet::new();
+        query_tokens.iter().filter(|t| seen.insert((*t).clone())).cloned().collect()
+    };
+    let ranked = index.bm25.score(&unique_q);
+    let mut results: Vec<SearchResult> = ranked
+        .iter()
+        .take(top_k)
+        .map(|(idx, score)| result_from(&index.chunks[*idx], *score))
+        .collect();
+    for (i, r) in results.iter_mut().enumerate() {
+        r.rank = i + 1;
+    }
+    results
+}
+
 /// The core §6 ranking (embed → candidates → RRF → confidence → penalty →
 /// diversity cap → top-K), WITHOUT graph expansion and WITHOUT assigning final
 /// ranks. Exposed so federated search (SPEC-V2.2 §6) can run the identical
@@ -437,7 +467,7 @@ mod tests {
     fn fixture_index() -> Index {
         let e = HashEmbedder;
         let dir = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/test/fixture/base"));
-        Index::build_from_dir(&dir, &e).0
+        Index::build_from_dir(&dir, &e).unwrap().0
     }
 
     #[test]
@@ -523,6 +553,27 @@ mod tests {
         assert!(with_graph.len() >= no_graph.len());
         // With graph enabled, an auth.py chunk should appear as a bonus.
         assert!(with_graph.iter().any(|r| r.file_path == "auth.py"));
+    }
+
+    #[test]
+    fn bm25_only_search_is_keyword_ranked_and_deterministic() {
+        // Issue #30: the explicit degraded mode for an ollama-built store with
+        // Ollama down — keyword hits only, no embeddings read, stable order.
+        let idx = fixture_index();
+        let res = bm25_only_search(&idx, "hash password", 5);
+        assert!(!res.is_empty());
+        assert_eq!(res[0].file_path, "auth.py");
+        assert_eq!(res[0].rank, 1);
+        assert!(res.iter().any(|r| r.content.contains("def hash_password")));
+        let res2 = bm25_only_search(&idx, "hash password", 5);
+        let a: Vec<(String, i64)> =
+            res.iter().map(|r| (r.chunk_id.clone(), score_key(r.score))).collect();
+        let b: Vec<(String, i64)> =
+            res2.iter().map(|r| (r.chunk_id.clone(), score_key(r.score))).collect();
+        assert_eq!(a, b);
+        // Empty / no-overlap queries return empty, like the main pipeline.
+        assert!(bm25_only_search(&idx, "", 5).is_empty());
+        assert!(bm25_only_search(&idx, "zzz qqq xxx", 5).is_empty());
     }
 
     #[test]

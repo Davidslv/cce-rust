@@ -120,7 +120,7 @@ fn ensure_hash_index(root: &Path, sha: &str) -> Result<Index, String> {
     // Always rebuild from the working tree so the export is exactly build(sha), never a
     // stale/foreign/pulled index.json. Use the same build path `cce index`/verify use.
     eprintln!("rebuilding index for {sha}");
-    let (idx, _) = Index::build_protected(root, &HashEmbedder, |_| true, true);
+    let (idx, _) = Index::build_protected(root, &HashEmbedder, |_| true, true)?;
     Ok(idx)
 }
 
@@ -475,7 +475,7 @@ pub fn cmd_verify(root: &Path, commit: Option<String>) -> Result<String, String>
     };
 
     // Rebuild locally from the working tree and export at the same identity.
-    let (index, _) = Index::build_protected(root, &HashEmbedder, |_| true, true);
+    let (index, _) = Index::build_protected(root, &HashEmbedder, |_| true, true)?;
     let meta = ManifestMeta { repo_id: repo_id.clone(), sha: sha.clone() };
     let rebuilt = Artifact::from_index(&index, meta);
     let actual = rebuilt.manifest.checksum;
@@ -617,7 +617,7 @@ mod tests {
         assert!(out.contains("matches — pulled index used as-is"), "got: {out}");
 
         // The pulled store is byte-identical to a fresh local hash index of src.
-        let (local, _) = Index::build_protected(src.path(), &HashEmbedder, |_| true, true);
+        let (local, _) = Index::build_protected(src.path(), &HashEmbedder, |_| true, true).unwrap();
         let pulled = Index::load(&default_store_path(dst.path())).unwrap();
         assert_eq!(pulled.chunks.len(), local.chunks.len());
         assert_eq!(pulled.file_imports, local.file_imports);
@@ -685,7 +685,8 @@ mod tests {
         let src = source_repo();
         init_cfg(src.path(), &url);
         // Plant an ollama-embedder store so ensure_hash_index refuses.
-        let (mut idx, _) = Index::build_protected(src.path(), &HashEmbedder, |_| true, true);
+        let (mut idx, _) =
+            Index::build_protected(src.path(), &HashEmbedder, |_| true, true).unwrap();
         idx.embedder_name = "ollama".to_string();
         idx.save(&default_store_path(src.path())).unwrap();
         let err = cmd_push(src.path(), None, false).unwrap_err();
@@ -938,7 +939,7 @@ mod tests {
         let ver = SYNC_FORMAT_VERSION.to_string();
 
         // The correct artifact checksum: a fresh build of the working tree.
-        let (fresh, _) = Index::build_protected(src.path(), &HashEmbedder, |_| true, true);
+        let (fresh, _) = Index::build_protected(src.path(), &HashEmbedder, |_| true, true).unwrap();
         let fresh_checksum = Artifact::from_index(
             &fresh,
             ManifestMeta { repo_id: repo_id.to_string(), sha: sha.clone() },
@@ -951,7 +952,8 @@ mod tests {
         // it a *hash* index so the non-hash refusal does not short-circuit the push.
         // (The deterministic hash build reproduces `fresh` exactly, so this is a
         // faithful copy with one chunk perturbed.)
-        let (mut foreign, _) = Index::build_protected(src.path(), &HashEmbedder, |_| true, true);
+        let (mut foreign, _) =
+            Index::build_protected(src.path(), &HashEmbedder, |_| true, true).unwrap();
         assert!(!foreign.chunks.is_empty());
         foreign.chunks[0].content.push_str("\n# stale foreign bytes from an older engine\n");
         let planted_checksum = Artifact::from_index(
@@ -1000,7 +1002,7 @@ mod tests {
         let pointer = pointer_address(HASH_EMBEDDER, &ver, repo_id, crate::sync::DEFAULT_REF);
 
         // The correct build(sha) checksum.
-        let (fresh, _) = Index::build_protected(src.path(), &HashEmbedder, |_| true, true);
+        let (fresh, _) = Index::build_protected(src.path(), &HashEmbedder, |_| true, true).unwrap();
         let correct = Artifact::from_index(
             &fresh,
             ManifestMeta { repo_id: repo_id.to_string(), sha: sha.clone() },
@@ -1011,7 +1013,8 @@ mod tests {
         // Seed the remote with a STALE artifact under the sha key (simulating a cache
         // built by an older/sibling engine: bytes that differ from build(sha)). The
         // deterministic hash build reproduces `fresh`; we perturb one chunk.
-        let (mut stale_idx, _) = Index::build_protected(src.path(), &HashEmbedder, |_| true, true);
+        let (mut stale_idx, _) =
+            Index::build_protected(src.path(), &HashEmbedder, |_| true, true).unwrap();
         stale_idx.chunks[0].content.push_str("\n# stale cache from an older cce version\n");
         let stale_artifact = Artifact::from_index(
             &stale_idx,
