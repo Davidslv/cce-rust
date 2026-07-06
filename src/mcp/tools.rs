@@ -38,7 +38,7 @@ use crate::chunker::{token_count, Chunk};
 use crate::compress::{compress, DetailLevel};
 use crate::config::{KnowledgeConfig, MemoryConfig, OutputLevel, RetrievalConfig, CHARS_PER_TOKEN};
 use crate::embedder::{format6, score_key, Embedder, HashEmbedder, OllamaEmbedder};
-use crate::federation::{combined_index, federated_search, load_member_stores, workspace_stats};
+use crate::federation::{federated_search_over, load_member_stores, workspace_stats, CachedWorkspace};
 use crate::knowledge::{search_knowledge, same_document_sections, KnowledgeHit, KnowledgeStore};
 use crate::mcp::server::McpServer;
 use crate::mcp::MCP_DEFAULT_TOP_K;
@@ -53,6 +53,7 @@ use crate::workspace::{Manifest, WorkspaceGraph};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::time::Instant;
 
 /// The `context_search` description (SPEC-V2.5 §6 + SPEC-V2.5-TUNING §B): core
@@ -409,11 +410,15 @@ fn context_search_workspace(
     let scope = package.map(|p| {
         p.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>()
     });
-    let members = match load_member_stores(&root, &manifest, scope.as_deref()) {
-        Ok(m) => m,
+    // Cached federated union (issue #26): built once per scope, reused across calls, and
+    // shared as the metrics baseline below — so a warm workspace search matches the CLI.
+    let bundle = match server.workspace_bundle(&manifest, scope.as_deref()) {
+        Ok(b) => b,
         // Unknown package or an unindexed member: surface the guidance, not a crash.
         Err(e) => return ToolOutput::ok(e),
     };
+    let members = &bundle.members;
+    let combined = &bundle.combined;
     let graph = WorkspaceGraph::load_or_empty(&root, &manifest);
 
     let uses_ollama = members.iter().any(|m| m.index.embedder_name == "ollama");
@@ -429,12 +434,13 @@ fn context_search_workspace(
     };
 
     let start = Instant::now();
-    let results = federated_search(&members, &graph, emb.as_ref(), query, top_k, !no_graph);
+    let results =
+        federated_search_over(combined, members, &graph, emb.as_ref(), query, top_k, !no_graph);
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     // Metrics: log a search event beside the workspace-root store so the root
-    // `cce dashboard` sees agent usage. Baseline/served tokens come from the union.
-    let combined = combined_index(&members);
+    // `cce dashboard` sees agent usage. Baseline/served tokens come from the (cached)
+    // union — no second assembly.
     let namespaced: Vec<SearchResult> = results
         .iter()
         .map(|r| SearchResult {
@@ -450,7 +456,7 @@ fn context_search_workspace(
         })
         .collect();
     let record = build_search_record(
-        &combined,
+        combined,
         &namespaced,
         query,
         top_k,
@@ -636,10 +642,13 @@ fn gather_code_hits_workspace(
     let scope = p.package.as_ref().map(|p| {
         p.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>()
     });
-    let members = match load_member_stores(&root, &manifest, scope.as_deref()) {
-        Ok(m) => m,
+    // Cached federated union (issue #26): same bundle the code-only path uses.
+    let bundle = match server.workspace_bundle(&manifest, scope.as_deref()) {
+        Ok(b) => b,
         Err(_) => return (Vec::new(), None, 0),
     };
+    let members = &bundle.members;
+    let combined = &bundle.combined;
     let graph = WorkspaceGraph::load_or_empty(&root, &manifest);
     let uses_ollama = members.iter().any(|m| m.index.embedder_name == "ollama");
     let emb: Box<dyn Embedder> = if uses_ollama {
@@ -653,9 +662,9 @@ fn gather_code_hits_workspace(
         Box::new(HashEmbedder)
     };
     let start = Instant::now();
-    let results = federated_search(&members, &graph, emb.as_ref(), query, p.top_k, !p.no_graph);
+    let results =
+        federated_search_over(combined, members, &graph, emb.as_ref(), query, p.top_k, !p.no_graph);
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
-    let combined = combined_index(&members);
     let namespaced: Vec<SearchResult> = results
         .iter()
         .map(|r| SearchResult {
@@ -671,7 +680,7 @@ fn gather_code_hits_workspace(
         })
         .collect();
     let record = build_search_record(
-        &combined,
+        combined,
         &namespaced,
         query,
         p.top_k,
@@ -1213,17 +1222,39 @@ pub fn summarize_context(server: &McpServer, args: &Value) -> ToolOutput {
 
 // --- Layer 7: progressive disclosure (expand_chunk / related_context) ---
 
+/// The read-only index expand/related work over: an owned single-repo store, or the
+/// server-cached federated union (shared, so a chunk_id from a workspace
+/// `context_search` resolves without re-federating). Both expose `&Index` via
+/// [`WorkingIndex::index`].
+enum WorkingIndex {
+    Single(Box<Index>),
+    Workspace(Rc<CachedWorkspace>),
+}
+
+impl WorkingIndex {
+    fn index(&self) -> &Index {
+        match self {
+            WorkingIndex::Single(i) => i.as_ref(),
+            WorkingIndex::Workspace(w) => &w.combined,
+        }
+    }
+}
+
 /// Resolve the read-only index that expand/related work over: the single-repo store,
 /// or the member-namespaced union in workspace mode (so a chunk_id from a workspace
-/// `context_search` resolves). A missing index yields the friendly guidance string.
-fn working_index(server: &McpServer) -> Result<Index, String> {
+/// `context_search` resolves). In workspace mode it reuses the server's cached union
+/// (issue #26) instead of re-loading and re-assembling every call. A missing index
+/// yields the friendly guidance string.
+fn working_index(server: &McpServer) -> Result<WorkingIndex, String> {
     if server.is_workspace() {
         let root = server.root();
         let manifest = Manifest::load(&root).map_err(|_| missing_index_message(true))?;
-        let members = load_member_stores(&root, &manifest, None)?;
-        Ok(combined_index(&members))
+        let bundle = server.workspace_bundle(&manifest, None)?;
+        Ok(WorkingIndex::Workspace(bundle))
     } else {
-        Index::load(&server.store_path()).map_err(|_| missing_index_message(false))
+        Index::load(&server.store_path())
+            .map(|i| WorkingIndex::Single(Box::new(i)))
+            .map_err(|_| missing_index_message(false))
     }
 }
 
@@ -1298,7 +1329,8 @@ pub fn expand_chunk(server: &McpServer, args: &Value) -> ToolOutput {
     server.record_expand(chunk_id, scope);
     let code_index = working_index(server);
     // Code chunk first — unchanged behaviour for a code chunk_id.
-    if let Ok(index) = &code_index {
+    if let Ok(wi) = &code_index {
+        let index = wi.index();
         if let Some(target) = index.chunks.iter().find(|c| c.chunk_id == chunk_id) {
             return match scope {
                 // scope=body recovers the EXACT full body (round-trips `detail:full`).
@@ -1419,7 +1451,8 @@ pub fn related_context(server: &McpServer, args: &Value) -> ToolOutput {
     // L6: record the well-formed related_context call in the session ledger.
     server.record_related(chunk_id);
     let code_index = working_index(server);
-    if let Ok(index) = &code_index {
+    if let Ok(wi) = &code_index {
+        let index = wi.index();
         if let Some(target) = index.chunks.iter().find(|c| c.chunk_id == chunk_id) {
             let mut ns = neighbor_chunks(index, &target.file_path);
             ns.truncate(top_k);

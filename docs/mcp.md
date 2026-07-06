@@ -339,6 +339,32 @@ search. `index_status` reports per-member counts and the dependency graph.
 Metrics for a workspace session land in the workspace-root `.cce/metrics.jsonl`, so
 `cce dashboard --workspace` sees agent usage across the ecosystem.
 
+### Scope large workspaces with `package` (recommended)
+
+For a large multi-repo workspace, pass `package` to `context_search` (and `--package`
+to `cce search --workspace`) to scope the search to one or more members instead of the
+whole union:
+
+```json
+{ "name": "context_search",
+  "arguments": { "query": "how are invoices charged", "package": "billing" } }
+```
+
+**Why it matters (issue #26).** A federated search is the standard retrieval run over
+the *union* of the members' chunks, so its cost scales with the total corpus. Scoping
+to `package` loads and searches **only the named members**, so latency tracks that
+member's size rather than the whole ecosystem's — the single most effective lever on a
+large workspace. `package` accepts a **member name** or a member's **`package:` field**
+from `workspace.yml`; an unknown value returns an actionable error listing the
+available members (never a silent empty result). Comma-separate to scope to several
+members (`"package": "billing,payments"`).
+
+The long-lived MCP server **caches the assembled union per scope** for its lifetime, so
+the first `context_search` in a scope pays the federation cost and subsequent calls
+reuse it — a warm workspace search is as fast as a single-repo one. The index is warmed
+once via CCE Sync at startup (never mid-session), so the cache is always consistent;
+after a fresh remote build, restart `cce mcp` to pick it up.
+
 ---
 
 ## Freshness via CCE Sync

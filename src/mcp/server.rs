@@ -19,6 +19,7 @@
 //!   an absent remote, or an offline network.
 
 use crate::config::{OutputConfig, OutputLevel, SummarizationConfig, METRICS_FILE};
+use crate::federation::{load_cached_workspace, CachedWorkspace};
 use crate::mcp::protocol::{self, Request};
 use crate::mcp::tools;
 use crate::mcp::{MCP_PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION};
@@ -27,10 +28,13 @@ use crate::store::{default_metrics_path, default_store_path};
 use crate::sync::commands::{cmd_pull, PullTarget};
 use crate::sync::config::SyncConfig;
 use crate::tokenizer::estimate_tokens;
+use crate::workspace::Manifest;
 use serde_json::{json, Value};
 use std::cell::{Cell, RefCell};
+use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 
 /// The resolved context for a CCE MCP session (SPEC-MCP §"The server").
 pub struct McpServer {
@@ -61,6 +65,15 @@ pub struct McpServer {
     /// one `cce.tokens/v1` estimator over every tool's returned text (SPEC-V2.5 §4).
     /// Deterministic given the call sequence; backs the auto-summarize threshold.
     served_tokens: Cell<u64>,
+    /// Federated-workspace cache (issue #26), keyed by scope. Assembling the union of
+    /// the members' stores (load + BM25-over-union) is the entire cost of a federated
+    /// query, so the long-lived server builds it once per distinct `--package` scope and
+    /// reuses it across `context_search` calls — a warm workspace call then matches the
+    /// CLI instead of re-federating every time. Lifetime = the server process: the index
+    /// is warmed once via CCE Sync at startup (never mid-session), so the assembled union
+    /// is stable for the session; a fresh index requires restarting `cce mcp`. `RefCell`
+    /// because the stdio loop is single-threaded and every handler takes `&self`.
+    workspace_cache: RefCell<HashMap<String, Rc<CachedWorkspace>>>,
 }
 
 impl McpServer {
@@ -78,7 +91,33 @@ impl McpServer {
             ledger: RefCell::new(SessionLedger::new()),
             auto_tokens,
             served_tokens: Cell::new(0),
+            workspace_cache: RefCell::new(HashMap::new()),
         }
+    }
+
+    /// The assembled federated workspace for `scope` (issue #26), built once per distinct
+    /// scope and cached for the server's lifetime. The first `context_search` in a scope
+    /// pays the load+union cost; later calls reuse the same `CachedWorkspace` (members +
+    /// union index), so a warm federated query is as fast as a single-repo one. `scope`
+    /// is `None` for the whole workspace or the `--package` member list otherwise; the
+    /// cache key is order-sensitive so it maps 1:1 to what `load_member_stores` selects.
+    /// Errors (missing member, unknown package) are NOT cached — they are cheap and may be
+    /// user-fixable mid-session.
+    pub fn workspace_bundle(
+        &self,
+        manifest: &Manifest,
+        scope: Option<&[String]>,
+    ) -> Result<Rc<CachedWorkspace>, String> {
+        let key = match scope {
+            None => "\u{0}all".to_string(),
+            Some(names) => format!("scope\u{0}{}", names.join("\u{0}")),
+        };
+        if let Some(hit) = self.workspace_cache.borrow().get(&key) {
+            return Ok(Rc::clone(hit));
+        }
+        let bundle = Rc::new(load_cached_workspace(&self.root(), manifest, scope)?);
+        self.workspace_cache.borrow_mut().insert(key, Rc::clone(&bundle));
+        Ok(bundle)
     }
 
     /// Whether this session federates over a workspace.
@@ -730,6 +769,88 @@ mod tests {
         assert_eq!(lines.len(), 2, "got: {text}");
         assert!(lines[0].contains("protocolVersion"));
         assert!(lines[1].contains("context_search"));
+    }
+
+    /// Copy the workspace fixture into `root`, write its manifest + graph, and index
+    /// every member — the on-disk shape a `cce mcp --workspace` session reads.
+    fn index_workspace_fixture(root: &Path) {
+        use crate::store::default_store_path;
+        use crate::workspace::{build_graph, build_manifest};
+        let fixture = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/test/fixture/workspace"));
+        for entry in walkdir::WalkDir::new(&fixture).into_iter().flatten() {
+            let rel = entry.path().strip_prefix(&fixture).unwrap();
+            let target = root.join(rel);
+            if entry.file_type().is_dir() {
+                std::fs::create_dir_all(&target).unwrap();
+            } else {
+                std::fs::copy(entry.path(), &target).unwrap();
+            }
+        }
+        let manifest = build_manifest(root);
+        manifest.save(root).unwrap();
+        build_graph(root, &manifest).save(root).unwrap();
+        for m in &manifest.members {
+            let dir = root.join(&m.path);
+            let (idx, _) = Index::build_from_dir(&dir, &HashEmbedder);
+            idx.save(&default_store_path(&dir)).unwrap();
+        }
+    }
+
+    #[test]
+    fn workspace_context_search_is_cached_and_warm_call_is_identical() {
+        let tmp = tempfile::tempdir().unwrap();
+        index_workspace_fixture(tmp.path());
+        let s = McpServer::new(Some(tmp.path().to_path_buf()), None, true);
+        assert!(s.is_workspace());
+
+        let call = || {
+            let resp = s
+                .handle_line(
+                    r#"{"id":1,"method":"tools/call","params":{"name":"context_search","arguments":{"query":"billing charge amount","no_graph":true}}}"#,
+                )
+                .unwrap();
+            let v: Value = serde_json::from_str(&resp).unwrap();
+            v["result"]["content"][0]["text"].as_str().unwrap().to_string()
+        };
+
+        // Cold call federates + caches the union.
+        let cold = call();
+        assert_eq!(s.workspace_cache.borrow().len(), 1, "cold call must cache the union");
+        // Warm call reuses the cached union and returns byte-identical results (minus
+        // the per-call query_id, which is a fresh metrics id — strip it for comparison).
+        let warm = call();
+        assert_eq!(s.workspace_cache.borrow().len(), 1, "warm call must not add a bundle");
+        // Drop the two lines that carry the per-call metrics query_id (a fresh id each
+        // call by design); the ranked result block itself must be byte-identical.
+        let strip = |t: &str| -> String {
+            t.lines()
+                .filter(|l| !l.starts_with("query_id:") && !l.starts_with("Rate this"))
+                .collect::<Vec<_>>()
+                .join("\n")
+        };
+        assert_eq!(strip(&cold), strip(&warm), "warm workspace search must equal the cold one");
+        assert!(cold.contains("billing"), "expected a billing result, got: {cold}");
+    }
+
+    #[test]
+    fn scoped_workspace_search_caches_under_a_distinct_key() {
+        let tmp = tempfile::tempdir().unwrap();
+        index_workspace_fixture(tmp.path());
+        let s = McpServer::new(Some(tmp.path().to_path_buf()), None, true);
+        // A scoped call caches one bundle; the full call caches a second, distinct one.
+        s.handle_line(
+            r#"{"id":1,"method":"tools/call","params":{"name":"context_search","arguments":{"query":"billing charge amount","package":"billing","no_graph":true}}}"#,
+        )
+        .unwrap();
+        s.handle_line(
+            r#"{"id":2,"method":"tools/call","params":{"name":"context_search","arguments":{"query":"billing charge amount","no_graph":true}}}"#,
+        )
+        .unwrap();
+        assert_eq!(
+            s.workspace_cache.borrow().len(),
+            2,
+            "scope and full workspace cache separately"
+        );
     }
 
     #[test]

@@ -42,6 +42,28 @@ pub struct MemberStore {
     pub index: Index,
 }
 
+/// The loaded members for a scope **plus** their assembled union index. This is the
+/// unit the long-lived MCP server caches (issue #26): building the union (loading each
+/// member store + BM25-over-union) is the whole cost of a federated query, so a warm
+/// server reuses it across `context_search` calls instead of re-federating every time.
+/// Immutable once built; the server keeps one per distinct scope.
+pub struct CachedWorkspace {
+    pub members: Vec<MemberStore>,
+    pub combined: Index,
+}
+
+/// Load the in-scope member stores and assemble their union index in one step — the
+/// bundle a caller caches (see [`CachedWorkspace`]).
+pub fn load_cached_workspace(
+    root: &Path,
+    manifest: &Manifest,
+    scope: Option<&[String]>,
+) -> Result<CachedWorkspace, String> {
+    let members = load_member_stores(root, manifest, scope)?;
+    let combined = combined_index(&members);
+    Ok(CachedWorkspace { members, combined })
+}
+
 /// One federated search result, tagged with its member/package. `file_path` is
 /// member-relative (the member namespace is stripped for output).
 #[derive(Debug, Clone, Serialize)]
@@ -75,9 +97,48 @@ fn denamespace(path: &str) -> (&str, &str) {
     }
 }
 
-/// Load the in-scope member stores. `scope` (from `--package`) restricts to the
-/// named members; an unknown name is an error. A member whose store is missing is
-/// an error telling the user to index the workspace.
+/// Resolve one `--package`/`package:` scope token to a member. A token matches by
+/// member **name** first (the historical behaviour, kept byte-identical for existing
+/// name scopes), then by the `package:` field from `workspace.yml` — so scoping by a
+/// package whose name differs from its member id now works instead of failing. An
+/// unmatched token is an error listing what IS available (never a silent empty
+/// result).
+fn resolve_scope_token<'a>(
+    manifest: &'a Manifest,
+    token: &str,
+) -> Result<&'a crate::workspace::Member, String> {
+    if let Some(m) = manifest.members.iter().find(|m| m.name == token) {
+        return Ok(m);
+    }
+    if let Some(m) = manifest.members.iter().find(|m| m.package == token) {
+        return Ok(m);
+    }
+    let available: Vec<String> = manifest
+        .members
+        .iter()
+        .map(|m| {
+            if m.package == m.name {
+                m.name.clone()
+            } else {
+                format!("{} (package {})", m.name, m.package)
+            }
+        })
+        .collect();
+    Err(format!(
+        "unknown member/package '{token}' — available: {}. Scope by a member name or its \
+         workspace.yml `package:` field.",
+        available.join(", ")
+    ))
+}
+
+/// Load the in-scope member stores. `scope` (from `--package`) restricts to the named
+/// members/packages; an unmatched token is an error (never a silent empty result). A
+/// member whose store is missing is an error telling the user to index the workspace.
+///
+/// Member stores are loaded **without** their own BM25 index (graph only): the
+/// federation path scores only the assembled union's BM25 (built once by
+/// [`combined_index`]), so per-member BM25 building would re-tokenize the whole corpus
+/// a second time for nothing. This is the ~2× over-linear factor of issue #26.
 pub fn load_member_stores(
     root: &Path,
     manifest: &Manifest,
@@ -87,8 +148,7 @@ pub fn load_member_stores(
         Some(names) => {
             let mut out = Vec::new();
             for n in names {
-                let m = manifest.member(n).ok_or_else(|| format!("unknown member/package: {n}"))?;
-                out.push(m);
+                out.push(resolve_scope_token(manifest, n)?);
             }
             out
         }
@@ -98,7 +158,7 @@ pub fn load_member_stores(
     let mut stores = Vec::with_capacity(selected.len());
     for m in selected {
         let store_path = default_store_path(&root.join(&m.path));
-        let index = Index::load(&store_path).map_err(|_| {
+        let index = Index::load_without_bm25(&store_path).map_err(|_| {
             format!(
                 "member '{}' is not indexed ({} missing) — run `cce index --workspace` first",
                 m.name,
@@ -164,11 +224,30 @@ pub fn federated_search(
     graph_enabled: bool,
 ) -> Vec<FedResult> {
     let combined = combined_index(members);
+    federated_search_over(&combined, members, graph, embedder, query, top_k, graph_enabled)
+}
+
+/// Federated search over a **pre-built** union index (SPEC-V2.2 §6). Identical to
+/// [`federated_search`] but takes the assembled `combined` corpus as an argument so a
+/// long-lived caller (the MCP server) can build the union once, cache it, and reuse it
+/// across queries — and serve the metrics baseline from the same corpus — instead of
+/// re-assembling and re-BM25-building it every call. `combined` MUST be
+/// `combined_index(members)`; the result is byte-identical to `federated_search`.
+#[allow(clippy::too_many_arguments)]
+pub fn federated_search_over(
+    combined: &Index,
+    members: &[MemberStore],
+    graph: &WorkspaceGraph,
+    embedder: &dyn Embedder,
+    query: &str,
+    top_k: usize,
+    graph_enabled: bool,
+) -> Vec<FedResult> {
     let package_of: BTreeMap<String, String> =
         members.iter().map(|m| (m.name.clone(), m.package.clone())).collect();
 
     let qvec = embedder.embed(query);
-    let mut results = rank_core(&combined, &qvec, query, top_k);
+    let mut results = rank_core(combined, &qvec, query, top_k);
     if results.is_empty() {
         return Vec::new();
     }
@@ -178,10 +257,10 @@ pub fn federated_search(
         // follow cross-member edges). Captured before any expansion.
         let core_members: Vec<String> = top_result_members(&results);
         // Intra-store expansion over the union import graph (SPEC §6.7).
-        expand_graph(&combined, &qvec, &mut results);
+        expand_graph(combined, &qvec, &mut results);
         // Cross-member expansion (SPEC-V2.2 §6): pull chunks from dependency
         // target members.
-        cross_member_expand(&combined, graph, &qvec, &core_members, &mut results);
+        cross_member_expand(combined, graph, &qvec, &core_members, &mut results);
     }
 
     results.into_iter().enumerate().map(|(i, r)| fed_result(i + 1, r, &package_of)).collect()
@@ -493,7 +572,133 @@ mod tests {
             Ok(_) => panic!("unknown package must error"),
             Err(e) => e,
         };
-        assert!(err.contains("unknown member/package"), "got: {err}");
+        // The error names the bad token AND lists what is available (never silent-empty).
+        assert!(err.contains("unknown member/package 'nope'"), "got: {err}");
+        assert!(err.contains("available:"), "error must list available members: {err}");
+    }
+
+    /// A workspace with a member whose `package:` field differs from its member name:
+    /// dir `store` holds a gemspec named `acme-store`, so name=`store`, package=`acme-store`.
+    fn workspace_with_distinct_package() -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let root = tmp.path();
+        // Member `store` whose gem name is `acme-store` (package != name).
+        let d = root.join("store").join("lib");
+        std::fs::create_dir_all(&d).unwrap();
+        std::fs::write(
+            root.join("store").join("store.gemspec"),
+            "Gem::Specification.new do |s|\n  s.name = \"acme-store\"\nend\n",
+        )
+        .unwrap();
+        std::fs::write(
+            d.join("catalog.rb"),
+            "module Store\n  class Catalog\n    def add_item(name, price)\n      @items << [name, price]\n    end\n  end\nend\n",
+        )
+        .unwrap();
+        tmp
+    }
+
+    #[test]
+    fn scope_resolves_by_package_field_not_just_member_name() {
+        let tmp = workspace_with_distinct_package();
+        let manifest = build_manifest(tmp.path());
+        let e = HashEmbedder;
+        for m in &manifest.members {
+            let dir = tmp.path().join(&m.path);
+            let (idx, _) = Index::build_from_dir(&dir, &e);
+            idx.save(&default_store_path(&dir)).unwrap();
+        }
+        // Sanity: the member is named `store` but its package is `acme-store`.
+        let m = &manifest.members[0];
+        assert_eq!(m.name, "store");
+        assert_eq!(m.package, "acme-store");
+
+        // Scoping by the PACKAGE field resolves the member (the pre-fix code matched
+        // only the name and would have errored here).
+        let by_pkg =
+            load_member_stores(tmp.path(), &manifest, Some(&["acme-store".to_string()])).unwrap();
+        assert_eq!(by_pkg.len(), 1);
+        assert_eq!(by_pkg[0].name, "store");
+        // Scoping by the NAME still works (byte-identical to before).
+        let by_name =
+            load_member_stores(tmp.path(), &manifest, Some(&["store".to_string()])).unwrap();
+        assert_eq!(by_name.len(), 1);
+        assert_eq!(by_name[0].name, "store");
+    }
+
+    /// The perf refactor's core invariant (issue #26): loading member stores WITHOUT
+    /// their own BM25 (the federation path) yields byte-identical federated results —
+    /// same ids, order, AND scores — as loading them WITH BM25 (the pre-fix behaviour),
+    /// for both the full workspace and a scoped subset.
+    #[test]
+    fn member_bm25_skip_is_byte_identical_full_and_scoped() {
+        let tmp = copy_fixture();
+        let (manifest, graph, _) = indexed_members(tmp.path());
+        let e = HashEmbedder;
+
+        // Load the same members WITH their own BM25 (pre-fix), for a given scope.
+        let heavy = |scope: Option<&[String]>| -> Vec<MemberStore> {
+            let selected: Vec<&crate::workspace::Member> = match scope {
+                Some(names) => names.iter().map(|n| manifest.member(n).unwrap()).collect(),
+                None => manifest.members.iter().collect(),
+            };
+            selected
+                .into_iter()
+                .map(|m| {
+                    let sp = default_store_path(&tmp.path().join(&m.path));
+                    MemberStore {
+                        name: m.name.clone(),
+                        package: m.package.clone(),
+                        rel_path: m.path.clone(),
+                        index: Index::load(&sp).unwrap(),
+                    }
+                })
+                .collect()
+        };
+
+        for (label, scope) in
+            [("full", None), ("scoped", Some(vec!["app".to_string(), "billing".to_string()]))]
+        {
+            let query = "billing charge amount";
+            // The federation loader (BM25 skipped).
+            let light = load_member_stores(tmp.path(), &manifest, scope.as_deref()).unwrap();
+            let a = federated_search(&light, &graph, &e, query, 10, true);
+            // The pre-fix loader (BM25 built per member).
+            let heavy_members = heavy(scope.as_deref());
+            let b = federated_search(&heavy_members, &graph, &e, query, 10, true);
+
+            let ax: Vec<(String, i64)> =
+                a.iter().map(|r| (r.chunk_id.clone(), score_key(r.score))).collect();
+            let bx: Vec<(String, i64)> =
+                b.iter().map(|r| (r.chunk_id.clone(), score_key(r.score))).collect();
+            assert_eq!(ax, bx, "{label}: BM25-skip changed the ranking");
+            assert!(!ax.is_empty(), "{label}: expected results");
+        }
+    }
+
+    /// `federated_search_over` (the MCP path, given a pre-built + cached union) is
+    /// byte-identical to `federated_search` (which builds its own union).
+    #[test]
+    fn federated_search_over_equals_federated_search() {
+        let tmp = copy_fixture();
+        let (manifest, graph, _) = indexed_members(tmp.path());
+        let members = load_member_stores(tmp.path(), &manifest, None).unwrap();
+        let e = HashEmbedder;
+        let query = "billing charge amount";
+
+        let base = federated_search(&members, &graph, &e, query, 10, true);
+        let combined = combined_index(&members);
+        let over = federated_search_over(&combined, &members, &graph, &e, query, 10, true);
+
+        let bx: Vec<(String, i64, String)> = base
+            .iter()
+            .map(|r| (r.chunk_id.clone(), score_key(r.score), r.file_path.clone()))
+            .collect();
+        let ox: Vec<(String, i64, String)> = over
+            .iter()
+            .map(|r| (r.chunk_id.clone(), score_key(r.score), r.file_path.clone()))
+            .collect();
+        assert_eq!(bx, ox);
     }
 
     #[test]
