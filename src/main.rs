@@ -1104,9 +1104,12 @@ fn cmd_dashboard_workspace(
     let root = workspace_root(dir);
     let manifest = Manifest::load(&root)?;
     let members = member_metrics(&root, &manifest);
+    // Issue #28: `cce mcp --workspace` writes agent searches to the workspace-root
+    // log; fold it into the dashboard roll-up so that usage appears.
+    let root_metrics = cce::store::default_metrics_path(&root);
     let port = port.unwrap_or(DEFAULT_DASHBOARD_PORT);
     let price = price.unwrap_or(DEFAULT_INPUT_PRICE_PER_MILLION);
-    cce::dashboard::run_workspace(members, price, port)
+    cce::dashboard::run_workspace(members, Some(root_metrics), price, port)
         .map_err(|e| format!("dashboard failed: {e}"))
 }
 

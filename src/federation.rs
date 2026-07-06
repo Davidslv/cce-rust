@@ -425,8 +425,16 @@ pub struct PackageRollup {
 /// over the concatenation of members' events, plus a `by_package` section
 /// (searches, tokens saved, mean savings per member). `now_secs`/`price` are
 /// injected for determinism.
+///
+/// `root_metrics_path` (issue #28) is the workspace-root `.cce/metrics.jsonl`,
+/// where `cce mcp --workspace` writes federated (agent) searches. Its events are
+/// folded into the roll-up — `totals`, `recent_searches`, `by_source` — so agent
+/// usage across the ecosystem shows up, matching `docs/mcp.md`. They are
+/// deliberately NOT added to `by_package`: a federated search spans members, so
+/// there is no honest single-package bucket for it.
 pub fn federated_metrics_json(
     members: &[MemberMetrics],
+    root_metrics_path: Option<&Path>,
     now_secs: i64,
     price: f64,
 ) -> serde_json::Value {
@@ -436,6 +444,13 @@ pub fn federated_metrics_json(
     for m in members {
         let log = read_log(&m.metrics_path);
         all_events.extend(log.events);
+    }
+    // Fold in the workspace-root log (agent/MCP searches). Guarded against a
+    // member whose path is the root itself, so events are never double-counted.
+    if let Some(root) = root_metrics_path {
+        if !members.iter().any(|m| m.metrics_path == root) {
+            all_events.extend(read_log(root).events);
+        }
     }
     let rollup = aggregate(&all_events, now_secs, price);
     let mut val = serde_json::to_value(&rollup).unwrap_or(serde_json::Value::Null);
@@ -757,7 +772,7 @@ mod tests {
             mk("billing", "2026-07-04T11:00:00Z", 3000, 0.75),
         ];
         let now = crate::metrics::parse_iso("2026-07-05T00:00:00Z").unwrap();
-        let json = federated_metrics_json(&members, now, 3.00);
+        let json = federated_metrics_json(&members, None, now, 3.00);
         // Roll-up totals span both members.
         assert_eq!(json["totals"]["searches"], 2);
         assert_eq!(json["totals"]["tokens_saved"], 4000);
@@ -773,5 +788,80 @@ mod tests {
         // The roll-up carries the v2.4.1 agent-vs-human split (all CLI here).
         assert_eq!(json["by_source"]["cli"]["searches"], 2);
         assert_eq!(json["by_source"]["mcp"]["searches"], 0);
+    }
+
+    #[test]
+    fn root_log_folds_into_rollup_but_not_by_package() {
+        // Issue #28: `cce mcp --workspace` writes agent searches to the workspace-
+        // root log. The dashboard must include them in the roll-up (totals /
+        // by_source) yet leave by_package to the members only.
+        let tmp = tempfile::tempdir().unwrap();
+        let write_search = |dir: &Path, id: &str, ts: &str, tokens: u64, source: &str| {
+            std::fs::create_dir_all(dir).unwrap();
+            let line = format!(
+                "{{\"schema\":\"cce.metrics/v1\",\"event\":\"search\",\"ts\":\"{ts}\",\"id\":\"{id}\",\"query\":\"q\",\"result_count\":1,\"tokens_saved\":{tokens},\"savings_ratio\":0.5,\"top_score\":0.9,\"empty\":false,\"low_confidence\":false,\"source\":\"{source}\"}}\n"
+            );
+            std::fs::write(dir.join("metrics.jsonl"), line).unwrap();
+        };
+        // One member with a single (human/CLI) search.
+        let member_cce = tmp.path().join("app").join(".cce");
+        write_search(&member_cce, "app000000000", "2026-07-04T10:00:00Z", 1000, "cli");
+        let members = vec![MemberMetrics {
+            name: "app".to_string(),
+            package: "app".to_string(),
+            metrics_path: member_cce.join("metrics.jsonl"),
+        }];
+        // Two agent/MCP searches at the workspace root (where `cce mcp --workspace` writes).
+        let root_cce = tmp.path().join(".cce");
+        std::fs::create_dir_all(&root_cce).unwrap();
+        let root_log = root_cce.join("metrics.jsonl");
+        std::fs::write(
+            &root_log,
+            format!(
+                "{}{}",
+                "{\"schema\":\"cce.metrics/v1\",\"event\":\"search\",\"ts\":\"2026-07-04T12:00:00Z\",\"id\":\"root00000001\",\"query\":\"q\",\"result_count\":1,\"tokens_saved\":500,\"savings_ratio\":0.5,\"top_score\":0.9,\"empty\":false,\"low_confidence\":false,\"source\":\"mcp\"}\n",
+                "{\"schema\":\"cce.metrics/v1\",\"event\":\"search\",\"ts\":\"2026-07-04T13:00:00Z\",\"id\":\"root00000002\",\"query\":\"q\",\"result_count\":1,\"tokens_saved\":700,\"savings_ratio\":0.5,\"top_score\":0.9,\"empty\":false,\"low_confidence\":false,\"source\":\"mcp\"}\n",
+            ),
+        )
+        .unwrap();
+        let now = crate::metrics::parse_iso("2026-07-05T00:00:00Z").unwrap();
+
+        // Without the root path: only the member's search is counted (the pre-fix bug).
+        let before = federated_metrics_json(&members, None, now, 3.00);
+        assert_eq!(before["totals"]["searches"], 1);
+
+        // With the root path: member + root searches roll up together.
+        let after = federated_metrics_json(&members, Some(root_log.as_path()), now, 3.00);
+        assert_eq!(after["totals"]["searches"], 3);
+        assert_eq!(after["totals"]["tokens_saved"], 2200);
+        assert_eq!(after["by_source"]["cli"]["searches"], 1);
+        assert_eq!(after["by_source"]["mcp"]["searches"], 2);
+        // by_package stays members-only: the two federated searches are NOT attributed.
+        let by = after["by_package"].as_array().unwrap();
+        assert_eq!(by.len(), 1);
+        assert_eq!(by[0]["package"], "app");
+        assert_eq!(by[0]["searches"], 1);
+    }
+
+    #[test]
+    fn root_log_equal_to_a_member_path_is_not_double_counted() {
+        // Guard: if a member's own log IS the root log, don't add it twice.
+        let tmp = tempfile::tempdir().unwrap();
+        let cce = tmp.path().join(".cce");
+        std::fs::create_dir_all(&cce).unwrap();
+        let log = cce.join("metrics.jsonl");
+        std::fs::write(
+            &log,
+            "{\"schema\":\"cce.metrics/v1\",\"event\":\"search\",\"ts\":\"2026-07-04T10:00:00Z\",\"id\":\"one000000000\",\"query\":\"q\",\"result_count\":1,\"tokens_saved\":100,\"savings_ratio\":0.5,\"top_score\":0.9,\"empty\":false,\"low_confidence\":false}\n",
+        )
+        .unwrap();
+        let members = vec![MemberMetrics {
+            name: "root".to_string(),
+            package: "root".to_string(),
+            metrics_path: log.clone(),
+        }];
+        let now = crate::metrics::parse_iso("2026-07-05T00:00:00Z").unwrap();
+        let json = federated_metrics_json(&members, Some(log.as_path()), now, 3.00);
+        assert_eq!(json["totals"]["searches"], 1, "must not double-count");
     }
 }

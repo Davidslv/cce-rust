@@ -336,8 +336,13 @@ members exactly as `cce search --workspace` does: results are tagged by package,
 `package` argument scopes to one member, and cross-member dependency edges expand the
 search. `index_status` reports per-member counts and the dependency graph.
 
-Metrics for a workspace session land in the workspace-root `.cce/metrics.jsonl`, so
-`cce dashboard --workspace` sees agent usage across the ecosystem.
+Metrics for a workspace session land in the workspace-root `.cce/metrics.jsonl`, and
+`cce dashboard --workspace` folds that root log into its roll-up (alongside every
+member's log), so agent usage across the ecosystem shows up in `totals`,
+`recent_searches`, and `by_source`. These federated searches span members, so they
+are intentionally **not** attributed to `by_package` — that panel stays per-member,
+reflecting direct usage of each repo. (Per-package attribution of agent searches is
+tracked in issue #28's follow-up options.)
 
 ### Scope large workspaces with `package` (recommended)
 

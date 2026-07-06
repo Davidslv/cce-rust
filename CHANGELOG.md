@@ -7,7 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-## [2.6.4] - 2026-07-06
+## [2.6.5] - 2026-07-06
+
+### Fixed
+- **The workspace dashboard now shows `cce mcp --workspace` (agent) searches (#28).** In workspace mode
+  the MCP server writes `search` events to the workspace-root `.cce/metrics.jsonl`, but
+  `cce dashboard --workspace` aggregated only the member logs — so agent/MCP searches never appeared in
+  `totals`, `recent_searches`, or `by_source`, contradicting `docs/mcp.md`. The workspace dashboard now
+  folds the root log into its roll-up (guarded against double-counting a member that points at the root).
+  These federated searches span members and stay **out of `by_package`** by design — that panel remains
+  per-member. Docs aligned; per-package attribution of agent searches is left as a follow-up option.
 
 ### Changed
 - **Faster, correcter workspace federation (#26).** Member stores load **without** building per-member
