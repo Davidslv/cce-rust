@@ -196,6 +196,82 @@ fn index_without_store_uses_default_path_and_search_resolves_it() {
 }
 
 #[test]
+fn search_json_field_set_is_pinned_at_the_binary_level() {
+    // Issue #32: `cce search --json` is a script-facing contract. Beyond the
+    // in-process goldens (src/main.rs), this pins the shape as emitted by the
+    // real binary: the exact top-level and per-result field SETS, so a field
+    // added, renamed, or dropped fails here even if each remaining field still
+    // parses.
+    let tmp = tempfile::tempdir().unwrap();
+    write_tiny_repo(tmp.path());
+    let store = tmp.path().join("index.json");
+    let out = Command::new(bin())
+        .args(["index"])
+        .arg(tmp.path())
+        .arg("--store")
+        .arg(&store)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "index failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    let out = Command::new(bin())
+        .args(["search", "hash password", "--store"])
+        .arg(&store)
+        .args(["--json", "--top-k", "3"])
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "search failed: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    let v: serde_json::Value = serde_json::from_str(&stdout).unwrap();
+
+    // Top level: exactly {query_id, results}.
+    let top: Vec<&str> = v.as_object().unwrap().keys().map(String::as_str).collect();
+    assert_eq!(top, vec!["query_id", "results"]);
+    assert!(v["query_id"].is_string(), "metrics on: query_id is a string");
+
+    // Every result object: exactly this field set (serde_json's sorted order),
+    // with the pinned types — score a fixed 6-decimal string, lines/rank numbers.
+    let results = v["results"].as_array().unwrap();
+    assert!(!results.is_empty());
+    for (i, r) in results.iter().enumerate() {
+        let keys: Vec<&str> = r.as_object().unwrap().keys().map(String::as_str).collect();
+        assert_eq!(
+            keys,
+            vec![
+                "chunk_id",
+                "chunk_type",
+                "end_line",
+                "file_path",
+                "kind",
+                "rank",
+                "score",
+                "start_line"
+            ],
+            "result {i} field set changed"
+        );
+        assert_eq!(r["rank"].as_u64().unwrap(), (i + 1) as u64, "rank is 1-based and ordered");
+        assert!(r["start_line"].is_u64() && r["end_line"].is_u64());
+        let score = r["score"].as_str().expect("score is a string");
+        assert_eq!(score.split('.').nth(1).unwrap().len(), 6, "score has 6 decimals: {score}");
+    }
+
+    // The trailing newline after the JSON body is part of the contract too.
+    assert!(stdout.ends_with("}\n"), "output ends with a single trailing newline");
+
+    // With --no-metrics no query-id is assigned: the field is null, never absent.
+    let out = Command::new(bin())
+        .args(["search", "hash password", "--store"])
+        .arg(&store)
+        .args(["--json", "--no-metrics"])
+        .output()
+        .unwrap();
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert!(v["query_id"].is_null());
+    assert!(v.as_object().unwrap().contains_key("query_id"));
+}
+
+#[test]
 fn search_with_no_matches_prints_no_results() {
     let tmp = tempfile::tempdir().unwrap();
     write_tiny_repo(tmp.path());
