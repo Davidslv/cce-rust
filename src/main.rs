@@ -1380,6 +1380,182 @@ mod tests {
         assert_eq!(parse_scope(Some(" , , ".to_string())), Some(vec![]));
     }
 
+    // --- results_json: the single-repo `cce search --json` contract ---
+    //
+    // Byte-pinned (same discipline as the MCP result grammars): pretty-printed
+    // with two-space indent, object keys in serde_json's alphabetical order,
+    // scores as fixed 6-decimal STRINGS (format6, round-half-away-from-zero),
+    // chunk content NOT included, and a single trailing newline. Scripts parse
+    // this — a field rename or float-formatting change must fail here first.
+
+    fn sample_results() -> Vec<SearchResult> {
+        vec![
+            SearchResult {
+                rank: 1,
+                chunk_id: "cafef00dcafef00d".to_string(),
+                file_path: "auth.py".to_string(),
+                start_line: 1,
+                end_line: 3,
+                chunk_type: "function".to_string(),
+                kind: "function_definition".to_string(),
+                score: 0.5,
+                content: "def hash_password(pw):\n    return pw\n".to_string(),
+            },
+            SearchResult {
+                rank: 2,
+                chunk_id: "0123456789abcdef".to_string(),
+                file_path: "payments.py".to_string(),
+                start_line: 10,
+                end_line: 42,
+                chunk_type: "class".to_string(),
+                kind: "class_definition".to_string(),
+                // Pins format6's round-half-away-from-zero: 0.1234565 → "0.123457".
+                score: 0.123_456_5,
+                content: "class Payment:\n    pass\n".to_string(),
+            },
+        ]
+    }
+
+    #[test]
+    fn results_json_is_byte_pinned() {
+        let s = results_json(&sample_results(), Some("id0000000000"));
+        let golden = r#"{
+  "query_id": "id0000000000",
+  "results": [
+    {
+      "chunk_id": "cafef00dcafef00d",
+      "chunk_type": "function",
+      "end_line": 3,
+      "file_path": "auth.py",
+      "kind": "function_definition",
+      "rank": 1,
+      "score": "0.500000",
+      "start_line": 1
+    },
+    {
+      "chunk_id": "0123456789abcdef",
+      "chunk_type": "class",
+      "end_line": 42,
+      "file_path": "payments.py",
+      "kind": "class_definition",
+      "rank": 2,
+      "score": "0.123457",
+      "start_line": 10
+    }
+  ]
+}
+"#;
+        assert_eq!(s, golden);
+    }
+
+    #[test]
+    fn results_json_without_query_id_pins_null() {
+        // `--no-metrics` (or a failed metrics write) yields no query-id: the
+        // field stays present as JSON null — it never disappears.
+        let s = results_json(&sample_results()[..1], None);
+        let golden = r#"{
+  "query_id": null,
+  "results": [
+    {
+      "chunk_id": "cafef00dcafef00d",
+      "chunk_type": "function",
+      "end_line": 3,
+      "file_path": "auth.py",
+      "kind": "function_definition",
+      "rank": 1,
+      "score": "0.500000",
+      "start_line": 1
+    }
+  ]
+}
+"#;
+        assert_eq!(s, golden);
+    }
+
+    #[test]
+    fn results_json_empty_results_is_byte_pinned() {
+        let s = results_json(&[], Some("id0000000000"));
+        let golden = "{\n  \"query_id\": \"id0000000000\",\n  \"results\": []\n}\n";
+        assert_eq!(s, golden);
+    }
+
+    // --- fed_results_json: the workspace `cce search --workspace --json` contract ---
+    //
+    // Same grammar as the single-repo shape plus a `package` field per result;
+    // the query_id is always a string here (generated, not logged).
+
+    fn sample_fed_results() -> Vec<FedResult> {
+        vec![
+            FedResult {
+                rank: 1,
+                package: "billing".to_string(),
+                member: "billing".to_string(),
+                chunk_id: "cafef00dcafef00d".to_string(),
+                file_path: "lib/billing/invoice.rb".to_string(),
+                start_line: 4,
+                end_line: 9,
+                chunk_type: "method".to_string(),
+                kind: "method".to_string(),
+                score: 0.987_654_3,
+                content: "def total\n  42\nend\n".to_string(),
+            },
+            FedResult {
+                rank: 2,
+                package: "app".to_string(),
+                member: "app".to_string(),
+                chunk_id: "0123456789abcdef".to_string(),
+                file_path: "app/models/user.rb".to_string(),
+                start_line: 1,
+                end_line: 8,
+                chunk_type: "class".to_string(),
+                kind: "class".to_string(),
+                score: 0.25,
+                content: "class User\nend\n".to_string(),
+            },
+        ]
+    }
+
+    #[test]
+    fn fed_results_json_is_byte_pinned() {
+        let s = fed_results_json(&sample_fed_results(), "id0000000000");
+        let golden = r#"{
+  "query_id": "id0000000000",
+  "results": [
+    {
+      "chunk_id": "cafef00dcafef00d",
+      "chunk_type": "method",
+      "end_line": 9,
+      "file_path": "lib/billing/invoice.rb",
+      "kind": "method",
+      "package": "billing",
+      "rank": 1,
+      "score": "0.987654",
+      "start_line": 4
+    },
+    {
+      "chunk_id": "0123456789abcdef",
+      "chunk_type": "class",
+      "end_line": 8,
+      "file_path": "app/models/user.rb",
+      "kind": "class",
+      "package": "app",
+      "rank": 2,
+      "score": "0.250000",
+      "start_line": 1
+    }
+  ]
+}
+"#;
+        assert_eq!(s, golden);
+    }
+
+    #[test]
+    fn fed_results_json_empty_results_is_byte_pinned() {
+        let s = fed_results_json(&[], "id0000000000");
+        let golden = "{\n  \"query_id\": \"id0000000000\",\n  \"results\": []\n}\n";
+        assert_eq!(s, golden);
+    }
+
     // --- resolve_read_store: --store, else --dir/.cce, else ./.cce ---
 
     #[test]
