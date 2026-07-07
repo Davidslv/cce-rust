@@ -502,6 +502,170 @@ mod tests {
         McpServer::new(Some(dir.to_path_buf()), None, false)
     }
 
+    /// Push `path`'s mtime clearly forward, so a rewrite within the same clock tick
+    /// still changes the freshness fingerprint on filesystems with coarse mtimes.
+    fn bump_mtime(path: &Path) {
+        let f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        f.set_modified(SystemTime::now() + std::time::Duration::from_secs(5)).unwrap();
+    }
+
+    /// Run a `context_search` for `query` (no_graph, so results are query-only) and
+    /// return the served text block.
+    fn search_text(s: &McpServer, query: &str) -> String {
+        let resp = s
+            .handle_line(&format!(
+                r#"{{"id":1,"method":"tools/call","params":{{"name":"context_search","arguments":{{"query":"{query}","no_graph":true}}}}}}"#,
+            ))
+            .unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        v["result"]["content"][0]["text"].as_str().unwrap().to_string()
+    }
+
+    /// Drop the per-call metrics lines (`query_id` is a fresh id each call by design);
+    /// the ranked result block itself must be byte-identical warm vs cold.
+    fn strip_query_id(t: &str) -> String {
+        t.lines()
+            .filter(|l| !l.starts_with("query_id:") && !l.starts_with("Rate this"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn single_repo_context_search_is_cached_and_warm_call_is_identical() {
+        let tmp = tempfile::tempdir().unwrap();
+        index_fixture(tmp.path());
+        let s = server_for(tmp.path());
+
+        // Cold call loads + caches the index.
+        let cold = search_text(&s, "hash password");
+        assert!(cold.contains("auth.py"), "expected auth.py, got: {cold}");
+        let cold_ptr = Rc::as_ptr(&s.index_cache.borrow().as_ref().unwrap().1);
+
+        // Warm call reuses the SAME cached index (pointer-identical) and serves a
+        // byte-identical ranked block.
+        let warm = search_text(&s, "hash password");
+        let warm_ptr = Rc::as_ptr(&s.index_cache.borrow().as_ref().unwrap().1);
+        assert_eq!(cold_ptr, warm_ptr, "warm call must reuse the cached index");
+        assert_eq!(strip_query_id(&cold), strip_query_id(&warm));
+    }
+
+    #[test]
+    fn single_repo_reindex_is_picked_up_on_the_next_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        index_fixture(tmp.path());
+        let s = server_for(tmp.path());
+        assert!(search_text(&s, "hash password").contains("auth.py"));
+        let cold_ptr = Rc::as_ptr(&s.index_cache.borrow().as_ref().unwrap().1);
+
+        // Re-index from a DIFFERENT corpus over the same store path (what a re-index
+        // or a mid-session `cce sync pull` does), bumping mtime explicitly so the
+        // fingerprint change never depends on filesystem clock granularity.
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("widgets.py"), "def frobnicate_widget():\n    return 42\n")
+            .unwrap();
+        let (idx, _) = Index::build_from_dir(src.path(), &HashEmbedder).unwrap();
+        let store = default_store_path(tmp.path());
+        idx.save(&store).unwrap();
+        bump_mtime(&store);
+
+        // The next call reflects the NEW store, and the cache was swapped.
+        let after = search_text(&s, "frobnicate widget");
+        assert!(after.contains("widgets.py"), "re-index not picked up: {after}");
+        assert!(!after.contains("auth.py"), "stale corpus served: {after}");
+        let new_ptr = Rc::as_ptr(&s.index_cache.borrow().as_ref().unwrap().1);
+        assert_ne!(cold_ptr, new_ptr, "a changed fingerprint must reload the index");
+    }
+
+    #[test]
+    fn deleting_the_store_mid_session_is_friendly_not_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        index_fixture(tmp.path());
+        let s = server_for(tmp.path());
+        assert!(search_text(&s, "hash password").contains("auth.py"));
+        assert!(s.index_cache.borrow().is_some(), "cold call must populate the cache");
+
+        std::fs::remove_file(default_store_path(tmp.path())).unwrap();
+
+        // Exactly today's behaviour: the friendly missing-index message — never the
+        // cached (now deleted) index — and the cache is dropped.
+        let after = search_text(&s, "hash password");
+        assert!(after.contains("not indexed"), "got: {after}");
+        assert!(!after.contains("auth.py"), "stale cached index served: {after}");
+        assert!(s.index_cache.borrow().is_none(), "a deleted store must drop the cache");
+
+        let resp = s
+            .handle_line(r#"{"id":2,"method":"tools/call","params":{"name":"index_status"}}"#)
+            .unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert!(v["result"]["content"][0]["text"].as_str().unwrap().contains("not indexed"));
+    }
+
+    /// Write + ingest a one-record knowledge feed whose body carries `sentence`.
+    fn ingest_knowledge(root: &Path, id: &str, title: &str, sentence: &str) {
+        let feed = root.join("feed.jsonl");
+        std::fs::write(
+            &feed,
+            format!(
+                "{{\"id\":\"{id}\",\"title\":\"{title}\",\"body\":\"## Rule\\n\\n{sentence}\",\"source\":\"github-issues\"}}\n"
+            ),
+        )
+        .unwrap();
+        crate::knowledge::ingest_file(&feed, root, 400).unwrap();
+    }
+
+    /// A knowledge-only `context_search`, returning the served text block.
+    fn knowledge_search_text(s: &McpServer, query: &str) -> String {
+        let resp = s
+            .handle_line(&format!(
+                r#"{{"id":1,"method":"tools/call","params":{{"name":"context_search","arguments":{{"query":"{query}","source":"knowledge"}}}}}}"#,
+            ))
+            .unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        v["result"]["content"][0]["text"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn knowledge_search_is_cached_warm_identical_and_reingest_invalidates() {
+        let tmp = tempfile::tempdir().unwrap();
+        ingest_knowledge(
+            tmp.path(),
+            "gh:1",
+            "Login policy",
+            "Lock the account after five failed login attempts.",
+        );
+        let s = server_for(tmp.path());
+
+        // Cold call loads + caches the knowledge store; warm call reuses it
+        // (pointer-identical) and serves byte-identical text (knowledge-only
+        // searches log no query_id, so the whole block must match).
+        let cold = knowledge_search_text(&s, "login attempts lock account");
+        assert!(cold.contains("Login policy"), "got: {cold}");
+        let cold_ptr = Rc::as_ptr(&s.knowledge_cache.borrow().as_ref().unwrap().1);
+        let warm = knowledge_search_text(&s, "login attempts lock account");
+        let warm_ptr = Rc::as_ptr(&s.knowledge_cache.borrow().as_ref().unwrap().1);
+        assert_eq!(cold_ptr, warm_ptr, "warm call must reuse the cached knowledge store");
+        assert_eq!(cold, warm, "warm knowledge search must equal the cold one");
+
+        // Re-ingest a superseding snapshot (new artifact + rewritten pointer), with an
+        // explicit mtime bump on the pointer so granularity can never mask the change.
+        ingest_knowledge(
+            tmp.path(),
+            "gh:2",
+            "Refund policy",
+            "Refund a captured login charge within thirty days.",
+        );
+        bump_mtime(&KnowledgeStore::current_pointer_path(tmp.path()));
+        let after = knowledge_search_text(&s, "refund captured charge days");
+        assert!(after.contains("Refund policy"), "re-ingest not picked up: {after}");
+        assert!(!after.contains("Login policy"), "stale knowledge served: {after}");
+
+        // Deleting the knowledge store behaves exactly like no store at all.
+        std::fs::remove_dir_all(KnowledgeStore::dir(tmp.path())).unwrap();
+        let gone = knowledge_search_text(&s, "refund captured charge days");
+        assert!(!gone.contains("Refund policy"), "stale knowledge after delete: {gone}");
+        assert!(s.knowledge_cache.borrow().is_none(), "a deleted store must drop the cache");
+    }
+
     #[test]
     fn initialize_advertises_protocol_and_identity() {
         let tmp = tempfile::tempdir().unwrap();
@@ -982,6 +1146,49 @@ mod tests {
             2,
             "scope and full workspace cache separately"
         );
+    }
+
+    #[test]
+    fn workspace_member_reindex_is_picked_up_mid_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        index_workspace_fixture(tmp.path());
+        let s = McpServer::new(Some(tmp.path().to_path_buf()), None, true);
+
+        // Cold call assembles + caches the union.
+        let resp = s
+            .handle_line(
+                r#"{"id":1,"method":"tools/call","params":{"name":"context_search","arguments":{"query":"billing charge amount","no_graph":true}}}"#,
+            )
+            .unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert!(v["result"]["content"][0]["text"].as_str().unwrap().contains("billing"));
+        assert_eq!(s.workspace_cache.borrow().len(), 1);
+        let cold_ptr = Rc::as_ptr(&s.workspace_cache.borrow().values().next().unwrap().1);
+
+        // Re-index ONE member mid-session (new file, rebuilt store, explicit mtime
+        // bump so granularity can never mask the change).
+        let manifest = Manifest::load(tmp.path()).unwrap();
+        let billing = manifest.members.iter().find(|m| m.name == "billing").unwrap();
+        let member_dir = tmp.path().join(&billing.path);
+        std::fs::write(member_dir.join("widgets.py"), "def frobnicate_widget():\n    return 42\n")
+            .unwrap();
+        let (idx, _) = Index::build_from_dir(&member_dir, &HashEmbedder).unwrap();
+        let store = default_store_path(&member_dir);
+        idx.save(&store).unwrap();
+        bump_mtime(&store);
+
+        // The next call rebuilds the union and serves the new member content.
+        let resp = s
+            .handle_line(
+                r#"{"id":2,"method":"tools/call","params":{"name":"context_search","arguments":{"query":"frobnicate widget","no_graph":true}}}"#,
+            )
+            .unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        let text = v["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("widgets.py"), "member re-index not picked up: {text}");
+        assert_eq!(s.workspace_cache.borrow().len(), 1, "the entry is replaced, not added");
+        let new_ptr = Rc::as_ptr(&s.workspace_cache.borrow().values().next().unwrap().1);
+        assert_ne!(cold_ptr, new_ptr, "a changed member fingerprint must rebuild the union");
     }
 
     #[test]

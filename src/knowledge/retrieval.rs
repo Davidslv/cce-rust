@@ -31,7 +31,7 @@ use std::collections::{BTreeMap, HashSet};
 
 /// One ranked knowledge result (SPEC-V2.6 §5): the section's identity + content plus
 /// the facets the provenance line needs and the final (post-staleness) score.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct KnowledgeHit {
     pub rank: usize,
     pub chunk_id: String,
@@ -439,6 +439,27 @@ mod tests {
         assert!(hits.len() >= 2);
         // The implemented (merged-PR) record wins despite being older.
         assert_eq!(hits[0].record_id, "implemented");
+    }
+
+    #[test]
+    fn loaded_knowledge_search_is_byte_identical_to_the_one_shot_path() {
+        // The cached path (issue #31) must be indistinguishable from the one-shot
+        // `search_knowledge`, for every field of every hit — and stable across
+        // repeated queries against the same `LoadedKnowledge`.
+        let recs = vec![
+            rec(
+                "a",
+                "Login policy",
+                "## Rule\n\nLock the account after five failed login attempts.",
+            ),
+            rec("b", "Payments", "## Refund\n\nRefund a captured charge within thirty days."),
+        ];
+        let store = ingest_default(&recs, b"feed");
+        let one_shot = search_knowledge(&store, "login attempts lock account", 5, 0.30);
+        assert!(!one_shot.is_empty());
+        let loaded = LoadedKnowledge::new(store);
+        assert_eq!(loaded.search("login attempts lock account", 5, 0.30), one_shot);
+        assert_eq!(loaded.search("login attempts lock account", 5, 0.30), one_shot);
     }
 
     #[test]
