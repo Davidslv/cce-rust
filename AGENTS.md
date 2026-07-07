@@ -70,7 +70,7 @@ ambient filesystem state. The only test needing a real server (live Ollama) is
 (via `CCE_OLLAMA_URL`) or a closed local port, never a real server.
 The metrics tests inject a fixed clock/id source, and the dashboard's socket test
 binds an **ephemeral loopback port** and serves a bounded number of connections.
-Keep coverage at or above the baseline (**500 tests, ~94% line coverage** via
+Keep coverage at or above the baseline (**540 tests, ~94% line coverage** via
 `cargo llvm-cov`); a change that lowers coverage should add tests. The CI test
 gate also runs the three-layer validators over every language pack.
 
@@ -107,10 +107,16 @@ scores are compared, sorted, or emitted.
   transforms (compact chunks, output/grammar/memory/summary blocks, the ledger) are
   deterministic and byte-pinned; cce-rust is the reference the Ruby engine catches up
   to. `SYNC_FORMAT_VERSION` stays `2.3` (decoupled from the app version); v2.5 does
-  not change `conformance.json` or the Sync artifact.
+  not change `conformance.json` or the Sync artifact. **v2.6 (Knowledge Sources)**
+  adds `src/markdown.rs` + `src/knowledge/` (`cce knowledge index`, the
+  `cce.knowledge/v1` contract, the `source: code|knowledge|both` blend on
+  `context_search` — still nine tools) and the committed-`.gitignore`-aware walk in
+  `src/walker.rs`; all fully additive — `conformance.json` and the Sync artifact
+  stay byte-identical.
 - [`docs/mcp.md`](docs/mcp.md) · [`docs/savings.md`](docs/savings.md) ·
-  [`docs/sync.md`](docs/sync.md) — the MCP (nine tools), Savings Layers, and Sync
-  user docs; [`docs/VERIFIED.md`](docs/VERIFIED.md) is the cold-start transcript.
+  [`docs/sync.md`](docs/sync.md) · [`docs/knowledge.md`](docs/knowledge.md) — the
+  MCP (nine tools), Savings Layers, Sync, and Knowledge Sources user docs;
+  [`docs/VERIFIED.md`](docs/VERIFIED.md) is the cold-start transcript.
 - [`docs/adding-a-language.md`](docs/adding-a-language.md) — how to add a pack.
 - [`docs/architecture.md`](docs/architecture.md) — module map, pipeline, design
   rationale, and where the design strains.
