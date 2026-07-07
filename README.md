@@ -17,6 +17,9 @@ stays isolated (see [Workspaces / ecosystems](#workspaces--ecosystems)). Since
 default retrieval with expand-on-demand, output/grammar/memory/summarization
 layers, nine agent-facing MCP tools, and a `cce savings` ledger that reports token
 savings **honestly** (vs a full-file baseline, not your real end-to-end agent cost).
+Since **v2.6** it can also ingest **non-code knowledge** — issues, epics, policy
+docs — via a neutral NDJSON contract and search it alongside the code (see
+[Knowledge sources](#knowledge-sources--search-the-why-v26)).
 
 ```
 index a directory → walk → AST-chunk → embed → store (vectors + BM25 + import graph)
@@ -170,6 +173,15 @@ Indexed ./src
 By default the store is written to `<dir>/.cce/index.json`. Override it with
 `--store <path>`, or select the embedder with `--embedder hash|ollama`.
 
+**Which files get indexed** (since v2.6.3 the walk is gitignore-aware): files
+ignored by the repository's **committed `.gitignore`** are skipped, exactly as git
+sees the tree at a commit. Machine-local ignore sources — `.git/info/exclude` and
+the global `core.excludesfile` — are deliberately **not** honored, and neither is a
+`.gitignore` above the walk root, so the same commit indexes identically on every
+machine (this keeps [CCE Sync](#cce-sync--a-distributed-offline-first-cache-v23)
+artifacts builder-independent). `.git/` and `.cce/` (cce's own cache) are always
+skipped, as are binary, non-UTF-8, and >2 MB files.
+
 #### Secret protection (secure by default)
 
 Since v2.1, indexing is **secret-safe by default** — you do not have to opt in.
@@ -242,7 +254,7 @@ wrapping the `results` array. Human output prints the same id on a final
 `query-id:` line. Pass `--no-metrics` to skip recording (then `query_id` is null).
 
 Search flags: `--dir <dir>` (resolves `<dir>/.cce`) or `--store <path>`,
-`--top-k N` (default 5), `--no-graph` (skip import-graph expansion), `--json`,
+`--top-k N` (default 10), `--no-graph` (skip import-graph expansion), `--json`,
 `--no-metrics`.
 
 ### A worked example (AST chunking)
@@ -586,7 +598,7 @@ widen**: `context_search` returns **compact** chunks by default (each with a
 
 | Tool | What it does |
 |---|---|
-| `context_search` | Ranked, **compact** code chunks (`file:line + kind + #chunk_id`) for a query, over the same hybrid vector + BM25 index as `cce search`. Logs a `search` event, returns a `query_id`. Args: `query` (required), `top_k` (8), `package`, `no_graph`, `max_tokens`, `detail` (signature\|compact\|full). |
+| `context_search` | Ranked, **compact** code chunks (`file:line + kind + #chunk_id`) for a query, over the same hybrid vector + BM25 index as `cce search`. Logs a `search` event, returns a `query_id`. Args: `query` (required), `top_k` (8), `package`, `no_graph`, `max_tokens`, `detail` (signature\|compact\|full), `source` (code\|knowledge\|both — blend in [knowledge](docs/knowledge.md) hits). |
 | `index_status` | Whether the project is indexed, per-language/per-kind counts, and — if CCE Sync is configured — the source (local vs pulled), sha, and whether it is behind the remote. |
 | `record_feedback` | Rate a prior result (`query_id`, `helpful`, optional `note`); appends a `feedback` event so the dashboard's quality signal reflects agent use. |
 | `expand_chunk` | Read the **full** body / file / neighbours of a returned chunk by `chunk_id` (`scope`: body\|file\|neighbors). `body` recovers the exact full bytes. |
@@ -611,6 +623,29 @@ canonical `main@sha` on startup. This is a **soft dependency** — with no remot
 configured, MCP works fully on the local index, offline. See
 [`docs/mcp.md`](docs/mcp.md) for the tool schemas, the workspace (`--workspace`)
 flow, and the sync-freshness details.
+
+## Knowledge sources — search the "why" (v2.6)
+
+Code says *what/how*; issues, epics, and policy docs say **why**. Since v2.6 any
+adapter can emit a neutral **`cce.knowledge/v1`** NDJSON feed (one record per line —
+CCE ships no ticket-system integrations) and ingest it into a separate,
+snapshot-keyed knowledge store:
+
+```bash
+cce knowledge index curated.jsonl        # → .cce/knowledge/ (redacted, heading-chunked)
+```
+
+Each record's markdown body is split by **heading section** (a tree-sitter-markdown
+chunker, `markdown.max_section_tokens` budget, default 400) and redacted before it
+is stored. At search time the MCP `context_search` tool takes an optional
+`source: code|knowledge|both` (default `both` once a knowledge store exists —
+otherwise always `code`); knowledge hits rank through the **same** hybrid pipeline
+as code, carry a `[knowledge] <title> — <state> · <updated_at> · <url>` provenance
+header, and pass deterministic staleness weighting (recency, wontfix-drop, a
+merged-PR boost, a 0.30 precision floor) so a stale record never surfaces. Fully
+additive: the code index, `conformance.json`, and the Sync artifact are
+byte-identical. Config: `knowledge.enabled` / `knowledge.min_score` /
+`knowledge.default_source`. See [`docs/knowledge.md`](docs/knowledge.md).
 
 ## Token savings — honestly
 
@@ -681,6 +716,7 @@ real offline cold-start run in [`docs/VERIFIED.md`](docs/VERIFIED.md):
 | `cce workspace` / `--workspace` | ✅ fully offline | detection, federated index/search/stats/dashboard |
 | `cce mcp` | ✅ fully offline | serves the **local** index (nine tools) to the agent; auto-pull is a soft dependency that no-ops with no remote |
 | `cce savings` / `cce eval` | ✅ fully offline | log-derived ledger + A/B aggregation; embedded pricing, no network |
+| `cce knowledge index` | ✅ fully offline | reads a local NDJSON feed; writes the local `.cce/knowledge/` store |
 | `cce feedback` / `cce conformance` / `cce packs` / `cce bench` | ✅ fully offline | pure local operations |
 
 The **only** things that ever touch the network are, explicitly:
@@ -708,8 +744,10 @@ ephemeral loopback port; sync tests use a `file://` bare remote).
   every merge ([`docs/ci/cce-sync.yml`](docs/ci/cce-sync.yml)); developers only ever
   **pull**. The CI token needs *write* to the cache repo only; developers need *read*.
 - **`.gitignore` your `.cce/`.** The local store and metrics log are machine-local —
-  keep them out of the source repo. A one-line `.gitignore` entry (`.cce/`) also keeps
-  `cce sync push`'s clean-tree check from tripping on store churn.
+  keep them out of the source repo. Since v2.6.3 `cce init` does this for you in a git
+  repo (it appends `.cce/*` + `!.cce/workspace.yml`, keeping a shared workspace
+  manifest committable); the entry also keeps `cce sync push`'s clean-tree check from
+  tripping on store churn.
 - **Only the hash embedder is shareable.** `cce sync push` refuses a non-hash index or
   a dirty tree — a cache is content-addressed by commit, so it must be reproducible.
 - **`cce sync verify` when in doubt.** It re-indexes locally and confirms the pulled
@@ -774,12 +812,12 @@ node type in a `kind` field alongside the coarse `chunk_type`
 ## Tests & coverage
 
 ```bash
-cargo test                                                  # 500 tests
+cargo test                                                  # 540 tests
 cargo clippy --all-targets --all-features -- -D warnings    # lint gate
 cargo fmt --check                                           # format gate
 ```
 
-The suite is **500 passing tests** (+1 `#[ignore]` live-Ollama integration test)
+The suite is **540 passing tests** (+1 `#[ignore]` live-Ollama integration test)
 and measures **~94% line coverage** via `cargo llvm-cov`. The default suite is
 fully deterministic and makes no network calls — including the metrics subsystem,
 whose clock and id source are injected and whose dashboard tests bind an
@@ -801,9 +839,11 @@ language pack, and a guard test asserts the core chunker names no language.
 | [`docs/sync.md`](docs/sync.md) | CCE Sync: model, artifact format, content address, permissions, troubleshooting |
 | [`docs/mcp.md`](docs/mcp.md) | CCE MCP: the server, the **nine tools**, `cce init`, sync freshness, and how to confirm agent use |
 | [`docs/savings.md`](docs/savings.md) | The seven Savings Layers, the ledger, `cce savings`, the token estimator, and the `cce eval` A/B harness |
+| [`docs/knowledge.md`](docs/knowledge.md) | Knowledge sources (v2.6): the markdown-heading chunker, the `cce.knowledge/v1` contract, `cce knowledge index`, and the `source:` retrieval blend |
 | [`docs/VERIFIED.md`](docs/VERIFIED.md) | Offline + online cold-start verification transcripts (index/search/stats/dashboard/workspace/MCP offline; Sync online) |
 | [`docs/ci/cce-sync.yml`](docs/ci/cce-sync.yml) | Ready-to-copy GitHub Actions cache-push workflow |
 | [`docs/getting-started.md`](docs/getting-started.md) | Install → first index + search |
+| [`docs/how-it-works.md`](docs/how-it-works.md) | The benefit and the mechanism, in diagrams — why serving chunks beats reading files |
 | [`docs/adding-a-language.md`](docs/adding-a-language.md) | Step-by-step guide to adding a language pack |
 | [`docs/architecture.md`](docs/architecture.md) | Design goals, pipeline, language packs, and where it strains |
 | [`docs/workspace.md`](docs/workspace.md) | Workspace model, manifest, detection, federation semantics |
@@ -812,6 +852,7 @@ language pack, and a guard test asserts the core chunker names no language.
 | [`docs/DECISIONS.md`](docs/DECISIONS.md) | How each spec ambiguity was resolved |
 | [`docs/TDD.md`](docs/TDD.md) | The red → green log and coverage |
 | [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | Measured numbers on a real corpus |
+| [`RELEASING.md`](RELEASING.md) | The automated, tag-driven release process behind the prebuilt binaries |
 | [`CONTRIBUTING.md`](CONTRIBUTING.md) · [`SECURITY.md`](SECURITY.md) · [`SUPPORT.md`](SUPPORT.md) · [`GOVERNANCE.md`](GOVERNANCE.md) | Project process |
 
 ## License
