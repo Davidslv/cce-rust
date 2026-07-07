@@ -401,7 +401,7 @@ mod tests {
     }
 
     fn built() -> Artifact {
-        let (idx, _) = Index::build_from_dir(&fixture(), &HashEmbedder);
+        let (idx, _) = Index::build_from_dir(&fixture(), &HashEmbedder).unwrap();
         Artifact::from_index(&idx, meta())
     }
 
@@ -506,7 +506,7 @@ mod tests {
     #[test]
     fn external_imports_produce_no_edges() {
         // The samples corpus: every import (os, fs, std, …) is external, so edges=[].
-        let (idx, _) = Index::build_from_dir(&samples(), &HashEmbedder);
+        let (idx, _) = Index::build_from_dir(&samples(), &HashEmbedder).unwrap();
         let a = Artifact::from_index(&idx, meta());
         let text = String::from_utf8(a.to_bytes()).unwrap();
         let graph_line = text.lines().nth(a.manifest.chunk_count + 1).unwrap();
@@ -542,7 +542,7 @@ mod tests {
 
     #[test]
     fn import_reconstructs_a_graph_with_identical_expansion_behaviour() {
-        let (idx, _) = Index::build_from_dir(&fixture(), &HashEmbedder);
+        let (idx, _) = Index::build_from_dir(&fixture(), &HashEmbedder).unwrap();
         let a = Artifact::from_index(&idx, meta());
         // Import from the SERIALIZED bytes, so file_imports is reconstructed from the
         // resolved graph edges (dropping external imports is behaviour-preserving).
@@ -620,7 +620,7 @@ mod tests {
     /// Ruby. A diff here is a breaking-format decision, not a test to "fix".
     #[test]
     fn shared_golden_checksum_for_samples() {
-        let (idx, _) = Index::build_from_dir(&samples(), &HashEmbedder);
+        let (idx, _) = Index::build_from_dir(&samples(), &HashEmbedder).unwrap();
         let meta = ManifestMeta {
             repo_id: "cce/demo".to_string(),
             sha: "0000000000000000000000000000000000000000".to_string(),
@@ -661,7 +661,7 @@ mod tests {
                 )
                 .unwrap();
             }
-            let (idx, _) = Index::build_from_dir(root, &HashEmbedder);
+            let (idx, _) = Index::build_from_dir(root, &HashEmbedder).unwrap();
             Artifact::from_index(&idx, meta()).manifest.checksum
         };
         assert_eq!(

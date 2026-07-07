@@ -363,7 +363,7 @@ mod tests {
     /// Build a hash index of the base fixture into `dir/.cce/index.json`.
     fn index_fixture(dir: &Path) {
         let fixture = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/test/fixture/base"));
-        let (idx, _) = Index::build_from_dir(&fixture, &HashEmbedder);
+        let (idx, _) = Index::build_from_dir(&fixture, &HashEmbedder).unwrap();
         idx.save(&default_store_path(dir)).unwrap();
     }
 
@@ -791,7 +791,7 @@ mod tests {
         build_graph(root, &manifest).save(root).unwrap();
         for m in &manifest.members {
             let dir = root.join(&m.path);
-            let (idx, _) = Index::build_from_dir(&dir, &HashEmbedder);
+            let (idx, _) = Index::build_from_dir(&dir, &HashEmbedder).unwrap();
             idx.save(&default_store_path(&dir)).unwrap();
         }
     }

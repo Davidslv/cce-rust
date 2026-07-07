@@ -114,8 +114,12 @@ ollama pull nomic-embed-text
 cce index ./my-project --embedder ollama
 ```
 
-If Ollama is not running, `cce` warns and falls back to the hash embedder — it
-never fails because of it.
+If Ollama is not running (or dies mid-index), `cce index --embedder ollama`
+fails loud with a clear error and writes no store — a store must never contain
+dead (empty) embeddings (#30). Searching an ollama-built index while Ollama is
+down also errors with guidance: start Ollama, or re-index with the default hash
+embedder. Set `CCE_OLLAMA_URL` / `CCE_OLLAMA_MODEL` to use a non-default
+endpoint or model.
 
 ## Where to next
 

@@ -40,15 +40,18 @@ green. Tests are deterministic and hermetic — no network in the default suite
     invalid index dir and missing store exit non-zero. Coverage-hardening pass
     added: default store-path resolution (`--dir` and bare cwd), human (non-JSON)
     search output, the "(no results)" empty-query path, `--embedder ollama`
-    graceful fallback, empty-index stats (`avg token/chunk: 0.0`), missing-store
+    loud failure when unreachable (revised by #30 — originally a graceful
+    fallback), empty-index stats (`avg token/chunk: 0.0`), missing-store
     `stats`, `bench` against a tiny local temp repo (default `unknown` commit and
     explicit `--commit`/`--name`), and invalid-dir exits for `bench`/`conformance`.
-13. **embedder / Ollama graceful failure (`embedder.rs` unit tests)** — the
-    `OllamaEmbedder` error path exercised **hermetically** against a closed local
-    port (`127.0.0.1:1`, connection refused — no server contacted): `try_embed_batch`
-    returns `Err`, `healthy()` is false, `embed`/`embed_batch` fall back to empty
-    vectors, empty text short-circuits, plus `round6` and the default
-    `embed_batch` trait method.
+13. **embedder / Ollama loud failure (`embedder.rs` unit tests + `tests/ollama.rs`)**
+    — the `OllamaEmbedder` error path exercised **hermetically** against a closed
+    local port (`127.0.0.1:1`, connection refused — no server contacted):
+    `try_embed_batch`/`try_embed` return `Err` (never empty vectors — issue #30
+    removed the silent fallbacks), `healthy()` is false, empty text
+    short-circuits, plus `round6` and the default trait methods. The end-to-end
+    policy (index aborts, CLI search refuses, MCP degrades to BM25-only with a
+    notice) is pinned in `tests/ollama.rs` against a loopback HTTP stub.
 14. **config / store edges** — `EmbedderKind::parse` (case-insensitive ollama,
     unknown → hash), `Config::default`, `default_store_path`, save into missing
     parent dirs, legacy JSON without an `embedder` field, and invalid-JSON load error.

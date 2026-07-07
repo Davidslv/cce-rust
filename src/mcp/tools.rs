@@ -38,14 +38,17 @@ use crate::chunker::{token_count, Chunk};
 use crate::compress::{compress, DetailLevel};
 use crate::config::{KnowledgeConfig, MemoryConfig, OutputLevel, RetrievalConfig, CHARS_PER_TOKEN};
 use crate::embedder::{format6, score_key, Embedder, HashEmbedder, OllamaEmbedder};
-use crate::federation::{federated_search_over, load_member_stores, workspace_stats, CachedWorkspace};
+use crate::federation::{
+    federated_bm25_only_search, federated_search_over, load_member_stores, workspace_stats,
+    CachedWorkspace, MemberStore,
+};
 use crate::knowledge::{search_knowledge, same_document_sections, KnowledgeHit, KnowledgeStore};
 use crate::mcp::server::McpServer;
 use crate::mcp::MCP_DEFAULT_TOP_K;
 use crate::memory::{self, RecallHit};
 use crate::metrics::{HexIdSource, MetricsWriter, SystemClock};
 use crate::packs::Registry;
-use crate::retriever::{build_search_record, search, SearchResult};
+use crate::retriever::{bm25_only_search, build_search_record, search, SearchResult};
 use crate::session::{short_label, SummaryScope};
 use crate::store::Index;
 use crate::sync::commands::{freshness, IndexSource};
@@ -369,10 +372,15 @@ fn context_search_single(
         Ok(i) => i,
         Err(_) => return ToolOutput::ok(missing_index_message(false)),
     };
-    let emb = pick_embedder(&index);
-
     let start = Instant::now();
-    let results = search(&index, emb.as_ref(), query, top_k, !no_graph);
+    // Ollama-built store with Ollama down (issue #30): BM25-only, with the
+    // pinned notice — visible degradation, never a cross-space cosine.
+    let (results, notice) = match pick_embedder(&index) {
+        QueryEmbedder::Ready(emb) => (search(&index, emb.as_ref(), query, top_k, !no_graph), None),
+        QueryEmbedder::Bm25Only => {
+            (bm25_only_search(&index, query, top_k), Some(OLLAMA_DOWN_NOTICE))
+        }
+    };
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     // Identical to the CLI path: a `cce.metrics/v1` search event beside the store,
@@ -388,7 +396,10 @@ fn context_search_single(
     server.record_search(query, &chunk_ids, &file_paths);
 
     let rows: Vec<Row> = results.iter().map(Row::from_single).collect();
-    ToolOutput::ok(format_rows(&rows, query_id.as_deref(), max_tokens, index.chunks.len(), detail))
+    ToolOutput::ok(with_notice(
+        notice,
+        format_rows(&rows, query_id.as_deref(), max_tokens, index.chunks.len(), detail),
+    ))
 }
 
 /// Workspace retrieval: SPEC-V2.2 federation over the in-scope members.
@@ -421,21 +432,18 @@ fn context_search_workspace(
     let combined = &bundle.combined;
     let graph = WorkspaceGraph::load_or_empty(&root, &manifest);
 
-    let uses_ollama = members.iter().any(|m| m.index.embedder_name == "ollama");
-    let emb: Box<dyn Embedder> = if uses_ollama {
-        let oll = OllamaEmbedder::default();
-        if oll.healthy() {
-            Box::new(oll)
-        } else {
-            Box::new(HashEmbedder)
-        }
-    } else {
-        Box::new(HashEmbedder)
-    };
-
     let start = Instant::now();
-    let results =
-        federated_search_over(combined, members, &graph, emb.as_ref(), query, top_k, !no_graph);
+    // Ollama-built members with Ollama down (issue #30): BM25-only over the
+    // union, with the pinned notice — never a cross-space cosine.
+    let (results, notice) = match pick_workspace_embedder(members) {
+        QueryEmbedder::Ready(emb) => (
+            federated_search_over(combined, members, &graph, emb.as_ref(), query, top_k, !no_graph),
+            None,
+        ),
+        QueryEmbedder::Bm25Only => {
+            (federated_bm25_only_search(combined, members, query, top_k), Some(OLLAMA_DOWN_NOTICE))
+        }
+    };
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
 
     // Metrics: log a search event beside the workspace-root store so the root
@@ -476,7 +484,10 @@ fn context_search_workspace(
 
     let total_chunks: usize = members.iter().map(|m| m.index.chunks.len()).sum();
     let rows: Vec<Row> = results.iter().map(Row::from_fed).collect();
-    ToolOutput::ok(format_rows(&rows, query_id.as_deref(), max_tokens, total_chunks, detail))
+    ToolOutput::ok(with_notice(
+        notice,
+        format_rows(&rows, query_id.as_deref(), max_tokens, total_chunks, detail),
+    ))
 }
 
 // --- knowledge + blend (SPEC-V2.6 §5) ---
@@ -568,15 +579,16 @@ impl BlendItem {
     }
 }
 
+/// What a code-side gather returns for blending: the rows, the logged
+/// `query_id`, the code chunk count, and — when the store is ollama-built and
+/// Ollama is down (issue #30) — the pinned degradation notice to surface.
+type CodeHits = (Vec<CodeRow>, Option<String>, usize, Option<&'static str>);
+
 /// Run code retrieval and return owned code rows plus the logged `query_id` and the
 /// code chunk count — reusing the SAME §6 pipeline, metrics event, and session-ledger
 /// recording as the code-only path (so the dashboard and digest are unchanged), but
 /// deferring rendering so the rows can be blended with knowledge.
-fn gather_code_hits(
-    server: &McpServer,
-    query: &str,
-    p: &SearchParams,
-) -> (Vec<CodeRow>, Option<String>, usize) {
+fn gather_code_hits(server: &McpServer, query: &str, p: &SearchParams) -> CodeHits {
     if server.is_workspace() {
         gather_code_hits_workspace(server, query, p)
     } else {
@@ -584,19 +596,21 @@ fn gather_code_hits(
     }
 }
 
-fn gather_code_hits_single(
-    server: &McpServer,
-    query: &str,
-    p: &SearchParams,
-) -> (Vec<CodeRow>, Option<String>, usize) {
+fn gather_code_hits_single(server: &McpServer, query: &str, p: &SearchParams) -> CodeHits {
     let store = server.store_path();
     let index = match Index::load(&store) {
         Ok(i) => i,
-        Err(_) => return (Vec::new(), None, 0),
+        Err(_) => return (Vec::new(), None, 0, None),
     };
-    let emb = pick_embedder(&index);
     let start = Instant::now();
-    let results = search(&index, emb.as_ref(), query, p.top_k, !p.no_graph);
+    let (results, notice) = match pick_embedder(&index) {
+        QueryEmbedder::Ready(emb) => {
+            (search(&index, emb.as_ref(), query, p.top_k, !p.no_graph), None)
+        }
+        QueryEmbedder::Bm25Only => {
+            (bm25_only_search(&index, query, p.top_k), Some(OLLAMA_DOWN_NOTICE))
+        }
+    };
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
     let record = build_search_record(
         &index,
@@ -626,18 +640,14 @@ fn gather_code_hits_single(
             content: r.content,
         })
         .collect();
-    (rows, query_id, index.chunks.len())
+    (rows, query_id, index.chunks.len(), notice)
 }
 
-fn gather_code_hits_workspace(
-    server: &McpServer,
-    query: &str,
-    p: &SearchParams,
-) -> (Vec<CodeRow>, Option<String>, usize) {
+fn gather_code_hits_workspace(server: &McpServer, query: &str, p: &SearchParams) -> CodeHits {
     let root = server.root();
     let manifest = match Manifest::load(&root) {
         Ok(m) => m,
-        Err(_) => return (Vec::new(), None, 0),
+        Err(_) => return (Vec::new(), None, 0, None),
     };
     let scope = p.package.as_ref().map(|p| {
         p.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>()
@@ -645,25 +655,30 @@ fn gather_code_hits_workspace(
     // Cached federated union (issue #26): same bundle the code-only path uses.
     let bundle = match server.workspace_bundle(&manifest, scope.as_deref()) {
         Ok(b) => b,
-        Err(_) => return (Vec::new(), None, 0),
+        Err(_) => return (Vec::new(), None, 0, None),
     };
     let members = &bundle.members;
     let combined = &bundle.combined;
     let graph = WorkspaceGraph::load_or_empty(&root, &manifest);
-    let uses_ollama = members.iter().any(|m| m.index.embedder_name == "ollama");
-    let emb: Box<dyn Embedder> = if uses_ollama {
-        let oll = OllamaEmbedder::default();
-        if oll.healthy() {
-            Box::new(oll)
-        } else {
-            Box::new(HashEmbedder)
-        }
-    } else {
-        Box::new(HashEmbedder)
-    };
     let start = Instant::now();
-    let results =
-        federated_search_over(combined, members, &graph, emb.as_ref(), query, p.top_k, !p.no_graph);
+    let (results, notice) = match pick_workspace_embedder(members) {
+        QueryEmbedder::Ready(emb) => (
+            federated_search_over(
+                combined,
+                members,
+                &graph,
+                emb.as_ref(),
+                query,
+                p.top_k,
+                !p.no_graph,
+            ),
+            None,
+        ),
+        QueryEmbedder::Bm25Only => (
+            federated_bm25_only_search(combined, members, query, p.top_k),
+            Some(OLLAMA_DOWN_NOTICE),
+        ),
+    };
     let latency_ms = start.elapsed().as_secs_f64() * 1000.0;
     let namespaced: Vec<SearchResult> = results
         .iter()
@@ -709,7 +724,7 @@ fn gather_code_hits_workspace(
             content: r.content,
         })
         .collect();
-    (rows, query_id, total_chunks)
+    (rows, query_id, total_chunks, notice)
 }
 
 /// The knowledge-only path (SPEC-V2.6 §5, `source:"knowledge"`).
@@ -728,13 +743,13 @@ fn context_search_knowledge(server: &McpServer, args: &Value, query: &str) -> To
 /// through the one shared ranking into a single top-K.
 fn context_search_both(server: &McpServer, args: &Value, query: &str) -> ToolOutput {
     let p = parse_params(server, args);
-    let (code_rows, query_id, code_chunks) = gather_code_hits(server, query, &p);
+    let (code_rows, query_id, code_chunks, notice) = gather_code_hits(server, query, &p);
     let khits = load_knowledge_hits(server, query, p.top_k);
     let mut items: Vec<BlendItem> = Vec::with_capacity(code_rows.len() + khits.len());
     items.extend(code_rows.into_iter().map(BlendItem::Code));
     items.extend(khits.into_iter().map(BlendItem::Knowledge));
     let total = code_chunks + knowledge_total_chunks(server);
-    ToolOutput::ok(render_blend(items, query_id.as_deref(), &p, total))
+    ToolOutput::ok(with_notice(notice, render_blend(items, query_id.as_deref(), &p, total)))
 }
 
 /// The knowledge store's chunk count (for the "no matches" hint), 0 if none/disabled.
@@ -867,16 +882,59 @@ fn write_search_event(
     writer.log_search(record)
 }
 
-/// Pick the query embedder: the index's own backend if it is a healthy Ollama,
-/// else the deterministic hash embedder (mirrors the CLI `search` path).
-fn pick_embedder(index: &Index) -> Box<dyn Embedder> {
+/// The pinned notice line served when an ollama-built store is queried while
+/// Ollama is down (issue #30): the session must not crash (the friendly-error
+/// pattern), but the degradation must be VISIBLE — the results below it are
+/// keyword (BM25) matches only, never a hash-vs-ollama cosine.
+pub(crate) const OLLAMA_DOWN_NOTICE: &str = "NOTICE: this index was built with the ollama \
+embedder but Ollama is unreachable — vector recall is disabled; results are keyword (BM25) \
+matches only. Start Ollama, or re-index with the default hash embedder (`cce index <dir>`), to \
+restore semantic search.";
+
+/// The query embedder decision for a loaded store (issue #30).
+enum QueryEmbedder {
+    /// The store's own backend is usable — run the full §6 pipeline.
+    Ready(Box<dyn Embedder>),
+    /// The store was built with ollama and Ollama is down: degrade EXPLICITLY
+    /// to BM25-only (with [`OLLAMA_DOWN_NOTICE`]) — never cosine across two
+    /// different embedding spaces.
+    Bm25Only,
+}
+
+/// Pick the query embedder: the deterministic hash backend for hash stores, a
+/// health-checked Ollama for ollama stores, and the explicit BM25-only
+/// degradation when an ollama store's server is unreachable.
+fn pick_embedder(index: &Index) -> QueryEmbedder {
     if index.embedder_name == "ollama" {
         let oll = OllamaEmbedder::default();
         if oll.healthy() {
-            return Box::new(oll);
+            return QueryEmbedder::Ready(Box::new(oll));
         }
+        return QueryEmbedder::Bm25Only;
     }
-    Box::new(HashEmbedder)
+    QueryEmbedder::Ready(Box::new(HashEmbedder))
+}
+
+/// The workspace twin of [`pick_embedder`]: ollama applies if ANY member's
+/// store was built with it (mirrors the CLI federation path).
+fn pick_workspace_embedder(members: &[MemberStore]) -> QueryEmbedder {
+    let uses_ollama = members.iter().any(|m| m.index.embedder_name == "ollama");
+    if uses_ollama {
+        let oll = OllamaEmbedder::default();
+        if oll.healthy() {
+            return QueryEmbedder::Ready(Box::new(oll));
+        }
+        return QueryEmbedder::Bm25Only;
+    }
+    QueryEmbedder::Ready(Box::new(HashEmbedder))
+}
+
+/// Prepend the pinned Ollama-down notice to a rendered result body.
+fn with_notice(notice: Option<&'static str>, body: String) -> String {
+    match notice {
+        Some(n) => format!("{n}\n\n{body}"),
+        None => body,
+    }
 }
 
 // --- index_status ---

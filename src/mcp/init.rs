@@ -157,7 +157,7 @@ fn ensure_index(opts: &InitOptions, is_workspace: bool) -> Result<String, String
         let (files, chunks) = build_workspace_index(dir)?;
         Ok(format!("index     : built {chunks} chunk(s) from {files} file(s) across the workspace"))
     } else {
-        let (idx, stats) = Index::build_protected(dir, &HashEmbedder, |_| true, true);
+        let (idx, stats) = Index::build_protected(dir, &HashEmbedder, |_| true, true)?;
         idx.save(&default_store_path(dir)).map_err(|e| e.to_string())?;
         Ok(format!(
             "index     : built {} chunk(s) from {} file(s)",
@@ -175,7 +175,7 @@ fn build_workspace_index(dir: &Path) -> Result<(usize, usize), String> {
     let mut chunks = 0usize;
     for m in &manifest.members {
         let member_dir = dir.join(&m.path);
-        let (idx, stats) = Index::build_protected(&member_dir, &emb, |_| true, true);
+        let (idx, stats) = Index::build_protected(&member_dir, &emb, |_| true, true)?;
         idx.save(&default_store_path(&member_dir)).map_err(|e| e.to_string())?;
         files += stats.files_indexed;
         chunks += stats.total_chunks;

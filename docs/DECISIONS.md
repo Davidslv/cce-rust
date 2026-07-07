@@ -65,13 +65,18 @@ recall/token-savings numbers comparable to the Ruby implementation. General
 the first remaining. Scoped packages (`@scope/pkg`) therefore resolve to
 `@scope`; an acceptable edge case not exercised by the spec.
 
-## D10 — Ollama backend at search time
+## D10 — Ollama backend at search time (revised by #30)
 **Ambiguity:** `cce search` has no `--embedder` flag (SPEC §9) but ollama vectors
 are model-specific.
-**Decision:** The store records which embedder built it. `search` uses the same
-backend; if the index used ollama and the server is now unreachable, it warns and
-embeds the query with the hash embedder (degraded but non-fatal). Hash indexes
-(the default and conformance path) always use the hash embedder.
+**Decision:** The store records which embedder built it, and `search` uses the
+same backend. *Originally* an unreachable server meant a warning and a hash-embedded
+query — but that cosines a hash query vector against ollama-built embeddings, two
+unrelated vector spaces, so retrieval quality collapsed silently. **Revised
+(issue #30):** `cce search` on an ollama-built index with Ollama down now errors
+with guidance (start Ollama, or re-index with the hash embedder); the MCP
+`context_search` degrades to BM25-only under a pinned `NOTICE:` line. Index time
+also fails loud: an embedding failure aborts `cce index` and writes no store.
+Hash indexes (the default and conformance path) always use the hash embedder.
 
 ## D11 — Coverage tool
 **Decision:** `cargo llvm-cov` for line/region coverage. CLI wiring (`main.rs`)
@@ -92,10 +97,13 @@ through the built binary in `tests/cli.rs`: default store-path resolution, human
 vs JSON output, empty-query "(no results)", `--embedder ollama` fallback,
 empty/missing-store `stats`, and `bench`/`conformance` against a tiny local temp
 repo — never the flask corpus), plus `config`/`store` edge functions.
-**Ollama graceful-failure path:** exercised **without ever contacting a real
+**Ollama failure path:** exercised **without ever contacting a real
 server** by pointing `OllamaEmbedder` at a closed local port (`127.0.0.1:1`,
-instant connection-refused). This covers `try_embed_batch`'s error branch,
-`healthy() == false`, and the empty-vector fallbacks in `embed`/`embed_batch`.
+instant connection-refused). This covers `try_embed_batch`'s error branch and
+`healthy() == false`. (The silent empty-vector fallbacks this pass also covered
+were removed by issue #30 — failures now propagate as errors; the loud-failure
+policy is pinned hermetically in `tests/ollama.rs` against a loopback HTTP stub
+via `CCE_OLLAMA_URL`.)
 The Ollama HTTP **success** path (response parsing) remains uncovered by design —
 it requires a live model server and is out of scope for the hermetic suite, so
 `embedder.rs` is intentionally the last file below 100%.

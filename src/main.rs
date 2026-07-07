@@ -5,9 +5,10 @@
 //! arguments and drives the library, keeping all algorithm logic in `lib`.
 //!
 //! **What it is / does:** Defines the clap command tree, resolves store paths,
-//! selects the embedder backend (with Ollama health-check + fallback), and
-//! prints human or JSON output. Errors exit non-zero with a clear message;
-//! invalid/empty inputs return empty results rather than crashing.
+//! selects the embedder backend (health-checking Ollama and failing loud when
+//! it is required but unreachable — issue #30), and prints human or JSON
+//! output. Errors exit non-zero with a clear message; invalid/empty inputs
+//! return empty results rather than crashing.
 //!
 //! **Responsibilities:**
 //! - Own argument parsing, store-path resolution, and output formatting.
@@ -449,21 +450,28 @@ fn resolve_metrics_path(
     }
 }
 
-/// Build an embedder for indexing, health-checking Ollama and falling back.
-fn build_embedder(kind: EmbedderKind) -> Box<dyn Embedder> {
+/// Build an embedder for indexing, health-checking Ollama first.
+///
+/// Fail loud (issue #30): an explicitly requested `--embedder ollama` with no
+/// reachable server is an error, NOT a silent fallback — falling back to the
+/// hash embedder would build a store whose declared embedder space does not
+/// match its vectors' provenance expectations, and quality would degrade with
+/// no signal.
+fn build_embedder(kind: EmbedderKind) -> Result<Box<dyn Embedder>, String> {
     match kind {
-        EmbedderKind::Hash => Box::new(HashEmbedder),
+        EmbedderKind::Hash => Ok(Box::new(HashEmbedder)),
         EmbedderKind::Ollama => {
             let oll = OllamaEmbedder::default();
             if oll.healthy() {
                 eprintln!("using ollama embedder ({} @ {})", oll.model, oll.base_url);
-                Box::new(oll)
+                Ok(Box::new(oll))
             } else {
-                eprintln!(
-                    "warning: Ollama unreachable at {}; falling back to the hash embedder",
-                    oll.base_url
-                );
-                Box::new(HashEmbedder)
+                Err(format!(
+                    "Ollama is unreachable at {} — refusing to index with `--embedder ollama`. \
+                     Start Ollama (and `ollama pull {}`), or index with the default hash \
+                     embedder (drop `--embedder ollama`).",
+                    oll.base_url, oll.model
+                ))
             }
         }
     }
@@ -480,7 +488,7 @@ fn cmd_index(
         return Err(format!("not a directory: {}", dir.display()));
     }
     let kind = EmbedderKind::parse(embedder);
-    let emb = build_embedder(kind);
+    let emb = build_embedder(kind)?;
     let store_path = store.unwrap_or_else(|| default_store_path(dir));
 
     // SPEC-V2.1: protection is on unless --allow-secrets is passed. Warn loudly
@@ -494,7 +502,7 @@ fn cmd_index(
     }
 
     let start = std::time::Instant::now();
-    let (index, stats) = Index::build_protected(dir, emb.as_ref(), |_| true, protect_secrets);
+    let (index, stats) = Index::build_protected(dir, emb.as_ref(), |_| true, protect_secrets)?;
     index.save(&store_path).map_err(|e| e.to_string())?;
     let elapsed = start.elapsed().as_secs_f64();
 
@@ -542,15 +550,21 @@ fn cmd_search(
     let top_k = top_k.unwrap_or(cce::config::DEFAULT_TOP_K);
     let graph_enabled = !no_graph;
 
-    // Use the backend recorded at index time; fall back to hash for search.
+    // Use the backend recorded at index time. If the store was built with
+    // ollama and the server is down, refuse (issue #30): embedding the query
+    // with the hash backend would cosine across two unrelated vector spaces,
+    // silently collapsing retrieval quality.
     let emb: Box<dyn Embedder> = if index.embedder_name == "ollama" {
         let oll = OllamaEmbedder::default();
-        if oll.healthy() {
-            Box::new(oll)
-        } else {
-            eprintln!("warning: index used ollama but it is unreachable; query embedded with hash");
-            Box::new(HashEmbedder)
+        if !oll.healthy() {
+            return Err(format!(
+                "this index was built with the ollama embedder but Ollama is unreachable at {} \
+                 — refusing to search across mismatched embedding spaces. Start Ollama, or \
+                 re-index with the default hash embedder (`cce index <dir>`).",
+                oll.base_url
+            ));
         }
+        Box::new(oll)
     } else {
         Box::new(HashEmbedder)
     };
@@ -915,7 +929,7 @@ fn cmd_index_workspace(
     }
     let manifest = Manifest::load(&root)?;
     let kind = EmbedderKind::parse(embedder);
-    let emb = build_embedder(kind);
+    let emb = build_embedder(kind)?;
     let protect_secrets = !allow_secrets;
     if allow_secrets {
         eprintln!("warning: --allow-secrets set — secret protection is DISABLED for every member");
@@ -929,7 +943,7 @@ fn cmd_index_workspace(
         let store_path = default_store_path(&member_dir);
         let start = std::time::Instant::now();
         let (index, stats) =
-            Index::build_protected(&member_dir, emb.as_ref(), |_| true, protect_secrets);
+            Index::build_protected(&member_dir, emb.as_ref(), |_| true, protect_secrets)?;
         index.save(&store_path).map_err(|e| e.to_string())?;
         let elapsed = start.elapsed().as_secs_f64();
 
@@ -995,17 +1009,21 @@ fn cmd_search_workspace(
     let graph = WorkspaceGraph::load_or_empty(&root, &manifest);
     let top_k = top_k.unwrap_or(cce::config::DEFAULT_TOP_K);
 
-    // Mirror single-repo embedder selection: if members were indexed with ollama,
-    // try it (falling back to hash), else hash.
+    // Mirror single-repo embedder selection: the backend recorded at index time.
+    // An ollama-built workspace with Ollama down is a refusal (issue #30), never
+    // a silent hash-vs-ollama cosine.
     let uses_ollama = members.iter().any(|m| m.index.embedder_name == "ollama");
     let emb: Box<dyn Embedder> = if uses_ollama {
         let oll = OllamaEmbedder::default();
-        if oll.healthy() {
-            Box::new(oll)
-        } else {
-            eprintln!("warning: workspace indexed with ollama but it is unreachable; using hash");
-            Box::new(HashEmbedder)
+        if !oll.healthy() {
+            return Err(format!(
+                "this workspace was indexed with the ollama embedder but Ollama is unreachable \
+                 at {} — refusing to search across mismatched embedding spaces. Start Ollama, \
+                 or re-index with the default hash embedder (`cce index --workspace`).",
+                oll.base_url
+            ));
         }
+        Box::new(oll)
     } else {
         Box::new(HashEmbedder)
     };

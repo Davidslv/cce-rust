@@ -65,10 +65,12 @@ This codebase is built test-first (see [`docs/TDD.md`](docs/TDD.md)):
 3. Refactor with tests green.
 
 Tests must be **deterministic and hermetic** — no network, no wall-clock, no
-ambient filesystem state. The only network-touching test (Ollama) is `#[ignore]`.
+ambient filesystem state. The only test needing a real server (live Ollama) is
+`#[ignore]`; the Ollama failure-policy tests run against a **loopback HTTP stub**
+(via `CCE_OLLAMA_URL`) or a closed local port, never a real server.
 The metrics tests inject a fixed clock/id source, and the dashboard's socket test
 binds an **ephemeral loopback port** and serves a bounded number of connections.
-Keep coverage at or above the baseline (**416 tests, ~93.9% line coverage** via
+Keep coverage at or above the baseline (**500 tests, ~94% line coverage** via
 `cargo llvm-cov`); a change that lowers coverage should add tests. The CI test
 gate also runs the three-layer validators over every language pack.
 

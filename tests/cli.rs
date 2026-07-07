@@ -216,10 +216,11 @@ fn search_with_no_matches_prints_no_results() {
 }
 
 #[test]
-fn index_with_ollama_embedder_falls_back_gracefully() {
-    // Requesting the ollama backend must never crash: with no reachable server
-    // it health-checks, warns, and falls back to the hash embedder. (If a local
-    // Ollama happens to be up, it is used; either way indexing succeeds.)
+fn index_with_ollama_unreachable_fails_loud_and_writes_no_store() {
+    // Issue #30: an explicitly requested `--embedder ollama` with no reachable
+    // server is a clear non-zero error, NOT a silent fallback to the hash
+    // embedder. Hermetic: `CCE_OLLAMA_URL` points at a closed local port
+    // (127.0.0.1:1, instant connection-refused — no server contacted).
     let tmp = tempfile::tempdir().unwrap();
     write_tiny_repo(tmp.path());
     let store = tmp.path().join("index.json");
@@ -228,10 +229,14 @@ fn index_with_ollama_embedder_falls_back_gracefully() {
         .arg(tmp.path())
         .args(["--embedder", "ollama", "--store"])
         .arg(&store)
+        .env("CCE_OLLAMA_URL", "http://127.0.0.1:1")
         .output()
         .unwrap();
-    assert!(out.status.success(), "index failed: {}", String::from_utf8_lossy(&out.stderr));
-    assert!(store.exists());
+    assert!(!out.status.success(), "unreachable ollama must exit non-zero");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("Ollama is unreachable"), "stderr must say why: {stderr}");
+    assert!(stderr.contains("hash embedder"), "stderr must offer the way out: {stderr}");
+    assert!(!store.exists(), "no store may be written on a refused index");
 }
 
 #[test]

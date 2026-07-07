@@ -133,7 +133,13 @@ impl Index {
 
     /// Build an index by walking `root` and embedding with `embedder`, with the
     /// secure-by-default secret protection of SPEC-V2.1 (Layers 1 & 2) enabled.
-    pub fn build_from_dir(root: &Path, embedder: &dyn Embedder) -> (Index, BuildStats) {
+    ///
+    /// Errors if any chunk fails to embed (fallible backends only — the hash
+    /// embedder cannot fail): a store must never contain empty embeddings (#30).
+    pub fn build_from_dir(
+        root: &Path,
+        embedder: &dyn Embedder,
+    ) -> Result<(Index, BuildStats), String> {
         Index::build_from_dir_filtered(root, embedder, |_| true)
     }
 
@@ -143,7 +149,7 @@ impl Index {
         root: &Path,
         embedder: &dyn Embedder,
         keep: impl Fn(&str) -> bool,
-    ) -> (Index, BuildStats) {
+    ) -> Result<(Index, BuildStats), String> {
         Index::build_protected(root, embedder, keep, true)
     }
 
@@ -154,12 +160,17 @@ impl Index {
     /// each file's content *before* chunking — so the redacted text is what gets
     /// chunked, embedded, and stored. When false (`--allow-secrets`), both layers
     /// are off and content is indexed verbatim.
+    ///
+    /// Embedding is fallible (issue #30): a failed embed — e.g. Ollama dying
+    /// mid-index — aborts the whole build with an `Err`, so a store can never
+    /// silently persist empty/dead embeddings. Nothing is written by this
+    /// function; callers only `save` an `Ok` index.
     pub fn build_protected(
         root: &Path,
         embedder: &dyn Embedder,
         keep: impl Fn(&str) -> bool,
         protect_secrets: bool,
-    ) -> (Index, BuildStats) {
+    ) -> Result<(Index, BuildStats), String> {
         let walked = crate::walker::walk(root, protect_secrets);
         let files_skipped = walked.skipped;
         let sensitive_skipped = walked.sensitive_skipped;
@@ -191,14 +202,25 @@ impl Index {
                 file_imports.insert(rel_path.clone(), fc.imports);
             }
             for mut chunk in fc.chunks {
-                chunk.embedding = embedder.embed(&chunk.content);
+                // Fail loud (#30): propagate an embedding failure instead of
+                // storing an empty vector that would score cosine 0 forever.
+                chunk.embedding = embedder.try_embed(&chunk.content).map_err(|e| {
+                    format!(
+                        "embedding failed at {rel_path}:{} ({}): {e}. Aborting the index — a \
+                         store must never contain empty embeddings. Fix the `{}` backend or \
+                         re-index with the default hash embedder.",
+                        chunk.start_line,
+                        chunk.chunk_id,
+                        embedder.name()
+                    )
+                })?;
                 chunks.push(chunk);
             }
         }
 
         let total_chunks = chunks.len();
         let index = Index::assemble(chunks, file_imports, file_tokens, embedder.name().to_string());
-        (index, BuildStats { files_indexed, files_skipped, sensitive_skipped, total_chunks })
+        Ok((index, BuildStats { files_indexed, files_skipped, sensitive_skipped, total_chunks }))
     }
 
     /// Persist the index to `path` (JSON). Creates parent directories.
@@ -276,7 +298,7 @@ mod tests {
     #[test]
     fn builds_seven_chunks_from_fixture() {
         let e = HashEmbedder;
-        let (idx, stats) = Index::build_from_dir(&fixture_dir(), &e);
+        let (idx, stats) = Index::build_from_dir(&fixture_dir(), &e).unwrap();
         assert_eq!(stats.total_chunks, 7);
         assert_eq!(idx.chunks.len(), 7);
         // payments.py -> auth edge present
@@ -291,7 +313,7 @@ mod tests {
         // with served_tokens.
         use crate::tokenizer::estimate_tokens;
         let e = HashEmbedder;
-        let (idx, _) = Index::build_from_dir(&fixture_dir(), &e);
+        let (idx, _) = Index::build_from_dir(&fixture_dir(), &e).unwrap();
 
         // Every source file has a whole-file token count equal to the estimator over
         // the file's full contents.
@@ -320,7 +342,7 @@ mod tests {
     #[test]
     fn save_load_roundtrip() {
         let e = HashEmbedder;
-        let (idx, _) = Index::build_from_dir(&fixture_dir(), &e);
+        let (idx, _) = Index::build_from_dir(&fixture_dir(), &e).unwrap();
         let tmp = tempfile::tempdir().unwrap();
         let path = tmp.path().join("index.json");
         idx.save(&path).unwrap();
@@ -333,8 +355,8 @@ mod tests {
     #[test]
     fn reindex_is_idempotent() {
         let e = HashEmbedder;
-        let (a, _) = Index::build_from_dir(&fixture_dir(), &e);
-        let (b, _) = Index::build_from_dir(&fixture_dir(), &e);
+        let (a, _) = Index::build_from_dir(&fixture_dir(), &e).unwrap();
+        let (b, _) = Index::build_from_dir(&fixture_dir(), &e).unwrap();
         let ids_a: Vec<&String> = a.chunks.iter().map(|c| &c.chunk_id).collect();
         let ids_b: Vec<&String> = b.chunks.iter().map(|c| &c.chunk_id).collect();
         assert_eq!(ids_a, ids_b);
@@ -343,7 +365,7 @@ mod tests {
     #[test]
     fn save_creates_missing_parent_directories() {
         let e = HashEmbedder;
-        let (idx, _) = Index::build_from_dir(&fixture_dir(), &e);
+        let (idx, _) = Index::build_from_dir(&fixture_dir(), &e).unwrap();
         let tmp = tempfile::tempdir().unwrap();
         // Nested path whose parents do not yet exist.
         let path = tmp.path().join("a").join("b").join("index.json");

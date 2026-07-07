@@ -300,7 +300,7 @@ fn chunk_compression_ledger_math_on_a_real_index() {
     // `chunk_compression` bucket equals Σ(full − compressed) with baseline Σ(full),
     // computed with the one `cce.tokens/v1` estimator (SPEC-V2.5 §2/§4).
     let reg = default_registry();
-    let (index, _) = Index::build_from_dir(&fixture_dir(), &HashEmbedder);
+    let (index, _) = Index::build_from_dir(&fixture_dir(), &HashEmbedder).unwrap();
     let results = search(&index, &HashEmbedder, "parse amount currency", 8, false);
     assert!(!results.is_empty(), "the query must return results");
 
