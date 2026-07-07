@@ -19,12 +19,13 @@
 //!   an absent remote, or an offline network.
 
 use crate::config::{OutputConfig, OutputLevel, SummarizationConfig, METRICS_FILE};
-use crate::federation::{load_cached_workspace, CachedWorkspace};
+use crate::federation::{load_cached_workspace, member_store_paths, CachedWorkspace};
+use crate::knowledge::{KnowledgeStore, LoadedKnowledge};
 use crate::mcp::protocol::{self, Request};
 use crate::mcp::tools;
 use crate::mcp::{MCP_PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION};
 use crate::session::{SessionLedger, SummaryScope};
-use crate::store::{default_metrics_path, default_store_path};
+use crate::store::{default_metrics_path, default_store_path, Index};
 use crate::sync::commands::{cmd_pull, PullTarget};
 use crate::sync::config::SyncConfig;
 use crate::tokenizer::estimate_tokens;
@@ -35,6 +36,32 @@ use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::SystemTime;
+
+/// A cheap freshness fingerprint of one store file: `(mtime, len)` from a single
+/// `fs::metadata` call (issue #31). A re-index or a `cce sync pull` replaces the file,
+/// changing at least one of the two, so a stale cache is dropped on the next call.
+type Fingerprint = (SystemTime, u64);
+
+/// The fingerprint of `path`, or `None` if the file is missing/unreadable — the
+/// signal to drop any cache entry derived from it (never serve a deleted store).
+fn file_fingerprint(path: &Path) -> Option<Fingerprint> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+/// The combined fingerprint of the file(s) `KnowledgeStore::load_current` reads: the
+/// `current` pointer and the snapshot artifact it names. A re-ingest rewrites both.
+fn knowledge_fingerprint(root: &Path) -> Option<Vec<Fingerprint>> {
+    let pointer = KnowledgeStore::current_pointer_path(root);
+    let pointer_fp = file_fingerprint(&pointer)?;
+    let snapshot = std::fs::read_to_string(&pointer).ok()?;
+    let snapshot_fp = file_fingerprint(&KnowledgeStore::snapshot_path(root, snapshot.trim()))?;
+    Some(vec![pointer_fp, snapshot_fp])
+}
+
+/// One cached workspace bundle plus the member-store fingerprints it was built from.
+type FingerprintedWorkspace = (Vec<Fingerprint>, Rc<CachedWorkspace>);
 
 /// The resolved context for a CCE MCP session (SPEC-MCP §"The server").
 pub struct McpServer {
@@ -69,11 +96,23 @@ pub struct McpServer {
     /// the members' stores (load + BM25-over-union) is the entire cost of a federated
     /// query, so the long-lived server builds it once per distinct `--package` scope and
     /// reuses it across `context_search` calls — a warm workspace call then matches the
-    /// CLI instead of re-federating every time. Lifetime = the server process: the index
-    /// is warmed once via CCE Sync at startup (never mid-session), so the assembled union
-    /// is stable for the session; a fresh index requires restarting `cce mcp`. `RefCell`
-    /// because the stdio loop is single-threaded and every handler takes `&self`.
-    workspace_cache: RefCell<HashMap<String, Rc<CachedWorkspace>>>,
+    /// CLI instead of re-federating every time. Each bundle carries the fingerprints of
+    /// its in-scope member store files (issue #31): a member re-index or a mid-session
+    /// `cce sync pull` changes a fingerprint, so the next call rebuilds the union
+    /// instead of serving a stale one. `RefCell` because the stdio loop is
+    /// single-threaded and every handler takes `&self`.
+    workspace_cache: RefCell<HashMap<String, FingerprintedWorkspace>>,
+    /// Single-repo index cache (issue #31). `Index::load` reads + JSON-parses the whole
+    /// store AND rebuilds BM25 + the import graph — O(corpus) work that the long-lived
+    /// server previously repeated on EVERY tool call. Cached once and reused while the
+    /// store file's fingerprint (mtime+len) is unchanged; a re-index or `cce sync pull`
+    /// invalidates it on the next call, and a deleted store drops it (never stale).
+    index_cache: RefCell<Option<(Fingerprint, Rc<Index>)>>,
+    /// Knowledge-store cache (issue #31): the parsed store + its lazily built ranking
+    /// index, reused across calls under the same fingerprint rule (over the `current`
+    /// pointer and the snapshot artifact it names). A re-ingest supersedes on the next
+    /// call; a deleted store behaves exactly like no knowledge store at all.
+    knowledge_cache: RefCell<Option<(Vec<Fingerprint>, Rc<LoadedKnowledge>)>>,
 }
 
 impl McpServer {
@@ -92,16 +131,90 @@ impl McpServer {
             auto_tokens,
             served_tokens: Cell::new(0),
             workspace_cache: RefCell::new(HashMap::new()),
+            index_cache: RefCell::new(None),
+            knowledge_cache: RefCell::new(None),
+        }
+    }
+
+    /// The loaded single-repo `Index`, cached across tool calls (issue #31). One
+    /// `fs::metadata` per call decides freshness: an unchanged fingerprint reuses the
+    /// cached index (skipping the store parse + BM25/graph rebuild); a changed one —
+    /// re-index, `cce sync pull` (startup auto-pull or mid-session) — reloads; a
+    /// missing store drops the cache and errors exactly like `Index::load` today, so
+    /// a deleted store is never served stale.
+    pub fn load_index(&self) -> std::io::Result<Rc<Index>> {
+        let store = self.store_path();
+        let fp = match file_fingerprint(&store) {
+            Some(fp) => fp,
+            None => {
+                self.index_cache.borrow_mut().take();
+                // Missing/unreadable store: surface today's load error unchanged.
+                return Index::load(&store).map(Rc::new);
+            }
+        };
+        if let Some((cached_fp, index)) = self.index_cache.borrow().as_ref() {
+            if *cached_fp == fp {
+                return Ok(Rc::clone(index));
+            }
+        }
+        match Index::load(&store) {
+            Ok(index) => {
+                let index = Rc::new(index);
+                *self.index_cache.borrow_mut() = Some((fp, Rc::clone(&index)));
+                Ok(index)
+            }
+            Err(e) => {
+                // Unparseable store: drop any cached copy rather than serve stale.
+                self.index_cache.borrow_mut().take();
+                Err(e)
+            }
+        }
+    }
+
+    /// The loaded knowledge store (+ lazily built ranking index), cached across tool
+    /// calls (issue #31) under the fingerprint of the files `load_current` reads (the
+    /// `current` pointer + the snapshot artifact). `None` behaves exactly like
+    /// `KnowledgeStore::load_current` failing today: no store, or an unreadable one.
+    /// A re-ingest changes both files, so the next call reloads; a deleted store
+    /// drops the cache — never a stale answer.
+    pub fn knowledge(&self) -> Option<Rc<LoadedKnowledge>> {
+        let root = self.root();
+        let fp = match knowledge_fingerprint(&root) {
+            Some(fp) => fp,
+            None => {
+                self.knowledge_cache.borrow_mut().take();
+                return None;
+            }
+        };
+        if let Some((cached_fp, k)) = self.knowledge_cache.borrow().as_ref() {
+            if *cached_fp == fp {
+                return Some(Rc::clone(k));
+            }
+        }
+        match KnowledgeStore::load_current(&root) {
+            Ok(store) => {
+                let k = Rc::new(LoadedKnowledge::new(store));
+                *self.knowledge_cache.borrow_mut() = Some((fp, Rc::clone(&k)));
+                Some(k)
+            }
+            Err(_) => {
+                self.knowledge_cache.borrow_mut().take();
+                None
+            }
         }
     }
 
     /// The assembled federated workspace for `scope` (issue #26), built once per distinct
-    /// scope and cached for the server's lifetime. The first `context_search` in a scope
-    /// pays the load+union cost; later calls reuse the same `CachedWorkspace` (members +
-    /// union index), so a warm federated query is as fast as a single-repo one. `scope`
-    /// is `None` for the whole workspace or the `--package` member list otherwise; the
-    /// cache key is order-sensitive so it maps 1:1 to what `load_member_stores` selects.
-    /// Errors (missing member, unknown package) are NOT cached — they are cheap and may be
+    /// scope and cached while its member stores are unchanged. The first `context_search`
+    /// in a scope pays the load+union cost; later calls reuse the same `CachedWorkspace`
+    /// (members + union index), so a warm federated query is as fast as a single-repo one.
+    /// Freshness (issue #31) is the combined fingerprint (mtime+len) of the in-scope
+    /// member store files: a member re-index or a mid-session `cce sync pull` changes it,
+    /// so the next call rebuilds the union; a missing member store drops the entry and
+    /// surfaces today's "not indexed" guidance — never a stale union. `scope` is `None`
+    /// for the whole workspace or the `--package` member list otherwise; the cache key is
+    /// order-sensitive so it maps 1:1 to what `load_member_stores` selects. Errors
+    /// (missing member, unknown package) are NOT cached — they are cheap and may be
     /// user-fixable mid-session.
     pub fn workspace_bundle(
         &self,
@@ -112,11 +225,29 @@ impl McpServer {
             None => "\u{0}all".to_string(),
             Some(names) => format!("scope\u{0}{}", names.join("\u{0}")),
         };
-        if let Some(hit) = self.workspace_cache.borrow().get(&key) {
-            return Ok(Rc::clone(hit));
+        // The freshness fingerprint of the in-scope member stores. An unknown
+        // member/package errors here with the same message as the loader; a missing
+        // store file yields `None` (fall through to the loader's guidance).
+        let store_paths = member_store_paths(&self.root(), manifest, scope)?;
+        let fp: Option<Vec<Fingerprint>> =
+            store_paths.iter().map(|p| file_fingerprint(p)).collect();
+        match &fp {
+            Some(fp) => {
+                if let Some((cached_fp, bundle)) = self.workspace_cache.borrow().get(&key) {
+                    if cached_fp == fp {
+                        return Ok(Rc::clone(bundle));
+                    }
+                }
+            }
+            // A member store vanished: drop the stale bundle before erroring below.
+            None => {
+                self.workspace_cache.borrow_mut().remove(&key);
+            }
         }
         let bundle = Rc::new(load_cached_workspace(&self.root(), manifest, scope)?);
-        self.workspace_cache.borrow_mut().insert(key, Rc::clone(&bundle));
+        if let Some(fp) = fp {
+            self.workspace_cache.borrow_mut().insert(key, (fp, Rc::clone(&bundle)));
+        }
         Ok(bundle)
     }
 
@@ -369,6 +500,170 @@ mod tests {
 
     fn server_for(dir: &Path) -> McpServer {
         McpServer::new(Some(dir.to_path_buf()), None, false)
+    }
+
+    /// Push `path`'s mtime clearly forward, so a rewrite within the same clock tick
+    /// still changes the freshness fingerprint on filesystems with coarse mtimes.
+    fn bump_mtime(path: &Path) {
+        let f = std::fs::OpenOptions::new().append(true).open(path).unwrap();
+        f.set_modified(SystemTime::now() + std::time::Duration::from_secs(5)).unwrap();
+    }
+
+    /// Run a `context_search` for `query` (no_graph, so results are query-only) and
+    /// return the served text block.
+    fn search_text(s: &McpServer, query: &str) -> String {
+        let resp = s
+            .handle_line(&format!(
+                r#"{{"id":1,"method":"tools/call","params":{{"name":"context_search","arguments":{{"query":"{query}","no_graph":true}}}}}}"#,
+            ))
+            .unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        v["result"]["content"][0]["text"].as_str().unwrap().to_string()
+    }
+
+    /// Drop the per-call metrics lines (`query_id` is a fresh id each call by design);
+    /// the ranked result block itself must be byte-identical warm vs cold.
+    fn strip_query_id(t: &str) -> String {
+        t.lines()
+            .filter(|l| !l.starts_with("query_id:") && !l.starts_with("Rate this"))
+            .collect::<Vec<_>>()
+            .join("\n")
+    }
+
+    #[test]
+    fn single_repo_context_search_is_cached_and_warm_call_is_identical() {
+        let tmp = tempfile::tempdir().unwrap();
+        index_fixture(tmp.path());
+        let s = server_for(tmp.path());
+
+        // Cold call loads + caches the index.
+        let cold = search_text(&s, "hash password");
+        assert!(cold.contains("auth.py"), "expected auth.py, got: {cold}");
+        let cold_ptr = Rc::as_ptr(&s.index_cache.borrow().as_ref().unwrap().1);
+
+        // Warm call reuses the SAME cached index (pointer-identical) and serves a
+        // byte-identical ranked block.
+        let warm = search_text(&s, "hash password");
+        let warm_ptr = Rc::as_ptr(&s.index_cache.borrow().as_ref().unwrap().1);
+        assert_eq!(cold_ptr, warm_ptr, "warm call must reuse the cached index");
+        assert_eq!(strip_query_id(&cold), strip_query_id(&warm));
+    }
+
+    #[test]
+    fn single_repo_reindex_is_picked_up_on_the_next_call() {
+        let tmp = tempfile::tempdir().unwrap();
+        index_fixture(tmp.path());
+        let s = server_for(tmp.path());
+        assert!(search_text(&s, "hash password").contains("auth.py"));
+        let cold_ptr = Rc::as_ptr(&s.index_cache.borrow().as_ref().unwrap().1);
+
+        // Re-index from a DIFFERENT corpus over the same store path (what a re-index
+        // or a mid-session `cce sync pull` does), bumping mtime explicitly so the
+        // fingerprint change never depends on filesystem clock granularity.
+        let src = tempfile::tempdir().unwrap();
+        std::fs::write(src.path().join("widgets.py"), "def frobnicate_widget():\n    return 42\n")
+            .unwrap();
+        let (idx, _) = Index::build_from_dir(src.path(), &HashEmbedder).unwrap();
+        let store = default_store_path(tmp.path());
+        idx.save(&store).unwrap();
+        bump_mtime(&store);
+
+        // The next call reflects the NEW store, and the cache was swapped.
+        let after = search_text(&s, "frobnicate widget");
+        assert!(after.contains("widgets.py"), "re-index not picked up: {after}");
+        assert!(!after.contains("auth.py"), "stale corpus served: {after}");
+        let new_ptr = Rc::as_ptr(&s.index_cache.borrow().as_ref().unwrap().1);
+        assert_ne!(cold_ptr, new_ptr, "a changed fingerprint must reload the index");
+    }
+
+    #[test]
+    fn deleting_the_store_mid_session_is_friendly_not_stale() {
+        let tmp = tempfile::tempdir().unwrap();
+        index_fixture(tmp.path());
+        let s = server_for(tmp.path());
+        assert!(search_text(&s, "hash password").contains("auth.py"));
+        assert!(s.index_cache.borrow().is_some(), "cold call must populate the cache");
+
+        std::fs::remove_file(default_store_path(tmp.path())).unwrap();
+
+        // Exactly today's behaviour: the friendly missing-index message — never the
+        // cached (now deleted) index — and the cache is dropped.
+        let after = search_text(&s, "hash password");
+        assert!(after.contains("not indexed"), "got: {after}");
+        assert!(!after.contains("auth.py"), "stale cached index served: {after}");
+        assert!(s.index_cache.borrow().is_none(), "a deleted store must drop the cache");
+
+        let resp = s
+            .handle_line(r#"{"id":2,"method":"tools/call","params":{"name":"index_status"}}"#)
+            .unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert!(v["result"]["content"][0]["text"].as_str().unwrap().contains("not indexed"));
+    }
+
+    /// Write + ingest a one-record knowledge feed whose body carries `sentence`.
+    fn ingest_knowledge(root: &Path, id: &str, title: &str, sentence: &str) {
+        let feed = root.join("feed.jsonl");
+        std::fs::write(
+            &feed,
+            format!(
+                "{{\"id\":\"{id}\",\"title\":\"{title}\",\"body\":\"## Rule\\n\\n{sentence}\",\"source\":\"github-issues\"}}\n"
+            ),
+        )
+        .unwrap();
+        crate::knowledge::ingest_file(&feed, root, 400).unwrap();
+    }
+
+    /// A knowledge-only `context_search`, returning the served text block.
+    fn knowledge_search_text(s: &McpServer, query: &str) -> String {
+        let resp = s
+            .handle_line(&format!(
+                r#"{{"id":1,"method":"tools/call","params":{{"name":"context_search","arguments":{{"query":"{query}","source":"knowledge"}}}}}}"#,
+            ))
+            .unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        v["result"]["content"][0]["text"].as_str().unwrap().to_string()
+    }
+
+    #[test]
+    fn knowledge_search_is_cached_warm_identical_and_reingest_invalidates() {
+        let tmp = tempfile::tempdir().unwrap();
+        ingest_knowledge(
+            tmp.path(),
+            "gh:1",
+            "Login policy",
+            "Lock the account after five failed login attempts.",
+        );
+        let s = server_for(tmp.path());
+
+        // Cold call loads + caches the knowledge store; warm call reuses it
+        // (pointer-identical) and serves byte-identical text (knowledge-only
+        // searches log no query_id, so the whole block must match).
+        let cold = knowledge_search_text(&s, "login attempts lock account");
+        assert!(cold.contains("Login policy"), "got: {cold}");
+        let cold_ptr = Rc::as_ptr(&s.knowledge_cache.borrow().as_ref().unwrap().1);
+        let warm = knowledge_search_text(&s, "login attempts lock account");
+        let warm_ptr = Rc::as_ptr(&s.knowledge_cache.borrow().as_ref().unwrap().1);
+        assert_eq!(cold_ptr, warm_ptr, "warm call must reuse the cached knowledge store");
+        assert_eq!(cold, warm, "warm knowledge search must equal the cold one");
+
+        // Re-ingest a superseding snapshot (new artifact + rewritten pointer), with an
+        // explicit mtime bump on the pointer so granularity can never mask the change.
+        ingest_knowledge(
+            tmp.path(),
+            "gh:2",
+            "Refund policy",
+            "Refund a captured login charge within thirty days.",
+        );
+        bump_mtime(&KnowledgeStore::current_pointer_path(tmp.path()));
+        let after = knowledge_search_text(&s, "refund captured charge days");
+        assert!(after.contains("Refund policy"), "re-ingest not picked up: {after}");
+        assert!(!after.contains("Login policy"), "stale knowledge served: {after}");
+
+        // Deleting the knowledge store behaves exactly like no store at all.
+        std::fs::remove_dir_all(KnowledgeStore::dir(tmp.path())).unwrap();
+        let gone = knowledge_search_text(&s, "refund captured charge days");
+        assert!(!gone.contains("Refund policy"), "stale knowledge after delete: {gone}");
+        assert!(s.knowledge_cache.borrow().is_none(), "a deleted store must drop the cache");
     }
 
     #[test]
@@ -851,6 +1146,49 @@ mod tests {
             2,
             "scope and full workspace cache separately"
         );
+    }
+
+    #[test]
+    fn workspace_member_reindex_is_picked_up_mid_session() {
+        let tmp = tempfile::tempdir().unwrap();
+        index_workspace_fixture(tmp.path());
+        let s = McpServer::new(Some(tmp.path().to_path_buf()), None, true);
+
+        // Cold call assembles + caches the union.
+        let resp = s
+            .handle_line(
+                r#"{"id":1,"method":"tools/call","params":{"name":"context_search","arguments":{"query":"billing charge amount","no_graph":true}}}"#,
+            )
+            .unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert!(v["result"]["content"][0]["text"].as_str().unwrap().contains("billing"));
+        assert_eq!(s.workspace_cache.borrow().len(), 1);
+        let cold_ptr = Rc::as_ptr(&s.workspace_cache.borrow().values().next().unwrap().1);
+
+        // Re-index ONE member mid-session (new file, rebuilt store, explicit mtime
+        // bump so granularity can never mask the change).
+        let manifest = Manifest::load(tmp.path()).unwrap();
+        let billing = manifest.members.iter().find(|m| m.name == "billing").unwrap();
+        let member_dir = tmp.path().join(&billing.path);
+        std::fs::write(member_dir.join("widgets.py"), "def frobnicate_widget():\n    return 42\n")
+            .unwrap();
+        let (idx, _) = Index::build_from_dir(&member_dir, &HashEmbedder).unwrap();
+        let store = default_store_path(&member_dir);
+        idx.save(&store).unwrap();
+        bump_mtime(&store);
+
+        // The next call rebuilds the union and serves the new member content.
+        let resp = s
+            .handle_line(
+                r#"{"id":2,"method":"tools/call","params":{"name":"context_search","arguments":{"query":"frobnicate widget","no_graph":true}}}"#,
+            )
+            .unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        let text = v["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("widgets.py"), "member re-index not picked up: {text}");
+        assert_eq!(s.workspace_cache.borrow().len(), 1, "the entry is replaced, not added");
+        let new_ptr = Rc::as_ptr(&s.workspace_cache.borrow().values().next().unwrap().1);
+        assert_ne!(cold_ptr, new_ptr, "a changed member fingerprint must rebuild the union");
     }
 
     #[test]

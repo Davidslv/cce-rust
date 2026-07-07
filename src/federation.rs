@@ -144,16 +144,7 @@ pub fn load_member_stores(
     manifest: &Manifest,
     scope: Option<&[String]>,
 ) -> Result<Vec<MemberStore>, String> {
-    let selected: Vec<&crate::workspace::Member> = match scope {
-        Some(names) => {
-            let mut out = Vec::new();
-            for n in names {
-                out.push(resolve_scope_token(manifest, n)?);
-            }
-            out
-        }
-        None => manifest.members.iter().collect(),
-    };
+    let selected = select_members(manifest, scope)?;
 
     let mut stores = Vec::with_capacity(selected.len());
     for m in selected {
@@ -173,6 +164,37 @@ pub fn load_member_stores(
         });
     }
     Ok(stores)
+}
+
+/// Resolve a scope to its members: every member for `None`, else each token via
+/// [`resolve_scope_token`] (an unmatched token is an error, never a silent empty).
+fn select_members<'a>(
+    manifest: &'a Manifest,
+    scope: Option<&[String]>,
+) -> Result<Vec<&'a crate::workspace::Member>, String> {
+    match scope {
+        Some(names) => {
+            let mut out = Vec::new();
+            for n in names {
+                out.push(resolve_scope_token(manifest, n)?);
+            }
+            Ok(out)
+        }
+        None => Ok(manifest.members.iter().collect()),
+    }
+}
+
+/// The on-disk store paths of the in-scope members, in scope order. Resolves scope
+/// tokens exactly like [`load_member_stores`] (same unknown-token error) but touches
+/// no store file — this is what the long-lived MCP server fingerprints (mtime+len)
+/// to decide whether its cached union is still fresh (issue #31).
+pub fn member_store_paths(
+    root: &Path,
+    manifest: &Manifest,
+    scope: Option<&[String]>,
+) -> Result<Vec<std::path::PathBuf>, String> {
+    let selected = select_members(manifest, scope)?;
+    Ok(selected.iter().map(|m| default_store_path(&root.join(&m.path))).collect())
 }
 
 /// Build the combined union corpus over `members`, with member-namespaced paths.

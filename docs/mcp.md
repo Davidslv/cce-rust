@@ -92,6 +92,14 @@ messages). It pins protocol version **`2025-06-18`**.
 - **Missing/empty index:** tools still respond — `context_search` returns a clear
   *"not indexed — run `cce index`"* message rather than erroring; `index_status`
   reports "not indexed."
+- **Cached across calls (issues #26/#31):** the long-lived server loads the
+  single-repo index, the knowledge store, and each workspace union **once** and
+  reuses them across tool calls, instead of re-parsing the store and rebuilding
+  BM25 per request. Freshness is a cheap fingerprint (`mtime`+length, one
+  `fs::metadata` per call) of the store file(s): a re-index, a re-ingest, or a
+  `cce sync pull` (startup auto-pull or mid-session) is picked up on the very next
+  call, and a deleted store returns the friendly missing-index message — never a
+  stale cached answer. Results are byte-identical warm vs cold.
 - **Secret-safe by construction:** it only returns what is already in the store,
   which was redacted at index time (v2.1). Nothing new to scrub.
 
@@ -364,11 +372,12 @@ from `workspace.yml`; an unknown value returns an actionable error listing the
 available members (never a silent empty result). Comma-separate to scope to several
 members (`"package": "billing,payments"`).
 
-The long-lived MCP server **caches the assembled union per scope** for its lifetime, so
-the first `context_search` in a scope pays the federation cost and subsequent calls
-reuse it — a warm workspace search is as fast as a single-repo one. The index is warmed
-once via CCE Sync at startup (never mid-session), so the cache is always consistent;
-after a fresh remote build, restart `cce mcp` to pick it up.
+The long-lived MCP server **caches the assembled union per scope**, so the first
+`context_search` in a scope pays the federation cost and subsequent calls reuse it — a
+warm workspace search is as fast as a single-repo one. Each cached union carries the
+combined fingerprint (`mtime`+length) of its member store files (issue #31): a member
+re-index or a mid-session `cce sync pull` is picked up on the very next call, with no
+restart needed.
 
 ---
 

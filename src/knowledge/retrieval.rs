@@ -26,11 +26,12 @@ use crate::knowledge::store::{KnowledgeChunk, KnowledgeStore};
 use crate::retriever::search;
 use crate::store::Index;
 use crate::tokenizer::tokenize;
+use std::cell::OnceCell;
 use std::collections::{BTreeMap, HashSet};
 
 /// One ranked knowledge result (SPEC-V2.6 §5): the section's identity + content plus
 /// the facets the provenance line needs and the final (post-staleness) score.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct KnowledgeHit {
     pub rank: usize,
     pub chunk_id: String,
@@ -146,6 +147,24 @@ fn to_chunk(kc: &KnowledgeChunk, embedder: &HashEmbedder) -> crate::chunker::Chu
     }
 }
 
+/// The live (non-dropped) chunks of a store, in store order — staleness rule 1
+/// (SPEC-V2.6 §5): `not_planned`/`wontfix` records are never candidates at all.
+fn live_chunks(store: &KnowledgeStore) -> Vec<&KnowledgeChunk> {
+    store.chunks.iter().filter(|c| !is_dropped_reason(c.state_reason.as_deref())).collect()
+}
+
+/// Build the ranking `Index` over a store's live chunks — the expensive half of a
+/// knowledge search (per-chunk conversion, a legacy-snapshot re-embed, and the BM25
+/// build all live here). Split out so a long-lived caller (the MCP server, issue #31)
+/// can build it once and reuse it across queries via [`search_knowledge_over`];
+/// [`search_knowledge`] composes the two for one-shot callers, byte-identically.
+pub fn knowledge_ranking_index(store: &KnowledgeStore) -> Index {
+    let embedder = HashEmbedder;
+    let chunks: Vec<crate::chunker::Chunk> =
+        live_chunks(store).iter().map(|c| to_chunk(c, &embedder)).collect();
+    Index::from_parts(chunks, BTreeMap::new(), BTreeMap::new(), embedder.name().to_string())
+}
+
 /// Search the knowledge store (SPEC-V2.6 §5): rank with the identical §6 hybrid
 /// pipeline, drop `not_planned`/`wontfix`, precision-filter (score ≥ `min_score` AND a
 /// shared query token), apply the merged-PR boost, then order by score, then recency
@@ -159,27 +178,38 @@ pub fn search_knowledge(
     if store.chunks.is_empty() || query.trim().is_empty() || top_k == 0 {
         return Vec::new();
     }
-    let embedder = HashEmbedder;
+    let index = knowledge_ranking_index(store);
+    search_knowledge_over(store, &index, query, top_k, min_score)
+}
 
-    // Staleness rule 1 (SPEC-V2.6 §5): drop `not_planned`/`wontfix` BEFORE ranking, so
-    // a decided-against record is never a candidate at all.
-    let live: Vec<&KnowledgeChunk> =
-        store.chunks.iter().filter(|c| !is_dropped_reason(c.state_reason.as_deref())).collect();
+/// [`search_knowledge`] over an already-built ranking index (from
+/// [`knowledge_ranking_index`] on the SAME store). Everything after the index build —
+/// ranking, staleness rules, the precision filter, ordering — is identical, so the
+/// results are byte-for-byte the same whether the index is fresh or reused.
+pub fn search_knowledge_over(
+    store: &KnowledgeStore,
+    index: &Index,
+    query: &str,
+    top_k: usize,
+    min_score: f64,
+) -> Vec<KnowledgeHit> {
+    if store.chunks.is_empty() || query.trim().is_empty() || top_k == 0 {
+        return Vec::new();
+    }
+    let embedder = HashEmbedder;
+    let live = live_chunks(store);
     if live.is_empty() {
         return Vec::new();
     }
 
     let by_id: BTreeMap<&str, &KnowledgeChunk> =
         live.iter().map(|c| (c.chunk_id.as_str(), *c)).collect();
-    let chunks: Vec<crate::chunker::Chunk> = live.iter().map(|c| to_chunk(c, &embedder)).collect();
-    let index =
-        Index::from_parts(chunks, BTreeMap::new(), BTreeMap::new(), embedder.name().to_string());
 
     // Rank generously (the whole live corpus) so the recency re-order and the precision
     // filter see every candidate before we truncate to `top_k`. No graph (knowledge has
     // no import edges).
     let generous = live.len().max(top_k);
-    let ranked = search(&index, &embedder, query, generous, false);
+    let ranked = search(index, &embedder, query, generous, false);
 
     let mut hits: Vec<KnowledgeHit> = Vec::new();
     for r in ranked {
@@ -228,6 +258,34 @@ pub fn search_knowledge(
         h.rank = i + 1;
     }
     hits
+}
+
+/// A knowledge store loaded once and reused across MCP tool calls (issue #31): the
+/// parsed store plus a lazily built ranking index, so a warm knowledge query skips
+/// both the JSON parse and the per-query embed + BM25 rebuild. The index is lazy
+/// (`OnceCell`) because several consumers (`expand_chunk`, `related_context`, the
+/// source resolver) only need the chunks, never the ranking structures. Freshness is
+/// the CALLER's job (the server fingerprints the store files); this type is a pure
+/// snapshot. Results are byte-identical to the uncached [`search_knowledge`].
+pub struct LoadedKnowledge {
+    pub store: KnowledgeStore,
+    index: OnceCell<Index>,
+}
+
+impl LoadedKnowledge {
+    pub fn new(store: KnowledgeStore) -> Self {
+        LoadedKnowledge { store, index: OnceCell::new() }
+    }
+
+    /// The ranking index over the store's live chunks, built on first use.
+    fn index(&self) -> &Index {
+        self.index.get_or_init(|| knowledge_ranking_index(&self.store))
+    }
+
+    /// [`search_knowledge`] against the cached ranking index — byte-identical results.
+    pub fn search(&self, query: &str, top_k: usize, min_score: f64) -> Vec<KnowledgeHit> {
+        search_knowledge_over(&self.store, self.index(), query, top_k, min_score)
+    }
 }
 
 /// Find a chunk by id in the store (for `expand_chunk` on a knowledge chunk_id).
@@ -381,6 +439,27 @@ mod tests {
         assert!(hits.len() >= 2);
         // The implemented (merged-PR) record wins despite being older.
         assert_eq!(hits[0].record_id, "implemented");
+    }
+
+    #[test]
+    fn loaded_knowledge_search_is_byte_identical_to_the_one_shot_path() {
+        // The cached path (issue #31) must be indistinguishable from the one-shot
+        // `search_knowledge`, for every field of every hit — and stable across
+        // repeated queries against the same `LoadedKnowledge`.
+        let recs = vec![
+            rec(
+                "a",
+                "Login policy",
+                "## Rule\n\nLock the account after five failed login attempts.",
+            ),
+            rec("b", "Payments", "## Refund\n\nRefund a captured charge within thirty days."),
+        ];
+        let store = ingest_default(&recs, b"feed");
+        let one_shot = search_knowledge(&store, "login attempts lock account", 5, 0.30);
+        assert!(!one_shot.is_empty());
+        let loaded = LoadedKnowledge::new(store);
+        assert_eq!(loaded.search("login attempts lock account", 5, 0.30), one_shot);
+        assert_eq!(loaded.search("login attempts lock account", 5, 0.30), one_shot);
     }
 
     #[test]
