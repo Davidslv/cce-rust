@@ -96,7 +96,11 @@ chunks. Concretely:
 
 1. Load each in-scope member's store; annotate every chunk with its `member` name
    (its `file_path` stays member-relative). `--package a,b` restricts the scope to
-   named members and errors on an unknown name.
+   the named members — a name resolves against the member **name** or the
+   manifest's **`package:` field** (v2.6.4) — and an unknown value errors loudly,
+   listing the available members (never a silent empty result). Scoping is also
+   the main performance lever: only the named members' stores are loaded, so
+   latency tracks their size, not the whole ecosystem's.
 2. Form the combined corpus = the union of those chunks and run the §6 pipeline
    **once** over it: query embed → vector search + BM25 (statistics computed over
    the union) → RRF → confidence blend → path penalty → per-file diversity cap
@@ -137,11 +141,15 @@ only cross-member links are the declared dependency edges.
 
 ## Where this would strain
 
-- **Many members, reloaded per query.** A federated search loads every in-scope
-  member's store and unions their chunks on each invocation. For a huge ecosystem
-  (dozens of large members) that is a lot of JSON to read and hold in memory per
-  query — a persistent index server or a shared on-disk vector store would scale
-  better than the reload-and-union model used here.
+- **Many members, reloaded per query (CLI).** A CLI federated search loads every
+  in-scope member's store and unions their chunks on each invocation. For a huge
+  ecosystem (dozens of large members) that is a lot of JSON to read and hold in
+  memory per query. Two mitigations since v2.6: scope with `--package` (only the
+  named members load), and use the long-lived MCP server — it **caches the
+  assembled union per scope** across calls, invalidated by an `mtime`+length
+  fingerprint of the member stores, so a warm agent search is as fast as a
+  single-repo one (see [`mcp.md`](mcp.md)). A shared on-disk vector store would
+  still scale better than reload-and-union for the cold CLI path.
 - **Edges are declared, not behavioural.** Cross-member edges come only from
   declared manifest dependencies. A Rails app that *mounts* an engine's routes,
   or reaches into it through runtime constant lookup rather than a `Gemfile`

@@ -59,7 +59,11 @@ responsibilities header.
 | `src/savings.rs` | The seven-bucket ledger roll-up + the honesty note (SPEC-V2.5 §3) | `sum_by_layer`, `SavingsByLayer`, `SAVINGS_NOTE` |
 | `src/pricing.rs` / `src/pricing.json` | Embedded, offline model pricing for the `$` estimate (SPEC-V2.5 §3) | `PriceTable`, `dollars_saved`, `builtin` |
 | `src/eval.rs` | The real-world A/B harness aggregator — correctness-gated, cost-primary, paired (SPEC-V2.5 §7) | `evaluate_files`, `ArmSummary` |
-| `src/walker.rs` | Filesystem walk + ignore rules + Layer-1 sensitive-file skip (SPEC §7.1, SPEC-V2.1 §2) | `walk` |
+| `src/markdown.rs` | The markdown-heading chunker behind knowledge ingest (SPEC-V2.6 §2) | `chunk_markdown` |
+| `src/knowledge/contract.rs` | The `cce.knowledge/v1` NDJSON ingest contract — parse, validate, fail loud with line numbers (SPEC-V2.6 §3) | `KnowledgeRecord`, `parse_ndjson`, `render_document` |
+| `src/knowledge/store.rs` | The snapshot-keyed knowledge store under `.cce/knowledge/` (SPEC-V2.6 §4) | `KnowledgeStore`, `KnowledgeChunk`, `ingest`, `snapshot_id` |
+| `src/knowledge/retrieval.rs` | The M4 knowledge search blend — same §6 pipeline, plus provenance, staleness rules, the precision floor (SPEC-V2.6 §5) | `KnowledgeHit`, `provenance_line`, `search_knowledge` |
+| `src/walker.rs` | Gitignore-aware filesystem walk + ignore rules + Layer-1 sensitive-file skip (SPEC §7.1, SPEC-V2.1 §2; committed `.gitignore` only — v2.6.3) | `walk` |
 | `src/sensitive.rs` | Layer-1 sensitive-file policy: is a basename secret material? (SPEC-V2.1 §1) | `is_sensitive` |
 | `src/redactor.rs` | Layer-2 secret redaction over indexed content (SPEC-V2.1 §1) | `redact` |
 | `src/store.rs` | Index assembly + JSON persistence, whole-file token counts (SPEC §7, DASH §3, SPEC-V2.1 §2) | `Index`, `build_from_dir`, `build_protected`, `save`, `load`, `baseline_tokens` |
@@ -68,7 +72,7 @@ responsibilities header.
 | `src/metrics.rs` | Persisted metrics event log; injected clock/id source (DASH §2) | `MetricsWriter`, `read_log`, `parse_log`, `Clock`, `IdSource`, `parse_iso` |
 | `src/aggregator.rs` | Pure aggregate: totals, north-stars, series, deltas (DASH §4) | `aggregate`, `Aggregate`, `direction` |
 | `src/dashboard.rs` | Loopback-only, read-only, self-contained web server (DASH §6, SPEC-V2.2 §7) | `run`, `serve`, `route`, `run_workspace`, `route_workspace` |
-| `src/main.rs` | CLI (SPEC §9, DASH §5, SPEC-V2.2 §9, SPEC-SYNC §5, SPEC-MCP, SPEC-V2.5 §3/§7) | clap command tree — incl. `cce savings`, `cce eval` |
+| `src/main.rs` | CLI (SPEC §9, DASH §5, SPEC-V2.2 §9, SPEC-SYNC §5, SPEC-MCP, SPEC-V2.5 §3/§7, SPEC-V2.6 §4) | clap command tree — incl. `cce savings`, `cce eval`, `cce knowledge` |
 
 The metrics/dashboard modules (`DASH` = [`DASHBOARD-SPEC.md`](../DASHBOARD-SPEC.md),
 v1.1) are the one part of the system that uses real wall-clock time; the clock and
@@ -81,7 +85,7 @@ schema, and the aggregation formulas live in [`dashboard.md`](dashboard.md).
 ### Indexing (`cce index`)
 
 ```
-dir ──walker::walk──▶ [(rel_path, content)]         # ignore rules, UTF-8, ≤2 MB
+dir ──walker::walk──▶ [(rel_path, content)]         # ignore rules + committed .gitignore, UTF-8, ≤2 MB
       │                                                # Layer 1: sensitive::is_sensitive → skip (never read)
       └─ per file ─ redactor::redact ─▶ content'      # Layer 2: [REDACTED:LABEL] before chunking
                       └ chunker::chunk_file ─▶ Chunk[] # registry.pack_for(path); pack grammar or module fallback
@@ -103,6 +107,14 @@ and `store::build_protected` runs `redactor::redact` over each file's content
 stored, and `chunk_id`/`token_count` derive from it. `cce index --allow-secrets`
 turns both layers off. Because the shared sample corpus contains no secrets, both
 layers are no-ops there and `conformance.json` is unchanged.
+
+The walk is **gitignore-aware** (since v2.6.3), and deliberately honors **only
+committed `.gitignore` files at/below the walk root**: machine-local ignore sources
+(`.git/info/exclude`, the global `core.excludesfile`) and `.gitignore` files above
+the root are ignored, because they vary by machine and would break the Sync
+invariant `artifact == build(sha)` — the index must be a pure function of the
+committed tree, whoever builds it. `.git/` and `.cce/` are hard-pruned regardless
+of gitignore state.
 
 The BM25 index and the import graph are **derived** structures — recomputed on
 load, not persisted (SPEC §7 allows this).
@@ -247,11 +259,15 @@ Being honest about the edges of the design:
   floating-point or ordering difference in either implementation would surface as
   a conformance mismatch — which is precisely why `conformance.json` is a gate,
   not an afterthought.
-- **Workspaces reload every member per query (v2.2).** A federated search loads
-  and unions all in-scope members' stores on each invocation; for a large
-  ecosystem that is a lot of JSON per query — the reload-and-union model favours
-  simplicity and the union-equals-single-index correctness anchor over scale. And
-  cross-member edges are **declared, not behavioural**: they come only from
-  manifest dependencies (`Gemfile`/`*.gemspec`/`package.json`), so runtime coupling
-  such as Rails route mounting produces no edge yet. See
-  [`workspace.md`](workspace.md).
+- **Workspace federation cost scales with the union (v2.2).** A *CLI* federated
+  search loads and unions all in-scope members' stores on each invocation — the
+  reload-and-union model favours simplicity and the union-equals-single-index
+  correctness anchor over scale. Two v2.6 mitigations: `--package` short-circuits
+  to load **only** the scoped member(s) (v2.6.4, the biggest lever on a large
+  workspace), and the long-lived **MCP server caches** the loaded index, the
+  knowledge store, and each assembled workspace union across calls, invalidated by
+  an `mtime`+length fingerprint per call (v2.6.7) — so warm agent searches skip the
+  reload entirely. And cross-member edges are **declared, not behavioural**: they
+  come only from manifest dependencies (`Gemfile`/`*.gemspec`/`package.json`), so
+  runtime coupling such as Rails route mounting produces no edge yet. See
+  [`workspace.md`](workspace.md) and [`mcp.md`](mcp.md).
