@@ -18,6 +18,10 @@ cce index ./my-project
   removed files (chunk IDs are content-derived). See [`DECISIONS.md`](DECISIONS.md) D3.
 - Files that are binary, non-UTF-8, or larger than 2 MB are skipped (reported as
   `files skipped`).
+- The walk honors the repo's **committed `.gitignore`** (since v2.6.3) but
+  deliberately not machine-local excludes (`.git/info/exclude`, the global
+  `core.excludesfile`) or a `.gitignore` above the walk root — so the same commit
+  indexes identically on every machine. `.git/` and `.cce/` are always skipped.
 
 ## Search a store
 
@@ -34,7 +38,7 @@ cce search "process payment" --dir ./my-project --json
 
 Flags:
 
-- `--top-k N` — number of results (default 5).
+- `--top-k N` — number of results (default 10).
 - `--no-graph` — skip import-graph expansion (step §6.7); results come only from
   direct vector + BM25 + RRF ranking.
 - `--json` — emit an object `{query_id, results: [{rank, chunk_id, file_path,
@@ -141,6 +145,23 @@ cce savings --dir ./my-project --json   # the same shape as /api/metrics.savings
 - Note: `cce search` (CLI) serves full bodies, so its `chunk_compression` bucket is
   zero; the compact chunks (and that bucket) come from the agent-facing
   `context_search` MCP tool. See [`mcp.md`](mcp.md).
+
+## Ingest a knowledge feed (issues, epics, policy docs)
+
+```bash
+cce knowledge index curated.jsonl --dir ./my-project
+```
+
+- Ingests a **`cce.knowledge/v1`** NDJSON feed (one record per line — any adapter
+  that emits the contract) into a separate, snapshot-keyed store under
+  `<dir>/.cce/knowledge/`. Each record is redacted, then split by markdown heading
+  (`markdown.max_section_tokens`, default 400). A newer ingest supersedes the old.
+- Search it through the MCP `context_search` tool's `source: code|knowledge|both`
+  argument (default `both` once a store exists); hits carry a
+  `[knowledge] <title> — <state> · …` provenance header and staleness weighting.
+  The CLI `cce search` stays code-only.
+- Fully offline; the code index and Sync artifact are untouched. See
+  [`knowledge.md`](knowledge.md).
 
 ## Run the real-world A/B eval harness
 
