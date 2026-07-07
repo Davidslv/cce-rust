@@ -19,12 +19,13 @@
 //!   an absent remote, or an offline network.
 
 use crate::config::{OutputConfig, OutputLevel, SummarizationConfig, METRICS_FILE};
-use crate::federation::{load_cached_workspace, CachedWorkspace};
+use crate::federation::{load_cached_workspace, member_store_paths, CachedWorkspace};
+use crate::knowledge::{KnowledgeStore, LoadedKnowledge};
 use crate::mcp::protocol::{self, Request};
 use crate::mcp::tools;
 use crate::mcp::{MCP_PROTOCOL_VERSION, SERVER_NAME, SERVER_VERSION};
 use crate::session::{SessionLedger, SummaryScope};
-use crate::store::{default_metrics_path, default_store_path};
+use crate::store::{default_metrics_path, default_store_path, Index};
 use crate::sync::commands::{cmd_pull, PullTarget};
 use crate::sync::config::SyncConfig;
 use crate::tokenizer::estimate_tokens;
@@ -35,6 +36,32 @@ use std::collections::HashMap;
 use std::io::{BufRead, Write};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
+use std::time::SystemTime;
+
+/// A cheap freshness fingerprint of one store file: `(mtime, len)` from a single
+/// `fs::metadata` call (issue #31). A re-index or a `cce sync pull` replaces the file,
+/// changing at least one of the two, so a stale cache is dropped on the next call.
+type Fingerprint = (SystemTime, u64);
+
+/// The fingerprint of `path`, or `None` if the file is missing/unreadable — the
+/// signal to drop any cache entry derived from it (never serve a deleted store).
+fn file_fingerprint(path: &Path) -> Option<Fingerprint> {
+    let meta = std::fs::metadata(path).ok()?;
+    Some((meta.modified().ok()?, meta.len()))
+}
+
+/// The combined fingerprint of the file(s) `KnowledgeStore::load_current` reads: the
+/// `current` pointer and the snapshot artifact it names. A re-ingest rewrites both.
+fn knowledge_fingerprint(root: &Path) -> Option<Vec<Fingerprint>> {
+    let pointer = KnowledgeStore::current_pointer_path(root);
+    let pointer_fp = file_fingerprint(&pointer)?;
+    let snapshot = std::fs::read_to_string(&pointer).ok()?;
+    let snapshot_fp = file_fingerprint(&KnowledgeStore::snapshot_path(root, snapshot.trim()))?;
+    Some(vec![pointer_fp, snapshot_fp])
+}
+
+/// One cached workspace bundle plus the member-store fingerprints it was built from.
+type FingerprintedWorkspace = (Vec<Fingerprint>, Rc<CachedWorkspace>);
 
 /// The resolved context for a CCE MCP session (SPEC-MCP §"The server").
 pub struct McpServer {
@@ -69,11 +96,23 @@ pub struct McpServer {
     /// the members' stores (load + BM25-over-union) is the entire cost of a federated
     /// query, so the long-lived server builds it once per distinct `--package` scope and
     /// reuses it across `context_search` calls — a warm workspace call then matches the
-    /// CLI instead of re-federating every time. Lifetime = the server process: the index
-    /// is warmed once via CCE Sync at startup (never mid-session), so the assembled union
-    /// is stable for the session; a fresh index requires restarting `cce mcp`. `RefCell`
-    /// because the stdio loop is single-threaded and every handler takes `&self`.
-    workspace_cache: RefCell<HashMap<String, Rc<CachedWorkspace>>>,
+    /// CLI instead of re-federating every time. Each bundle carries the fingerprints of
+    /// its in-scope member store files (issue #31): a member re-index or a mid-session
+    /// `cce sync pull` changes a fingerprint, so the next call rebuilds the union
+    /// instead of serving a stale one. `RefCell` because the stdio loop is
+    /// single-threaded and every handler takes `&self`.
+    workspace_cache: RefCell<HashMap<String, FingerprintedWorkspace>>,
+    /// Single-repo index cache (issue #31). `Index::load` reads + JSON-parses the whole
+    /// store AND rebuilds BM25 + the import graph — O(corpus) work that the long-lived
+    /// server previously repeated on EVERY tool call. Cached once and reused while the
+    /// store file's fingerprint (mtime+len) is unchanged; a re-index or `cce sync pull`
+    /// invalidates it on the next call, and a deleted store drops it (never stale).
+    index_cache: RefCell<Option<(Fingerprint, Rc<Index>)>>,
+    /// Knowledge-store cache (issue #31): the parsed store + its lazily built ranking
+    /// index, reused across calls under the same fingerprint rule (over the `current`
+    /// pointer and the snapshot artifact it names). A re-ingest supersedes on the next
+    /// call; a deleted store behaves exactly like no knowledge store at all.
+    knowledge_cache: RefCell<Option<(Vec<Fingerprint>, Rc<LoadedKnowledge>)>>,
 }
 
 impl McpServer {
@@ -92,16 +131,90 @@ impl McpServer {
             auto_tokens,
             served_tokens: Cell::new(0),
             workspace_cache: RefCell::new(HashMap::new()),
+            index_cache: RefCell::new(None),
+            knowledge_cache: RefCell::new(None),
+        }
+    }
+
+    /// The loaded single-repo `Index`, cached across tool calls (issue #31). One
+    /// `fs::metadata` per call decides freshness: an unchanged fingerprint reuses the
+    /// cached index (skipping the store parse + BM25/graph rebuild); a changed one —
+    /// re-index, `cce sync pull` (startup auto-pull or mid-session) — reloads; a
+    /// missing store drops the cache and errors exactly like `Index::load` today, so
+    /// a deleted store is never served stale.
+    pub fn load_index(&self) -> std::io::Result<Rc<Index>> {
+        let store = self.store_path();
+        let fp = match file_fingerprint(&store) {
+            Some(fp) => fp,
+            None => {
+                self.index_cache.borrow_mut().take();
+                // Missing/unreadable store: surface today's load error unchanged.
+                return Index::load(&store).map(Rc::new);
+            }
+        };
+        if let Some((cached_fp, index)) = self.index_cache.borrow().as_ref() {
+            if *cached_fp == fp {
+                return Ok(Rc::clone(index));
+            }
+        }
+        match Index::load(&store) {
+            Ok(index) => {
+                let index = Rc::new(index);
+                *self.index_cache.borrow_mut() = Some((fp, Rc::clone(&index)));
+                Ok(index)
+            }
+            Err(e) => {
+                // Unparseable store: drop any cached copy rather than serve stale.
+                self.index_cache.borrow_mut().take();
+                Err(e)
+            }
+        }
+    }
+
+    /// The loaded knowledge store (+ lazily built ranking index), cached across tool
+    /// calls (issue #31) under the fingerprint of the files `load_current` reads (the
+    /// `current` pointer + the snapshot artifact). `None` behaves exactly like
+    /// `KnowledgeStore::load_current` failing today: no store, or an unreadable one.
+    /// A re-ingest changes both files, so the next call reloads; a deleted store
+    /// drops the cache — never a stale answer.
+    pub fn knowledge(&self) -> Option<Rc<LoadedKnowledge>> {
+        let root = self.root();
+        let fp = match knowledge_fingerprint(&root) {
+            Some(fp) => fp,
+            None => {
+                self.knowledge_cache.borrow_mut().take();
+                return None;
+            }
+        };
+        if let Some((cached_fp, k)) = self.knowledge_cache.borrow().as_ref() {
+            if *cached_fp == fp {
+                return Some(Rc::clone(k));
+            }
+        }
+        match KnowledgeStore::load_current(&root) {
+            Ok(store) => {
+                let k = Rc::new(LoadedKnowledge::new(store));
+                *self.knowledge_cache.borrow_mut() = Some((fp, Rc::clone(&k)));
+                Some(k)
+            }
+            Err(_) => {
+                self.knowledge_cache.borrow_mut().take();
+                None
+            }
         }
     }
 
     /// The assembled federated workspace for `scope` (issue #26), built once per distinct
-    /// scope and cached for the server's lifetime. The first `context_search` in a scope
-    /// pays the load+union cost; later calls reuse the same `CachedWorkspace` (members +
-    /// union index), so a warm federated query is as fast as a single-repo one. `scope`
-    /// is `None` for the whole workspace or the `--package` member list otherwise; the
-    /// cache key is order-sensitive so it maps 1:1 to what `load_member_stores` selects.
-    /// Errors (missing member, unknown package) are NOT cached — they are cheap and may be
+    /// scope and cached while its member stores are unchanged. The first `context_search`
+    /// in a scope pays the load+union cost; later calls reuse the same `CachedWorkspace`
+    /// (members + union index), so a warm federated query is as fast as a single-repo one.
+    /// Freshness (issue #31) is the combined fingerprint (mtime+len) of the in-scope
+    /// member store files: a member re-index or a mid-session `cce sync pull` changes it,
+    /// so the next call rebuilds the union; a missing member store drops the entry and
+    /// surfaces today's "not indexed" guidance — never a stale union. `scope` is `None`
+    /// for the whole workspace or the `--package` member list otherwise; the cache key is
+    /// order-sensitive so it maps 1:1 to what `load_member_stores` selects. Errors
+    /// (missing member, unknown package) are NOT cached — they are cheap and may be
     /// user-fixable mid-session.
     pub fn workspace_bundle(
         &self,
@@ -112,11 +225,29 @@ impl McpServer {
             None => "\u{0}all".to_string(),
             Some(names) => format!("scope\u{0}{}", names.join("\u{0}")),
         };
-        if let Some(hit) = self.workspace_cache.borrow().get(&key) {
-            return Ok(Rc::clone(hit));
+        // The freshness fingerprint of the in-scope member stores. An unknown
+        // member/package errors here with the same message as the loader; a missing
+        // store file yields `None` (fall through to the loader's guidance).
+        let store_paths = member_store_paths(&self.root(), manifest, scope)?;
+        let fp: Option<Vec<Fingerprint>> =
+            store_paths.iter().map(|p| file_fingerprint(p)).collect();
+        match &fp {
+            Some(fp) => {
+                if let Some((cached_fp, bundle)) = self.workspace_cache.borrow().get(&key) {
+                    if cached_fp == fp {
+                        return Ok(Rc::clone(bundle));
+                    }
+                }
+            }
+            // A member store vanished: drop the stale bundle before erroring below.
+            None => {
+                self.workspace_cache.borrow_mut().remove(&key);
+            }
         }
         let bundle = Rc::new(load_cached_workspace(&self.root(), manifest, scope)?);
-        self.workspace_cache.borrow_mut().insert(key, Rc::clone(&bundle));
+        if let Some(fp) = fp {
+            self.workspace_cache.borrow_mut().insert(key, (fp, Rc::clone(&bundle)));
+        }
         Ok(bundle)
     }
 

@@ -20,6 +20,7 @@ pub mod store;
 pub use contract::{parse_ndjson, render_document, KnowledgeRecord, KNOWLEDGE_SCHEMA_ID};
 pub use retrieval::{
     is_merged_pr_link, provenance_line, same_document_sections, search_knowledge, KnowledgeHit,
+    LoadedKnowledge,
 };
 pub use store::{
     ingest, ingest_default, ingest_file, snapshot_id, IngestSummary, KnowledgeChunk, KnowledgeStore,

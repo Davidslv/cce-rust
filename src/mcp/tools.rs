@@ -42,7 +42,7 @@ use crate::federation::{
     federated_bm25_only_search, federated_search_over, load_member_stores, workspace_stats,
     CachedWorkspace, MemberStore,
 };
-use crate::knowledge::{search_knowledge, same_document_sections, KnowledgeHit, KnowledgeStore};
+use crate::knowledge::{same_document_sections, KnowledgeHit};
 use crate::mcp::server::McpServer;
 use crate::mcp::MCP_DEFAULT_TOP_K;
 use crate::memory::{self, RecallHit};
@@ -306,7 +306,7 @@ fn resolve_source(server: &McpServer, args: &Value) -> SourceSel {
     }
     let root = server.root();
     let cfg = KnowledgeConfig::load(&root);
-    if cfg.enabled && KnowledgeStore::load_current(&root).is_ok() {
+    if cfg.enabled && server.knowledge().is_some() {
         match cfg.default_source.as_str() {
             "code" => SourceSel::Code,
             "knowledge" => SourceSel::Knowledge,
@@ -367,8 +367,8 @@ fn context_search_single(
     max_tokens: Option<usize>,
     detail: DetailLevel,
 ) -> ToolOutput {
-    let store = server.store_path();
-    let index = match Index::load(&store) {
+    // Cached across calls (issue #31): reused while the store file is unchanged.
+    let index = match server.load_index() {
         Ok(i) => i,
         Err(_) => return ToolOutput::ok(missing_index_message(false)),
     };
@@ -523,15 +523,15 @@ fn parse_params(server: &McpServer, args: &Value) -> SearchParams {
 
 /// Load the ranked knowledge hits for a query (SPEC-V2.6 §5), honouring
 /// `knowledge.enabled` and `knowledge.min_score`. No store (or disabled) ⇒ empty.
+/// The loaded+embedded store is cached across calls by the server (issue #31).
 fn load_knowledge_hits(server: &McpServer, query: &str, top_k: usize) -> Vec<KnowledgeHit> {
-    let root = server.root();
-    let cfg = KnowledgeConfig::load(&root);
+    let cfg = KnowledgeConfig::load(&server.root());
     if !cfg.enabled {
         return Vec::new();
     }
-    match KnowledgeStore::load_current(&root) {
-        Ok(store) => search_knowledge(&store, query, top_k, cfg.min_score),
-        Err(_) => Vec::new(),
+    match server.knowledge() {
+        Some(k) => k.search(query, top_k, cfg.min_score),
+        None => Vec::new(),
     }
 }
 
@@ -597,8 +597,8 @@ fn gather_code_hits(server: &McpServer, query: &str, p: &SearchParams) -> CodeHi
 }
 
 fn gather_code_hits_single(server: &McpServer, query: &str, p: &SearchParams) -> CodeHits {
-    let store = server.store_path();
-    let index = match Index::load(&store) {
+    // Cached across calls (issue #31): reused while the store file is unchanged.
+    let index = match server.load_index() {
         Ok(i) => i,
         Err(_) => return (Vec::new(), None, 0, None),
     };
@@ -754,11 +754,10 @@ fn context_search_both(server: &McpServer, args: &Value, query: &str) -> ToolOut
 
 /// The knowledge store's chunk count (for the "no matches" hint), 0 if none/disabled.
 fn knowledge_total_chunks(server: &McpServer) -> usize {
-    let root = server.root();
-    if !KnowledgeConfig::load(&root).enabled {
+    if !KnowledgeConfig::load(&server.root()).enabled {
         return 0;
     }
-    KnowledgeStore::load_current(&root).map(|s| s.chunks.len()).unwrap_or(0)
+    server.knowledge().map(|k| k.store.chunks.len()).unwrap_or(0)
 }
 
 /// The byte-pinned compact header for ONE knowledge hit (SPEC-V2.6 §5), mirroring the
@@ -950,7 +949,8 @@ pub fn index_status(server: &McpServer) -> ToolOutput {
 
 fn index_status_single(server: &McpServer) -> ToolOutput {
     let store = server.store_path();
-    let index = match Index::load(&store) {
+    // Cached across calls (issue #31): reused while the store file is unchanged.
+    let index = match server.load_index() {
         Ok(i) => i,
         Err(_) => {
             return ToolOutput::ok(format!(
@@ -1280,12 +1280,12 @@ pub fn summarize_context(server: &McpServer, args: &Value) -> ToolOutput {
 
 // --- Layer 7: progressive disclosure (expand_chunk / related_context) ---
 
-/// The read-only index expand/related work over: an owned single-repo store, or the
-/// server-cached federated union (shared, so a chunk_id from a workspace
+/// The read-only index expand/related work over: the server-cached single-repo store,
+/// or the server-cached federated union (shared, so a chunk_id from a workspace
 /// `context_search` resolves without re-federating). Both expose `&Index` via
 /// [`WorkingIndex::index`].
 enum WorkingIndex {
-    Single(Box<Index>),
+    Single(Rc<Index>),
     Workspace(Rc<CachedWorkspace>),
 }
 
@@ -1300,9 +1300,9 @@ impl WorkingIndex {
 
 /// Resolve the read-only index that expand/related work over: the single-repo store,
 /// or the member-namespaced union in workspace mode (so a chunk_id from a workspace
-/// `context_search` resolves). In workspace mode it reuses the server's cached union
-/// (issue #26) instead of re-loading and re-assembling every call. A missing index
-/// yields the friendly guidance string.
+/// `context_search` resolves). Both reuse the server's cache (issues #26/#31) instead
+/// of re-loading and re-assembling every call. A missing index yields the friendly
+/// guidance string.
 fn working_index(server: &McpServer) -> Result<WorkingIndex, String> {
     if server.is_workspace() {
         let root = server.root();
@@ -1310,9 +1310,7 @@ fn working_index(server: &McpServer) -> Result<WorkingIndex, String> {
         let bundle = server.workspace_bundle(&manifest, None)?;
         Ok(WorkingIndex::Workspace(bundle))
     } else {
-        Index::load(&server.store_path())
-            .map(|i| WorkingIndex::Single(Box::new(i)))
-            .map_err(|_| missing_index_message(false))
+        server.load_index().map(WorkingIndex::Single).map_err(|_| missing_index_message(false))
     }
 }
 
@@ -1458,23 +1456,23 @@ fn render_knowledge_group(
 /// `file`/`neighbors` return the document's sections (neighbours exclude the target).
 /// Returns `None` when the id is not a knowledge chunk, so the caller can fall through.
 fn expand_knowledge_chunk(server: &McpServer, chunk_id: &str, scope: &str) -> Option<ToolOutput> {
-    let root = server.root();
-    if !KnowledgeConfig::load(&root).enabled {
+    if !KnowledgeConfig::load(&server.root()).enabled {
         return None;
     }
-    let store = KnowledgeStore::load_current(&root).ok()?;
+    let loaded = server.knowledge()?;
+    let store = &loaded.store;
     let target = store.chunks.iter().find(|c| c.chunk_id == chunk_id)?;
     let out = match scope {
         "body" => target.content.clone(),
         "file" => {
-            let sections = same_document_sections(&store, &target.record_id, None);
+            let sections = same_document_sections(store, &target.record_id, None);
             let blocks: Vec<(&crate::knowledge::KnowledgeChunk, String)> =
                 sections.iter().map(|c| (*c, c.content.clone())).collect();
             let title = format!("document {} — {} section(s):", target.record_id, blocks.len());
             render_knowledge_group(&title, &blocks)
         }
         _ => {
-            let sections = same_document_sections(&store, &target.record_id, Some(chunk_id));
+            let sections = same_document_sections(store, &target.record_id, Some(chunk_id));
             if sections.is_empty() {
                 return Some(ToolOutput::ok(format!(
                     "no same-document neighbours for {} in the knowledge store.",
@@ -1546,13 +1544,13 @@ pub fn related_context(server: &McpServer, args: &Value) -> ToolOutput {
 /// `related_context` over a knowledge chunk_id (SPEC-V2.6 §5): the other sections of the
 /// same document, COMPACT, up to `top_k`. `None` when the id is not a knowledge chunk.
 fn related_knowledge_chunk(server: &McpServer, chunk_id: &str, top_k: usize) -> Option<ToolOutput> {
-    let root = server.root();
-    if !KnowledgeConfig::load(&root).enabled {
+    if !KnowledgeConfig::load(&server.root()).enabled {
         return None;
     }
-    let store = KnowledgeStore::load_current(&root).ok()?;
+    let loaded = server.knowledge()?;
+    let store = &loaded.store;
     let target = store.chunks.iter().find(|c| c.chunk_id == chunk_id)?;
-    let mut sections = same_document_sections(&store, &target.record_id, Some(chunk_id));
+    let mut sections = same_document_sections(store, &target.record_id, Some(chunk_id));
     sections.truncate(top_k);
     if sections.is_empty() {
         return Some(ToolOutput::ok(format!(
