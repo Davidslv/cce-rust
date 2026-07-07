@@ -1311,3 +1311,172 @@ fn cmd_conformance(fixture_dir: &Path, output: &Path) -> Result<(), String> {
     println!("wrote {}", output.display());
     Ok(())
 }
+
+#[cfg(test)]
+mod tests {
+    //! Unit tests for the pure CLI helpers (issue #32). These pin CURRENT
+    //! behavior — the `--json` contract, the `--package` scope parser edges, and
+    //! the store/metrics path-precedence chains — they do not redesign it.
+
+    use super::*;
+
+    // --- parse_scope: the comma-split `--package` scope parser ---
+
+    #[test]
+    fn parse_scope_none_stays_none() {
+        assert_eq!(parse_scope(None), None);
+    }
+
+    #[test]
+    fn parse_scope_splits_on_commas() {
+        assert_eq!(
+            parse_scope(Some("app,billing".to_string())),
+            Some(vec!["app".to_string(), "billing".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_scope_single_name_is_one_element() {
+        assert_eq!(parse_scope(Some("app".to_string())), Some(vec!["app".to_string()]));
+    }
+
+    #[test]
+    fn parse_scope_empty_string_is_some_empty_vec() {
+        // Pinned: `--package ""` yields Some([]) — an empty scope, NOT None.
+        // Downstream (federation::select_members) an empty scope selects zero
+        // members, so the search silently returns no results rather than
+        // falling back to all members or erroring.
+        assert_eq!(parse_scope(Some(String::new())), Some(vec![]));
+    }
+
+    #[test]
+    fn parse_scope_drops_empty_segments() {
+        assert_eq!(
+            parse_scope(Some("a,,b".to_string())),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_scope_trims_whitespace_around_names() {
+        assert_eq!(
+            parse_scope(Some(" a , b ".to_string())),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_scope_ignores_trailing_comma() {
+        assert_eq!(
+            parse_scope(Some("a,b,".to_string())),
+            Some(vec!["a".to_string(), "b".to_string()])
+        );
+    }
+
+    #[test]
+    fn parse_scope_whitespace_and_commas_only_is_empty() {
+        // Same edge as the empty string: all segments trim to empty and are
+        // dropped, leaving an empty (zero-member) scope.
+        assert_eq!(parse_scope(Some(" , , ".to_string())), Some(vec![]));
+    }
+
+    // --- resolve_read_store: --store, else --dir/.cce, else ./.cce ---
+
+    #[test]
+    fn resolve_read_store_explicit_store_wins_over_dir() {
+        let got = resolve_read_store(
+            Some(PathBuf::from("/explicit/store.json")),
+            Some(PathBuf::from("/some/project")),
+        );
+        assert_eq!(got, PathBuf::from("/explicit/store.json"));
+    }
+
+    #[test]
+    fn resolve_read_store_dir_maps_to_default_store_path() {
+        let got = resolve_read_store(None, Some(PathBuf::from("/some/project")));
+        assert_eq!(got, PathBuf::from("/some/project/.cce/index.json"));
+    }
+
+    #[test]
+    fn resolve_read_store_defaults_to_cwd_dot_cce() {
+        let got = resolve_read_store(None, None);
+        assert_eq!(got, PathBuf::from("./.cce/index.json"));
+    }
+
+    // --- metrics_beside_store: `<store-dir>/metrics.jsonl` ---
+
+    #[test]
+    fn metrics_beside_store_joins_the_store_parent() {
+        let got = metrics_beside_store(Path::new("/proj/.cce/index.json"));
+        assert_eq!(got, PathBuf::from("/proj/.cce/metrics.jsonl"));
+    }
+
+    #[test]
+    fn metrics_beside_store_bare_filename_falls_back_to_cwd() {
+        // A store path with no parent component ("index.json") puts the metrics
+        // log in the current directory.
+        let got = metrics_beside_store(Path::new("index.json"));
+        assert_eq!(got, PathBuf::from("metrics.jsonl"));
+    }
+
+    #[test]
+    fn metrics_beside_store_relative_store_keeps_relative_parent() {
+        let got = metrics_beside_store(Path::new("sub/store.json"));
+        assert_eq!(got, PathBuf::from("sub/metrics.jsonl"));
+    }
+
+    // --- resolve_metrics_path: --metrics wins, else beside the resolved store ---
+
+    #[test]
+    fn resolve_metrics_path_explicit_metrics_wins_over_everything() {
+        let got = resolve_metrics_path(
+            Some(PathBuf::from("/explicit/metrics.jsonl")),
+            Some(PathBuf::from("/store/index.json")),
+            Some(PathBuf::from("/dir")),
+        );
+        assert_eq!(got, PathBuf::from("/explicit/metrics.jsonl"));
+    }
+
+    #[test]
+    fn resolve_metrics_path_sits_beside_an_explicit_store() {
+        let got = resolve_metrics_path(None, Some(PathBuf::from("/store/index.json")), None);
+        assert_eq!(got, PathBuf::from("/store/metrics.jsonl"));
+    }
+
+    #[test]
+    fn resolve_metrics_path_beside_store_beats_dir_default() {
+        // --store outranks --dir in the chain: the metrics log follows the store.
+        let got = resolve_metrics_path(
+            None,
+            Some(PathBuf::from("/store/index.json")),
+            Some(PathBuf::from("/dir")),
+        );
+        assert_eq!(got, PathBuf::from("/store/metrics.jsonl"));
+    }
+
+    #[test]
+    fn resolve_metrics_path_dir_maps_to_dot_cce_metrics() {
+        let got = resolve_metrics_path(None, None, Some(PathBuf::from("/dir")));
+        assert_eq!(got, PathBuf::from("/dir/.cce/metrics.jsonl"));
+    }
+
+    #[test]
+    fn resolve_metrics_path_defaults_to_cwd_dot_cce_metrics() {
+        let got = resolve_metrics_path(None, None, None);
+        assert_eq!(got, PathBuf::from("./.cce/metrics.jsonl"));
+    }
+
+    // --- workspace_root / sync_root: `--dir`, else the current directory ---
+
+    #[test]
+    fn workspace_root_passes_dir_through_and_defaults_to_dot() {
+        assert_eq!(workspace_root(Some(PathBuf::from("/ws"))), PathBuf::from("/ws"));
+        assert_eq!(workspace_root(None), PathBuf::from("."));
+    }
+
+    #[test]
+    fn sync_root_passes_dir_through_and_defaults_to_dot() {
+        assert_eq!(sync_root(Some(PathBuf::from("/ws"))), PathBuf::from("/ws"));
+        assert_eq!(sync_root(None), PathBuf::from("."));
+    }
+}
