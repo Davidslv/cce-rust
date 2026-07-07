@@ -33,6 +33,13 @@ across people and across the Ruby/Rust engines (already proven by conformance).
 Therefore the cache is **content-addressable**: no "whose version wins," no merge,
 no conflict. A teammate's push == CI's push == a fresh local build, bit-for-bit.
 
+**Builder independence is why the walker honors only committed `.gitignore`**
+(v2.6.3): the ignore rules that shape the file set are part of the tree at the sha,
+so every builder skips the same files. Machine-local ignore sources —
+`.git/info/exclude` and the global `core.excludesfile` — and `.gitignore` files
+above the walk root are deliberately **not** honored: they vary by machine and would
+break `artifact == build(sha)`. `.git/` and `.cce/` are always skipped.
+
 ```
   CI on merge to main:  cce index (hash embedder)  →  cce sync push
   developer:            cce sync pull --latest      →  main@sha index, instantly
@@ -162,6 +169,13 @@ cce sync verify [--commit <sha>] [--dir <path>]
 Rules:
 - `push` refuses a **dirty working tree** (a cache is content-addressed by commit)
   and a **non-hash index**. It is best-effort and never blocks other work.
+- `push` **always rebuilds the index from the working tree** before exporting
+  (v2.6.2) — it never republishes an existing `.cce/index.json`, so a just-pulled
+  or otherwise stale/foreign index can never be re-uploaded under a sha it was not
+  built from. The invariant is `artifact == build(sha)`.
+- `push` exports the **code index only**; the mutable `.cce/knowledge/` store is
+  snapshot-keyed and never enters the byte-identical code cache (see
+  [`knowledge.md`](knowledge.md)).
 - `pull` installs the artifact into `.cce/`. If the local working tree matches
   `sha`, the pulled index is used as-is. It never silently overwrites a local cache
   for a **different** sha without `--force`.
@@ -205,11 +219,11 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
-        with: { fetch-depth: 0 }          # full history so built_at is available
+        with: { fetch-depth: 0 }          # full history so the sha's commit metadata resolves
       - name: Install git-LFS
         run: sudo apt-get update && sudo apt-get install -y git-lfs && git lfs install
-      - name: Install cce
-        run: cargo install --git https://github.com/davidslv/cce-rust --tag v2.4.0
+      - name: Install cce                 # pin the latest release tag (see CHANGELOG.md)
+        run: cargo install --git https://github.com/davidslv/cce-rust --tag vX.Y.Z
       - name: Configure git identity for the cache clone
         run: |
           git config --global user.name  "cce-ci"

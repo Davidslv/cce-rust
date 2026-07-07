@@ -46,10 +46,10 @@ not distracted by code it did not need.
 
 ```
   repo files          walk + ignore          LanguagePack registry
- +-----------+        (.git, node_modules,   (resolve by extension)
- | *.rb *.ts |  --->  build output, dotdirs  .rb -> ruby   .ts -> typescript
- | *.c  *.py |        skipped; >2MB/binary   .c  -> c      ...no pack -> whole-file
- | .env  (!) |        skipped)                        |
+ +-----------+        (committed .gitignore  (resolve by extension)
+ | *.rb *.ts |  --->  honored; .git, .cce,   .rb -> ruby   .ts -> typescript
+ | *.c  *.py |        node_modules, >2MB,    .c  -> c      ...no pack -> whole-file
+ | .env  (!) |        binary skipped)                 |
  | Gemfile   |                                        v
  +-----------+                                 tree-sitter AST parse
        |                                        -> one chunk per
@@ -118,6 +118,10 @@ not distracted by code it did not need.
   Secret-safe     --- .env & keys never read; tokens redacted before storage
                       (secure by default; --allow-secrets to override)
 
+  Gitignore-aware --- committed .gitignore honored; machine-local excludes
+                      deliberately not -> the same commit indexes identically
+                      on every machine (v2.6.3)
+
   Observability   --- every search logs savings + quality -> `cce dashboard`
                       shows "is this actually helping?" trended over time
                         Savings 82.9% ^improving   Quality 0.797 ^improving
@@ -127,6 +131,10 @@ not distracted by code it did not need.
   Savings Layers  --- v2.5: compact-by-default chunks + expand-on-demand, output/
                       grammar/memory/summarization, nine agent MCP tools, and a
                       `cce savings` ledger reported honestly (vs full-file baseline)
+
+  Knowledge       --- v2.6: issues/epics/policy docs fed in via the neutral
+                      cce.knowledge/v1 contract (`cce knowledge index`) and searched
+                      alongside code with provenance + staleness weighting
 ```
 
 Why it is genuinely beneficial, concretely:

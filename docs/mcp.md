@@ -68,6 +68,11 @@ Re-running `cce init` is safe: the `cce` server entry and the block are **merged
 never duplicated. Other MCP servers already in `.mcp.json` and other content in
 `CLAUDE.md` are preserved.
 
+In a git repo, `cce init` also gitignores cce's own cache (since v2.6.3): it appends
+`.cce/*` + `!.cce/workspace.yml` to the repo `.gitignore` (idempotent), so the local
+index and metrics log are never committed while a shared `.cce/workspace.yml` stays
+committable.
+
 `cce init` flags:
 
 | Flag | Meaning |
@@ -161,7 +166,8 @@ chunks; `expand_chunk` reads a full body when you actually need it;
     "package":    { "type": "string", "description": "scope to one workspace member (optional)" },
     "no_graph":   { "type": "boolean", "default": false },
     "max_tokens": { "type": "integer", "description": "cap the returned context (optional)" },
-    "detail":     { "type": "string", "enum": ["signature", "compact", "full"], "description": "chunk compression level (optional; default from config, usually compact)" }
+    "detail":     { "type": "string", "enum": ["signature", "compact", "full"], "description": "chunk compression level (optional; default from config, usually compact)" },
+    "source":     { "type": "string", "enum": ["code", "knowledge", "both"], "description": "which pools to search (optional; default `both` when a knowledge store exists, else `code`)" }
   },
   "required": ["query"]
 }
@@ -169,7 +175,20 @@ chunks; `expand_chunk` reads a full body when you actually need it;
 
 `detail` (Savings Layer 2) picks the compression level — `signature`, `compact`
 (default), or `full`; absent ⇒ the project's `retrieval.detail` config, which
-defaults to `compact` (see [`savings.md`](savings.md)). **Output** is a text block:
+defaults to `compact` (see [`savings.md`](savings.md)).
+
+`source` (v2.6.1, [Knowledge Sources](knowledge.md)) picks the pool: `code` (the
+unchanged code path), `knowledge` (the `cce knowledge index` store), or `both` —
+code + knowledge candidates merged through the one shared ranking. Absent ⇒ the
+`knowledge.default_source` config (default `both`) **when a knowledge store
+exists**, else always `code` — so with no knowledge store the tool is byte-identical
+to pre-v2.6. A knowledge hit's header carries its provenance in place of
+`file:line (type/kind)` — `[knowledge] <title> — <state> · <updated_at> · <url>` —
+and staleness weighting (recency, wontfix-drop, merged-PR boost, the 0.30 precision
+floor) is applied before the blend; see [`knowledge.md`](knowledge.md).
+`expand_chunk`/`related_context` accept knowledge `chunk_id`s too.
+
+**Output** is a text block:
 one header line per result — `#. [score] file:start-end (chunk_type/kind)
 #chunk_id` — followed by the chunk body served at that detail, then the
 expand-on-demand hint and the `query_id`:

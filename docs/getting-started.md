@@ -38,14 +38,19 @@ sudo apt-get update && sudo apt-get install -y build-essential
 git clone https://github.com/davidslv/cce-rust
 cd cce-rust
 cargo build --release     # binary at target/release/cce
-cargo test                # 416 tests — confirms a green build
+cargo test                # confirms a green build (540 tests)
 ```
+
+Prefer not to build at all? Every release ships **prebuilt binaries** for macOS
+and Linux with a `SHA256SUMS` — see the
+[Releases page](https://github.com/davidslv/cce-rust/releases) and the
+[README install section](../README.md#installation--environment-setup).
 
 Optionally put the binary on your PATH:
 
 ```bash
 cargo install --path .    # installs `cce` into ~/.cargo/bin
-cce --version             # cce 2.5.5
+cce --version             # prints the version you built (see ../CHANGELOG.md)
 ```
 
 The rest of this guide writes `cce`; if you did not install it, use
@@ -103,6 +108,12 @@ cce stats --dir ./my-project
 
 Add `--json` to `search` for machine-readable results.
 
+The walk is **gitignore-aware** (since v2.6.3): files ignored by the repo's
+committed `.gitignore` are skipped, exactly as git sees the tree — while
+machine-local excludes (`.git/info/exclude`, the global `core.excludesfile`) are
+deliberately not honored, so the same commit indexes identically on every machine.
+`.git/` and `.cce/` are always skipped.
+
 ## 6. Optional: semantic embeddings
 
 The default hashing embedder is offline and deterministic. If you want
@@ -127,6 +138,8 @@ endpoint or model.
 - [`mcp.md`](mcp.md) — wire CCE into an agent (Claude Code) as nine MCP tools.
 - [`savings.md`](savings.md) — the seven Savings Layers, `cce savings`, and the
   honest "vs full-file baseline" framing.
+- [`knowledge.md`](knowledge.md) — feed issues/epics/policy docs in with
+  `cce knowledge index` and search them alongside the code (v2.6).
 - [`adding-a-language.md`](adding-a-language.md) — add a language pack in one file.
 - [`architecture.md`](architecture.md) — how the pipeline is built and why.
 - [`../SPEC.md`](../SPEC.md) + [`../SPEC-V2.md`](../SPEC-V2.md) — the authoritative

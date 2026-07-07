@@ -24,7 +24,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
         with:
-          # Full history so `built_at` (the commit date of the sha) is available.
+          # Full history so the pushed sha's commit metadata resolves.
           fetch-depth: 0
 
       - name: Install git-LFS
@@ -34,7 +34,8 @@ jobs:
           git lfs install
 
       - name: Install the cce binary
-        run: cargo install --git https://github.com/davidslv/cce-rust --tag v2.3.0
+        # Pin the latest release tag (see CHANGELOG.md / the Releases page).
+        run: cargo install --git https://github.com/davidslv/cce-rust --tag vX.Y.Z
 
       - name: Configure git identity for the cache working clone
         run: |

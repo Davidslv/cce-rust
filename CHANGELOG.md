@@ -33,6 +33,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and markdown section ordering/coverage. Test-only: goldens, `conformance.json`, and the `cce`
   binary are unchanged.
 
+### Documentation
+- **v2.6 documentation sweep (#34).** Re-ran the gapless-docs discipline (#11, last executed at
+  v2.5.5) over the v2.6.0–v2.6.7 surface. The knowledge track (`cce knowledge index`, the
+  `cce.knowledge/v1` contract, the `context_search` `source: code|knowledge|both` blend, provenance +
+  staleness weighting, the `knowledge.*` config keys) now appears in `docs/knowledge.md` (M4 section),
+  `docs/mcp.md` (the `source` schema property), the README, and the getting-started/how-to/
+  how-it-works/architecture cross-references; the v2.6.3 gitignore-aware walker (committed
+  `.gitignore` only — builder independence) is documented in the README, guides, architecture, and
+  sync's rationale; `docs/sync.md` states that push always rebuilds from source (v2.6.2);
+  `docs/workspace.md` + `docs/architecture.md` carry the v2.6.4 `--package` semantics (name or
+  `package:` field, loud error with the available list) and the v2.6.7 MCP caching instead of the
+  stale "reloaded per query" claim. Stale pins fixed: `cce 2.5.5` / `--tag v2.3.0/v2.4.0` examples,
+  the retired `built_at` CI comment, the `--top-k` default (10, not 5), and the 416/500 test counts
+  (now 540); the Cargo.toml `description` extends through v2.6 (metadata only). Docs-only — no engine
+  change; `conformance.json` and all goldens are byte-identical.
+
 ## [2.6.7] - 2026-07-06
 
 ### Changed
