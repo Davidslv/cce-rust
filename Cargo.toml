@@ -58,3 +58,8 @@ opt-level = 3
 
 [dev-dependencies]
 tempfile = "=3.27.0"
+# Property-based testing for the chunker/tokenizer invariants (#33). Test-only:
+# generates adversarial-but-legal source (CRLF, unicode identifiers, empty and
+# comment-only files, deep nesting, markdown heading edge cases) and asserts the
+# invariants the byte-pinned goldens cannot cover.
+proptest = "=1.11.0"

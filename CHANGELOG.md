@@ -22,6 +22,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   release binaries for macOS (arm64/x86_64) and Linux (x86_64/arm64), and publishes a GitHub Release
   with this file's section as the notes plus a `SHA256SUMS`. Process documented in `RELEASING.md`;
   README gains a prebuilt-binary install path. (Repo infrastructure — the `cce` binary is unchanged.)
+- **Property-based tests for the chunkers and the pinned token rule (#33).** A new `proptest` suite
+  (`tests/property_chunkers.rs`) generates adversarial-but-legal source for all six language packs
+  (unicode identifiers, CRLF line endings, trailing whitespace, missing final newline, empty and
+  comment-only files, deeply nested definitions, raw printable-unicode garbage) and markdown
+  (ATX/setext headings, preambles, fenced code blocks containing `#` lines, varied split budgets),
+  and asserts the chunkers' documented invariants on every input: in-bounds ordered line ranges,
+  content as an exact byte slice of the input, pre-order nested-or-disjoint emission, determinism,
+  `chunk_id` recomputable from the persisted fields, the pinned `max(1, floor(bytes/4))` token rule,
+  and markdown section ordering/coverage. Test-only: goldens, `conformance.json`, and the `cce`
+  binary are unchanged.
 
 ## [2.6.7] - 2026-07-06
 
