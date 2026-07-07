@@ -437,6 +437,28 @@ fn workspace_context_search_scopes_to_a_package() {
 }
 
 #[test]
+fn workspace_context_search_empty_package_is_a_friendly_error() {
+    // Issue #45: `context_search {"package": ""}` must surface the actionable
+    // guidance, never federate over zero members and return silent no-results.
+    let tmp = copy_workspace_fixture();
+    let dir = tmp.path().to_string_lossy().to_string();
+
+    let out = Command::new(bin()).args(["workspace", "init"]).arg(tmp.path()).output().unwrap();
+    assert!(out.status.success(), "workspace init: {}", String::from_utf8_lossy(&out.stderr));
+    let out = Command::new(bin()).args(["index", "--workspace"]).arg(tmp.path()).output().unwrap();
+    assert!(out.status.success(), "index --workspace: {}", String::from_utf8_lossy(&out.stderr));
+
+    let input = "{\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"context_search\",\"arguments\":{\"query\":\"billing charge amount\",\"package\":\"\"}}}\n";
+    let out = drive(&["mcp", "--workspace", "--dir", &dir], input, &[]);
+    let resps = responses(&out);
+    let text = by_id(&resps, 1)["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(
+        text.contains("--package requires at least one member or package name"),
+        "expected the empty-scope guidance, got: {text}"
+    );
+}
+
+#[test]
 fn cce_init_writes_valid_idempotent_mcp_json_and_claude_md() {
     let tmp = tempfile::tempdir().unwrap();
     write_tiny_repo(tmp.path());

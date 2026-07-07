@@ -97,6 +97,24 @@ fn denamespace(path: &str) -> (&str, &str) {
     }
 }
 
+/// Parse a `--package a,b` (or MCP `package`) value into trimmed, non-empty scope
+/// tokens. `None` (flag absent) stays `None` — the full workspace. A present value
+/// whose segments all trim to empty (`""`, `","`, `"  "`) is a hard error (issue
+/// #45): a zero-member federation would silently return no results, which is
+/// exactly the failure mode the #26 unknown-token error removed.
+pub fn parse_scope(package: Option<String>) -> Result<Option<Vec<String>>, String> {
+    let Some(p) = package else { return Ok(None) };
+    let tokens: Vec<String> =
+        p.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect();
+    if tokens.is_empty() {
+        return Err(
+            "--package requires at least one member or package name (e.g. --package app,billing)"
+                .to_string(),
+        );
+    }
+    Ok(Some(tokens))
+}
+
 /// Resolve one `--package`/`package:` scope token to a member. A token matches by
 /// member **name** first (the historical behaviour, kept byte-identical for existing
 /// name scopes), then by the `package:` field from `workspace.yml` — so scoping by a

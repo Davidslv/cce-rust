@@ -7,6 +7,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **`cce search --workspace --package ""` now errors loudly instead of silently returning no
+  results (#45).** An empty-but-present `--package` value (`""`, `","`, whitespace — e.g. an unset
+  shell variable in `--package "$PKG"`) used to parse to an empty scope, federate over zero members,
+  and print nothing, bypassing the #26 unknown-token error. `parse_scope` now lives in
+  `cce::federation` and rejects a scope with no usable token with an actionable message
+  (`--package requires at least one member or package name (e.g. --package app,billing)`); the MCP
+  `context_search` `package` argument goes through the same parser, so `{"package": ""}` gets the
+  same friendly guidance instead of silent no-results. Valid scopes are byte-identical.
+
 ### Added
 - **Tests for `src/main.rs` and a byte-pinned `search --json` golden (#32).** The CLI entry point
   (~1,300 lines) previously had zero tests. It now has a unit suite pinning current behavior of the

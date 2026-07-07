@@ -17,7 +17,7 @@
 use cce::config::{EmbedderKind, DEFAULT_DASHBOARD_PORT, DEFAULT_INPUT_PRICE_PER_MILLION, METRICS_FILE};
 use cce::embedder::{format6, Embedder, HashEmbedder, OllamaEmbedder};
 use cce::federation::{
-    federated_search, load_member_stores, member_metrics, workspace_stats, FedResult,
+    federated_search, load_member_stores, member_metrics, parse_scope, workspace_stats, FedResult,
 };
 use cce::metrics::{HexIdSource, IdSource, IndexRecord, MetricsWriter, SystemClock};
 use cce::retriever::{build_search_record, search, SearchResult};
@@ -988,11 +988,6 @@ fn cmd_index_workspace(
     Ok(())
 }
 
-/// Parse a `--package a,b` scope into trimmed, non-empty member names.
-fn parse_scope(package: Option<String>) -> Option<Vec<String>> {
-    package.map(|p| p.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect())
-}
-
 /// `cce search "q" --workspace [<dir>]` (SPEC-V2.2 §6): federated retrieval.
 fn cmd_search_workspace(
     query: &str,
@@ -1004,7 +999,9 @@ fn cmd_search_workspace(
 ) -> Result<(), String> {
     let root = workspace_root(dir);
     let manifest = Manifest::load(&root)?;
-    let scope = parse_scope(package);
+    // An empty-but-present scope (`--package ""`) is a hard error (issue #45),
+    // never a silent zero-member federation.
+    let scope = parse_scope(package)?;
     let members = load_member_stores(&root, &manifest, scope.as_deref())?;
     let graph = WorkspaceGraph::load_or_empty(&root, &manifest);
     let top_k = top_k.unwrap_or(cce::config::DEFAULT_TOP_K);
@@ -1324,36 +1321,36 @@ mod tests {
 
     #[test]
     fn parse_scope_none_stays_none() {
-        assert_eq!(parse_scope(None), None);
+        assert_eq!(parse_scope(None), Ok(None));
     }
 
     #[test]
     fn parse_scope_splits_on_commas() {
         assert_eq!(
             parse_scope(Some("app,billing".to_string())),
-            Some(vec!["app".to_string(), "billing".to_string()])
+            Ok(Some(vec!["app".to_string(), "billing".to_string()]))
         );
     }
 
     #[test]
     fn parse_scope_single_name_is_one_element() {
-        assert_eq!(parse_scope(Some("app".to_string())), Some(vec!["app".to_string()]));
+        assert_eq!(parse_scope(Some("app".to_string())), Ok(Some(vec!["app".to_string()])));
     }
 
     #[test]
-    fn parse_scope_empty_string_is_some_empty_vec() {
-        // Pinned: `--package ""` yields Some([]) — an empty scope, NOT None.
-        // Downstream (federation::select_members) an empty scope selects zero
-        // members, so the search silently returns no results rather than
-        // falling back to all members or erroring.
-        assert_eq!(parse_scope(Some(String::new())), Some(vec![]));
+    fn parse_scope_empty_string_is_an_error() {
+        // Pinned (issue #45): `--package ""` is a hard error, never Some([]) — a
+        // zero-member scope would federate over nothing and silently return no
+        // results, the failure mode the #26 unknown-token error removed.
+        let err = parse_scope(Some(String::new())).unwrap_err();
+        assert!(err.contains("--package requires at least one member or package name"), "{err}");
     }
 
     #[test]
     fn parse_scope_drops_empty_segments() {
         assert_eq!(
             parse_scope(Some("a,,b".to_string())),
-            Some(vec!["a".to_string(), "b".to_string()])
+            Ok(Some(vec!["a".to_string(), "b".to_string()]))
         );
     }
 
@@ -1361,7 +1358,7 @@ mod tests {
     fn parse_scope_trims_whitespace_around_names() {
         assert_eq!(
             parse_scope(Some(" a , b ".to_string())),
-            Some(vec!["a".to_string(), "b".to_string()])
+            Ok(Some(vec!["a".to_string(), "b".to_string()]))
         );
     }
 
@@ -1369,15 +1366,16 @@ mod tests {
     fn parse_scope_ignores_trailing_comma() {
         assert_eq!(
             parse_scope(Some("a,b,".to_string())),
-            Some(vec!["a".to_string(), "b".to_string()])
+            Ok(Some(vec!["a".to_string(), "b".to_string()]))
         );
     }
 
     #[test]
-    fn parse_scope_whitespace_and_commas_only_is_empty() {
-        // Same edge as the empty string: all segments trim to empty and are
-        // dropped, leaving an empty (zero-member) scope.
-        assert_eq!(parse_scope(Some(" , , ".to_string())), Some(vec![]));
+    fn parse_scope_whitespace_and_commas_only_is_an_error() {
+        // Same edge as the empty string (issue #45): every segment trims to
+        // empty, so the scope carries no usable token — error, not Some([]).
+        let err = parse_scope(Some(" , , ".to_string())).unwrap_err();
+        assert!(err.contains("--package requires at least one member or package name"), "{err}");
     }
 
     // --- results_json: the single-repo `cce search --json` contract ---
