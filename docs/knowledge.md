@@ -1,4 +1,4 @@
-# Knowledge Sources (v2.6 Phase A)
+# Knowledge Sources (v2.6)
 
 Code says *what/how*; epics, issues, and policy docs say **why** — the intent and
 constraints the code implements. CCE today indexes any `.md` as **one whole-file
@@ -9,10 +9,11 @@ without CCE learning a single ticket system's API.
 The guiding principle: **CCE owns the *engine* — chunking, a neutral ingest
 contract, retrieval — never the *integrations*.** Teams bring their own extractor.
 
-> **Phase A scope.** This note covers M1 (the markdown-heading chunker), M2 (the
-> `cce.knowledge/v1` contract), and M3 (`cce knowledge index`). Retrieval blend and
-> the `source:` search filter (M4) land in Phase B; sync of the knowledge corpus and
-> the reference adapter (M5) in Phase C.
+> **Scope.** Phase A (v2.6.0) covers M1 (the markdown-heading chunker), M2 (the
+> `cce.knowledge/v1` contract), and M3 (`cce knowledge index`). Phase B (v2.6.1)
+> covers M4 — the retrieval blend and the `source:` search filter (see
+> [Searching knowledge](#searching-knowledge-m4--the-source-blend) below). Sync of
+> the knowledge corpus and the reference adapter (M5, Phase C) are still future work.
 
 ## The markdown-heading chunker (M1)
 
@@ -100,13 +101,55 @@ The result is written to a **separate, snapshot-keyed knowledge store** under
 Knowledge is *mutable*, which is exactly why it is snapshot-keyed rather than
 `repo@sha`-keyed and never enters the byte-identical code cache.
 
+## Searching knowledge (M4) — the `source:` blend
+
+Since v2.6.1, knowledge chunks are searchable through the **exact same hybrid
+retrieval as code** — the deterministic hash embedder + BM25 + RRF of SPEC §6; there
+is no bespoke knowledge scorer. The MCP `context_search` tool gains an optional
+`source` argument (**still nine tools**; the CLI `cce search` is code-only):
+
+- `source: "code"` — the unchanged code path (byte-identical to pre-v2.6).
+- `source: "knowledge"` — search only the knowledge store.
+- `source: "both"` — code + knowledge candidates merged through the one shared
+  ranking into a single top-K (ties break code-before-knowledge, then `chunk_id`).
+
+When the caller omits `source`, the config `knowledge.default_source` applies (default
+`both`) — **only if a knowledge store exists**; with no store, retrieval always
+resolves to `code`, preserving the previous behaviour exactly.
+
+**Provenance.** Every knowledge hit renders a byte-pinned provenance header in place
+of the code grammar's `file:line (type/kind)`:
+
+```
+ 1. [0.842311] [knowledge] Checkout retries — closed · 2026-02-01T09:00:00Z · https://…/issues/123 #a1b2c3d4e5f60789
+```
+
+(`[knowledge] <title> — <state> · <updated_at> · <url>`, missing facets omitted
+cleanly), so freshness and origin are always judgeable at a glance.
+`expand_chunk`/`related_context` work on knowledge chunks too — neighbours are the
+same document's other sections.
+
+**Staleness weighting** (deterministic, byte-pinned):
+
+- Records whose `state_reason` is `not_planned` (wontfix) are **dropped** — rejected
+  intent must never surface as guidance.
+- The L5 **precision floor** applies: a hit below `knowledge.min_score` (default
+  **0.30**) or without a shared query token is dropped, so a loosely-related or
+  stale record never surfaces.
+- A record whose `links` include a **merged-PR** reference is intent AND
+  implementation, so its score is scaled by a pinned **×1.10** boost.
+- Final order: score desc, then **recency** (`updated_at` newest-first), then
+  `chunk_id` — a missing `updated_at` sorts oldest.
+
 ## Configuration (`.cce/config`)
 
 ```yaml
 markdown:
   max_section_tokens: 400   # byte-pinned split budget for oversized sections
 knowledge:
-  enabled: true             # ingest is on by default
+  enabled: true             # ingest + retrieval are on by default
+  min_score: 0.30           # the recall precision floor (shared with L5 memory)
+  default_source: both      # code | knowledge | both — used when a search omits `source`
 ```
 
 ## The plugin / adapter strategy
