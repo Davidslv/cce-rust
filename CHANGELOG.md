@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Tests for `src/main.rs` and a byte-pinned `search --json` golden (#32).** The CLI entry point
+  (~1,300 lines) previously had zero tests. It now has a unit suite pinning current behavior of the
+  pure helpers — `parse_scope` comma/whitespace/empty-segment edges, `resolve_read_store` /
+  `resolve_metrics_path` / `metrics_beside_store` precedence (explicit `--metrics` wins, else beside
+  the resolved `--store`, else `<root>/.cce/metrics.jsonl`) — plus byte-pinned goldens for the
+  script-facing `results_json` / `fed_results_json` shapes (field order, 6-decimal string scores
+  incl. round-half-away-from-zero, `query_id: null` when metrics are off, trailing newline), and a
+  binary-level `tests/cli.rs` test pinning the parsed `--json` field set. Test-only — no behavior
+  change; all existing goldens and `conformance.json` unchanged.
 - **Automated, tag-driven releases.** Pushing a `vX.Y.Z` tag now re-runs every CI gate on the tagged
   commit, verifies the tag matches `Cargo.toml` and that this file has a matching section, builds
   release binaries for macOS (arm64/x86_64) and Linux (x86_64/arm64), and publishes a GitHub Release
