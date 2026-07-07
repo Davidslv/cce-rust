@@ -14,6 +14,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   with this file's section as the notes plus a `SHA256SUMS`. Process documented in `RELEASING.md`;
   README gains a prebuilt-binary install path. (Repo infrastructure — the `cce` binary is unchanged.)
 
+## [2.6.7] - 2026-07-06
+
+### Changed
+- **The MCP server caches the single-repo index and the knowledge store across calls (#31).** The
+  long-lived `cce mcp` server did O(corpus) work on EVERY tool call: the single-repo path re-read +
+  JSON-parsed the whole store and rebuilt the entire BM25 index and import graph per request
+  (`Index::load`), and the knowledge path additionally re-ran the embedder over legacy chunks and
+  rebuilt a BM25 index per query. Extending the #26 workspace pattern, `McpServer` now caches the
+  loaded `Index` and the loaded+embedded knowledge store, keyed by a cheap freshness fingerprint —
+  store-file `mtime`+length from one `fs::metadata` call per tool call (for knowledge: the `current`
+  pointer plus the snapshot artifact it names). A re-index, a knowledge re-ingest, or a
+  `cce sync pull` (startup auto-pull or mid-session) invalidates on the next call; a **deleted store
+  drops the cache and serves the friendly missing-index message** — never a stale answer. The #26
+  workspace union cache (previously cached forever) now carries the combined fingerprint of its
+  in-scope member store files, so a member re-index mid-session is picked up without restarting
+  `cce mcp`. Warm calls sit under the #41 per-query embedder choice (BM25-only degradation
+  unchanged). Perf only — **ranked results and MCP result text are byte-identical warm vs cold**
+  (regression-tested), CLI one-shot paths are untouched, and `conformance.json` + all goldens are
+  unchanged. On a synthetic 3.2k-chunk store driven over stdio, a warm MCP `context_search` drops
+  from ~23ms to ~2ms per call (~10×); a warm knowledge query (300 records) from ~6ms to ~1ms (~5×) —
+  and the win scales with corpus size, since the removed work was O(corpus) per call.
+
 ## [2.6.6] - 2026-07-06
 
 ### Fixed
