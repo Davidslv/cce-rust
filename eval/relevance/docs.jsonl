@@ -1,0 +1,5 @@
+{"schema":"cce.relevance/v1","corpus":"docs-corpus"}
+{"id":"docs-rate-limit","query":"how many login attempts before lockout","expected":["rate-limiting.md"],"k":3}
+{"id":"docs-deploy","query":"deployment checklist migrations rollback","expected":["deploy-checklist.md"],"k":3}
+{"id":"docs-retry","query":"webhook retry backoff jitter","expected":["retry-policy.md"],"k":3}
+{"id":"docs-fusion","query":"reciprocal rank fusion weights","expected":["search-tuning.md"],"k":3}

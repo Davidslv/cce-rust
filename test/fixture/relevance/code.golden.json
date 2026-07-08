@@ -1,0 +1,197 @@
+{
+  "backends": [
+    {
+      "backend": "bm25",
+      "f1": "0.623016",
+      "mrr": "0.888889",
+      "per_query": [
+        {
+          "f1": "0.571429",
+          "first_relevant_rank": 3,
+          "id": "code-read-config",
+          "k": 5,
+          "mrr": "0.333333",
+          "precision_at_k": "0.400000",
+          "recall": "1.000000"
+        },
+        {
+          "f1": "0.333333",
+          "first_relevant_rank": 1,
+          "id": "code-parse-json",
+          "k": 5,
+          "mrr": "1.000000",
+          "precision_at_k": "0.200000",
+          "recall": "1.000000"
+        },
+        {
+          "f1": "0.750000",
+          "first_relevant_rank": 1,
+          "id": "code-build-index",
+          "k": 5,
+          "mrr": "1.000000",
+          "precision_at_k": "0.600000",
+          "recall": "1.000000"
+        },
+        {
+          "f1": "1.000000",
+          "first_relevant_rank": 1,
+          "id": "code-loader-class",
+          "k": 5,
+          "mrr": "1.000000",
+          "precision_at_k": "1.000000",
+          "recall": "1.000000"
+        },
+        {
+          "f1": "0.750000",
+          "first_relevant_rank": 1,
+          "id": "code-sum-node",
+          "k": 5,
+          "mrr": "1.000000",
+          "precision_at_k": "0.600000",
+          "recall": "1.000000"
+        },
+        {
+          "f1": "0.333333",
+          "first_relevant_rank": 1,
+          "id": "code-interface-kind",
+          "k": 5,
+          "mrr": "1.000000",
+          "precision_at_k": "0.200000",
+          "recall": "1.000000"
+        }
+      ],
+      "precision_at_k": "0.500000",
+      "recall": "1.000000"
+    },
+    {
+      "backend": "vector",
+      "f1": "0.646164",
+      "mrr": "1.000000",
+      "per_query": [
+        {
+          "f1": "0.571429",
+          "first_relevant_rank": 1,
+          "id": "code-read-config",
+          "k": 5,
+          "mrr": "1.000000",
+          "precision_at_k": "0.400000",
+          "recall": "1.000000"
+        },
+        {
+          "f1": "0.333333",
+          "first_relevant_rank": 1,
+          "id": "code-parse-json",
+          "k": 5,
+          "mrr": "1.000000",
+          "precision_at_k": "0.200000",
+          "recall": "1.000000"
+        },
+        {
+          "f1": "0.888889",
+          "first_relevant_rank": 1,
+          "id": "code-build-index",
+          "k": 5,
+          "mrr": "1.000000",
+          "precision_at_k": "0.800000",
+          "recall": "1.000000"
+        },
+        {
+          "f1": "1.000000",
+          "first_relevant_rank": 1,
+          "id": "code-loader-class",
+          "k": 5,
+          "mrr": "1.000000",
+          "precision_at_k": "1.000000",
+          "recall": "1.000000"
+        },
+        {
+          "f1": "0.750000",
+          "first_relevant_rank": 1,
+          "id": "code-sum-node",
+          "k": 5,
+          "mrr": "1.000000",
+          "precision_at_k": "0.600000",
+          "recall": "1.000000"
+        },
+        {
+          "f1": "0.333333",
+          "first_relevant_rank": 1,
+          "id": "code-interface-kind",
+          "k": 5,
+          "mrr": "1.000000",
+          "precision_at_k": "0.200000",
+          "recall": "1.000000"
+        }
+      ],
+      "precision_at_k": "0.533333",
+      "recall": "1.000000"
+    },
+    {
+      "backend": "hybrid",
+      "f1": "0.623016",
+      "mrr": "0.916667",
+      "per_query": [
+        {
+          "f1": "0.571429",
+          "first_relevant_rank": 2,
+          "id": "code-read-config",
+          "k": 5,
+          "mrr": "0.500000",
+          "precision_at_k": "0.400000",
+          "recall": "1.000000"
+        },
+        {
+          "f1": "0.333333",
+          "first_relevant_rank": 1,
+          "id": "code-parse-json",
+          "k": 5,
+          "mrr": "1.000000",
+          "precision_at_k": "0.200000",
+          "recall": "1.000000"
+        },
+        {
+          "f1": "0.750000",
+          "first_relevant_rank": 1,
+          "id": "code-build-index",
+          "k": 5,
+          "mrr": "1.000000",
+          "precision_at_k": "0.600000",
+          "recall": "1.000000"
+        },
+        {
+          "f1": "1.000000",
+          "first_relevant_rank": 1,
+          "id": "code-loader-class",
+          "k": 5,
+          "mrr": "1.000000",
+          "precision_at_k": "1.000000",
+          "recall": "1.000000"
+        },
+        {
+          "f1": "0.750000",
+          "first_relevant_rank": 1,
+          "id": "code-sum-node",
+          "k": 5,
+          "mrr": "1.000000",
+          "precision_at_k": "0.600000",
+          "recall": "1.000000"
+        },
+        {
+          "f1": "0.333333",
+          "first_relevant_rank": 1,
+          "id": "code-interface-kind",
+          "k": 5,
+          "mrr": "1.000000",
+          "precision_at_k": "0.200000",
+          "recall": "1.000000"
+        }
+      ],
+      "precision_at_k": "0.500000",
+      "recall": "1.000000"
+    }
+  ],
+  "corpus": "eval/relevance/../../test/fixture/samples",
+  "embedder": "hash",
+  "queries": 6,
+  "schema": "cce.relevance.report/v1"
+}
