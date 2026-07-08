@@ -24,6 +24,7 @@ pub mod commands;
 pub mod config;
 pub mod git;
 pub mod knowledge_artifact;
+pub mod knowledge_commands;
 pub mod remote;
 
 use sha2::{Digest, Sha256};

@@ -28,6 +28,10 @@ const PUSH_RETRIES: usize = 5;
 /// The `.gitattributes` line that routes `*.cce` blobs through git-LFS.
 pub const LFS_ATTRIBUTES: &str = "*.cce filter=lfs diff=lfs merge=lfs -text\n";
 
+/// The `.gitattributes` line that routes `*.cck` corpus blobs through git-LFS
+/// (SPEC-SYNC-KNOWLEDGE §3: `*.cck` joins `*.cce` — corpora carry embeddings).
+pub const KNOWLEDGE_LFS_ATTRIBUTES: &str = "*.cck filter=lfs diff=lfs merge=lfs -text\n";
+
 /// A pluggable cache backend (SPEC-SYNC §4). The git backend is the only impl in
 /// v1; the trait keeps S3/HTTP possible without CLI changes.
 pub trait SyncRemote {
@@ -97,24 +101,36 @@ impl GitRemote {
     /// Write and commit `.gitattributes` for LFS if it is not already present, and
     /// run `git lfs install` (best effort).
     fn ensure_lfs(&self) -> Result<(), String> {
+        self.ensure_lfs_pattern("*.cce", LFS_ATTRIBUTES)
+    }
+
+    /// Route `*.cck` corpus blobs through git-LFS too (SPEC-SYNC-KNOWLEDGE §3).
+    /// Called by `knowledge push` when the project has LFS enabled; `cce sync
+    /// init` and every code-path write stay byte-identical (additive).
+    pub fn ensure_knowledge_lfs(&self) -> Result<(), String> {
+        self.ensure_lfs_pattern("*.cck", KNOWLEDGE_LFS_ATTRIBUTES)
+    }
+
+    /// Idempotently append one LFS attribute line (keyed by `pattern`) to the
+    /// cache's `.gitattributes`, commit, and push.
+    fn ensure_lfs_pattern(&self, pattern: &str, line: &str) -> Result<(), String> {
         let attrs = self.dir.join(".gitattributes");
-        let already = std::fs::read_to_string(&attrs).map(|s| s.contains("*.cce")).unwrap_or(false);
+        let already =
+            std::fs::read_to_string(&attrs).map(|s| s.contains(pattern)).unwrap_or(false);
         if !already {
             let mut content = std::fs::read_to_string(&attrs).unwrap_or_default();
             if !content.is_empty() && !content.ends_with('\n') {
                 content.push('\n');
             }
-            content.push_str(LFS_ATTRIBUTES);
+            content.push_str(line);
             std::fs::write(&attrs, content)
                 .map_err(|e| format!("cannot write .gitattributes: {e}"))?;
             // `git lfs install` is best-effort: absent git-lfs must not abort init.
             let _ = git::run(&self.dir, &["lfs", "install", "--local"]);
             git::run_commit(&self.dir, &["add", ".gitattributes"])?;
             // Commit may be empty if attrs already tracked; ignore that specific case.
-            let _ = git::run_commit(
-                &self.dir,
-                &["commit", "-q", "-m", "cce sync: enable git-LFS for *.cce"],
-            );
+            let msg = format!("cce sync: enable git-LFS for {pattern}");
+            let _ = git::run_commit(&self.dir, &["commit", "-q", "-m", &msg]);
             self.push_with_retry()?;
         }
         Ok(())
@@ -228,6 +244,63 @@ impl GitRemote {
             return None;
         }
         text.lines().find_map(|l| l.strip_prefix("size ")).and_then(|s| s.trim().parse().ok())
+    }
+
+    /// The full keys under `prefix` (recursive) whose basename ends with
+    /// `suffix`, sorted. The knowledge walk (SPEC-SYNC-KNOWLEDGE §3/§4.5) uses
+    /// this to enumerate a corpus's `<snapshot>.cck` keys; junk entries are
+    /// skipped silently (the #37 graceful-skip rule). An unborn branch or a
+    /// missing prefix lists as empty.
+    pub fn list_keys_with_suffix(&self, prefix: &str, suffix: &str) -> Result<Vec<String>, String> {
+        self.fetch()?;
+        let treeish = format!("origin/{}", self.branch);
+        let listing = match git::run(&self.dir, &["ls-tree", "-r", "--name-only", &treeish, prefix])
+        {
+            Ok(l) => l,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let mut keys: Vec<String> =
+            listing.lines().filter(|l| l.ends_with(suffix)).map(str::to_string).collect();
+        keys.sort();
+        keys.dedup();
+        Ok(keys)
+    }
+
+    /// The unix timestamp of the commit that FIRST ADDED `key` on the cache
+    /// branch (SPEC-SYNC-KNOWLEDGE §4.5): corpora have no sha ordering, so git
+    /// history is the only order the cache itself carries. `None` when the key
+    /// has no add commit (never existed, or an unborn branch).
+    pub fn first_added_epoch(&self, key: &str) -> Option<i64> {
+        let treeish = format!("origin/{}", self.branch);
+        // `--diff-filter=A` keeps only the commit(s) that added the path; the
+        // LAST line of the log is the earliest such commit.
+        let log = git::run(
+            &self.dir,
+            &["log", "--format=%ct", "--diff-filter=A", &treeish, "--", key],
+        )
+        .ok()?;
+        log.lines().last().and_then(|l| l.trim().parse().ok())
+    }
+
+    /// Remove `keys` from the cache in a single commit + push (retention pruning,
+    /// SPEC-SYNC-KNOWLEDGE §4.5). The caller decides WHAT to prune; this only
+    /// executes it. A no-op on an empty list.
+    pub fn remove_many(&self, keys: &[String], message: &str) -> Result<(), String> {
+        if keys.is_empty() {
+            return Ok(());
+        }
+        self.fetch()?;
+        let onto = format!("origin/{}", self.branch);
+        let _ = git::run_commit(&self.dir, &["checkout", "-q", "-B", &self.branch, &onto]);
+        let mut args: Vec<&str> = vec!["rm", "-q", "--ignore-unmatch", "--"];
+        args.extend(keys.iter().map(String::as_str));
+        git::run_commit(&self.dir, &args)?;
+        // Every key already absent ⇒ nothing staged ⇒ nothing to prune (success).
+        if git::run(&self.dir, &["diff", "--cached", "--quiet"]).is_ok() {
+            return Ok(());
+        }
+        git::run_commit(&self.dir, &["commit", "-q", "-m", message])?;
+        self.push_with_retry()
     }
 
     /// Read a small *non-artifact* text blob (e.g. a `refs/<ref>` latest pointer)
@@ -522,6 +595,42 @@ mod tests {
         remote.put("hash/2.3/x/refs/main", b"abc123\n").unwrap();
         assert_eq!(remote.read_blob_text("hash/2.3/x/refs/main").unwrap(), "abc123");
         assert!(remote.read_blob_text("hash/2.3/x/refs/nope").is_err());
+        std::env::remove_var("CCE_HOME");
+    }
+
+    #[test]
+    fn first_added_epoch_orders_keys_by_cache_history() {
+        let _home = with_home();
+        let (_bare, url) = bare_remote();
+        let remote = GitRemote::open(&url, false).unwrap();
+        remote.put("knowledge/v1/c/aaa.cck", b"A\n").unwrap();
+        remote.put("knowledge/v1/c/bbb.cck", b"B\n").unwrap();
+        let a = remote.first_added_epoch("knowledge/v1/c/aaa.cck").unwrap();
+        let b = remote.first_added_epoch("knowledge/v1/c/bbb.cck").unwrap();
+        assert!(a <= b, "the earlier push is not later in history");
+        assert_eq!(remote.first_added_epoch("knowledge/v1/c/nope.cck"), None);
+        std::env::remove_var("CCE_HOME");
+    }
+
+    #[test]
+    fn remove_many_prunes_keys_in_one_commit() {
+        let _home = with_home();
+        let (_bare, url) = bare_remote();
+        let remote = GitRemote::open(&url, false).unwrap();
+        remote
+            .put_many(&[
+                ("knowledge/v1/c/aaa.cck".to_string(), b"A\n".to_vec()),
+                ("knowledge/v1/c/bbb.cck".to_string(), b"B\n".to_vec()),
+                ("knowledge/v1/c/current".to_string(), b"bbb\n".to_vec()),
+            ])
+            .unwrap();
+        remote.remove_many(&["knowledge/v1/c/aaa.cck".to_string()], "prune").unwrap();
+        assert!(!remote.has("knowledge/v1/c/aaa.cck").unwrap());
+        assert!(remote.has("knowledge/v1/c/bbb.cck").unwrap());
+        assert!(remote.has("knowledge/v1/c/current").unwrap());
+        // Empty list and an already-absent key are both no-ops, not errors.
+        remote.remove_many(&[], "noop").unwrap();
+        remote.remove_many(&["knowledge/v1/c/aaa.cck".to_string()], "again").unwrap();
         std::env::remove_var("CCE_HOME");
     }
 
