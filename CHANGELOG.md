@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.9] - 2026-07-08
+
 ### Added
 - **`cce sync list [--remote <url>] [--json]` — enumerate what a sync cache holds (#53).**
   The discovery half of consumer mode: one row per `repo_id` with its **latest sha** (the
