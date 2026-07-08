@@ -31,8 +31,7 @@ fn fixture_log() -> PathBuf {
 fn usage_human_all_time_is_byte_pinned() {
     // "all time" carries no wall-clock text, so the whole block is byte-pinnable
     // at the process level over the committed fixture log.
-    let out =
-        Command::new(bin()).args(["usage", "--metrics"]).arg(fixture_log()).output().unwrap();
+    let out = Command::new(bin()).args(["usage", "--metrics"]).arg(fixture_log()).output().unwrap();
     assert!(out.status.success(), "usage failed: {}", String::from_utf8_lossy(&out.stderr));
     let got = String::from_utf8(out.stdout).unwrap();
     let want = "CCE usage — all time\n\
@@ -73,10 +72,7 @@ fn usage_empty_window_is_friendly_and_exits_zero() {
         .unwrap();
     assert!(out.status.success(), "an empty window must exit 0");
     let got = String::from_utf8(out.stdout).unwrap();
-    assert_eq!(
-        got,
-        "CCE usage — since 2027-01-01T00:00:00Z\n  no searches in this window\n"
-    );
+    assert_eq!(got, "CCE usage — since 2027-01-01T00:00:00Z\n  no searches in this window\n");
 }
 
 #[test]
@@ -247,8 +243,7 @@ fn usage_workspace_folds_the_root_log_and_matches_the_dashboard() {
 #[test]
 fn usage_workspace_human_shows_the_by_package_table() {
     let tmp = workspace_with_logs();
-    let out =
-        Command::new(bin()).args(["usage", "--workspace"]).arg(tmp.path()).output().unwrap();
+    let out = Command::new(bin()).args(["usage", "--workspace"]).arg(tmp.path()).output().unwrap();
     assert!(out.status.success(), "usage --workspace: {}", String::from_utf8_lossy(&out.stderr));
     let got = String::from_utf8(out.stdout).unwrap();
     assert!(got.contains("  by package\n"), "missing by-package table: {got}");

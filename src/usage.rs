@@ -162,7 +162,7 @@ pub fn fmt_thousands(n: u64) -> String {
     let digits = n.to_string();
     let mut out = String::with_capacity(digits.len() + digits.len() / 3);
     for (i, c) in digits.chars().enumerate() {
-        if i > 0 && (digits.len() - i) % 3 == 0 {
+        if i > 0 && (digits.len() - i).is_multiple_of(3) {
             out.push(',');
         }
         out.push(c);
@@ -290,8 +290,7 @@ pub fn render_human(
         if let Some(pkgs) = metrics["by_package"].as_array() {
             if !pkgs.is_empty() {
                 out.push_str("  by package\n");
-                let pw =
-                    pkgs.iter().map(|p| get_str(p, &["package"]).len()).max().unwrap_or(1);
+                let pw = pkgs.iter().map(|p| get_str(p, &["package"]).len()).max().unwrap_or(1);
                 let psw = pkgs
                     .iter()
                     .map(|p| get_u64(p, &["searches"]).to_string().len())
@@ -303,8 +302,7 @@ pub fn render_human(
                     .max()
                     .unwrap_or(1);
                 for p in pkgs {
-                    let pct =
-                        (get_f64(p, &["mean_savings_ratio"]) * 100.0).round() as i64;
+                    let pct = (get_f64(p, &["mean_savings_ratio"]) * 100.0).round() as i64;
                     out.push_str(&format!(
                         "    {:<pw$} : {:>psw$} searches · saved ~{:>ptw$} tok ({}%) · quality {:.2}\n",
                         get_str(p, &["package"]),
@@ -331,8 +329,11 @@ pub fn render_human(
             .map(|r| short_query(get_str(r, &["query"])).chars().count() + 2)
             .max()
             .unwrap_or(2);
-        let hw =
-            shown.iter().map(|r| get_u64(r, &["result_count"]).to_string().len()).max().unwrap_or(1);
+        let hw = shown
+            .iter()
+            .map(|r| get_u64(r, &["result_count"]).to_string().len())
+            .max()
+            .unwrap_or(1);
         for r in shown {
             let quoted = format!("\"{}\"", short_query(get_str(r, &["query"])));
             let pad = qw.saturating_sub(quoted.chars().count());
@@ -421,10 +422,7 @@ pub fn render_json(
     let body = UsageJson {
         schema: USAGE_SCHEMA.to_string(),
         generated_ts: format_iso(now_secs),
-        window: WindowJson {
-            since: since.map(|c| c.cutoff_iso()),
-            until: format_iso(now_secs),
-        },
+        window: WindowJson { since: since.map(|c| c.cutoff_iso()), until: format_iso(now_secs) },
         source_filter: source.as_str().to_string(),
         totals: TotalsJson {
             searches: get_u64(metrics, &["totals", "searches"]),
@@ -433,7 +431,11 @@ pub fn render_json(
             mean_top_score: get_f64(metrics, &["totals", "mean_top_score"]),
         },
         by_source: metrics["by_source"].clone(),
-        by_package: if workspace { Some(metrics["by_package"].clone()) } else { None },
+        by_package: if workspace {
+            Some(metrics["by_package"].clone())
+        } else {
+            None
+        },
         recent,
     };
     serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string()) + "\n"
@@ -552,7 +554,8 @@ mod tests {
     #[test]
     fn human_render_since_window_filters_and_labels() {
         let since = parse_since("48h", now()).unwrap();
-        let got = render_human(&metrics_value(Some(&since)), Some(&since), SourceFilter::All, false);
+        let got =
+            render_human(&metrics_value(Some(&since)), Some(&since), SourceFilter::All, false);
         let want = "CCE usage — last 48h (since 2026-07-04T10:00:00Z)\n\
                     \x20 agent (mcp) : 2 searches · saved ~16,500 tok (88%) · quality 0.79 · 58 ms avg\n\
                     \x20 human (cli) : 0 searches · saved ~     0 tok (0%) · quality 0.00 · 0 ms avg\n\
@@ -575,7 +578,8 @@ mod tests {
     #[test]
     fn human_render_empty_window_is_the_pinned_friendly_line() {
         let since = parse_since("1h", now()).unwrap();
-        let got = render_human(&metrics_value(Some(&since)), Some(&since), SourceFilter::All, false);
+        let got =
+            render_human(&metrics_value(Some(&since)), Some(&since), SourceFilter::All, false);
         assert_eq!(
             got,
             "CCE usage — last 1h (since 2026-07-06T09:00:00Z)\n  no searches in this window\n"
@@ -603,8 +607,13 @@ mod tests {
     #[test]
     fn json_projection_is_byte_pinned() {
         let since = parse_since("7d", now()).unwrap();
-        let got =
-            render_json(&metrics_value(Some(&since)), now(), Some(&since), SourceFilter::All, false);
+        let got = render_json(
+            &metrics_value(Some(&since)),
+            now(),
+            Some(&since),
+            SourceFilter::All,
+            false,
+        );
         let want = r#"{
   "schema": "cce.usage/v1",
   "generated_ts": "2026-07-06T10:00:00Z",
@@ -689,10 +698,7 @@ mod tests {
                 .unwrap();
         assert_eq!(usage["totals"]["searches"], dash["totals"]["searches"]);
         assert_eq!(usage["totals"]["tokens_saved"], dash["totals"]["tokens_saved"]);
-        assert_eq!(
-            usage["totals"]["mean_savings_ratio"],
-            dash["totals"]["mean_savings_ratio"]
-        );
+        assert_eq!(usage["totals"]["mean_savings_ratio"], dash["totals"]["mean_savings_ratio"]);
         assert_eq!(usage["totals"]["mean_top_score"], dash["totals"]["mean_top_score"]);
         // by_source is lifted VERBATIM — byte-identical shape and numbers.
         assert_eq!(usage["by_source"], dash["by_source"]);

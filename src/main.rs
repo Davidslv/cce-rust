@@ -1091,7 +1091,10 @@ fn cmd_usage(
     };
 
     if json {
-        print!("{}", usage::render_json(&metrics_val, now_secs, since_cut.as_ref(), source, workspace));
+        print!(
+            "{}",
+            usage::render_json(&metrics_val, now_secs, since_cut.as_ref(), source, workspace)
+        );
     } else {
         print!("{}", usage::render_human(&metrics_val, since_cut.as_ref(), source, workspace));
     }
