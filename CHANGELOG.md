@@ -7,6 +7,43 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`cce relevance --compare` — paired significance testing (#84).** The
+  comparison mode now reports, per metric, the paired t-statistic over the
+  per-query deltas, the two-sided p-value at `n−1` degrees of freedom, the
+  95% confidence interval on the mean delta, and `n` — in the human table
+  (an `n/a` marks a statistic undefined at the input, e.g. `t` at zero
+  variance) and in the `--json` report's new top-level `compare` block
+  (`null` there). The math is a dependency-free, closed-form t-distribution
+  CDF (log-gamma + regularized incomplete beta, new `src/stats.rs`) — chosen
+  over a fixed-seed permutation test because it needs no seed and no
+  resampling knob to pin in a golden, and an exact sign-flip permutation at
+  n=6 quantizes p to 1/64 steps. Hand-computed unit tests against exact
+  small-df closed forms and the classic t-table values. `docs/relevance.md`
+  gains a minimum-detectable-effect note: at n=6–7 only deltas ≈1.4× the
+  per-query delta SD are detectable, so private fixture sets should be sized
+  from a pilot variance estimate (Sakai's topic-set-size methodology;
+  Urbano et al. on small-n test behavior).
+- **`cce relevance` — line-range anchors + token-level metrics (#85).** The
+  anchor grammar gains an additive line-range facet: `path@a-b` and
+  `path#kind@a-b` (1-based, inclusive) match only results whose line span
+  overlaps the range — text after the last `@` is a range only when it is
+  all digits-and-dashes, so every existing `cce.relevance/v1` fixture parses
+  unchanged (the fixture schema does NOT bump). Cases with ranged anchors
+  are additionally scored at token resolution — token-level recall /
+  precision / IoU between the expected spans and the top-k result spans,
+  weighted per line with the ONE `cce.tokens/v1` estimator over the indexed
+  chunk texts (uncovered lines weigh the estimator floor of 1) — rendered as
+  a token-level section in the human summary and `tokens` objects in the
+  JSON report; unranged cases and sets score and render exactly as before.
+  The code starter set gains one ranged case (`python.py@3-4`) so the pinned
+  golden exercises the new path.
+- **`cce.relevance.report/v2`** — the `--json` report schema bumps once for
+  both features above; every v1 field is carried unchanged, and the harness
+  golden (`test/fixture/relevance/code.golden.json`) is re-pinned.
+  New-goldens-only: zero ranking bytes touched, `cce conformance` output over
+  `test/fixture/samples` verified byte-identical.
+
 ## [2.8.0] - 2026-07-08
 
 ### Added
