@@ -94,8 +94,7 @@ fn canonical_search_event(dir: &Path) -> String {
     let log = std::fs::read_to_string(dir.join(".cce").join("metrics.jsonl")).unwrap();
     let line = log
         .lines()
-        .filter(|l| l.contains("\"event\":\"search\""))
-        .next_back()
+        .rfind(|l| l.contains("\"event\":\"search\""))
         .expect("no search event recorded");
     let mut v: Value = serde_json::from_str(line).unwrap();
     let obj = v.as_object_mut().unwrap();
