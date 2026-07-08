@@ -40,6 +40,7 @@ pub mod conformance;
 pub mod relevance;
 pub mod metrics;
 pub mod aggregator;
+pub mod usage;
 pub mod dashboard;
 pub mod workspace;
 pub mod federation;

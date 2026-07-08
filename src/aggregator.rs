@@ -83,6 +83,10 @@ pub struct SourceUsage {
     pub tokens_saved: u64,
     pub mean_savings_ratio: f64,
     pub mean_top_score: f64,
+    /// Mean recorded `latency_ms` over the bucket's searches (v2.8, additive):
+    /// feeds the `cce usage` split. Pre-v2.4 events with no `latency_ms` count
+    /// as `0.0` (the read-side default), keeping the mean a pure log function.
+    pub mean_latency_ms: f64,
 }
 
 /// Secret-safety reassurance (v2.4.1): the sensitive files the secure-by-default
@@ -173,6 +177,9 @@ pub struct RecentSearch {
     pub top_score: f64,
     pub empty: bool,
     pub feedback: String,
+    /// The event's `source` tag — `"cli"` or `"mcp"` (v2.8, additive): lets the
+    /// recent view (dashboard + `cce usage`) label each query agent-vs-human.
+    pub source: String,
 }
 
 /// Round to 2 decimals, round-half-away-from-zero (for the USD cost estimate).
@@ -276,11 +283,13 @@ fn compute_usage_by_source(searches: &[(usize, &SearchEvent)]) -> UsageBySource 
 fn source_usage(searches: &[&SearchEvent]) -> SourceUsage {
     let tokens_saved: u64 = searches.iter().map(|s| s.tokens_saved).sum();
     let ratios: Vec<f64> = searches.iter().map(|s| s.savings_ratio).collect();
+    let latencies: Vec<f64> = searches.iter().map(|s| s.latency_ms).collect();
     SourceUsage {
         searches: searches.len() as u64,
         tokens_saved,
         mean_savings_ratio: round6(mean(&ratios)),
         mean_top_score: mean_top_score_of(searches),
+        mean_latency_ms: round6(mean(&latencies)),
     }
 }
 
@@ -522,6 +531,7 @@ fn compute_recent(
                 top_score: round6(s.top_score),
                 empty: s.empty,
                 feedback: feedback.to_string(),
+                source: s.source.clone(),
             }
         })
         .collect()

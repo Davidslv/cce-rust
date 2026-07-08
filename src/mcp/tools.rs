@@ -36,7 +36,10 @@
 
 use crate::chunker::{token_count, Chunk};
 use crate::compress::{compress, DetailLevel};
-use crate::config::{KnowledgeConfig, MemoryConfig, OutputLevel, RetrievalConfig, CHARS_PER_TOKEN};
+use crate::config::{
+    FooterMode, KnowledgeConfig, MemoryConfig, OutputLevel, RetrievalConfig, CHARS_PER_TOKEN,
+};
+use crate::grammar::FooterFacts;
 use crate::embedder::{format6, score_key, Embedder, HashEmbedder, OllamaEmbedder};
 use crate::federation::{
     federated_bm25_only_search, federated_search_over, load_member_stores, parse_scope,
@@ -390,6 +393,8 @@ fn context_search_single(
     let record =
         build_search_record(&index, &results, query, top_k, !no_graph, latency_ms, "mcp", detail);
     let query_id = write_search_event(&server.metrics_path(), &record);
+    // v2.8: accrue the record's own tokens_saved into the session usage counters.
+    server.note_search_usage(record.tokens_saved);
 
     // L6: record this search (query + the ids/paths it returned) in the session ledger.
     let chunk_ids: Vec<String> = results.iter().map(|r| r.chunk_id.clone()).collect();
@@ -397,10 +402,10 @@ fn context_search_single(
     server.record_search(query, &chunk_ids, &file_paths);
 
     let rows: Vec<Row> = results.iter().map(Row::from_single).collect();
-    ToolOutput::ok(with_notice(
-        notice,
-        format_rows(&rows, query_id.as_deref(), max_tokens, index.chunks.len(), detail),
-    ))
+    let text = format_rows(&rows, query_id.as_deref(), max_tokens, index.chunks.len(), detail);
+    // Opt-in usage footer (v2.8): appended last; `off` leaves the bytes untouched.
+    let text = append_usage_footer(server, &footer_facts(&record, index.chunks.len()), text);
+    ToolOutput::ok(with_notice(notice, text))
 }
 
 /// Workspace retrieval: SPEC-V2.2 federation over the in-scope members.
@@ -478,6 +483,8 @@ fn context_search_workspace(
         detail,
     );
     let query_id = write_search_event(&server.metrics_path(), &record);
+    // v2.8: accrue the record's own tokens_saved into the session usage counters.
+    server.note_search_usage(record.tokens_saved);
 
     // L6: record this search in the session ledger. File paths are member-prefixed
     // (`member/path`) so two members' same-named files stay distinct in the digest.
@@ -488,10 +495,10 @@ fn context_search_workspace(
 
     let total_chunks: usize = members.iter().map(|m| m.index.chunks.len()).sum();
     let rows: Vec<Row> = results.iter().map(Row::from_fed).collect();
-    ToolOutput::ok(with_notice(
-        notice,
-        format_rows(&rows, query_id.as_deref(), max_tokens, total_chunks, detail),
-    ))
+    let text = format_rows(&rows, query_id.as_deref(), max_tokens, total_chunks, detail);
+    // Opt-in usage footer (v2.8): appended last; `off` leaves the bytes untouched.
+    let text = append_usage_footer(server, &footer_facts(&record, total_chunks), text);
+    ToolOutput::ok(with_notice(notice, text))
 }
 
 // --- knowledge + blend (SPEC-V2.6 §5) ---
@@ -584,9 +591,10 @@ impl BlendItem {
 }
 
 /// What a code-side gather returns for blending: the rows, the logged
-/// `query_id`, the code chunk count, and — when the store is ollama-built and
-/// Ollama is down (issue #30) — the pinned degradation notice to surface.
-type CodeHits = (Vec<CodeRow>, Option<String>, usize, Option<&'static str>);
+/// `query_id`, the code chunk count, when the store is ollama-built and
+/// Ollama is down (issue #30) the pinned degradation notice to surface, and —
+/// when a `search` record was built — the v2.8 footer facts read off it.
+type CodeHits = (Vec<CodeRow>, Option<String>, usize, Option<&'static str>, Option<FooterFacts>);
 
 /// Run code retrieval and return owned code rows plus the logged `query_id` and the
 /// code chunk count — reusing the SAME §6 pipeline, metrics event, and session-ledger
@@ -604,7 +612,7 @@ fn gather_code_hits_single(server: &McpServer, query: &str, p: &SearchParams) ->
     // Cached across calls (issue #31): reused while the store file is unchanged.
     let index = match server.load_index() {
         Ok(i) => i,
-        Err(_) => return (Vec::new(), None, 0, None),
+        Err(_) => return (Vec::new(), None, 0, None, None),
     };
     let start = Instant::now();
     let (results, notice) = match pick_embedder(&index) {
@@ -627,6 +635,9 @@ fn gather_code_hits_single(server: &McpServer, query: &str, p: &SearchParams) ->
         p.detail,
     );
     let query_id = write_search_event(&server.metrics_path(), &record);
+    // v2.8: accrue the record's own tokens_saved into the session usage counters.
+    server.note_search_usage(record.tokens_saved);
+    let facts = footer_facts(&record, index.chunks.len());
     let chunk_ids: Vec<String> = results.iter().map(|r| r.chunk_id.clone()).collect();
     let file_paths: Vec<String> = results.iter().map(|r| r.file_path.clone()).collect();
     server.record_search(query, &chunk_ids, &file_paths);
@@ -644,25 +655,25 @@ fn gather_code_hits_single(server: &McpServer, query: &str, p: &SearchParams) ->
             content: r.content,
         })
         .collect();
-    (rows, query_id, index.chunks.len(), notice)
+    (rows, query_id, index.chunks.len(), notice, Some(facts))
 }
 
 fn gather_code_hits_workspace(server: &McpServer, query: &str, p: &SearchParams) -> CodeHits {
     let root = server.root();
     let manifest = match Manifest::load(&root) {
         Ok(m) => m,
-        Err(_) => return (Vec::new(), None, 0, None),
+        Err(_) => return (Vec::new(), None, 0, None, None),
     };
     // An empty-but-present `package` is invalid (issue #45); in this path a scope
     // error yields no code rows, exactly like an unknown package below.
     let scope = match parse_scope(p.package.clone()) {
         Ok(s) => s,
-        Err(_) => return (Vec::new(), None, 0, None),
+        Err(_) => return (Vec::new(), None, 0, None, None),
     };
     // Cached federated union (issue #26): same bundle the code-only path uses.
     let bundle = match server.workspace_bundle(&manifest, scope.as_deref()) {
         Ok(b) => b,
-        Err(_) => return (Vec::new(), None, 0, None),
+        Err(_) => return (Vec::new(), None, 0, None, None),
     };
     let members = &bundle.members;
     let combined = &bundle.combined;
@@ -712,11 +723,14 @@ fn gather_code_hits_workspace(server: &McpServer, query: &str, p: &SearchParams)
         p.detail,
     );
     let query_id = write_search_event(&server.metrics_path(), &record);
+    // v2.8: accrue the record's own tokens_saved into the session usage counters.
+    server.note_search_usage(record.tokens_saved);
     let chunk_ids: Vec<String> = results.iter().map(|r| r.chunk_id.clone()).collect();
     let file_paths: Vec<String> =
         results.iter().map(|r| format!("{}/{}", r.member, r.file_path)).collect();
     server.record_search(query, &chunk_ids, &file_paths);
     let total_chunks: usize = members.iter().map(|m| m.index.chunks.len()).sum();
+    let facts = footer_facts(&record, total_chunks);
     let rows = results
         .into_iter()
         .map(|r| CodeRow {
@@ -731,7 +745,7 @@ fn gather_code_hits_workspace(server: &McpServer, query: &str, p: &SearchParams)
             content: r.content,
         })
         .collect();
-    (rows, query_id, total_chunks, notice)
+    (rows, query_id, total_chunks, notice, Some(facts))
 }
 
 /// The knowledge-only path (SPEC-V2.6 §5, `source:"knowledge"`).
@@ -750,13 +764,20 @@ fn context_search_knowledge(server: &McpServer, args: &Value, query: &str) -> To
 /// through the one shared ranking into a single top-K.
 fn context_search_both(server: &McpServer, args: &Value, query: &str) -> ToolOutput {
     let p = parse_params(server, args);
-    let (code_rows, query_id, code_chunks, notice) = gather_code_hits(server, query, &p);
+    let (code_rows, query_id, code_chunks, notice, facts) = gather_code_hits(server, query, &p);
     let khits = load_knowledge_hits(server, query, p.top_k);
     let mut items: Vec<BlendItem> = Vec::with_capacity(code_rows.len() + khits.len());
     items.extend(code_rows.into_iter().map(BlendItem::Code));
     items.extend(khits.into_iter().map(BlendItem::Knowledge));
     let total = code_chunks + knowledge_total_chunks(server);
-    ToolOutput::ok(with_notice(notice, render_blend(items, query_id.as_deref(), &p, total)))
+    let mut text = render_blend(items, query_id.as_deref(), &p, total);
+    // Opt-in usage footer (v2.8): the recorded (code) event's numbers, with the
+    // blended chunk count the renderer shows. Only when a search was recorded.
+    if let Some(mut f) = facts {
+        f.total_chunks = total as u64;
+        text = append_usage_footer(server, &f, text);
+    }
+    ToolOutput::ok(with_notice(notice, text))
 }
 
 /// The knowledge store's chunk count (for the "no matches" hint), 0 if none/disabled.
@@ -886,6 +907,41 @@ fn write_search_event(
     let ids = HexIdSource::default();
     let writer = MetricsWriter::new(metrics_path.to_path_buf(), &clock, &ids, true);
     writer.log_search(record)
+}
+
+/// The footer facts for a search: every value read straight off the ALREADY-BUILT
+/// `search` record (plus the corpus chunk count the renderer shows). Pure
+/// projection — nothing here computes a new metric (SPEC-USAGE-VISIBILITY §3.2).
+fn footer_facts(record: &crate::metrics::SearchRecord, total_chunks: usize) -> FooterFacts {
+    FooterFacts {
+        result_count: record.result_count as u64,
+        total_chunks: total_chunks as u64,
+        served_tokens: record.served_tokens,
+        baseline_tokens: record.baseline_tokens,
+        tokens_saved: record.tokens_saved,
+        savings_ratio: record.savings_ratio,
+    }
+}
+
+/// Append the opt-in usage footer (SPEC-USAGE-VISIBILITY §3) to a rendered
+/// `context_search` result. `off` (the default) returns `text` UNTOUCHED —
+/// byte-identical to pre-v2.8 — which is what keeps the MCP golden and the
+/// conformance surfaces pinned. `on` appends the one byte-pinned line; `session`
+/// adds the running session clause. Rendered AFTER all savings measurement, from
+/// values already on the recorded event: toggling it never changes a recorded
+/// metric (Invariant 1).
+fn append_usage_footer(server: &McpServer, facts: &FooterFacts, mut text: String) -> String {
+    let session = match server.footer_mode() {
+        FooterMode::Off => return text,
+        FooterMode::On => None,
+        FooterMode::Session => Some(server.session_usage()),
+    };
+    if !text.ends_with('\n') {
+        text.push('\n');
+    }
+    text.push_str(&crate::grammar::usage_footer_line(facts, session));
+    text.push('\n');
+    text
 }
 
 /// The pinned notice line served when an ollama-built store is queried while

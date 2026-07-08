@@ -150,6 +150,53 @@ pub fn grammar_savings_for_results(results: &[SearchResult]) -> Bucket {
     grammar_savings(&rows)
 }
 
+// --- the opt-in MCP result footer (SPEC-USAGE-VISIBILITY §3, v2.8) ---
+
+/// The numbers the usage footer prints — every one already computed for the
+/// recorded `search` event (plus the union chunk count the renderer was given).
+/// The footer is a PURE PROJECTION of these values: rendering it never changes a
+/// recorded metric (Invariant 1).
+#[derive(Debug, Clone, PartialEq)]
+pub struct FooterFacts {
+    /// `result_count` off the search event.
+    pub result_count: u64,
+    /// The searched corpus size — the same chunk count the result renderer shows.
+    pub total_chunks: u64,
+    /// `served_tokens` off the search event.
+    pub served_tokens: u64,
+    /// `baseline_tokens` off the search event.
+    pub baseline_tokens: u64,
+    /// `tokens_saved` off the search event.
+    pub tokens_saved: u64,
+    /// `savings_ratio` off the search event (0..=1).
+    pub savings_ratio: f64,
+}
+
+/// The byte-pinned one-line usage footer (`mcp.result_footer: on`):
+/// `cce: 5 results from 38,628 chunks · served ~1,204 tok vs ~9,880 baseline · saved ~8,676 (88%)`
+/// — no trailing newline (the caller adds it). `session` totals (searches +
+/// tokens saved THIS session, including this call) append the trailing clause
+/// `· session: 42 searches, ~310k saved`. Thousands separators and the short
+/// token form are the pinned `cce usage` formats (`crate::usage`).
+pub fn usage_footer_line(facts: &FooterFacts, session: Option<(u64, u64)>) -> String {
+    let pct = (facts.savings_ratio * 100.0).round() as i64;
+    let mut line = format!(
+        "cce: {} results from {} chunks · served ~{} tok vs ~{} baseline · saved ~{} ({pct}%)",
+        facts.result_count,
+        crate::usage::fmt_thousands(facts.total_chunks),
+        crate::usage::fmt_thousands(facts.served_tokens),
+        crate::usage::fmt_thousands(facts.baseline_tokens),
+        crate::usage::fmt_thousands(facts.tokens_saved),
+    );
+    if let Some((searches, saved)) = session {
+        line.push_str(&format!(
+            " · session: {searches} searches, ~{} saved",
+            crate::usage::fmt_tokens_short(saved)
+        ));
+    }
+    line
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -246,6 +293,46 @@ mod tests {
         assert_eq!(grammar_savings(&[]), Bucket::default());
         assert_eq!(render_compact(&[]), "");
         assert_eq!(render_verbose(&[]), "");
+    }
+
+    #[test]
+    fn usage_footer_line_is_byte_pinned() {
+        // The spec's exact example (SPEC-USAGE-VISIBILITY §3.3).
+        let facts = FooterFacts {
+            result_count: 5,
+            total_chunks: 38_628,
+            served_tokens: 1_204,
+            baseline_tokens: 9_880,
+            tokens_saved: 8_676,
+            savings_ratio: 0.88,
+        };
+        assert_eq!(
+            usage_footer_line(&facts, None),
+            "cce: 5 results from 38,628 chunks · served ~1,204 tok vs ~9,880 baseline · saved \
+             ~8,676 (88%)"
+        );
+        // `session` appends the pinned trailing clause.
+        assert_eq!(
+            usage_footer_line(&facts, Some((42, 310_880))),
+            "cce: 5 results from 38,628 chunks · served ~1,204 tok vs ~9,880 baseline · saved \
+             ~8,676 (88%) · session: 42 searches, ~310k saved"
+        );
+    }
+
+    #[test]
+    fn usage_footer_line_zero_result_set_is_clean() {
+        let facts = FooterFacts {
+            result_count: 0,
+            total_chunks: 12,
+            served_tokens: 0,
+            baseline_tokens: 0,
+            tokens_saved: 0,
+            savings_ratio: 0.0,
+        };
+        assert_eq!(
+            usage_footer_line(&facts, None),
+            "cce: 0 results from 12 chunks · served ~0 tok vs ~0 baseline · saved ~0 (0%)"
+        );
     }
 
     #[test]

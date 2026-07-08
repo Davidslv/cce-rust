@@ -122,7 +122,7 @@ pub fn run(opts: &InitOptions) -> Result<String, String> {
     out.push_str("\nNext steps:\n");
     out.push_str("  1. Restart your editor (Claude Code) so it loads .mcp.json.\n");
     out.push_str("  2. Ask a question about this codebase — the agent calls context_search.\n");
-    out.push_str("  3. Confirm it was used: cce dashboard\n");
+    out.push_str("  3. Confirm it was used: cce usage (or cce dashboard)\n");
     Ok(out)
 }
 
