@@ -595,9 +595,15 @@ fn lfs_round_trip_smoke_or_skip() {
 
 /// A tiny one-file git repo with the given content, committed on `main`.
 fn tiny_repo(file: &str, content: &str) -> tempfile::TempDir {
+    tiny_repo_on("main", file, content)
+}
+
+/// The same tiny repo committed on an arbitrary branch (#72: CI pushing from a
+/// non-`main` default branch writes `refs/<branch>` pointers).
+fn tiny_repo_on(branch: &str, file: &str, content: &str) -> tempfile::TempDir {
     let tmp = tempfile::tempdir().unwrap();
     let d = tmp.path();
-    git(d, &["init", "-q", "-b", "main"]);
+    git(d, &["init", "-q", "-b", branch]);
     std::fs::write(d.join(file), content).unwrap();
     git(d, &["add", "-A"]);
     git(d, &["commit", "-q", "-m", "init"]);
@@ -1310,4 +1316,396 @@ fn verify_checksum_only_old_marker_is_a_notice_and_a_repull_restores_it() {
     assert!(out.status.success());
     let stdout = String::from_utf8_lossy(&out.stdout);
     assert!(stdout.contains("verify OK (checksum-only): 2 members"), "got: {stdout}");
+}
+
+// --- #72: single-ref fallback when `refs/main` is absent ---
+
+/// The HEAD sha of a source repo (what a push records in its ref pointer).
+fn head_of(dir: &Path) -> String {
+    let out = Command::new("git").arg("-C").arg(dir).args(["rev-parse", "HEAD"]).output().unwrap();
+    assert!(out.status.success());
+    String::from_utf8_lossy(&out.stdout).trim().to_string()
+}
+
+/// #72, byte-pinned: `sync list` over the three ref shapes in one cache —
+/// `refs/main` beside another ref (main WINS, rendered exactly as before),
+/// a single non-main ref (the fallback, annotated `<sha> (master)` in the
+/// human table and an optional `"ref"` field in the JSON row), and several
+/// non-main refs (no fallback: `-`/null, exactly as before).
+#[test]
+fn sync_list_annotates_the_single_ref_fallback_byte_pinned() {
+    let home = tempfile::tempdir().unwrap();
+    let (bare, url) = bare_remote();
+    seed_cache(
+        &url,
+        &[
+            // main + master: main wins — the row must stay byte-identical.
+            ("hash/2.3/aaa__one/1111111.cce", b"AA\n"),
+            ("hash/2.3/aaa__one/refs/main", b"1111111\n"),
+            ("hash/2.3/aaa__one/refs/master", b"9999999\n"),
+            // master only: the single-ref fallback, annotated.
+            ("hash/2.3/mmm__solo/2222222.cce", b"AA\n"),
+            ("hash/2.3/mmm__solo/refs/master", b"2222222\n"),
+            // develop + master, no main: no fallback — `-`/null as before.
+            ("hash/2.3/xxx__multi/3333333.cce", b"AA\n"),
+            ("hash/2.3/xxx__multi/refs/develop", b"3333333\n"),
+            ("hash/2.3/xxx__multi/refs/master", b"3333333\n"),
+        ],
+    );
+    let tip_before = cache_tip(bare.path());
+
+    let consumer = tempfile::tempdir().unwrap();
+    let out = cce(
+        home.path(),
+        &["sync", "list", "--remote", &url, "--dir", consumer.path().to_str().unwrap()],
+    );
+    assert!(out.status.success(), "list failed: {}", String::from_utf8_lossy(&out.stderr));
+    let human = String::from_utf8_lossy(&out.stdout).to_string();
+    let golden_human = format!(
+        "remote        : {url}\n\
+         \n\
+         repo_id     latest            artifacts  bytes\n\
+         aaa__one    1111111                   1      3\n\
+         mmm__solo   2222222 (master)          1      3\n\
+         xxx__multi  -                         1      3\n\
+         \n\
+         total         : 3 repos, 3 artifacts, 9 bytes\n"
+    );
+    assert_eq!(human, golden_human);
+
+    let out = cce(
+        home.path(),
+        &["sync", "list", "--remote", &url, "--json", "--dir", consumer.path().to_str().unwrap()],
+    );
+    assert!(out.status.success(), "list --json failed: {}", String::from_utf8_lossy(&out.stderr));
+    let json = String::from_utf8_lossy(&out.stdout).to_string();
+    let golden_json = format!(
+        r#"{{
+  "remote": "{url}",
+  "repos": [
+    {{
+      "artifacts": 1,
+      "bytes": 3,
+      "latest_sha": "1111111",
+      "repo_id": "aaa__one"
+    }},
+    {{
+      "artifacts": 1,
+      "bytes": 3,
+      "latest_sha": "2222222",
+      "ref": "master",
+      "repo_id": "mmm__solo"
+    }},
+    {{
+      "artifacts": 1,
+      "bytes": 3,
+      "latest_sha": null,
+      "repo_id": "xxx__multi"
+    }}
+  ],
+  "schema": "cce.synclist/v1"
+}}
+"#
+    );
+    assert_eq!(json, golden_json);
+
+    // Still read-only, ref enumeration included.
+    assert_eq!(cache_tip(bare.path()), tip_before, "list must never mutate the cache");
+    assert!(!consumer.path().join(".cce").exists(), "list must not create a local .cce/");
+}
+
+/// #72 end-to-end over REAL pushes: a repo whose CI pushes from `master` (so
+/// only `refs/master` exists) is no longer invisible — `pull --latest` and
+/// `pull --all` resolve it via the single-ref fallback, noting the ref; a
+/// sibling repo on `main` renders and pulls exactly as before, un-annotated.
+#[test]
+fn master_only_repo_is_pulled_by_latest_and_pull_all_noting_the_ref() {
+    let home = tempfile::tempdir().unwrap();
+    let (_bare, url) = bare_remote();
+    let alpha = tiny_repo("a.py", "def alpha_one():\n    return 1\n");
+    let solo = tiny_repo_on("master", "s.py", "def solo_master_engine(power):\n    return power\n");
+    init_and_push(home.path(), &url, alpha.path(), "example.com__team__alpha");
+    init_and_push(home.path(), &url, solo.path(), "example.com__team__solo");
+    let solo_sha = head_of(solo.path());
+
+    // `sync list --json`: the fallback row carries `ref`; the main row does not.
+    let lister = tempfile::tempdir().unwrap();
+    let out = cce(
+        home.path(),
+        &["sync", "list", "--remote", &url, "--json", "--dir", lister.path().to_str().unwrap()],
+    );
+    assert!(out.status.success(), "list failed: {}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    let repos = v["repos"].as_array().unwrap();
+    assert_eq!(repos[0]["repo_id"], "example.com__team__alpha");
+    assert!(repos[0].get("ref").is_none(), "a main-resolved row must not gain a ref field");
+    assert_eq!(repos[1]["repo_id"], "example.com__team__solo");
+    assert_eq!(repos[1]["latest_sha"], solo_sha.as_str());
+    assert_eq!(repos[1]["ref"], "master");
+
+    // A repo-less single-member consumer: `pull --latest` resolves refs/master.
+    let consumer = tempfile::tempdir().unwrap();
+    let dir = consumer.path().join("solo");
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = cce(
+        home.path(),
+        &[
+            "sync",
+            "init",
+            "--remote",
+            &url,
+            "--no-lfs",
+            "--repo-id",
+            "example.com__team__solo",
+            "--dir",
+            dir.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success());
+    let out = cce(home.path(), &["sync", "pull", "--latest", "--dir", dir.to_str().unwrap()]);
+    assert!(out.status.success(), "pull --latest: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&format!("Pulled example.com__team__solo@{solo_sha}")),
+        "got: {stdout}"
+    );
+    assert!(stdout.contains("  ref      : master\n"), "got: {stdout}");
+    assert!(dir.join(".cce/index.json").exists());
+
+    // `pull --all`: both repos land; the fallback member line notes the ref.
+    let ctx = consumer.path().join("ctx");
+    let out = cce(
+        home.path(),
+        &["sync", "pull", "--all", "--into", ctx.to_str().unwrap(), "--remote", &url],
+    );
+    assert!(out.status.success(), "pull --all failed: {}", String::from_utf8_lossy(&out.stderr));
+    let report = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        report.contains("summary       : 2 pulled · 0 up-to-date · 0 skipped"),
+        "got: {report}"
+    );
+    assert!(report.contains("alpha            pulled"), "got: {report}");
+    assert!(
+        report
+            .contains(&format!("solo             pulled      example.com__team__solo@{solo_sha}")),
+        "got: {report}"
+    );
+    assert!(report.contains("(ref master)"), "got: {report}");
+    let alpha_line = report.lines().find(|l| l.contains("alpha            pulled")).unwrap();
+    assert!(
+        !alpha_line.contains("(ref"),
+        "the main-resolved member must not be annotated: {alpha_line}"
+    );
+    assert!(ctx.join("solo/.cce/index.json").exists());
+
+    // The refresh is idempotent and keeps the annotation.
+    let out = cce(
+        home.path(),
+        &["sync", "pull", "--all", "--into", ctx.to_str().unwrap(), "--remote", &url],
+    );
+    assert!(out.status.success());
+    let report = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        report.contains("summary       : 0 pulled · 2 up-to-date · 0 skipped"),
+        "got: {report}"
+    );
+    assert!(
+        report.contains(&format!(
+            "solo             up-to-date  example.com__team__solo@{solo_sha}  (ref master)"
+        )),
+        "got: {report}"
+    );
+}
+
+/// #72 multi-ref rule + the explicit overrides: a repo with `refs/master` AND
+/// `refs/develop` (no main) keeps the skip/`-` behaviour but the warnings NAME
+/// the refs; `--ref develop` pulls it; a hand-set per-member `sync.ref` makes
+/// `pull --all` refresh it (and survives the refresh's config rewrite).
+#[test]
+fn multi_ref_repo_skips_with_named_refs_then_ref_flag_and_sync_ref_pull_it() {
+    let home = tempfile::tempdir().unwrap();
+    let (_bare, url) = bare_remote();
+    let alpha = tiny_repo("a.py", "def alpha_one():\n    return 1\n");
+    init_and_push(home.path(), &url, alpha.path(), "example.com__team__alpha");
+    // A repo pushed from `master`, then again from `develop`: two refs, no main.
+    let multi = tiny_repo_on("master", "m.py", "def multi_master():\n    return 1\n");
+    init_and_push(home.path(), &url, multi.path(), "example.com__team__multi");
+    git(multi.path(), &["checkout", "-q", "-b", "develop"]);
+    std::fs::write(multi.path().join("m.py"), "def multi_develop():\n    return 2\n").unwrap();
+    git(multi.path(), &["add", "-A"]);
+    git(multi.path(), &["commit", "-q", "-m", "develop"]);
+    let out = cce(home.path(), &["sync", "push", "--dir", multi.path().to_str().unwrap()]);
+    assert!(out.status.success(), "develop push: {}", String::from_utf8_lossy(&out.stderr));
+    let develop_sha = head_of(multi.path());
+
+    // `pull --all`: the multi-ref repo is skipped, the warning names the refs.
+    let consumer = tempfile::tempdir().unwrap();
+    let ctx = consumer.path().join("ctx");
+    let out = cce(
+        home.path(),
+        &["sync", "pull", "--all", "--into", ctx.to_str().unwrap(), "--remote", &url],
+    );
+    assert!(out.status.success(), "a multi-ref repo must not fail the run");
+    let report = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        report.contains(
+            "warning: skipped example.com__team__multi — no refs/main; available refs: \
+             develop, master"
+        ),
+        "got: {report}"
+    );
+    assert!(
+        report.contains("summary       : 1 pulled · 0 up-to-date · 1 skipped"),
+        "got: {report}"
+    );
+    assert!(!ctx.join("multi").exists(), "a skipped repo must leave no member dir");
+
+    // `--ref` composes with `--latest` only: with `--all` it is rejected.
+    let out = cce(
+        home.path(),
+        &[
+            "sync",
+            "pull",
+            "--all",
+            "--into",
+            ctx.to_str().unwrap(),
+            "--remote",
+            &url,
+            "--ref",
+            "develop",
+        ],
+    );
+    assert!(!out.status.success(), "--all --ref must be rejected (set sync.ref instead)");
+    // …and `--ref` without `--latest` is rejected too.
+    let out = cce(home.path(), &["sync", "pull", "--ref", "develop", "--dir", "."]);
+    assert!(!out.status.success(), "--ref requires --latest");
+
+    // A single-member consumer: the plain `pull --latest` error names the refs…
+    let dir = consumer.path().join("multi-solo");
+    std::fs::create_dir_all(&dir).unwrap();
+    let out = cce(
+        home.path(),
+        &[
+            "sync",
+            "init",
+            "--remote",
+            &url,
+            "--no-lfs",
+            "--repo-id",
+            "example.com__team__multi",
+            "--dir",
+            dir.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success());
+    let out = cce(home.path(), &["sync", "pull", "--latest", "--dir", dir.to_str().unwrap()]);
+    assert!(!out.status.success(), "several non-main refs must not silently pick one");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("available refs: develop, master"), "got: {stderr}");
+    assert!(stderr.contains("--ref"), "the error must point at the override: {stderr}");
+
+    // …and `--ref develop` pulls exactly that pointer, noting the ref.
+    let out = cce(
+        home.path(),
+        &["sync", "pull", "--latest", "--ref", "develop", "--dir", dir.to_str().unwrap()],
+    );
+    assert!(out.status.success(), "pull --ref: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(&format!("Pulled example.com__team__multi@{develop_sha}")),
+        "got: {stdout}"
+    );
+    assert!(stdout.contains("  ref      : develop\n"), "got: {stdout}");
+
+    // Per-member `sync.ref` (#54 config pattern): hand-add the member with the
+    // key set; the next `pull --all` refresh resolves refs/develop for it.
+    let member = ctx.join("multi");
+    std::fs::create_dir_all(member.join(".cce")).unwrap();
+    std::fs::write(
+        member.join(".cce/config"),
+        format!(
+            "sync:\n  remote: {url}\n  lfs: false\n  repo_id: example.com__team__multi\n  \
+             ref: develop\n  auto_pull: false\n  retention: all\n"
+        ),
+    )
+    .unwrap();
+    let manifest = ctx.join(".cce/workspace.yml");
+    let mut yaml = std::fs::read_to_string(&manifest).unwrap();
+    yaml.push_str("  - name: multi\n    path: multi\n    type: store-only\n    package: multi\n");
+    std::fs::write(&manifest, yaml).unwrap();
+
+    let out = cce(
+        home.path(),
+        &["sync", "pull", "--all", "--into", ctx.to_str().unwrap(), "--remote", &url],
+    );
+    assert!(out.status.success(), "pull --all failed: {}", String::from_utf8_lossy(&out.stderr));
+    let report = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        report.contains(&format!(
+            "multi            pulled      example.com__team__multi@{develop_sha}"
+        )),
+        "got: {report}"
+    );
+    assert!(report.contains("(ref develop)"), "got: {report}");
+    assert!(
+        report.contains("summary       : 1 pulled · 1 up-to-date · 0 skipped"),
+        "got: {report}"
+    );
+    assert!(ctx.join("multi/.cce/index.json").exists());
+
+    // The refresh rewrite preserved the hand-set key, so the NEXT run is
+    // idempotent — up-to-date on refs/develop, nothing skipped.
+    let cfg = std::fs::read_to_string(ctx.join("multi/.cce/config")).unwrap();
+    assert!(cfg.contains("  ref: develop\n"), "sync.ref must survive the refresh: {cfg}");
+    let out = cce(
+        home.path(),
+        &["sync", "pull", "--all", "--into", ctx.to_str().unwrap(), "--remote", &url],
+    );
+    assert!(out.status.success());
+    let report = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        report.contains("summary       : 0 pulled · 2 up-to-date · 0 skipped"),
+        "got: {report}"
+    );
+    assert!(
+        report.contains(&format!(
+            "multi            up-to-date  example.com__team__multi@{develop_sha}  (ref develop)"
+        )),
+        "got: {report}"
+    );
+}
+
+/// #72 guard: knowledge corpora resolve their `current` pointer — a DIFFERENT
+/// key family (`knowledge/<ver>/<corpus>/current`, no `refs/`) — and are
+/// untouched by the ref fallback: the listing row is unchanged (no `ref`
+/// field) even when a code repo in the same cache resolves via the fallback.
+#[test]
+fn knowledge_current_pointer_family_is_untouched_by_ref_fallback() {
+    let home = tempfile::tempdir().unwrap();
+    let (_bare, url) = bare_remote();
+    seed_cache(
+        &url,
+        &[
+            ("hash/2.3/mmm__solo/2222222.cce", b"AA\n"),
+            ("hash/2.3/mmm__solo/refs/master", b"2222222\n"),
+            ("knowledge/v1/tickets/aaa1111.cck", b"corpus-bytes\n"),
+            ("knowledge/v1/tickets/current", b"aaa1111\n"),
+        ],
+    );
+    let consumer = tempfile::tempdir().unwrap();
+    let out = cce(
+        home.path(),
+        &["sync", "list", "--remote", &url, "--json", "--dir", consumer.path().to_str().unwrap()],
+    );
+    assert!(out.status.success(), "list failed: {}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    // The code repo fell back to refs/master…
+    assert_eq!(v["repos"][0]["ref"], "master");
+    // …while the corpus row keeps the exact SPEC-SYNC-KNOWLEDGE §6 shape: its
+    // `current` pointer resolved as-is, and no `ref` field exists to gain.
+    let k = &v["knowledge"][0];
+    assert_eq!(k["corpus_id"], "tickets");
+    assert_eq!(k["current"], "aaa1111");
+    assert_eq!(k["snapshots"], 1);
+    assert!(k.get("ref").is_none(), "knowledge rows must not gain a ref field: {k}");
 }
