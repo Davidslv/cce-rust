@@ -86,3 +86,110 @@ fn serves_page_api_and_health_on_ephemeral_port() {
 
     handle.join().unwrap();
 }
+
+// --- `cce dashboard` driven through the real binary (issue #37) ---
+
+fn bin() -> &'static str {
+    env!("CARGO_BIN_EXE_cce")
+}
+
+/// Kill-on-drop guard: the dashboard child never outlives the test, even when
+/// an assertion (or the startup timeout) panics.
+struct ChildGuard(std::process::Child);
+
+impl Drop for ChildGuard {
+    fn drop(&mut self) {
+        let _ = self.0.kill();
+        let _ = self.0.wait();
+    }
+}
+
+/// Read the child's stdout until the `serving http://…` line appears and return
+/// the bound port. Robust to slow startup: a reader thread feeds a channel and
+/// the wait is bounded by a 30s deadline rather than blocking forever.
+fn wait_for_bound_port(child: &mut std::process::Child) -> u16 {
+    use std::io::BufRead;
+    let stdout = child.stdout.take().expect("child stdout must be piped");
+    let (tx, rx) = std::sync::mpsc::channel::<String>();
+    std::thread::spawn(move || {
+        for line in std::io::BufReader::new(stdout).lines() {
+            let Ok(line) = line else { break };
+            if tx.send(line).is_err() {
+                break;
+            }
+        }
+    });
+    let deadline = std::time::Instant::now() + std::time::Duration::from_secs(30);
+    loop {
+        let remaining = deadline.saturating_duration_since(std::time::Instant::now());
+        match rx.recv_timeout(remaining) {
+            Ok(line) => {
+                let Some(rest) = line.split("serving http://").nth(1) else { continue };
+                let addr = rest.split('/').next().unwrap_or_default();
+                // Loopback only (DASHBOARD-SPEC §6) — pinned at the binary level.
+                assert!(addr.starts_with("127.0.0.1:"), "must bind loopback, got: {line}");
+                return addr.rsplit(':').next().unwrap().parse().expect("port parses");
+            }
+            Err(_) => panic!("dashboard did not print its serving line within 30s"),
+        }
+    }
+}
+
+#[test]
+fn dashboard_cli_serves_health_on_an_ephemeral_port() {
+    // Issue #37: drive `cce dashboard --port 0 --no-open` through the real
+    // binary — port 0 binds an ephemeral port, the URL is printed to stdout,
+    // and /api/health answers 200 with valid JSON. The guard kills the child
+    // even if an assertion fails.
+    let child = std::process::Command::new(bin())
+        .args(["dashboard", "--metrics"])
+        .arg(fixture_metrics())
+        .args(["--port", "0", "--no-open"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut guard = ChildGuard(child);
+    let port = wait_for_bound_port(&mut guard.0);
+
+    let (status, body) = http_get(port, "/api/health");
+    assert!(status.contains("200"), "status: {status}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["status"], "ok");
+    assert_eq!(v["events"], 7, "fixture log has 7 events: {body}");
+}
+
+#[test]
+fn dashboard_cli_workspace_variant_serves_federated_health() {
+    // Issue #37: the `--workspace` wiring of cmd_dashboard — manifest load,
+    // member metrics federation, ephemeral port — driven through the binary.
+    let fixture = PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/test/fixture/workspace"));
+    let tmp = tempfile::tempdir().unwrap();
+    for entry in walkdir::WalkDir::new(&fixture).into_iter().flatten() {
+        let rel = entry.path().strip_prefix(&fixture).unwrap();
+        let target = tmp.path().join(rel);
+        if entry.file_type().is_dir() {
+            std::fs::create_dir_all(&target).unwrap();
+        } else {
+            std::fs::copy(entry.path(), &target).unwrap();
+        }
+    }
+    let root = tmp.path().to_str().unwrap();
+    let out = std::process::Command::new(bin()).args(["workspace", "init", root]).output().unwrap();
+    assert!(out.status.success(), "init failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    let child = std::process::Command::new(bin())
+        .args(["dashboard", root, "--workspace", "--port", "0", "--no-open"])
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut guard = ChildGuard(child);
+    let port = wait_for_bound_port(&mut guard.0);
+
+    let (status, body) = http_get(port, "/api/health");
+    assert!(status.contains("200"), "status: {status}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert_eq!(v["status"], "ok");
+    assert_eq!(v["members"], 3, "fixture workspace has 3 members: {body}");
+}
