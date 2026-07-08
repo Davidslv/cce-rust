@@ -568,6 +568,13 @@ pub struct RepoListing {
 pub struct CacheListing {
     pub remote: String,
     pub repos: Vec<RepoListing>,
+    /// Base repo_ids carrying **published workspace metadata** (#55): a
+    /// `workspace.yml` blob at the well-known `workspace_manifest_address`.
+    /// Sorted (repo_id order). A prefix that is *pure metadata* — no artifacts
+    /// and no latest pointer — lists here and NOT in `repos`, so the rendered
+    /// `sync list` output (byte-pinned `cce.synclist/v1`) is unchanged and
+    /// `pull --all` never warn-skips a metadata prefix as an unpullable repo.
+    pub workspaces: Vec<String>,
 }
 
 /// `cce sync list` (#53): enumerate what a cache holds — one row per `repo_id`
@@ -592,6 +599,7 @@ pub fn cmd_list(root: &Path, remote_override: Option<String>) -> Result<CacheLis
     let ver = SYNC_FORMAT_VERSION.to_string();
     let base = format!("{HASH_EMBEDDER}/{ver}");
     let mut repos = Vec::new();
+    let mut workspaces = Vec::new();
     for repo_id in remote.list_dirs(&base)? {
         let prefix = format!("{base}/{repo_id}");
         // The pinned #37 walk: `.cce` shas only, junk entries skipped gracefully.
@@ -599,10 +607,20 @@ pub fn cmd_list(root: &Path, remote_override: Option<String>) -> Result<CacheLis
         let bytes = remote.list_artifact_sizes(&prefix)?.iter().map(|(_, b)| b).sum();
         let pointer = pointer_address(HASH_EMBEDDER, &ver, &repo_id, crate::sync::DEFAULT_REF);
         let latest_sha = remote.read_blob_text(&pointer).ok().filter(|s| !s.is_empty());
+        // #55: a prefix carrying published workspace metadata is a workspace base.
+        let has_manifest =
+            remote.has(&workspace_manifest_address(HASH_EMBEDDER, &ver, &repo_id)).unwrap_or(false);
+        if has_manifest {
+            workspaces.push(repo_id.clone());
+            if shas.is_empty() && latest_sha.is_none() {
+                // Pure metadata — nothing pullable lives here; not a repo row.
+                continue;
+            }
+        }
         repos.push(RepoListing { repo_id, latest_sha, artifacts: shas.len(), bytes });
     }
-    // `list_dirs` already sorts, so the rows are deterministic by repo_id.
-    Ok(CacheListing { remote: url, repos })
+    // `list_dirs` already sorts, so rows and workspaces are deterministic by repo_id.
+    Ok(CacheListing { remote: url, repos, workspaces })
 }
 
 /// Render a cache listing as the human table: a `remote` header line in the
@@ -858,6 +876,47 @@ pub fn cmd_pull_all(into: &Path, remote_override: Option<String>) -> Result<Stri
         }
     }
 
+    // #55: apply the published workspace metadata (the self-describing cache).
+    // Each published manifest applies only to its OWN members — the ones whose
+    // repo_id is `<base>__<published-name>` — enriching the synthesized entries
+    // with the real type/package. Members covered by no manifest keep the #54
+    // synthesis. Consumer names/paths never change (the #54 short-name layout is
+    // the stable, refresh-idempotent one), so the published graphs' member
+    // references are REWRITTEN to the consumer names; the collision rule is
+    // therefore #54's: the first taker in repo_id order keeps the bare name, a
+    // later workspace's same-named member stays at its `-2`/`-3` name — warned.
+    let mut edge_set: BTreeSet<(String, String, String)> = BTreeSet::new();
+    let mut manifests_applied = 0usize;
+    for ws_base in &listing.workspaces {
+        let Some((published, graph)) = fetch_published_workspace(&remote, &ver, ws_base) else {
+            continue; // unparsable — treated as absent (best-effort, additive)
+        };
+        manifests_applied += 1;
+        // This workspace's mapping: published member name -> consumer member name.
+        let mut name_map: BTreeMap<String, String> = BTreeMap::new();
+        for pm in &published.members {
+            let repo_id = format!("{ws_base}__{}", pm.name);
+            let Some(&i) = by_repo_id.get(&repo_id) else { continue };
+            members[i].member_type = pm.member_type;
+            members[i].package = pm.package.clone();
+            name_map.insert(pm.name.clone(), members[i].name.clone());
+            if members[i].name != pm.name {
+                out.push_str(&format!(
+                    "  warning: workspace {ws_base}: member name `{}` was taken by an earlier \
+                     repo — kept as `{}` (first in repo_id order wins)\n",
+                    pm.name, members[i].name
+                ));
+            }
+        }
+        if let Some(g) = graph {
+            for e in &g.edges {
+                if let (Some(from), Some(to)) = (name_map.get(&e.from), name_map.get(&e.to)) {
+                    edge_set.insert((from.clone(), to.clone(), e.via.clone()));
+                }
+            }
+        }
+    }
+
     // Synthesize the workspace manifest + root config. Members sort by path (the
     // manifest's deterministic order); the root config records the remote so a
     // refresh run needs no `--remote`.
@@ -868,6 +927,26 @@ pub fn cmd_pull_all(into: &Path, remote_override: Option<String>) -> Result<Stri
     members.sort_by(|a, b| a.path.cmp(&b.path));
     let manifest = Manifest { version: 1, name: workspace_name, members };
     manifest.save(into).map_err(|e| format!("could not write workspace manifest: {e}"))?;
+
+    // #55: install the merged cross-member graph when any manifest was applied.
+    // With none published this writes nothing — exactly the #54 behaviour.
+    if manifests_applied > 0 {
+        let graph = crate::workspace::WorkspaceGraph {
+            members: manifest.members.iter().map(|m| m.name.clone()).collect(),
+            edges: edge_set
+                .into_iter()
+                .map(|(from, to, via)| crate::workspace::Edge { from, to, via })
+                .collect(),
+        };
+        graph.save(into).map_err(|e| format!("could not write workspace graph: {e}"))?;
+        out.push_str(&format!(
+            "\nmetadata      : {manifests_applied} published workspace manifest{} applied · {} \
+             cross-member edge{} installed",
+            if manifests_applied == 1 { "" } else { "s" },
+            graph.edges.len(),
+            if graph.edges.len() == 1 { "" } else { "s" }
+        ));
+    }
     let mut root_cfg = std::fs::read_to_string(crate::sync::config::config_path(into))
         .ok()
         .and_then(|t| SyncConfig::from_yaml(&t).ok())
@@ -1781,6 +1860,7 @@ mod tests {
                     bytes: 2048,
                 },
             ],
+            workspaces: vec![],
         }
     }
 
@@ -1818,6 +1898,7 @@ mod tests {
         let s = render_list_json(&CacheListing {
             remote: "file:///srv/cache.git".to_string(),
             repos: vec![],
+            workspaces: vec![],
         });
         let golden = "{\n  \"remote\": \"file:///srv/cache.git\",\n  \"repos\": [],\n  \"schema\": \"cce.synclist/v1\"\n}\n";
         assert_eq!(s, golden);
@@ -1843,6 +1924,7 @@ total         : 2 repos, 4 artifacts, 125504 bytes
         let s = render_list_human(&CacheListing {
             remote: "file:///srv/cache.git".to_string(),
             repos: vec![],
+            workspaces: vec![],
         });
         assert_eq!(
             s,
@@ -1961,6 +2043,145 @@ total         : 2 repos, 4 artifacts, 125504 bytes
         let manifest = Manifest::load(into.path()).unwrap();
         let names: Vec<&str> = manifest.members.iter().map(|m| m.name.as_str()).collect();
         assert_eq!(names, vec!["demo", "other"]);
+        std::env::remove_var("CCE_HOME");
+    }
+
+    // --- #55: published-metadata discovery + `pull --all` enrichment ---
+
+    /// The #53 listing, extended (#55): a prefix carrying a `workspace.yml` is
+    /// recorded in `workspaces`; a PURE metadata prefix (no artifacts, no
+    /// pointer) is hidden from `repos`, so the rendered listing (byte-pinned)
+    /// and `pull --all`'s warn-skip behaviour are unchanged by publication.
+    #[test]
+    fn cmd_list_records_workspace_prefixes_and_hides_pure_metadata_rows() {
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let remote = GitRemote::open(&url, false).unwrap();
+        remote
+            .put_many(&[
+                ("hash/2.3/acme__mono/workspace.yml".to_string(), b"version: 1\n".to_vec()),
+                ("hash/2.3/acme__mono__demo/1111111.cce".to_string(), b"AA\n".to_vec()),
+                ("hash/2.3/acme__mono__demo/refs/main".to_string(), b"1111111\n".to_vec()),
+            ])
+            .unwrap();
+        let bare_dir = tempfile::tempdir().unwrap();
+        let listing = cmd_list(bare_dir.path(), Some(url)).unwrap();
+        assert_eq!(listing.workspaces, vec!["acme__mono".to_string()]);
+        // The metadata prefix is not a repo row; the member repo is.
+        let ids: Vec<&str> = listing.repos.iter().map(|r| r.repo_id.as_str()).collect();
+        assert_eq!(ids, vec!["acme__mono__demo"]);
+        std::env::remove_var("CCE_HOME");
+    }
+
+    /// #55: `pull --all` applies the published manifest to the members it covers
+    /// (real types/packages) and installs the published graph rewritten to the
+    /// consumer member names — idempotently across a refresh run.
+    #[test]
+    fn pull_all_applies_published_metadata_and_installs_the_graph() {
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let src = workspace_repo();
+        SyncConfig {
+            remote: Some(url.clone()),
+            lfs: false,
+            repo_id: Some("example.com__acme__mono".to_string()),
+            auto_pull: false,
+            retention: crate::sync::config::Retention::All,
+        }
+        .save(src.path())
+        .unwrap();
+        cmd_push(src.path(), None, true).unwrap();
+
+        let into = tempfile::tempdir().unwrap();
+        let out = cmd_pull_all(into.path(), Some(url.clone())).unwrap();
+        assert!(
+            out.contains(
+                "metadata      : 1 published workspace manifest applied · 1 cross-member edge installed"
+            ),
+            "got: {out}"
+        );
+        // Enriched members: the real published type/package, consumer layout paths.
+        let manifest = Manifest::load(into.path()).unwrap();
+        let alpha = manifest.member("alpha").unwrap();
+        assert_eq!(alpha.member_type, MemberType::Javascript);
+        assert_eq!(alpha.package, "alpha");
+        assert_eq!(alpha.path, "alpha", "the #54 consumer layout is kept");
+        // The installed graph resolves by consumer member names.
+        let graph = crate::workspace::WorkspaceGraph::load_or_empty(into.path(), &manifest);
+        assert_eq!(graph.targets_from("alpha"), vec!["beta"]);
+
+        // Refresh run: byte-identical manifest + graph, everything up-to-date.
+        let yaml1 = std::fs::read_to_string(crate::workspace::manifest_path(into.path())).unwrap();
+        let graph1 = std::fs::read_to_string(crate::workspace::graph_path(into.path())).unwrap();
+        let out2 = cmd_pull_all(into.path(), None).unwrap();
+        assert!(
+            out2.contains("summary       : 0 pulled · 2 up-to-date · 0 skipped"),
+            "got: {out2}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(crate::workspace::manifest_path(into.path())).unwrap(),
+            yaml1
+        );
+        assert_eq!(
+            std::fs::read_to_string(crate::workspace::graph_path(into.path())).unwrap(),
+            graph1
+        );
+        std::env::remove_var("CCE_HOME");
+    }
+
+    /// A single-member workspace source repo whose member is named `demo`.
+    fn demo_workspace(package: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        git::run_commit(d, &["init", "-q", "-b", "main"]).unwrap();
+        let m = d.join("demo");
+        std::fs::create_dir_all(m.join("src")).unwrap();
+        std::fs::write(m.join("package.json"), format!("{{\"name\":\"{package}\"}}")).unwrap();
+        std::fs::write(m.join("src/index.js"), format!("function {package}() {{ return 1; }}\n"))
+            .unwrap();
+        crate::workspace::build_manifest(d).save(d).unwrap();
+        git::run_commit(d, &["add", "-A"]).unwrap();
+        git::run_commit(d, &["commit", "-q", "-m", "init"]).unwrap();
+        tmp
+    }
+
+    /// #55, the documented multi-workspace rule: each published manifest applies
+    /// to its OWN members; on a member-NAME collision across manifests the first
+    /// (repo_id order) keeps the bare name and the later one stays at its
+    /// deduped `-2` name, with a warning.
+    #[test]
+    fn pull_all_member_name_collision_across_workspaces_first_wins_with_warning() {
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        for (base, package) in
+            [("example.com__acme__mono", "demo_acme"), ("example.com__zeta__mono", "demo_zeta")]
+        {
+            let src = demo_workspace(package);
+            SyncConfig {
+                remote: Some(url.clone()),
+                lfs: false,
+                repo_id: Some(base.to_string()),
+                auto_pull: false,
+                retention: crate::sync::config::Retention::All,
+            }
+            .save(src.path())
+            .unwrap();
+            cmd_push(src.path(), None, true).unwrap();
+        }
+
+        let into = tempfile::tempdir().unwrap();
+        let out = cmd_pull_all(into.path(), Some(url)).unwrap();
+        assert!(
+            out.contains(
+                "warning: workspace example.com__zeta__mono: member name `demo` was taken by an \
+                 earlier repo — kept as `demo-2` (first in repo_id order wins)"
+            ),
+            "got: {out}"
+        );
+        // Each manifest enriched exactly its own member.
+        let manifest = Manifest::load(into.path()).unwrap();
+        assert_eq!(manifest.member("demo").unwrap().package, "demo_acme");
+        assert_eq!(manifest.member("demo-2").unwrap().package, "demo_zeta");
         std::env::remove_var("CCE_HOME");
     }
 
