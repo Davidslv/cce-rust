@@ -285,6 +285,9 @@ pub struct SearchEvent {
     pub top_score: f64,
     pub empty: bool,
     pub low_confidence: bool,
+    /// The recorded search latency in ms (v2.8, additive read side): powers the
+    /// `cce usage` per-source latency mean. Absent (older logs) reads back as `0.0`.
+    pub latency_ms: f64,
     /// `"cli"` or `"mcp"`; an absent field (pre-v2.4.1 logs) normalises to `"cli"`.
     pub source: String,
     /// The seven-bucket savings ledger for this search (SPEC-V2.5 §3). Parsed from
@@ -379,6 +382,7 @@ pub fn parse_log(text: &str) -> ParsedLog {
                     top_score: get_f64(&v, "top_score"),
                     empty: get_bool(&v, "empty"),
                     low_confidence: get_bool(&v, "low_confidence"),
+                    latency_ms: get_f64(&v, "latency_ms"),
                     source: normalize_source(&get_str(&v, "source"), "cli"),
                     savings: SavingsBuckets::from_event(&v),
                 })),

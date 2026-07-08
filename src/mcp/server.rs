@@ -18,7 +18,9 @@
 //! - It is READ-ONLY over the store and never blocks or errors on a missing index,
 //!   an absent remote, or an offline network.
 
-use crate::config::{OutputConfig, OutputLevel, SummarizationConfig, METRICS_FILE};
+use crate::config::{
+    FooterMode, McpConfig, OutputConfig, OutputLevel, SummarizationConfig, METRICS_FILE,
+};
 use crate::federation::{load_cached_workspace, member_store_paths, CachedWorkspace};
 use crate::knowledge::{KnowledgeStore, LoadedKnowledge};
 use crate::mcp::protocol::{self, Request};
@@ -92,6 +94,18 @@ pub struct McpServer {
     /// one `cce.tokens/v1` estimator over every tool's returned text (SPEC-V2.5 §4).
     /// Deterministic given the call sequence; backs the auto-summarize threshold.
     served_tokens: Cell<u64>,
+    /// The MCP result-footer mode (SPEC-USAGE-VISIBILITY §3, v2.8). Seeded from the
+    /// project's `.cce/config` `mcp.result_footer` at startup — config-only,
+    /// deliberately: there is no runtime tool to flip it, so the agent cannot
+    /// toggle its own observability mid-session. Default: off.
+    result_footer: FooterMode,
+    /// Session usage counters behind the footer's `session` clause (v2.8): how many
+    /// searches THIS session recorded and their summed `tokens_saved` — values read
+    /// straight off each already-built `search` record (pure projection, in-memory
+    /// only, never persisted). Accrued regardless of the footer mode so `session`
+    /// reads the same totals whenever it is enabled.
+    session_searches: Cell<u64>,
+    session_tokens_saved: Cell<u64>,
     /// Federated-workspace cache (issue #26), keyed by scope. Assembling the union of
     /// the members' stores (load + BM25-over-union) is the entire cost of a federated
     /// query, so the long-lived server builds it once per distinct `--package` scope and
@@ -122,6 +136,7 @@ impl McpServer {
         let root = dir.clone().unwrap_or_else(|| PathBuf::from("."));
         let output_level = Cell::new(OutputConfig::load(&root).level);
         let auto_tokens = SummarizationConfig::load(&root).auto_tokens;
+        let result_footer = McpConfig::load(&root).result_footer;
         McpServer {
             dir,
             store,
@@ -130,6 +145,9 @@ impl McpServer {
             ledger: RefCell::new(SessionLedger::new()),
             auto_tokens,
             served_tokens: Cell::new(0),
+            result_footer,
+            session_searches: Cell::new(0),
+            session_tokens_saved: Cell::new(0),
             workspace_cache: RefCell::new(HashMap::new()),
             index_cache: RefCell::new(None),
             knowledge_cache: RefCell::new(None),
@@ -315,6 +333,26 @@ impl McpServer {
     /// ⇒ manual only.
     pub fn auto_tokens(&self) -> Option<u64> {
         self.auto_tokens
+    }
+
+    /// The configured MCP result-footer mode (SPEC-USAGE-VISIBILITY §3): read from
+    /// `.cce/config` at startup, immutable for the session (config-only, no tool).
+    pub fn footer_mode(&self) -> FooterMode {
+        self.result_footer
+    }
+
+    /// Accrue one recorded search's `tokens_saved` into the session usage counters
+    /// (v2.8). Called once per `context_search` that built a `search` record; the
+    /// values are the record's own — no new accounting, nothing persisted.
+    pub fn note_search_usage(&self, tokens_saved: u64) {
+        self.session_searches.set(self.session_searches.get() + 1);
+        self.session_tokens_saved.set(self.session_tokens_saved.get() + tokens_saved);
+    }
+
+    /// THIS session's `(searches, tokens_saved)` running totals — what the footer's
+    /// `session` clause prints (including the call that just accrued).
+    pub fn session_usage(&self) -> (u64, u64) {
+        (self.session_searches.get(), self.session_tokens_saved.get())
     }
 
     /// Whether the session's served-token total has crossed the configured

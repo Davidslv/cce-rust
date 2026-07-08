@@ -88,6 +88,28 @@ cce dashboard --metrics ./path/to/metrics.jsonl --price 5.00
   external network requests. See [`dashboard.md`](dashboard.md) for the schema and
   formulas.
 
+## See who used CCE — agent vs human (`cce usage`)
+
+```bash
+cce usage --dir ./my-project                 # all time, human block
+cce usage --since 24h                        # "how much since yesterday?"
+cce usage --workspace shop --since 7d        # federated: members + the root log
+cce usage --source mcp                       # lead with the agent split only
+cce usage --json | jq .by_source.mcp         # the versioned cce.usage/v1 projection
+```
+
+- The one-shot, CI-friendly terminal answer to *"how many times did the agent
+  call CCE, and how many tokens did that save?"* — the agent (`mcp`) vs human
+  (`cli`) split, savings, quality, latency, and the recent queries.
+- A **pure projection** of the same aggregate `cce dashboard` serves, so the
+  numbers are identical to the dashboard's for the same window; `--workspace`
+  folds in the workspace-root log exactly like `cce dashboard --workspace`.
+- `--since` takes a relative duration (`90m`, `24h`, `7d`, `4w`) or an ISO UTC
+  instant/date; `--source` narrows the display only (the JSON always carries
+  both splits). Offline, read-only, exit 0 on an empty window.
+- To see savings **inside the conversation**, opt in to the MCP result footer
+  (`mcp.result_footer: "on"` in `.cce/config`) — see [`mcp.md`](mcp.md).
+
 ## Inspect a store
 
 ```bash

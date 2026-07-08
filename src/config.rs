@@ -351,6 +351,108 @@ impl SummarizationConfig {
     }
 }
 
+// --- MCP result footer / usage visibility (SPEC-USAGE-VISIBILITY §3, v2.8) ---
+
+/// The MCP result-footer mode (SPEC-USAGE-VISIBILITY §3): whether `context_search`
+/// results end with the one-line usage footer. OFF by default — context hygiene:
+/// printing savings into every tool result costs the agent's own context window.
+/// Config-only (no per-call arg and no runtime tool, deliberately — the agent must
+/// not toggle its own observability).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FooterMode {
+    /// No footer — tool-result bytes are identical to pre-v2.8 (the default).
+    Off,
+    /// Append the one-line footer reporting THIS call's already-recorded accounting.
+    On,
+    /// As `on`, plus a running session clause (searches + tokens saved this session).
+    Session,
+}
+
+impl FooterMode {
+    /// Parse the config string form (case-insensitive). Unknown ⇒ `None` so the
+    /// tolerant config loader falls back to the default (off) explicitly.
+    pub fn parse(s: &str) -> Option<FooterMode> {
+        match s.trim().to_ascii_lowercase().as_str() {
+            "off" | "false" => Some(FooterMode::Off),
+            "on" | "true" => Some(FooterMode::On),
+            "session" => Some(FooterMode::Session),
+            _ => None,
+        }
+    }
+
+    /// The canonical string form.
+    pub const fn as_str(&self) -> &'static str {
+        match self {
+            FooterMode::Off => "off",
+            FooterMode::On => "on",
+            FooterMode::Session => "session",
+        }
+    }
+}
+
+/// The default `mcp.result_footer`: off (SPEC-USAGE-VISIBILITY §3 — opt-in).
+pub const DEFAULT_MCP_RESULT_FOOTER: FooterMode = FooterMode::Off;
+
+/// The `mcp.*` runtime configuration (SPEC-USAGE-VISIBILITY §3/§4). Only
+/// `result_footer` is defined. Absent block / absent key / unrecognised value /
+/// bad YAML all fall back to the default (off), like every other config block.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct McpConfig {
+    pub result_footer: FooterMode,
+}
+
+impl Default for McpConfig {
+    fn default() -> Self {
+        McpConfig { result_footer: DEFAULT_MCP_RESULT_FOOTER }
+    }
+}
+
+impl McpConfig {
+    /// Parse from the `.cce/config` YAML text. Tolerant: no `mcp:` block, an
+    /// absent `result_footer`, or an unrecognised value all fall back to `off`.
+    /// YAML 1.1 quirk handled: a bare `on`/`off` parses as a boolean, so the raw
+    /// value is read as a YAML value and both strings and booleans are accepted.
+    pub fn from_yaml(text: &str) -> McpConfig {
+        #[derive(serde::Deserialize)]
+        struct RawMcp {
+            result_footer: Option<serde_yaml::Value>,
+        }
+        #[derive(serde::Deserialize)]
+        struct RawRoot {
+            mcp: Option<RawMcp>,
+        }
+        let mut cfg = McpConfig::default();
+        if let Ok(raw) = serde_yaml::from_str::<RawRoot>(text) {
+            if let Some(v) = raw.mcp.and_then(|m| m.result_footer) {
+                let s = match v {
+                    serde_yaml::Value::Bool(b) => {
+                        if b {
+                            "on".to_string()
+                        } else {
+                            "off".to_string()
+                        }
+                    }
+                    serde_yaml::Value::String(s) => s,
+                    _ => String::new(),
+                };
+                if let Some(mode) = FooterMode::parse(&s) {
+                    cfg.result_footer = mode;
+                }
+            }
+        }
+        cfg
+    }
+
+    /// Load the mcp config for `root`: the per-project `.cce/config` if it exists
+    /// and parses, else the default. Offline, read-only.
+    pub fn load(root: &std::path::Path) -> McpConfig {
+        std::fs::read_to_string(root.join(".cce").join("config"))
+            .ok()
+            .map(|t| McpConfig::from_yaml(&t))
+            .unwrap_or_default()
+    }
+}
+
 // --- Markdown heading-chunker / Knowledge sources (SPEC-V2.6 §2/§8) ---
 
 /// The default `markdown.max_section_tokens` (SPEC-V2.6 §8): the byte-pinned split
@@ -733,6 +835,52 @@ mod tests {
         std::fs::create_dir_all(&cce).unwrap();
         std::fs::write(cce.join("config"), "markdown:\n  max_section_tokens: 120\n").unwrap();
         assert_eq!(MarkdownConfig::load(tmp.path()).max_section_tokens, 120);
+    }
+
+    #[test]
+    fn mcp_footer_default_is_off() {
+        assert_eq!(McpConfig::default().result_footer, FooterMode::Off);
+        assert_eq!(DEFAULT_MCP_RESULT_FOOTER, FooterMode::Off);
+    }
+
+    #[test]
+    fn mcp_config_reads_result_footer_and_tolerates_junk() {
+        // The three modes — note YAML 1.1 parses bare on/off as booleans, which
+        // the loader maps back to the intended modes.
+        assert_eq!(
+            McpConfig::from_yaml("mcp:\n  result_footer: on\n").result_footer,
+            FooterMode::On
+        );
+        assert_eq!(
+            McpConfig::from_yaml("mcp:\n  result_footer: \"on\"\n").result_footer,
+            FooterMode::On
+        );
+        assert_eq!(
+            McpConfig::from_yaml("mcp:\n  result_footer: session\n").result_footer,
+            FooterMode::Session
+        );
+        assert_eq!(
+            McpConfig::from_yaml("mcp:\n  result_footer: off\n").result_footer,
+            FooterMode::Off
+        );
+        // Absent block, absent key, unknown value, and bad YAML all fall back to off.
+        assert_eq!(McpConfig::from_yaml("sync:\n  lfs: true\n").result_footer, FooterMode::Off);
+        assert_eq!(McpConfig::from_yaml("mcp: {}\n").result_footer, FooterMode::Off);
+        assert_eq!(
+            McpConfig::from_yaml("mcp:\n  result_footer: loud\n").result_footer,
+            FooterMode::Off
+        );
+        assert_eq!(McpConfig::from_yaml("not: yaml: [").result_footer, FooterMode::Off);
+    }
+
+    #[test]
+    fn mcp_config_load_from_disk_and_absent() {
+        let tmp = tempfile::tempdir().unwrap();
+        assert_eq!(McpConfig::load(tmp.path()).result_footer, FooterMode::Off);
+        let cce = tmp.path().join(".cce");
+        std::fs::create_dir_all(&cce).unwrap();
+        std::fs::write(cce.join("config"), "mcp:\n  result_footer: session\n").unwrap();
+        assert_eq!(McpConfig::load(tmp.path()).result_footer, FooterMode::Session);
     }
 
     #[test]

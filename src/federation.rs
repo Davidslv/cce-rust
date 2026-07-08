@@ -499,6 +499,22 @@ pub fn federated_metrics_json(
     now_secs: i64,
     price: f64,
 ) -> serde_json::Value {
+    federated_metrics_json_since(members, root_metrics_path, now_secs, price, None)
+}
+
+/// [`federated_metrics_json`] with an optional window cutoff (v2.8, `cce usage
+/// --workspace --since`): when `since_secs` is `Some(cutoff)`, every event with
+/// `ts < cutoff` is dropped **before** aggregation — for the roll-up (which still
+/// folds in the workspace-root log under the exact #28 rule) AND for each member's
+/// `by_package` aggregate, so the window applies uniformly. `None` is byte-identical
+/// to `federated_metrics_json` (the dashboard path is untouched).
+pub fn federated_metrics_json_since(
+    members: &[MemberMetrics],
+    root_metrics_path: Option<&Path>,
+    now_secs: i64,
+    price: f64,
+    since_secs: Option<i64>,
+) -> serde_json::Value {
     // Roll-up: concatenate every member's events (member tag not needed for the
     // roll-up itself; per-package numbers come from per-member aggregates).
     let mut all_events = Vec::new();
@@ -513,6 +529,9 @@ pub fn federated_metrics_json(
             all_events.extend(read_log(root).events);
         }
     }
+    if let Some(cutoff) = since_secs {
+        all_events = crate::usage::filter_since(all_events, cutoff);
+    }
     let rollup = aggregate(&all_events, now_secs, price);
     let mut val = serde_json::to_value(&rollup).unwrap_or(serde_json::Value::Null);
 
@@ -520,7 +539,11 @@ pub fn federated_metrics_json(
         .iter()
         .map(|m| {
             let log = read_log(&m.metrics_path);
-            let agg = aggregate(&log.events, now_secs, price);
+            let events = match since_secs {
+                Some(cutoff) => crate::usage::filter_since(log.events, cutoff),
+                None => log.events,
+            };
+            let agg = aggregate(&events, now_secs, price);
             PackageRollup {
                 package: m.package.clone(),
                 searches: agg.totals.searches,

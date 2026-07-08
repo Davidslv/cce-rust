@@ -219,6 +219,41 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Print a one-shot usage summary of the metrics log: the agent (mcp) vs
+    /// human (cli) split, tokens saved, quality, latency, and the recent
+    /// queries (SPEC-USAGE-VISIBILITY §2, v2.8).
+    ///
+    /// A pure projection of the SAME aggregate the dashboard serves — the
+    /// numbers always equal `cce dashboard [--workspace]` for the same window.
+    /// Offline, read-only, CI-friendly.
+    Usage {
+        /// Workspace root (positional, with `--workspace`; defaults to `.`).
+        #[arg(value_name = "DIR")]
+        ws_dir: Option<PathBuf>,
+        /// Federate every member's log + the workspace-root log (the #28 rule).
+        #[arg(long)]
+        workspace: bool,
+        /// Project/workspace root (default: current directory).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Single-repo: read the metrics log beside this store.
+        #[arg(long)]
+        store: Option<PathBuf>,
+        /// Single-repo: an explicit metrics.jsonl path.
+        #[arg(long)]
+        metrics: Option<PathBuf>,
+        /// Window start: an ISO UTC instant/date (2026-07-01[T09:00:00Z]) or a
+        /// relative duration (90m, 24h, 7d, 4w). Default: all time.
+        #[arg(long)]
+        since: Option<String>,
+        /// Which split leads the human render: mcp (agent), cli (human), or all.
+        /// Display-only — the JSON always carries both splits.
+        #[arg(long, default_value = "all")]
+        source: String,
+        /// Emit the versioned `cce.usage/v1` projection instead of the human block.
+        #[arg(long)]
+        json: bool,
+    },
     /// Check a store's health and detect config drift vs this binary (issue #62).
     ///
     /// Read-only: reports the recorded build fingerprint vs the running
@@ -560,6 +595,9 @@ fn main() -> ExitCode {
         Command::Conformance { fixture_dir, output } => cmd_conformance(&fixture_dir, &output),
         Command::Packs { validate } => cmd_packs(validate),
         Command::Savings { dir, store, metrics, json } => cmd_savings(dir, store, metrics, json),
+        Command::Usage { ws_dir, workspace, dir, store, metrics, since, source, json } => {
+            cmd_usage(ws_dir, workspace, dir, store, metrics, since, &source, json)
+        }
         // Doctor renders the SAME full report either way; only the exit code
         // differs (non-zero on definite corruption/mismatch, #62). A usage
         // error (no directory / no store) takes the ordinary error path.
@@ -994,6 +1032,72 @@ fn cmd_savings(
     println!();
     println!("  This is the internal \"vs full-file\" figure, NOT your real agent cost.");
     println!("  For the real end-to-end delta, run the A/B eval harness: see eval/README.md.");
+    Ok(())
+}
+
+/// `cce usage` (SPEC-USAGE-VISIBILITY §2, v2.8): the one-shot terminal usage
+/// summary — a pure projection of the SAME aggregate the dashboard serves.
+/// Single-repo reuses `aggregator::aggregate` over the resolved log; `--workspace`
+/// reuses `federation::federated_metrics_json_since` (member logs + the
+/// workspace-root log, the #28 rule), so the numbers are byte-identical to
+/// `/api/metrics`. The wall clock is read HERE, at the edge — every function
+/// below the CLI takes the injected `now`.
+#[allow(clippy::too_many_arguments)]
+fn cmd_usage(
+    ws_dir: Option<PathBuf>,
+    workspace: bool,
+    dir: Option<PathBuf>,
+    store: Option<PathBuf>,
+    metrics: Option<PathBuf>,
+    since: Option<String>,
+    source: &str,
+    json: bool,
+) -> Result<(), String> {
+    use cce::usage;
+    let now_secs = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_secs() as i64)
+        .unwrap_or(0);
+    let source = usage::SourceFilter::parse(source)?;
+    let since_cut = match since {
+        Some(s) => Some(usage::parse_since(&s, now_secs)?),
+        None => None,
+    };
+    let price = DEFAULT_INPUT_PRICE_PER_MILLION;
+
+    let metrics_val = if workspace {
+        let root = workspace_root(ws_dir.or(dir));
+        let manifest = Manifest::load(&root)?;
+        let members = member_metrics(&root, &manifest);
+        // Issue #28: fold in the workspace-root log (`cce mcp --workspace` agent
+        // searches) exactly like the dashboard, so both surfaces agree.
+        let root_metrics = cce::store::default_metrics_path(&root);
+        cce::federation::federated_metrics_json_since(
+            &members,
+            Some(&root_metrics),
+            now_secs,
+            price,
+            since_cut.as_ref().map(|c| c.cutoff_secs),
+        )
+    } else {
+        let metrics_path = resolve_metrics_path(metrics, store, dir);
+        let log = cce::metrics::read_log(&metrics_path);
+        let events = match &since_cut {
+            Some(c) => usage::filter_since(log.events, c.cutoff_secs),
+            None => log.events,
+        };
+        serde_json::to_value(cce::aggregator::aggregate(&events, now_secs, price))
+            .map_err(|e| format!("could not serialize the aggregate: {e}"))?
+    };
+
+    if json {
+        print!(
+            "{}",
+            usage::render_json(&metrics_val, now_secs, since_cut.as_ref(), source, workspace)
+        );
+    } else {
+        print!("{}", usage::render_human(&metrics_val, since_cut.as_ref(), source, workspace));
+    }
     Ok(())
 }
 
