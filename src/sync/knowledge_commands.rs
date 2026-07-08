@@ -142,10 +142,12 @@ fn apply_retention(
     let ver = knowledge_contract_version();
     let prefix = format!("knowledge/{ver}/{corpus_id}");
     let keys = remote.list_keys_with_suffix(&prefix, ".cck")?;
-    // Oldest first: (first-added commit time, key) — the key tiebreak keeps the
-    // order deterministic when two snapshots land in the same second.
-    let mut ordered: Vec<(i64, String)> =
-        keys.into_iter().map(|k| (remote.first_added_epoch(&k).unwrap_or(i64::MAX), k)).collect();
+    // Oldest first by first-added COMMIT ORDER (not timestamps — two pushes in
+    // the same second still have a well-defined ancestry). A key somehow absent
+    // from the walk sorts newest, so it is never pruned by a gap in history.
+    let history = remote.first_added_order(&prefix)?;
+    let position = |k: &str| history.iter().position(|h| h == k).unwrap_or(usize::MAX);
+    let mut ordered: Vec<(usize, String)> = keys.into_iter().map(|k| (position(&k), k)).collect();
     ordered.sort();
     let keep_from = ordered.len().saturating_sub(*n);
     let current_key = knowledge_content_address(ver, corpus_id, current_snapshot);
@@ -295,15 +297,14 @@ pub fn cmd_knowledge_pull(
     // Install = exactly what a local ingest writes: `<root>/.cce/knowledge/
     // <snapshot>.json` + the one-line `current` pointer (§7 byte-identity).
     let store = artifact.into_store();
-    let store_path = store
-        .save(root)
-        .map_err(|e| format!("could not write the knowledge store under {}: {e}", root.display()))?;
+    let store_path = store.save(root).map_err(|e| {
+        format!("could not write the knowledge store under {}: {e}", root.display())
+    })?;
 
     // #55 verbatim: hash the EXACT bytes just installed (read back from disk) so
     // a later checksum-only verify is version-independent. Best-effort: an
     // unreadable store leaves the field absent.
-    let installed_sha256 =
-        std::fs::read(&store_path).ok().map(|b| hex_lower(&Sha256::digest(&b)));
+    let installed_sha256 = std::fs::read(&store_path).ok().map(|b| hex_lower(&Sha256::digest(&b)));
     KnowledgeSyncState {
         corpus_id: corpus_id.clone(),
         snapshot: snapshot.clone(),
@@ -352,9 +353,13 @@ mod tests {
         }
     }
 
-    /// Ingest `feed` into a fresh project root; returns the root dir.
+    /// Ingest `feed` into a fresh project root; returns the root dir. LFS is
+    /// disabled in the config so the core path needs no `git-lfs` binary (the
+    /// tests/sync.rs hermeticity rule).
     fn root_with_store(feed: &str) -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".cce")).unwrap();
+        std::fs::write(tmp.path().join(".cce").join("config"), "sync:\n  lfs: false\n").unwrap();
         let recs = parse_ndjson(feed).unwrap();
         let store = ingest_default(&recs, feed.as_bytes());
         store.save(tmp.path()).unwrap();
@@ -384,8 +389,7 @@ mod tests {
         let root = root_with_store(&feed("a"));
         let err = cmd_knowledge_push(root.path(), None, None).unwrap_err();
         assert!(err.contains("cannot determine corpus_id"), "got: {err}");
-        let err =
-            cmd_knowledge_push(root.path(), Some("has space".into()), None).unwrap_err();
+        let err = cmd_knowledge_push(root.path(), Some("has space".into()), None).unwrap_err();
         assert!(err.contains("invalid corpus_id"), "got: {err}");
         // Validation happens before any remote is touched — no remote needed.
     }
@@ -420,8 +424,7 @@ mod tests {
         let _home = with_home();
         let (_bare, url) = bare_remote();
         let root = root_with_store(&feed("a"));
-        let out =
-            cmd_knowledge_push(root.path(), Some("c1".into()), Some(url.clone())).unwrap();
+        let out = cmd_knowledge_push(root.path(), Some("c1".into()), Some(url.clone())).unwrap();
         assert!(out.contains("Pushed corpus c1@"), "got: {out}");
 
         let store = KnowledgeStore::load_current(root.path()).unwrap();
@@ -451,22 +454,15 @@ mod tests {
         cmd_knowledge_push(producer.path(), Some("c1".into()), Some(url.clone())).unwrap();
         let store = KnowledgeStore::load_current(producer.path()).unwrap();
         let producer_bytes =
-            std::fs::read(KnowledgeStore::snapshot_path(producer.path(), &store.snapshot))
-                .unwrap();
+            std::fs::read(KnowledgeStore::snapshot_path(producer.path(), &store.snapshot)).unwrap();
 
         let consumer = tempfile::tempdir().unwrap();
-        let out = cmd_knowledge_pull(
-            consumer.path(),
-            Some("c1".into()),
-            None,
-            false,
-            Some(url.clone()),
-        )
-        .unwrap();
+        let out =
+            cmd_knowledge_pull(consumer.path(), Some("c1".into()), None, false, Some(url.clone()))
+                .unwrap();
         assert!(out.contains("Pulled corpus c1@"), "got: {out}");
         let consumer_bytes =
-            std::fs::read(KnowledgeStore::snapshot_path(consumer.path(), &store.snapshot))
-                .unwrap();
+            std::fs::read(KnowledgeStore::snapshot_path(consumer.path(), &store.snapshot)).unwrap();
         assert_eq!(producer_bytes, consumer_bytes, "install must equal a local ingest");
 
         let marker = KnowledgeSyncState::load(consumer.path()).unwrap();
@@ -490,14 +486,9 @@ mod tests {
         cmd_knowledge_pull(consumer.path(), Some("c1".into()), None, false, Some(url.clone()))
             .unwrap();
         // Different corpus: refused without --force.
-        let err = cmd_knowledge_pull(
-            consumer.path(),
-            Some("c2".into()),
-            None,
-            false,
-            Some(url.clone()),
-        )
-        .unwrap_err();
+        let err =
+            cmd_knowledge_pull(consumer.path(), Some("c2".into()), None, false, Some(url.clone()))
+                .unwrap_err();
         assert!(err.contains("--force"), "got: {err}");
         // Same corpus, newer snapshot: supersedes silently.
         let newer = feed("ccc");
@@ -556,9 +547,8 @@ mod tests {
         remote.put(&key, tampered.as_bytes()).unwrap();
 
         let consumer = tempfile::tempdir().unwrap();
-        let err =
-            cmd_knowledge_pull(consumer.path(), Some("c1".into()), None, false, Some(url))
-                .unwrap_err();
+        let err = cmd_knowledge_pull(consumer.path(), Some("c1".into()), None, false, Some(url))
+            .unwrap_err();
         assert!(err.contains(&key), "the failure names the key, got: {err}");
         assert!(err.contains("checksum mismatch"), "got: {err}");
         // Nothing was installed.
@@ -575,7 +565,7 @@ mod tests {
         std::fs::create_dir_all(root.path().join(".cce")).unwrap();
         std::fs::write(
             root.path().join(".cce").join("config"),
-            "knowledge:\n  sync:\n    corpus_id: c1\n    retention: keep-last-2\n",
+            "sync:\n  lfs: false\nknowledge:\n  sync:\n    corpus_id: c1\n    retention: keep-last-2\n",
         )
         .unwrap();
 
@@ -643,10 +633,9 @@ mod tests {
              \"installed_sha256\":\"def\"}"
         );
         // Additive: an older marker without installed_sha256 still parses.
-        let old: KnowledgeSyncState = serde_json::from_str(
-            "{\"corpus_id\":\"c1\",\"snapshot\":\"s\",\"checksum\":\"c\"}",
-        )
-        .unwrap();
+        let old: KnowledgeSyncState =
+            serde_json::from_str("{\"corpus_id\":\"c1\",\"snapshot\":\"s\",\"checksum\":\"c\"}")
+                .unwrap();
         assert_eq!(old.installed_sha256, None);
     }
 }

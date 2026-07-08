@@ -115,8 +115,7 @@ impl GitRemote {
     /// cache's `.gitattributes`, commit, and push.
     fn ensure_lfs_pattern(&self, pattern: &str, line: &str) -> Result<(), String> {
         let attrs = self.dir.join(".gitattributes");
-        let already =
-            std::fs::read_to_string(&attrs).map(|s| s.contains(pattern)).unwrap_or(false);
+        let already = std::fs::read_to_string(&attrs).map(|s| s.contains(pattern)).unwrap_or(false);
         if !already {
             let mut content = std::fs::read_to_string(&attrs).unwrap_or_default();
             if !content.is_empty() && !content.ends_with('\n') {
@@ -266,20 +265,40 @@ impl GitRemote {
         Ok(keys)
     }
 
-    /// The unix timestamp of the commit that FIRST ADDED `key` on the cache
-    /// branch (SPEC-SYNC-KNOWLEDGE §4.5): corpora have no sha ordering, so git
-    /// history is the only order the cache itself carries. `None` when the key
-    /// has no add commit (never existed, or an unborn branch).
-    pub fn first_added_epoch(&self, key: &str) -> Option<i64> {
+    /// The keys under `prefix` in FIRST-ADDED commit order, oldest first
+    /// (SPEC-SYNC-KNOWLEDGE §4.5): corpora have no sha ordering, so the cache
+    /// repo's commit history is the only order the cache itself carries. Commit
+    /// ORDER, not commit timestamps — two pushes in the same second still have a
+    /// well-defined ancestry. An unborn branch or a missing prefix is empty.
+    pub fn first_added_order(&self, prefix: &str) -> Result<Vec<String>, String> {
+        self.fetch()?;
         let treeish = format!("origin/{}", self.branch);
-        // `--diff-filter=A` keeps only the commit(s) that added the path; the
-        // LAST line of the log is the earliest such commit.
-        let log = git::run(
+        // `--reverse` walks oldest→newest; `--diff-filter=A --name-only` prints
+        // the paths each commit ADDED under the pathspec (the `--format=` keeps
+        // commit headers out of the listing).
+        let listing = match git::run(
             &self.dir,
-            &["log", "--format=%ct", "--diff-filter=A", &treeish, "--", key],
-        )
-        .ok()?;
-        log.lines().last().and_then(|l| l.trim().parse().ok())
+            &[
+                "log",
+                "--reverse",
+                "--format=",
+                "--name-only",
+                "--diff-filter=A",
+                &treeish,
+                "--",
+                prefix,
+            ],
+        ) {
+            Ok(l) => l,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let mut keys: Vec<String> = Vec::new();
+        for line in listing.lines().map(str::trim).filter(|l| !l.is_empty()) {
+            if !keys.iter().any(|k| k == line) {
+                keys.push(line.to_string());
+            }
+        }
+        Ok(keys)
     }
 
     /// Remove `keys` from the cache in a single commit + push (retention pruning,
@@ -599,16 +618,26 @@ mod tests {
     }
 
     #[test]
-    fn first_added_epoch_orders_keys_by_cache_history() {
+    fn first_added_order_walks_cache_history_oldest_first() {
         let _home = with_home();
         let (_bare, url) = bare_remote();
         let remote = GitRemote::open(&url, false).unwrap();
+        // Deliberately push in NON-lexicographic order, back-to-back (same
+        // second): commit order must win, never timestamps or key names.
+        remote.put("knowledge/v1/c/zzz.cck", b"Z\n").unwrap();
         remote.put("knowledge/v1/c/aaa.cck", b"A\n").unwrap();
-        remote.put("knowledge/v1/c/bbb.cck", b"B\n").unwrap();
-        let a = remote.first_added_epoch("knowledge/v1/c/aaa.cck").unwrap();
-        let b = remote.first_added_epoch("knowledge/v1/c/bbb.cck").unwrap();
-        assert!(a <= b, "the earlier push is not later in history");
-        assert_eq!(remote.first_added_epoch("knowledge/v1/c/nope.cck"), None);
+        remote.put("knowledge/v1/c/mmm.cck", b"M\n").unwrap();
+        let order = remote.first_added_order("knowledge/v1/c").unwrap();
+        assert_eq!(
+            order,
+            vec![
+                "knowledge/v1/c/zzz.cck".to_string(),
+                "knowledge/v1/c/aaa.cck".to_string(),
+                "knowledge/v1/c/mmm.cck".to_string(),
+            ]
+        );
+        // A missing prefix is empty, not an error.
+        assert!(remote.first_added_order("knowledge/v1/nope").unwrap().is_empty());
         std::env::remove_var("CCE_HOME");
     }
 
