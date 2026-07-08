@@ -7,6 +7,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`cce relevance` — the retrieval-relevance evaluation harness (#63).** The
+  missing third leg of the measurement story: `cce conformance` proves output
+  stability and `cce bench`/`cce eval` measure latency and token savings — this
+  measures **ranking quality**. Labeled query→expected-result fixture sets
+  (`cce.relevance/v1` NDJSON: `{query, expected: [file or file#kind anchors], k}`
+  per line — a documented contract like the knowledge feed) run through the REAL
+  retrieval pipeline at a named backend (`bm25` = the issue-#30 keyword-only
+  mode, `vector` = pure cosine order, `hybrid` = the full SPEC §6 pipeline
+  `cce search` serves) and are scored with standard IR metrics — precision@k,
+  recall, MRR, F1 — per query and macro-averaged per backend.
+  `--compare A,B` prints per-query deltas so a proposed ranking change shows
+  exactly which queries it helps or hurts before it merges. Two starter fixture
+  sets ship in `eval/relevance/` (code over the conformance sample corpus;
+  knowledge-style queries over a small markdown corpus); the hash-path `--json`
+  report (`cce.relevance.report/v1`) is byte-pinned in CI against
+  `test/fixture/relevance/code.golden.json`, conformance-style. Measurement
+  only: zero ranking-behavior changes. See `docs/relevance.md`.
+
 ## [2.7.1] - 2026-07-08
 
 ### Added
