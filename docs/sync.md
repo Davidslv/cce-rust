@@ -167,7 +167,7 @@ v1.
 cce sync init  --remote <git-url> [--lfs|--no-lfs] [--repo-id <id>] [--dir <path>]
 cce sync push  [--commit <sha>] [--workspace] [--dir <path>]
 cce sync pull  [--commit <sha> | --latest] [--force] [--workspace] [--dir <path>]
-cce sync pull  --all --into <dir> [--remote <url>]
+cce sync pull  --all --into <dir> [--remote <url>] [--corpus <id>]
 cce sync list  [--remote <url>] [--json] [--dir <path>]
 cce sync status [--dir <path>]
 cce sync verify [--commit <sha> | --checksum-only] [--dir <path>]
@@ -181,7 +181,9 @@ Rules:
   or otherwise stale/foreign index can never be re-uploaded under a sha it was not
   built from. The invariant is `artifact == build(sha)`.
 - `push` exports the **code index only**; the mutable `.cce/knowledge/` store is
-  snapshot-keyed and never enters the byte-identical code cache (see
+  snapshot-keyed and never enters the byte-identical code cache. Knowledge
+  corpora travel through their own additive `knowledge/…` key space via
+  `cce knowledge push`/`pull` (SPEC-SYNC-KNOWLEDGE; see
   [`knowledge.md`](knowledge.md)).
 - `pull` installs the artifact into `.cce/`. If the local working tree matches
   `sha`, the pulled index is used as-is. It never silently overwrites a local cache
@@ -195,14 +197,25 @@ Rules:
   friendly message, not an error. `--json` emits the stable `cce.synclist/v1`
   shape for scripting:
   `{"remote": …, "repos": [{"artifacts": N, "bytes": N, "latest_sha": sha|null, "repo_id": …}, …], "schema": "cce.synclist/v1"}`.
+  A cache carrying **knowledge corpora** additionally renders a `knowledge:`
+  section (one row per corpus: current snapshot, snapshot count, bytes,
+  `data as-of`) and the JSON gains an **optional `knowledge` array** — emitted
+  only when a corpus exists, so knowledge-free listings are byte-identical to
+  before (the schema stays `cce.synclist/v1`; see [`knowledge.md`](knowledge.md)).
 - `pull --all --into <dir>` is **consumer mode** (§7): enumerate the cache, pull
   every repo_id's latest artifact, and synthesize a ready-to-search workspace —
-  no source checkout anywhere.
+  no source checkout anywhere. A cache carrying a knowledge corpus also
+  installs it at the workspace root (`<dir>/.cce/knowledge/`); with several
+  corpora, pass `--corpus <id>` (otherwise knowledge is warn-skipped, naming
+  the ids — member pulls never fail because of it).
 - `verify --checksum-only` re-hashes the **pulled** store against the SHA-256
   **recorded from the installed bytes at pull time** — no source checkout, no
   rebuild, no remote, and no version coupling (§7, the consumer integrity
-  check). Full `verify` (rebuild-and-compare) remains the source-holders'
-  check.
+  check). A pulled knowledge corpus gets the same treatment: a `knowledge` row
+  passes/fails/notices exactly like a member row. Full `verify`
+  (rebuild-and-compare) remains the source-holders' check — and note that
+  knowledge corpora have **no full-verify analogue at all** (the puller lacks
+  the source feed; see the trust section of [`knowledge.md`](knowledge.md)).
 - Offline / no remote / auth failure → a clear message; local indexing and search
   continue to work.
 - **Workspace-aware:** `--workspace` iterates the manifest's members, each keyed by
@@ -289,6 +302,14 @@ Behaviour:
   `lfs: false`, so no consumer ever commits `.gitattributes` into the cache
   repo. (Reading an LFS-enabled cache still works — the smudge comes from the
   cache's own committed attributes — but needs `git-lfs` installed.)
+- **Knowledge comes along.** A cache carrying a knowledge corpus installs it at
+  the workspace root (`ctx/.cce/knowledge/`, byte-identical to a direct
+  `cce knowledge pull`), so `cce mcp --workspace --dir ctx` serves
+  `context_search source: knowledge|both` immediately. One active corpus per
+  root: `--corpus <id>` picks one when the cache carries several (otherwise
+  knowledge is warn-skipped, naming the ids). Refresh follows the member rule —
+  an unmoved corpus `current` is `up-to-date`, nothing re-fetched. See
+  [`knowledge.md`](knowledge.md).
 
 **The self-describing cache (published workspace metadata).** `cce sync push
 --workspace` also publishes the workspace's `workspace.yml` and its
@@ -423,6 +444,7 @@ access to the cache repo to `pull`; members with write access may also push
 | `could not clone remote …` | wrong URL / no auth / offline | check the URL and your git credentials; local commands are unaffected |
 | `verify FAILED` | working tree differs from the sha, or the cache is untrustworthy | check out the exact sha and re-run, or rebuild locally |
 | `verify FAILED (checksum-only): <member>` | the pulled store's on-disk bytes changed since pull (corruption, truncation, manual edit) | `cce sync pull --force` (or `pull --all` for a consumer workspace) to reinstall it |
+| `verify FAILED (checksum-only) for knowledge corpus …` | the pulled knowledge store's bytes changed since pull | `cce knowledge pull --corpus <id>` to reinstall it |
 | `no install checksum recorded (pulled by an older cce)` | the `.cce/synced.json` marker predates `installed_sha256` | not a failure (exit 0) — re-pull with `cce sync pull --force` to record the hash |
 | LFS: `git-lfs` filter errors on `get` | `.gitattributes` routes `*.cce` through LFS but `git-lfs` is not installed | `git lfs install`, or `cce sync init --no-lfs` for a plain-git cache |
 | `local cache is at … but you are pulling …` | pulling a different sha over an existing cache | `cce sync pull --force` (only if you intend to overwrite) |
@@ -436,6 +458,8 @@ local-only state.
 ## 11. See also
 
 - [`SPEC-SYNC.md`](../SPEC-SYNC.md) — the design specification.
+- [`SPEC-SYNC-KNOWLEDGE.md`](../SPEC-SYNC-KNOWLEDGE.md) — knowledge corpora
+  through the same cache (and [`knowledge.md`](knowledge.md) for the tour).
 - [`docs/VERIFIED.md`](VERIFIED.md) — the cold-start verification transcript.
 - [`docs/architecture.md`](architecture.md) — where sync sits in the module tree.
 - [`docs/DECISIONS.md`](DECISIONS.md) — the format/checksum decisions and their why.

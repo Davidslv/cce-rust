@@ -82,6 +82,78 @@ impl KnowledgeSyncState {
     }
 }
 
+/// A read-only knowledge freshness summary for MCP `index_status`
+/// (SPEC-SYNC-KNOWLEDGE §4.4) — the knowledge sibling of
+/// `sync::commands::Freshness`. Pure of side effects; the remote lookup is
+/// best-effort and offline-safe (any error leaves `remote_current = None`,
+/// `behind_remote = false`).
+#[derive(Debug, Clone)]
+pub struct KnowledgeFreshness {
+    /// The §4.1 corpus identity when the current store came from a pull whose
+    /// marker still matches; `None` = a local ingest (a local `cce knowledge
+    /// index` after a pull supersedes the pulled snapshot, §5).
+    pub corpus: Option<String>,
+    /// The current store's snapshot id.
+    pub snapshot: String,
+    /// Source records in the current store.
+    pub records: usize,
+    /// Chunks in the current store.
+    pub chunks: usize,
+    /// The deterministic data age (§2/§4.4: max `updated_at` across chunks) —
+    /// computable locally from any installed store.
+    pub data_as_of: Option<String>,
+    /// The remote corpus pointer's snapshot, if reachable.
+    pub remote_current: Option<String>,
+    /// True only when both snapshots are known and differ.
+    pub behind_remote: bool,
+}
+
+/// Summarise the local knowledge store's freshness for `root` (§4.4). `None`
+/// when no knowledge store exists — `index_status` then stays byte-identical.
+/// The remote lookup mirrors the code `freshness()` rules exactly: attempted
+/// only when a remote is configured, best-effort, never blocking, never an
+/// error — MCP's `index_status` must always answer.
+pub fn knowledge_freshness(root: &Path) -> Option<KnowledgeFreshness> {
+    let store = KnowledgeStore::load_current(root).ok()?;
+    let marker = KnowledgeSyncState::load(root);
+    let corpus =
+        marker.as_ref().filter(|m| m.snapshot == store.snapshot).map(|m| m.corpus_id.clone());
+    let data_as_of = crate::sync::knowledge_artifact::data_as_of(&store.chunks);
+
+    // Mirror the code freshness: no remote configured ⇒ no network at all. The
+    // pointer needs a corpus identity — the marker's, else the config's (never
+    // derived, §4.1); without one there is nothing to look up.
+    let kcfg = KnowledgeSyncConfig::load(root);
+    let cfg = SyncConfig::load(root);
+    let remote_current = if kcfg.remote.is_some() || cfg.remote.is_some() {
+        marker.as_ref().map(|m| m.corpus_id.clone()).or_else(|| kcfg.corpus_id.clone()).and_then(
+            |corpus_id| {
+                open_knowledge_remote(root, None).ok().and_then(|(remote, _)| {
+                    remote
+                        .read_blob_text(&knowledge_pointer_address(
+                            knowledge_contract_version(),
+                            &corpus_id,
+                        ))
+                        .ok()
+                        .filter(|s| !s.is_empty())
+                })
+            },
+        )
+    } else {
+        None
+    };
+    let behind_remote = matches!(&remote_current, Some(r) if *r != store.snapshot);
+    Some(KnowledgeFreshness {
+        corpus,
+        snapshot: store.snapshot.clone(),
+        records: store.records,
+        chunks: store.chunks.len(),
+        data_as_of,
+        remote_current,
+        behind_remote,
+    })
+}
+
 /// Resolve the corpus_id (SPEC-SYNC-KNOWLEDGE §4.1): the explicit `--corpus`,
 /// else `knowledge.sync.corpus_id` — **never derived** (knowledge has no git
 /// origin to normalize; a guessed identity would silently fork a corpus). The

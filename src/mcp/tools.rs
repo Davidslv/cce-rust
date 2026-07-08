@@ -52,6 +52,7 @@ use crate::retriever::{bm25_only_search, build_search_record, search, SearchResu
 use crate::session::{short_label, SummaryScope};
 use crate::store::Index;
 use crate::sync::commands::{freshness, IndexSource};
+use crate::sync::knowledge_commands::knowledge_freshness;
 use crate::workspace::{Manifest, WorkspaceGraph};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
@@ -959,10 +960,15 @@ fn index_status_single(server: &McpServer) -> ToolOutput {
     let index = match server.load_index() {
         Ok(i) => i,
         Err(_) => {
-            return ToolOutput::ok(format!(
+            // A knowledge-only consumer root (`cce knowledge pull` with no code
+            // index) still reports its knowledge freshness — additive: with no
+            // knowledge store the message is byte-identical to before.
+            let mut msg = format!(
                 "not indexed — no store at {}. Run `cce index` (or `cce init`).",
                 store.display()
-            ))
+            );
+            append_knowledge_freshness(&mut msg, &server.root());
+            return ToolOutput::ok(msg);
         }
     };
     let mut per_lang: BTreeMap<String, usize> = BTreeMap::new();
@@ -987,6 +993,7 @@ fn index_status_single(server: &McpServer) -> ToolOutput {
         out.push_str(&format!("    {k:<22}: {n}\n"));
     }
     append_freshness(&mut out, &server.root());
+    append_knowledge_freshness(&mut out, &server.root());
     ToolOutput::ok(out)
 }
 
@@ -1027,6 +1034,7 @@ fn index_status_workspace(server: &McpServer) -> ToolOutput {
         out.push_str(&format!("    {} -> {} (via {})\n", e.from, e.to, e.via));
     }
     append_freshness(&mut out, &root);
+    append_knowledge_freshness(&mut out, &root);
     ToolOutput::ok(out)
 }
 
@@ -1060,6 +1068,36 @@ fn append_freshness(out: &mut String, root: &Path) {
 /// First 12 chars of a sha (or the whole string if shorter).
 fn short_sha(sha: &str) -> String {
     sha.chars().take(12).collect()
+}
+
+/// Append the knowledge freshness block (SPEC-SYNC-KNOWLEDGE §4.4) when a
+/// knowledge store exists at the served root; with no store, nothing is
+/// appended and the report stays byte-identical to pre-M5. `remote current` /
+/// `behind remote` follow the code freshness rules exactly: best-effort,
+/// offline-safe (any error ⇒ `-` / `no`); `behind remote` is `yes` only when
+/// both snapshots are known and differ.
+fn append_knowledge_freshness(out: &mut String, root: &Path) {
+    let Some(f) = knowledge_freshness(root) else { return };
+    if !out.ends_with('\n') {
+        out.push('\n');
+    }
+    out.push_str("  knowledge :\n");
+    out.push_str(&format!(
+        "    corpus         : {}\n",
+        f.corpus.as_deref().unwrap_or("(local ingest)")
+    ));
+    out.push_str(&format!("    snapshot       : {}\n", f.snapshot));
+    out.push_str(&format!("    records/chunks : {} / {}\n", f.records, f.chunks));
+    out.push_str(&format!("    data as-of     : {}\n", f.data_as_of.as_deref().unwrap_or("-")));
+    out.push_str(&format!("    remote current : {}\n", f.remote_current.as_deref().unwrap_or("-")));
+    out.push_str(&format!(
+        "    behind remote  : {}\n",
+        if f.behind_remote {
+            "yes — run `cce knowledge pull`"
+        } else {
+            "no"
+        }
+    ));
 }
 
 // --- record_feedback ---

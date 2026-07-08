@@ -205,6 +205,17 @@ impl GitRemote {
     /// recorded `size` is reported, so bytes reflect the real artifact on an
     /// LFS-enabled cache, not the ~130-byte pointer file.
     pub fn list_artifact_sizes(&self, prefix: &str) -> Result<Vec<(String, u64)>, String> {
+        self.list_sizes_with_suffix(prefix, ".cce")
+    }
+
+    /// The same LFS-aware `(path, bytes)` walk for an arbitrary artifact suffix.
+    /// The knowledge listing (SPEC-SYNC-KNOWLEDGE §6) uses it with `.cck`, so a
+    /// corpus's bytes reflect the real artifact on an LFS-enabled cache too.
+    pub fn list_sizes_with_suffix(
+        &self,
+        prefix: &str,
+        suffix: &str,
+    ) -> Result<Vec<(String, u64)>, String> {
         self.fetch()?;
         let treeish = format!("origin/{}", self.branch);
         // `-l` (long) adds the object size: `<mode> <type> <object> <size>\t<path>`.
@@ -215,7 +226,7 @@ impl GitRemote {
         let mut out: Vec<(String, u64)> = Vec::new();
         for line in listing.lines() {
             let Some((meta, path)) = line.split_once('\t') else { continue };
-            if !path.ends_with(".cce") {
+            if !path.ends_with(suffix) {
                 continue;
             }
             let mut fields = meta.split_whitespace();

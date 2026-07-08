@@ -553,12 +553,21 @@ dependency graph, so repo-less consumers keep the real member metadata and the
 cross-member graph expansion, and `cce sync verify --checksum-only` gives them a
 real integrity check (re-hash the pulled store against the checksum recorded
 from the installed bytes at pull time — version-independent; detects
-corruption, not a malicious build; no source needed). See the consumer-mode
-section of [`docs/sync.md`](docs/sync.md).
+corruption, not a malicious build; no source needed). **Knowledge travels
+too:** when the cache carries a knowledge corpus, `pull --all` installs it at
+the workspace root (`--corpus <id>` picks one if there are several), the
+listing shows it, and `verify --checksum-only` covers it — so the same bare
+directory answers `context_search source: both` with issues/docs/tickets
+context beside the code (see [`docs/knowledge.md`](docs/knowledge.md)). See
+the consumer-mode section of [`docs/sync.md`](docs/sync.md).
 
 **CI (GitHub Actions):** index `main` and push on every merge with the ready-to-copy
 [`docs/ci/cce-sync.yml`](docs/ci/cce-sync.yml). The token it uses needs **write**
-access to the *cache* repo only; developers need only **read** to pull.
+access to the *cache* repo only; developers need only **read** to pull. For
+knowledge corpora, the scheduled-builder sibling is
+[`docs/ci/cce-knowledge-sync.yml`](docs/ci/cce-knowledge-sync.yml) — a nightly
+adapter run that emits the contract, indexes (redacting), and pushes; the raw
+feed never leaves the job.
 
 **Offline-first, always:** with no remote (or an unreachable one), `cce index`,
 `cce search`, and `cce sync status` still work — `status` just reports the
@@ -662,7 +671,24 @@ header, and pass deterministic staleness weighting (recency, wontfix-drop, a
 merged-PR boost, a 0.30 precision floor) so a stale record never surfaces. Fully
 additive: the code index, `conformance.json`, and the Sync artifact are
 byte-identical. Config: `knowledge.enabled` / `knowledge.min_score` /
-`knowledge.default_source`. See [`docs/knowledge.md`](docs/knowledge.md).
+`knowledge.default_source`.
+
+Since M5 the corpus also **travels** ([SPEC-SYNC-KNOWLEDGE.md](SPEC-SYNC-KNOWLEDGE.md)):
+
+```bash
+cce knowledge push --corpus internal-tickets   # .cck artifact + `current` pointer + corpus.json
+cce knowledge pull --corpus internal-tickets   # checksum-verified; byte-identical to a local ingest
+cce sync pull --all --into ctx                 # consumer mode installs the corpus too
+```
+
+A CI adapter cron is the canonical pusher
+([`docs/ci/cce-knowledge-sync.yml`](docs/ci/cce-knowledge-sync.yml)); a
+consumer with only git read access gets `context_search source: knowledge|both`
+from a bare directory — the *why* travels with the *what*. Trust is stated
+honestly: a corpus is **not rebuild-verifiable by consumers** (the puller lacks
+the source feed) — the posture is trust-the-pusher + the git host's ACL, with
+checksum integrity on every pull and `verify --checksum-only` offline. See
+[`docs/knowledge.md`](docs/knowledge.md).
 
 ## Token savings — honestly
 
@@ -734,10 +760,11 @@ real offline cold-start run in [`docs/VERIFIED.md`](docs/VERIFIED.md):
 | `cce mcp` | ✅ fully offline | serves the **local** index (nine tools) to the agent; auto-pull is a soft dependency that no-ops with no remote |
 | `cce savings` / `cce eval` | ✅ fully offline | log-derived ledger + A/B aggregation; embedded pricing, no network |
 | `cce knowledge index` | ✅ fully offline | reads a local NDJSON feed; writes the local `.cce/knowledge/` store |
+| `cce knowledge push` / `pull` | ❌ needs the cache remote | corpus sync through the same git cache (own additive `knowledge/…` key space); a pulled corpus is byte-identical to a local ingest, so search over it is then fully offline |
 | `cce feedback` / `cce conformance` / `cce packs` / `cce bench` | ✅ fully offline | pure local operations |
-| `cce sync list` | ❌ needs the cache remote | read-only enumeration of what a cache holds (repo_ids, latest shas, artifact counts/bytes); works from a bare directory with just `--remote <url>` |
-| `cce sync pull --all` | ❌ needs the cache remote | consumer mode: pulls every repo_id's latest artifact into `--into <dir>` and synthesizes the workspace (enriched from the published workspace metadata when the cache carries it) — the resulting search/MCP over it is then fully offline |
-| `cce sync verify --checksum-only` | ✅ fully offline | re-hashes the pulled store against the checksum recorded from the installed bytes at pull time; version-independent — no source checkout, no rebuild, no remote |
+| `cce sync list` | ❌ needs the cache remote | read-only enumeration of what a cache holds (repo_ids, latest shas, artifact counts/bytes — plus a knowledge section when the cache carries corpora); works from a bare directory with just `--remote <url>` |
+| `cce sync pull --all` | ❌ needs the cache remote | consumer mode: pulls every repo_id's latest artifact into `--into <dir>`, synthesizes the workspace (enriched from the published workspace metadata when the cache carries it), and installs the cache's knowledge corpus at the workspace root — the resulting search/MCP over it is then fully offline |
+| `cce sync verify --checksum-only` | ✅ fully offline | re-hashes the pulled store against the checksum recorded from the installed bytes at pull time (pulled knowledge stores included); version-independent — no source checkout, no rebuild, no remote |
 
 The **only** things that ever touch the network are, explicitly:
 
@@ -833,7 +860,7 @@ node type in a `kind` field alongside the coarse `chunk_type`
 ## Tests & coverage
 
 ```bash
-cargo test                                                  # 605 tests
+cargo test                                                  # 660 tests
 cargo clippy --all-targets --all-features -- -D warnings    # lint gate
 cargo fmt --check                                           # format gate
 ```
@@ -860,7 +887,7 @@ language pack, and a guard test asserts the core chunker names no language.
 | [`docs/sync.md`](docs/sync.md) | CCE Sync: model, artifact format, content address, consumer mode (repo-less), permissions, troubleshooting |
 | [`docs/mcp.md`](docs/mcp.md) | CCE MCP: the server, the **nine tools**, `cce init`, sync freshness, and how to confirm agent use |
 | [`docs/savings.md`](docs/savings.md) | The seven Savings Layers, the ledger, `cce savings`, the token estimator, and the `cce eval` A/B harness |
-| [`docs/knowledge.md`](docs/knowledge.md) | Knowledge sources (v2.6): the markdown-heading chunker, the `cce.knowledge/v1` contract, `cce knowledge index`, and the `source:` retrieval blend |
+| [`docs/knowledge.md`](docs/knowledge.md) | Knowledge sources (v2.6): the markdown-heading chunker, the `cce.knowledge/v1` contract, `cce knowledge index`, the `source:` retrieval blend, and corpus sync (`cce knowledge push`/`pull` + the consumer surface) |
 | [`docs/VERIFIED.md`](docs/VERIFIED.md) | Offline + online cold-start verification transcripts (index/search/stats/dashboard/workspace/MCP offline; Sync online) |
 | [`docs/ci/cce-sync.yml`](docs/ci/cce-sync.yml) | Ready-to-copy GitHub Actions cache-push workflow |
 | [`docs/getting-started.md`](docs/getting-started.md) | Install → first index + search |

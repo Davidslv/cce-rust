@@ -26,7 +26,12 @@
 > `cce sync list` enumerates a cache, `cce sync pull --all` synthesizes a
 > ready-to-search workspace with zero source checkouts, the cache self-describes
 > by publishing workspace metadata, and `cce sync verify --checksum-only` is a
-> source-free integrity check); six packs ship
+> source-free integrity check), and M5 knowledge-corpus sync (SPEC-SYNC-KNOWLEDGE
+> — `cce knowledge push`/`pull` move the built, redacted corpus through the same
+> git cache under an additive `knowledge/…` key space; corpora surface in
+> `cce sync list`, install via `pull --all`, verify with `--checksum-only`, and
+> report freshness in MCP `index_status`; trust is stated honestly —
+> not rebuild-verifiable by consumers, trust-the-pusher + the git ACL); six packs ship
 > (Python, JavaScript, Ruby, Rust, TypeScript, C) and every chunk records the
 > exact tree-sitter node type in a `kind` field. A sibling Ruby
 > implementation was built from the identical specs. MIT licensed, © 2026 David
@@ -43,13 +48,14 @@
 - [SPEC-V2.1.md](SPEC-V2.1.md): The secret-protection evolution spec (v2.1) — sensitive-file skip + secret redaction.
 - [SPEC-V2.2.md](SPEC-V2.2.md): The workspace-mode evolution spec (v2.2) — detection, manifest, federation, cross-member edges.
 - [SPEC-SYNC.md](SPEC-SYNC.md): The CCE Sync design spec (v2.3) — content-addressed cache, artifact format, remotes, offline-first.
+- [SPEC-SYNC-KNOWLEDGE.md](SPEC-SYNC-KNOWLEDGE.md): The knowledge-corpus sync spec (M5) — the `.cck` container, the `knowledge/…` key space, the six decisions (identity/trust/access/freshness/retention/redaction), the consumer surface, and the CI ingestion reference.
 - [SPEC-MCP.md](SPEC-MCP.md): The CCE MCP design spec (v2.4) — the stdio MCP server, the first three tools, `cce init`, sync freshness.
 - [SPEC-V2.5-SAVINGS.md](SPEC-V2.5-SAVINGS.md): The Savings Layers spec (v2.5) — the seven layers, the token estimator, the ledger, and the six new MCP tools.
 - [Workspace](docs/workspace.md): Workspace model, `workspace.yml`, detection rules, federation semantics, where it strains.
 - [Sync](docs/sync.md): CCE Sync model, artifact format, content address, consumer mode (repo-less list / pull --all / checksum-only verify), permissions, troubleshooting.
 - [MCP](docs/mcp.md): CCE MCP — the server, the **nine tools**, `cce init`, sync freshness, and how to confirm agent use.
 - [Savings](docs/savings.md): The seven Savings Layers, the `cce.tokens/v1` estimator, `cce savings`, the `cce eval` A/B harness, and the honest "vs full-file baseline" framing.
-- [Knowledge](docs/knowledge.md): Knowledge Sources (v2.6) — the markdown-heading chunker, the `cce.knowledge/v1` contract, `cce knowledge index`, and the `source:` retrieval blend with provenance + staleness weighting.
+- [Knowledge](docs/knowledge.md): Knowledge Sources (v2.6) — the markdown-heading chunker, the `cce.knowledge/v1` contract, `cce knowledge index`, the `source:` retrieval blend with provenance + staleness weighting, and corpus sync (`cce knowledge push`/`pull`, the consumer flow, freshness, trust).
 - [Verified](docs/VERIFIED.md): Offline + online cold-start verification transcripts (index/search/stats/dashboard/workspace/MCP offline; CCE Sync online).
 - [Getting started](docs/getting-started.md): Newcomer path from install to first successful index + search.
 - [How it works](docs/how-it-works.md): The benefit and the mechanism, in diagrams — why serving chunks beats reading whole files.
@@ -58,7 +64,7 @@
 - [Architecture](docs/architecture.md): Design goals, module map, pipeline, the language-pack architecture, and where the design strains.
 - [Dashboard](docs/dashboard.md): The metrics pipeline (log → aggregator → API → page), event schema, and aggregation formulas.
 - [Decisions](docs/DECISIONS.md): How each ambiguity in the spec was resolved, with rationale.
-- [TDD log](docs/TDD.md): The red → green build order and coverage (605 tests, ~94% line coverage).
+- [TDD log](docs/TDD.md): The red → green build order and coverage (660 tests, ~94% line coverage).
 - [Benchmarks](docs/BENCHMARKS.md): Measured index/latency/recall numbers per language (Ruby/Rust/TypeScript/C) on real corpora.
 
 ## Source (key files)
@@ -78,7 +84,7 @@
 - [src/aggregator.rs](src/aggregator.rs): The pure aggregator — totals, north-stars, daily series, deltas, plus the v2.4.1 agent-vs-human, secret-safety, and index-freshness sections (DASHBOARD-SPEC §4).
 - [src/dashboard.rs](src/dashboard.rs): The loopback-only, read-only, self-contained dashboard web server; serves the refreshed v2.4.1 panels, all purely log-derived so it makes zero network calls (DASHBOARD-SPEC §6).
 - [src/federation.rs](src/federation.rs): Federated indexing/search/stats/dashboard over workspace members (SPEC-V2.2 §4–7).
-- [src/sync/](src/sync/): CCE Sync — identity helpers, byte-exact artifact, `sync.*` config, git wrappers, the `SyncRemote` git backend, and `init/push/pull/list/status/verify` including the repo-less consumer mode (`list`, `pull --all`, `verify --checksum-only`) (SPEC-SYNC).
+- [src/sync/](src/sync/): CCE Sync — identity helpers, byte-exact artifacts (`.cce` code + `.cck` knowledge), `sync.*`/`knowledge.sync.*` config, git wrappers, the `SyncRemote` git backend, `init/push/pull/list/status/verify` including the repo-less consumer mode (`list`, `pull --all`, `verify --checksum-only`), and `knowledge push/pull` (SPEC-SYNC, SPEC-SYNC-KNOWLEDGE).
 - [src/mcp/](src/mcp/): CCE MCP — JSON-RPC 2.0 framing (`protocol`), the stdio dispatch loop + per-session ledger (`server`), the **nine tools** (`tools`), and `cce init` (`init`) (SPEC-MCP, SPEC-V2.5 §6).
 - [src/compress.rs](src/compress.rs), [src/grammar.rs](src/grammar.rs): L2 AST chunk compression (`signature`/`compact`/`full`) and the L3 byte-pinned result grammar (SPEC-V2.5 §2).
 - [src/memory.rs](src/memory.rs), [src/session.rs](src/session.rs): L5 local secret-scrubbed decision memory + precision recall, and the L6 deterministic per-session digest (SPEC-V2.5 §2).

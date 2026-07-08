@@ -301,6 +301,12 @@ enum SyncCmd {
         /// configured `sync.remote`).
         #[arg(long, requires = "all")]
         remote: Option<String>,
+        /// With `--all`: which knowledge corpus to install when the cache
+        /// carries several (one active corpus per consumer root,
+        /// SPEC-SYNC-KNOWLEDGE §7; a cache with exactly one installs it
+        /// without this flag).
+        #[arg(long, requires = "all")]
+        corpus: Option<String>,
         /// Project/workspace root (default: current directory).
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -1236,11 +1242,11 @@ fn cmd_sync(cmd: SyncCmd) -> Result<(), String> {
             print!("{report}");
             Ok(())
         }
-        SyncCmd::Pull { commit, latest, force, workspace, all, into, remote, dir } => {
+        SyncCmd::Pull { commit, latest, force, workspace, all, into, remote, corpus, dir } => {
             if all {
                 // clap enforces `--all requires --into`.
                 let into = into.ok_or_else(|| "--all requires --into <dir>".to_string())?;
-                let report = sync_cmd::cmd_pull_all(&into, remote)?;
+                let report = sync_cmd::cmd_pull_all(&into, remote, corpus)?;
                 print!("{report}");
                 return Ok(());
             }

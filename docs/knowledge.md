@@ -12,10 +12,12 @@ contract, retrieval — never the *integrations*.** Teams bring their own extrac
 > **Scope.** Phase A (v2.6.0) covers M1 (the markdown-heading chunker), M2 (the
 > `cce.knowledge/v1` contract), and M3 (`cce knowledge index`). Phase B (v2.6.1)
 > covers M4 — the retrieval blend and the `source:` search filter (see
-> [Searching knowledge](#searching-knowledge-m4--the-source-blend) below). Sync of
-> the knowledge corpus and the reference adapter (M5, Phase C) are specified in
-> [SPEC-SYNC-KNOWLEDGE.md](../SPEC-SYNC-KNOWLEDGE.md); implementation is tracked
-> in [#56](https://github.com/Davidslv/cce-rust/issues/56).
+> [Searching knowledge](#searching-knowledge-m4--the-source-blend) below).
+> Phase C (M5) is corpus sync — `cce knowledge push`/`pull`, the consumer
+> surface, and the reference adapter workflow (see
+> [Syncing a corpus](#syncing-a-corpus-m5--cce-knowledge-push--pull) below);
+> the normative spec is [SPEC-SYNC-KNOWLEDGE.md](../SPEC-SYNC-KNOWLEDGE.md)
+> ([#56](https://github.com/Davidslv/cce-rust/issues/56)).
 
 ## The markdown-heading chunker (M1)
 
@@ -154,26 +156,116 @@ knowledge:
   default_source: both      # code | knowledge | both — used when a search omits `source`
 ```
 
-## Syncing a corpus (M5.1/M5.2) — `cce knowledge push` / `pull`
+## Syncing a corpus (M5) — `cce knowledge push` / `pull`
 
 A built corpus travels through the **same content-addressed cache** as code
-indexes, as a canonical `.cck` artifact under its own additive
-`knowledge/<contract_version>/<corpus_id>/` key space — the built, redacted
-store, **never the raw feed**. The normative reference is
-[SPEC-SYNC-KNOWLEDGE.md](../SPEC-SYNC-KNOWLEDGE.md) (the six decisions, the
-byte-exact container, guards, retention); this section is a stub until the M5.4
-documentation pass.
+indexes ([sync.md](sync.md)), as a canonical `.cck` artifact under its own
+additive `knowledge/<contract_version>/<corpus_id>/` key space — the built,
+redacted store, **never the raw feed** (redaction runs at index time, so
+pushing the feed would put pre-redaction bytes on a remote). The normative
+reference is [SPEC-SYNC-KNOWLEDGE.md](../SPEC-SYNC-KNOWLEDGE.md); this section
+is the practical tour.
 
 ```sh
-cce knowledge push [--corpus <id>] [--remote <url>]   # export + publish the current store
+# Producer side (usually a CI adapter job — see the reference workflow below):
+cce knowledge index corpus.jsonl                      # ingest (redacts) → .cce/knowledge/
+cce knowledge push [--corpus <id>] [--remote <url>]   # artifact + `current` pointer + corpus.json,
+                                                      # one commit; then retention
+
+# Consumer side:
 cce knowledge pull [--corpus <id>] [--latest | --snapshot <id>] [--force] [--remote <url>]
+cce sync list [--json]              # corpora appear in a knowledge section
+cce sync pull --all --into <dir> [--corpus <id>]   # code members AND the corpus, one command
+cce sync verify --checksum-only     # covers the pulled knowledge store too
 ```
 
-Configured via `knowledge.sync.corpus_id` / `knowledge.sync.remote` /
-`knowledge.sync.retention` in `.cce/config` (SPEC-SYNC-KNOWLEDGE §8). A pulled
-corpus is **byte-identical to a local ingest**, so retrieval needs zero changes.
-The consumer surfaces (`cce sync list` knowledge section, `pull --all`,
-`verify --checksum-only`) land with M5.3.
+- **Identity.** `corpus_id` is an adapter-chosen stable slug (validated like a
+  `repo_id`), resolved from `--corpus` or `knowledge.sync.corpus_id` — never
+  derived: knowledge has no git origin to normalize.
+- **Push** refuses a missing store, an unresolved/invalid corpus_id, and an
+  embedding-less (pre-v2.6.1) store; it never blocks local work. Retention
+  (`knowledge.sync.retention: keep-last-<n>`) prunes the oldest snapshots after
+  the push — the snapshot named by `current` is never pruned, and a prune
+  failure only warns.
+- **Pull** verifies the artifact checksum (a mismatch fails loudly, naming the
+  key), installs into `.cce/knowledge/` **byte-identical to a local ingest**
+  (so retrieval needs zero changes), and records a sync marker with the
+  installed bytes' SHA-256. Pulling a *different* corpus than the marker
+  records refuses without `--force` — one active corpus per root; a newer
+  snapshot of the same corpus supersedes silently, exactly like a local
+  re-ingest.
+
+### The consumer flow — a corpus with no adapter and no source
+
+A consumer with only git read access to the cache gets the whole thing in one
+command:
+
+```sh
+cce sync pull --all --into ctx/          # code members + the corpus
+cce mcp --workspace --dir ctx/           # context_search source: knowledge|both just works
+```
+
+`pull --all` installs the corpus at the **workspace root** (`ctx/.cce/knowledge/`,
+where the MCP server loads knowledge from). Selection: `--corpus <id>` wins; a
+cache carrying exactly one corpus installs it; with several and no flag the run
+warns and skips knowledge, naming the ids — it never fails the member pulls.
+Refresh is idempotent: an unmoved remote `current` reports `up-to-date` and
+fetches nothing; a moved one refreshes exactly the corpus.
+
+### Freshness — two signals, surfaced everywhere
+
+- **How old is the data?** `data_as_of` — the maximum `updated_at` across the
+  corpus. Deterministic, inside the artifact, computable from any installed
+  store.
+- **How recently was it published?** `pushed_at` — deliberately *outside* the
+  artifact (it would break reproducibility), carried in the published
+  `corpus.json` and rewritten on every push.
+
+Both show up in `cce sync list` (and its `--json` `knowledge` array), and MCP
+`index_status` gains a knowledge block — corpus, snapshot, records/chunks,
+`data as-of`, plus best-effort `remote current` / `behind remote` lines that
+follow the same offline-safe rules as the code freshness lines (see
+[mcp.md](mcp.md)).
+
+### Trust — stated honestly
+
+Code artifacts are rebuild-verifiable: anyone with the source can check
+`artifact == build(sha)`. **No such analogue exists for knowledge** — the
+puller lacks the source feed, so a knowledge corpus is *not
+rebuild-verifiable by consumers*, and nothing in the tooling implies
+verify-parity with code artifacts. The posture: **trust the pusher** (the
+canonical pusher is a CI adapter job), the **git host's ACL is the gate**,
+and **content-address integrity** is checked on every pull, with
+`verify --checksum-only` detecting post-install corruption offline. Pusher-side
+determinism is an *audit path for feed-holders* (re-export, compare checksums),
+not a consumer verification. Detached signatures are a deferred, additive
+upgrade.
+
+### The ingestion reference — a builder job, never a serving process
+
+The production shape is a scheduled adapter run: CI cron fetches from the
+source tool, emits `cce.knowledge/v1` NDJSON, runs `cce knowledge index`
+(which redacts), and runs `cce knowledge push`. Nothing serves knowledge at
+runtime; consumers pull from git like every other artifact. A ready-to-copy
+workflow ships as [`docs/ci/cce-knowledge-sync.yml`](ci/cce-knowledge-sync.yml)
+— note its two secrets have disjoint scopes (source-tool READ vs cache WRITE),
+and the raw feed is ephemeral builder input: never committed, uploaded, or
+cached.
+
+Configured via `.cce/config` (all keys optional; absent ⇒ knowledge sync off,
+pure local knowledge exactly as before):
+
+```yaml
+knowledge:
+  sync:
+    corpus_id: internal-tickets   # required to push (or pass --corpus)
+    remote: null                  # per-corpus override; default = sync.remote
+    retention: keep-last-10       # all | keep-last-<n>; default all
+```
+
+The `remote:` override exists because a corpus (say, internal tickets) may
+have a different audience than the code it annotates: compartmentalization
+stays git's job — one cache repo per access boundary.
 
 ## The plugin / adapter strategy
 
