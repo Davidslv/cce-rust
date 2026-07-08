@@ -456,21 +456,59 @@ Config lives in `.cce/config` (see [`docs/sync.md`](sync.md)); the relevant key 
 
 ---
 
+## The opt-in result footer (v2.8)
+
+Want the savings visible **in the conversation**? Set the per-project
+`.cce/config` key ([`SPEC-USAGE-VISIBILITY.md`](../SPEC-USAGE-VISIBILITY.md) §3):
+
+```yaml
+mcp:
+  result_footer: "off"       # off (default) | on | session
+```
+
+With `on`, every `context_search` result ends with one byte-pinned line:
+
+```
+cce: 5 results from 38,628 chunks · served ~1,204 tok vs ~9,880 baseline · saved ~8,676 (88%)
+```
+
+`session` appends a running total for THIS server session:
+`· session: 42 searches, ~310k saved`.
+
+- **Off by default — context hygiene.** Printing savings into every tool result
+  costs the agent's own context window, so the default keeps the result lean;
+  the aggregate surfaces (`cce usage`, the dashboard) carry the numbers.
+- **Pure projection.** The footer renders values **already on** the recorded
+  `search` event, after all measurement — toggling it never changes a recorded
+  metric, so the dashboard and `cce usage` stay honest whatever the setting.
+- **Config-only, deliberately.** There is no per-call argument and no runtime
+  tool to flip it: the agent must not toggle its own observability. Read at
+  server startup; restart `cce mcp` after changing it.
+
+---
+
 ## How to confirm the agent used it
 
-Two independent signals:
+Three independent signals:
 
 1. **Tool-call log** — Claude Code shows each `context_search` call in its tool-call
    log, with the arguments and the returned chunks.
-2. **Dashboard** — every `context_search` is a `search` event on `cce dashboard`
+2. **`cce usage`** — the one-shot terminal summary of the same log: the agent (mcp)
+   vs human (cli) split, tokens saved, quality, latency, and the recent queries.
+   CI-friendly (`--json` emits the versioned `cce.usage/v1` projection).
+3. **Dashboard** — every `context_search` is a `search` event on `cce dashboard`
    (queries, counts, tokens saved, latency). This is proof of *use* and of *value*;
    `record_feedback` adds the quality signal.
 
 ```bash
+cce usage --since 24h    # "how much did the agent lean on CCE since yesterday?"
 cce dashboard            # open the loopback, read-only dashboard
 # or, non-interactively:
 cat .cce/metrics.jsonl   # one JSON line per search / feedback event
 ```
+
+`cce usage` and the dashboard are projections of the SAME pure aggregate, so
+their numbers are always identical for the same log and window.
 
 ---
 

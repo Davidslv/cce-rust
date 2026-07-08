@@ -643,7 +643,7 @@ any MCP client) calls CCE as a **first-class tool it auto-invokes** — instead 
 reading and grepping whole files, the agent runs `context_search` and pays tokens
 only for the handful of relevant chunks. `cce init` wires the editor up so it is
 plug-and-play, and every search is logged to `.cce/metrics.jsonl`, so
-`cce dashboard` proves the agent used it (and what it saved).
+`cce usage` and `cce dashboard` prove the agent used it (and what it saved).
 
 ```bash
 # 1. In your project: build the index, write .mcp.json + a CLAUDE.md block.
@@ -658,7 +658,8 @@ cce init .
 #    Claude Code calls the `context_search` tool and answers from the chunks it
 #    returns — no whole-file reads.
 
-# 3. Confirm it was used — the search shows up on the dashboard:
+# 3. Confirm it was used — one shot in the terminal, or on the dashboard:
+cce usage --since 24h
 cce dashboard
 ```
 
@@ -693,10 +694,12 @@ widen**: `context_search` returns **compact** chunks by default (each with a
 See [`docs/mcp.md`](docs/mcp.md) for every input schema and worked output, and
 [`docs/savings.md`](docs/savings.md) for the layers behind them.
 
-**How to confirm the agent used it.** Two independent signals: the tool call is
-visible in Claude Code's tool-call log, and every `context_search` is a `search`
-event on `cce dashboard` (queries, counts, tokens saved). That is proof of *use*
-and of *value*.
+**How to confirm the agent used it.** Three independent signals: the tool call is
+visible in Claude Code's tool-call log; `cce usage [--since 24h] [--json]` prints
+the one-shot agent-vs-human summary in the terminal; and every `context_search` is
+a `search` event on `cce dashboard` (queries, counts, tokens saved). That is proof
+of *use* and of *value*. Opt in to `mcp.result_footer` to see each call's savings
+inline in the conversation ([`docs/mcp.md`](docs/mcp.md)).
 
 **Fresh, team-shared context via CCE Sync (optional).** `cce init --remote <cache>`
 pulls the CI-built index (seconds, not a full local re-index) instead of indexing
@@ -813,6 +816,7 @@ real offline cold-start run in [`docs/VERIFIED.md`](docs/VERIFIED.md):
 | `cce stats` | ✅ fully offline | reads the local store |
 | `cce doctor` | ✅ fully offline | read-only store health + config-drift check: the recorded build fingerprint (embedder, chunker pack set, tokenizer rule, redaction) vs this binary, the #30 empty-embedding tripwire, the #55 installed-bytes re-hash for pulled stores, and the knowledge contract/freshness; non-zero exit only on definite corruption/mismatch (#62) |
 | `cce dashboard` | ✅ fully offline | loopback-only, read-only; inlines all CSS/JS/SVG; **every panel is purely log-derived, so it makes zero network calls** (behind-remote is answered by `cce sync status`) |
+| `cce usage` | ✅ fully offline | one-shot terminal usage summary (agent vs human split, savings, recent queries); a pure projection of the same aggregate the dashboard serves, so the numbers always match (#35) |
 | `cce workspace` / `--workspace` | ✅ fully offline | detection, federated index/search/stats/dashboard |
 | `cce mcp` | ✅ fully offline | serves the **local** index (nine tools) to the agent; auto-pull is a soft dependency that no-ops with no remote |
 | `cce savings` / `cce eval` | ✅ fully offline | log-derived ledger + A/B aggregation; embedded pricing, no network |
@@ -945,6 +949,7 @@ language pack, and a guard test asserts the core chunker names no language.
 | [`SPEC-SYNC.md`](SPEC-SYNC.md) | The CCE Sync design spec (v2.3) |
 | [`SPEC-MCP.md`](SPEC-MCP.md) | The CCE MCP design spec (v2.4) |
 | [`SPEC-V2.5-SAVINGS.md`](SPEC-V2.5-SAVINGS.md) | The Savings Layers spec (v2.5) — the seven layers, the ledger, the nine tools |
+| [`SPEC-USAGE-VISIBILITY.md`](SPEC-USAGE-VISIBILITY.md) | Usage visibility (v2.8) — `cce usage` + the opt-in MCP result footer |
 | [`docs/sync.md`](docs/sync.md) | CCE Sync: model, artifact format, content address, consumer mode (repo-less), permissions, troubleshooting |
 | [`docs/mcp.md`](docs/mcp.md) | CCE MCP: the server, the **nine tools**, `cce init`, sync freshness, and how to confirm agent use |
 | [`docs/savings.md`](docs/savings.md) | The seven Savings Layers, the ledger, `cce savings`, the token estimator, and the `cce eval` A/B harness |

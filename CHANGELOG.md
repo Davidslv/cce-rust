@@ -8,6 +8,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **Usage visibility (v2.8): `cce usage` + the opt-in MCP result footer (#35).**
+  `cce usage [--workspace] [--since 24h|7d|<ISO>] [--source mcp|cli|all] [--json]`
+  is the one-shot, CI-friendly terminal counterpart to the dashboard's
+  agent-vs-human panel: the `mcp` (agent) vs `cli` (human) split — searches,
+  tokens saved, savings ratio, quality, latency — the recent queries, and a
+  `by_package` mini-table in workspace mode. **Pure projection, zero new
+  accounting**: it reuses the exact `aggregate()` / federated aggregation the
+  dashboard serves (including the #28 workspace-root-log rule), so its numbers
+  are always identical to `cce dashboard`'s for the same log and window (proven
+  by tests that run both paths over one fixture). `--json` emits the versioned,
+  byte-pinned `cce.usage/v1` projection (stable field names, the same shapes as
+  `/api/metrics` where they overlap); the human block is byte-pinned too.
+  Deterministic, offline, read-only; `now` is injected below the CLI edge.
+  Second surface: a per-project `.cce/config` key `mcp.result_footer:
+  off (default) | on | session` appends ONE byte-pinned line to `context_search`
+  results — `cce: 5 results from 38,628 chunks · served ~1,204 tok vs ~9,880
+  baseline · saved ~8,676 (88%)` (`session` adds a running per-session clause).
+  Rendered after all measurement from values already on the recorded `search`
+  event: toggling it never changes a recorded metric (same query, footer off vs
+  on ⇒ an identical recorded event, test-proven), and with the footer `off` the
+  MCP tool-result bytes, `conformance.json`, and every MCP golden are untouched.
+  Config-only by design — no runtime tool, so the agent cannot toggle its own
+  observability. Additive `/api/metrics` fields feed the new surfaces:
+  `by_source.*.mean_latency_ms` and `recent_searches[].source`. Spec committed
+  as `SPEC-USAGE-VISIBILITY.md`; docs in `docs/mcp.md`, `docs/dashboard.md`,
+  and `docs/how-to.md`.
 - **`cce relevance` — the retrieval-relevance evaluation harness (#63).** The
   missing third leg of the measurement story: `cce conformance` proves output
   stability and `cce bench`/`cce eval` measure latency and token savings — this

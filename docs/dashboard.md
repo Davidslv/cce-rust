@@ -10,6 +10,12 @@ The base engine (chunking, embedding, retrieval) is unchanged and stays
 byte-for-byte conformant to [`SPEC.md`](../SPEC.md); `conformance.json` is
 identical to the 1.0.0 release.
 
+**Prefer a terminal?** `cce usage [--workspace] [--since 24h] [--json]` (v2.8) is
+the one-shot CLI counterpart to the dashboard's agent-vs-human panel — a pure
+projection of the SAME aggregate documented below, so its numbers always equal
+this dashboard's for the same log and window. See
+[`SPEC-USAGE-VISIBILITY.md`](../SPEC-USAGE-VISIBILITY.md).
+
 ## The pipeline
 
 ```
@@ -142,8 +148,9 @@ schema, totals{searches, indexes, feedback, tokens_saved, cost_saved_usd,
                mean_savings_ratio, mean_top_score, helpful, not_helpful, helpful_rate},
 north_star{ savings{current, prior, delta_ratio, direction},
             quality{current, prior, delta_top_score, direction} },
-by_source{ cli{searches, tokens_saved, mean_savings_ratio, mean_top_score},
-           mcp{searches, tokens_saved, mean_savings_ratio, mean_top_score} },
+by_source{ cli{searches, tokens_saved, mean_savings_ratio, mean_top_score, mean_latency_ms},
+           mcp{searches, tokens_saved, mean_savings_ratio, mean_top_score, mean_latency_ms} },
+                                          // mean_latency_ms added (additively) in v2.8
 savings_by_layer{ retrieval{saved_tokens, baseline_tokens}, chunk_compression{…},
                   grammar{…}, output{…}, memory{…}, turn_summarization{…},
                   progressive_disclosure{…}, total{…}, note },   // v2.5 seven-bucket ledger
@@ -153,7 +160,8 @@ series{ daily:[ {date, searches, tokens_saved, mean_savings_ratio,
                  mean_top_score, empty_rate, low_conf_rate, helpful,
                  not_helpful} ] },        // one per UTC date with ANY search/feedback, ascending
 recent_searches:[ {ts, id, query, result_count, tokens_saved, savings_ratio,
-                   top_score, empty, feedback} ]   // ≤20, newest first
+                   top_score, empty, feedback, source} ]   // ≤20, newest first
+                                          // source added (additively) in v2.8
 by_package:[ {package, searches, tokens_saved, mean_savings_ratio, mean_top_score} ]
                                           // workspace dashboard only (SPEC-V2.2 §7)
 ```

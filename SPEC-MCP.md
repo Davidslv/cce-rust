@@ -85,9 +85,10 @@ _(Keep the tool set small and focused. Graph `related` / `expand_chunk` can be a
 
 ## Observability — "how do I know it used it"
 
-- Every `context_search` logs a `search` event to `.cce/metrics.jsonl` (same as the CLI), so `cce dashboard` shows the agent's queries, counts, and token savings — proof of use *and* value.
+- Every `context_search` logs a `search` event to `.cce/metrics.jsonl` (same as the CLI), so `cce dashboard` shows the agent's queries, counts, and token savings — proof of use *and* value. Since v2.8, `cce usage` is the one-shot terminal projection of the same aggregate.
 - The MCP tool calls are also visible in the editor's tool-call log.
 - `record_feedback` closes the quality loop into the dashboard's retrieval-quality north-star.
+- **v2.8 footer note:** with `mcp.result_footer: on|session` in `.cce/config` (default `off`), a `context_search` result ends with one byte-pinned usage line rendered from the already-recorded event — output formatting only; the tool contract, protocol version, and recorded metrics are unchanged. See [`SPEC-USAGE-VISIBILITY.md`](SPEC-USAGE-VISIBILITY.md).
 
 ## Testing (hermetic — no editor, no network)
 
