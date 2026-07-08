@@ -590,3 +590,304 @@ fn lfs_round_trip_smoke_or_skip() {
     assert!(out.status.success(), "lfs verify failed: {}", String::from_utf8_lossy(&out.stderr));
     let _ = PathBuf::new();
 }
+
+// --- `cce sync pull --all --into <dir>` (#54): the repo-less consumer workspace ---
+
+/// A tiny one-file git repo with the given content, committed on `main`.
+fn tiny_repo(file: &str, content: &str) -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    git(d, &["init", "-q", "-b", "main"]);
+    std::fs::write(d.join(file), content).unwrap();
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-q", "-m", "init"]);
+    tmp
+}
+
+/// `cce sync init` + `cce sync push` for `dir` under `repo_id`, asserting success.
+fn init_and_push(home: &Path, url: &str, dir: &Path, repo_id: &str) {
+    let out = cce(
+        home,
+        &[
+            "sync",
+            "init",
+            "--remote",
+            url,
+            "--no-lfs",
+            "--repo-id",
+            repo_id,
+            "--dir",
+            dir.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success(), "init failed: {}", String::from_utf8_lossy(&out.stderr));
+    let out = cce(home, &["sync", "push", "--dir", dir.to_str().unwrap()]);
+    assert!(out.status.success(), "push failed: {}", String::from_utf8_lossy(&out.stderr));
+}
+
+/// Drive an MCP session over stdio (the tests/mcp.rs pattern): feed newline-
+/// delimited JSON-RPC on stdin, return stdout after EOF-driven exit.
+fn drive_mcp(home: &Path, args: &[&str], input: &str) -> String {
+    use std::io::Write;
+    let mut child = Command::new(bin())
+        .args(args)
+        .env("CCE_HOME", home)
+        .stdin(std::process::Stdio::piped())
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::piped())
+        .spawn()
+        .unwrap();
+    child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
+    let out = child.wait_with_output().unwrap();
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// The `modified` time of a member's installed store — refresh proof.
+fn store_mtime(ctx: &Path, member: &str) -> std::time::SystemTime {
+    std::fs::metadata(ctx.join(member).join(".cce/index.json")).unwrap().modified().unwrap()
+}
+
+#[test]
+fn pull_all_end_to_end_federated_search_and_mcp_from_a_bare_directory() {
+    // Three independent tiny repos with distinct content, pushed to ONE cache…
+    let home = tempfile::tempdir().unwrap();
+    let (_bare, url) = bare_remote();
+    let alpha = tiny_repo("rocket.py", "def alpha_rocket_launch(thrust):\n    return thrust * 2\n");
+    let beta = tiny_repo("submarine.py", "def beta_submarine_dive(depth):\n    return depth + 1\n");
+    let gamma = tiny_repo("glacier.py", "def gamma_glacier_melt(rate):\n    return rate - 1\n");
+    init_and_push(home.path(), &url, alpha.path(), "example.com__team__alpha");
+    init_and_push(home.path(), &url, beta.path(), "example.com__team__beta");
+    init_and_push(home.path(), &url, gamma.path(), "example.com__team__gamma");
+
+    // …then one command from a bare directory: no source checkout anywhere.
+    let consumer = tempfile::tempdir().unwrap();
+    let ctx = consumer.path().join("ctx");
+    let out = cce(
+        home.path(),
+        &["sync", "pull", "--all", "--into", ctx.to_str().unwrap(), "--remote", &url],
+    );
+    assert!(out.status.success(), "pull --all failed: {}", String::from_utf8_lossy(&out.stderr));
+    let report = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        report.contains("summary       : 3 pulled · 0 up-to-date · 0 skipped"),
+        "got: {report}"
+    );
+
+    // Short member names; each member has a store + a config carrying the repo_id.
+    for m in ["alpha", "beta", "gamma"] {
+        assert!(ctx.join(m).join(".cce/index.json").exists(), "{m} store missing");
+        let cfg = std::fs::read_to_string(ctx.join(m).join(".cce/config")).unwrap();
+        assert!(cfg.contains(&format!("repo_id: example.com__team__{m}")), "got: {cfg}");
+    }
+    // The synthesized manifest declares store-only members and parses via the
+    // ordinary parser (`cce workspace list` loads it).
+    let yaml = std::fs::read_to_string(ctx.join(".cce/workspace.yml")).unwrap();
+    assert!(yaml.contains("    type: store-only\n"), "got: {yaml}");
+    let out = cce(home.path(), &["workspace", "list", ctx.to_str().unwrap()]);
+    assert!(out.status.success(), "workspace list: {}", String::from_utf8_lossy(&out.stderr));
+
+    // Federated search returns member-tagged hits from ALL three members.
+    for (query, member) in [
+        ("alpha rocket launch thrust", "alpha"),
+        ("beta submarine dive depth", "beta"),
+        ("gamma glacier melt rate", "gamma"),
+    ] {
+        let out = cce(
+            home.path(),
+            &["search", query, ctx.to_str().unwrap(), "--workspace", "--json", "--no-graph"],
+        );
+        assert!(out.status.success(), "search failed: {}", String::from_utf8_lossy(&out.stderr));
+        let v: serde_json::Value =
+            serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+        let results = v["results"].as_array().unwrap();
+        assert!(!results.is_empty(), "no federated results for {query}");
+        assert_eq!(results[0]["package"], member, "top hit for {query} should be {member}");
+    }
+
+    // `cce mcp --workspace` serves a federated context_search over stdio.
+    let input = "{\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"context_search\",\"arguments\":{\"query\":\"beta submarine dive depth\",\"no_graph\":true}}}\n";
+    let stdout =
+        drive_mcp(home.path(), &["mcp", "--workspace", "--dir", ctx.to_str().unwrap()], input);
+    let resp: serde_json::Value = stdout
+        .lines()
+        .filter_map(|l| serde_json::from_str::<serde_json::Value>(l).ok())
+        .find(|v| v["id"] == 1)
+        .expect("no MCP response with id 1");
+    let text = resp["result"]["content"][0]["text"].as_str().unwrap();
+    assert!(text.contains("beta · "), "expected a beta-tagged federated row, got: {text}");
+    assert!(text.contains("submarine.py"), "got: {text}");
+}
+
+#[test]
+fn pull_all_warns_and_skips_repos_without_a_latest_pointer() {
+    let home = tempfile::tempdir().unwrap();
+    let (_bare, url) = bare_remote();
+    let alpha = tiny_repo("a.py", "def alpha_one():\n    return 1\n");
+    let beta = tiny_repo("b.py", "def beta_two():\n    return 2\n");
+    init_and_push(home.path(), &url, alpha.path(), "example.com__team__alpha");
+    init_and_push(home.path(), &url, beta.path(), "example.com__team__beta");
+    // A repo_id with an artifact but NO latest pointer — real caches have these
+    // (`cce sync list` renders them `-`). It must be warned + skipped, not fatal.
+    seed_cache(&url, &[("hash/2.3/example.com__team__nolatest/1234567.cce", b"raw\n")]);
+
+    let consumer = tempfile::tempdir().unwrap();
+    let ctx = consumer.path().join("ctx");
+    let out = cce(
+        home.path(),
+        &["sync", "pull", "--all", "--into", ctx.to_str().unwrap(), "--remote", &url],
+    );
+    assert!(out.status.success(), "one unpullable repo must not fail the run");
+    let report = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        report.contains("warning: skipped example.com__team__nolatest — no latest pointer"),
+        "got: {report}"
+    );
+    assert!(
+        report.contains("summary       : 2 pulled · 0 up-to-date · 1 skipped"),
+        "got: {report}"
+    );
+    assert!(ctx.join("alpha/.cce/index.json").exists());
+    assert!(ctx.join("beta/.cce/index.json").exists());
+    assert!(!ctx.join("nolatest").exists(), "a skipped repo must leave no member dir");
+}
+
+#[test]
+fn pull_all_is_idempotent_and_refreshes_exactly_the_moved_member() {
+    let home = tempfile::tempdir().unwrap();
+    let (_bare, url) = bare_remote();
+    let alpha = tiny_repo("a.py", "def alpha_one():\n    return 1\n");
+    let beta = tiny_repo("b.py", "def beta_two():\n    return 2\n");
+    init_and_push(home.path(), &url, alpha.path(), "example.com__team__alpha");
+    init_and_push(home.path(), &url, beta.path(), "example.com__team__beta");
+
+    let consumer = tempfile::tempdir().unwrap();
+    let ctx = consumer.path().join("ctx");
+    let run = || {
+        cce(
+            home.path(),
+            &["sync", "pull", "--all", "--into", ctx.to_str().unwrap(), "--remote", &url],
+        )
+    };
+    let out = run();
+    assert!(out.status.success());
+    let (alpha_t1, beta_t1) = (store_mtime(&ctx, "alpha"), store_mtime(&ctx, "beta"));
+
+    // Second run: nothing moved — all up-to-date, nothing re-written.
+    let out = run();
+    assert!(out.status.success());
+    let report = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        report.contains("summary       : 0 pulled · 2 up-to-date · 0 skipped"),
+        "got: {report}"
+    );
+    assert!(report.contains("alpha            up-to-date"), "got: {report}");
+    assert_eq!(store_mtime(&ctx, "alpha"), alpha_t1, "an up-to-date member must not be re-written");
+    assert_eq!(store_mtime(&ctx, "beta"), beta_t1, "an up-to-date member must not be re-written");
+
+    // Move alpha's latest pointer (new commit + push) and add a brand-NEW repo.
+    std::fs::write(alpha.path().join("a.py"), "def alpha_one_v2():\n    return 11\n").unwrap();
+    git(alpha.path(), &["add", "-A"]);
+    git(alpha.path(), &["commit", "-q", "-m", "v2"]);
+    let out = cce(home.path(), &["sync", "push", "--dir", alpha.path().to_str().unwrap()]);
+    assert!(out.status.success(), "re-push failed: {}", String::from_utf8_lossy(&out.stderr));
+    let gamma = tiny_repo("g.py", "def gamma_three():\n    return 3\n");
+    init_and_push(home.path(), &url, gamma.path(), "example.com__team__gamma");
+
+    // Third run: exactly alpha refreshed, gamma picked up, beta untouched.
+    let out = run();
+    assert!(out.status.success());
+    let report = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        report.contains("summary       : 2 pulled · 1 up-to-date · 0 skipped"),
+        "got: {report}"
+    );
+    assert!(report.contains("alpha            pulled"), "got: {report}");
+    assert!(report.contains("gamma            pulled"), "got: {report}");
+    assert!(report.contains("beta             up-to-date"), "got: {report}");
+    assert_ne!(store_mtime(&ctx, "alpha"), alpha_t1, "a moved pointer must refresh the member");
+    assert_eq!(store_mtime(&ctx, "beta"), beta_t1, "an unmoved member must not be re-written");
+    assert!(ctx.join("gamma/.cce/index.json").exists(), "new repo_ids join the workspace");
+    let yaml = std::fs::read_to_string(ctx.join(".cce/workspace.yml")).unwrap();
+    assert!(yaml.contains("  - name: gamma\n"), "got: {yaml}");
+}
+
+#[test]
+fn pull_all_synthesized_manifest_round_trips_and_hand_written_golden_is_untouched() {
+    let home = tempfile::tempdir().unwrap();
+    let (_bare, url) = bare_remote();
+    let alpha = tiny_repo("a.py", "def alpha_one():\n    return 1\n");
+    init_and_push(home.path(), &url, alpha.path(), "example.com__team__alpha");
+
+    let consumer = tempfile::tempdir().unwrap();
+    let ctx = consumer.path().join("ctx");
+    let out = cce(
+        home.path(),
+        &["sync", "pull", "--all", "--into", ctx.to_str().unwrap(), "--remote", &url],
+    );
+    assert!(out.status.success());
+    // The synthesized manifest is byte-stable across a refresh run (parse →
+    // re-serialize is the identity: the round-trip proof at the file level).
+    let yaml1 = std::fs::read_to_string(ctx.join(".cce/workspace.yml")).unwrap();
+    let out = cce(
+        home.path(),
+        &["sync", "pull", "--all", "--into", ctx.to_str().unwrap(), "--remote", &url],
+    );
+    assert!(out.status.success());
+    let yaml2 = std::fs::read_to_string(ctx.join(".cce/workspace.yml")).unwrap();
+    assert_eq!(yaml1, yaml2, "a refresh must round-trip the manifest byte-identically");
+
+    // Golden: a hand-written manifest is untouched by consumer mode — `cce
+    // workspace list` (the ordinary parser) accepts it byte-for-byte as written.
+    let hand = consumer.path().join("hand");
+    std::fs::create_dir_all(hand.join(".cce")).unwrap();
+    std::fs::create_dir_all(hand.join("api")).unwrap();
+    let golden = "version: 1\nname: hand\nmembers:\n  - name: api\n    path: api\n    type: rails-app\n    package: api\n";
+    std::fs::write(hand.join(".cce/workspace.yml"), golden).unwrap();
+    let out = cce(home.path(), &["workspace", "list", hand.to_str().unwrap()]);
+    assert!(out.status.success(), "hand-written manifest must still parse");
+    assert_eq!(
+        std::fs::read_to_string(hand.join(".cce/workspace.yml")).unwrap(),
+        golden,
+        "hand-written manifests must stay byte-identical"
+    );
+}
+
+#[test]
+fn pull_all_name_collision_gets_the_dash2_suffix() {
+    let home = tempfile::tempdir().unwrap();
+    let (_bare, url) = bare_remote();
+    // Two repo_ids whose last segment collides: `…acme__demo` and `…zeta__demo`.
+    let a = tiny_repo("a.py", "def acme_demo():\n    return 1\n");
+    let z = tiny_repo("z.py", "def zeta_demo():\n    return 2\n");
+    init_and_push(home.path(), &url, a.path(), "example.com__acme__demo");
+    init_and_push(home.path(), &url, z.path(), "example.com__zeta__demo");
+
+    let consumer = tempfile::tempdir().unwrap();
+    let ctx = consumer.path().join("ctx");
+    let out = cce(
+        home.path(),
+        &["sync", "pull", "--all", "--into", ctx.to_str().unwrap(), "--remote", &url],
+    );
+    assert!(out.status.success(), "pull --all failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    // repo_id order (acme < zeta): acme keeps `demo`, zeta gets `demo-2`.
+    let demo = std::fs::read_to_string(ctx.join("demo/.cce/config")).unwrap();
+    assert!(demo.contains("repo_id: example.com__acme__demo"), "got: {demo}");
+    let demo2 = std::fs::read_to_string(ctx.join("demo-2/.cce/config")).unwrap();
+    assert!(demo2.contains("repo_id: example.com__zeta__demo"), "got: {demo2}");
+    let yaml = std::fs::read_to_string(ctx.join(".cce/workspace.yml")).unwrap();
+    assert!(yaml.contains("  - name: demo\n    path: demo\n"), "got: {yaml}");
+    assert!(yaml.contains("  - name: demo-2\n    path: demo-2\n"), "got: {yaml}");
+
+    // A refresh keeps the mapping stable (config repo_id, not name re-derivation).
+    let out = cce(
+        home.path(),
+        &["sync", "pull", "--all", "--into", ctx.to_str().unwrap(), "--remote", &url],
+    );
+    assert!(out.status.success());
+    let report = String::from_utf8_lossy(&out.stdout).to_string();
+    assert!(
+        report.contains("summary       : 0 pulled · 2 up-to-date · 0 skipped"),
+        "got: {report}"
+    );
+}

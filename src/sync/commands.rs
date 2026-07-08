@@ -26,8 +26,9 @@ use crate::sync::remote::{GitRemote, SyncRemote};
 use crate::sync::{
     content_address, git, normalize_repo_id, pointer_address, HASH_EMBEDDER, SYNC_FORMAT_VERSION,
 };
-use crate::workspace::Manifest;
+use crate::workspace::{Manifest, Member, MemberType};
 use serde::{Deserialize, Serialize};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// Which sha a `pull` targets (SPEC-SYNC §5).
@@ -357,7 +358,11 @@ pub fn cmd_pull(
                 "  tree     : differs from the pulled sha — `cce index` locally for a WIP index\n",
             );
         }
-        None => {}
+        None => {
+            // Consumer mode (#54): no source checkout at all. The pulled index IS
+            // the corpus — nothing to compare, nothing to re-index.
+            out.push_str("  tree     : (no source checkout — consumer mode; the pulled index is the corpus)\n");
+        }
     }
     Ok(out)
 }
@@ -573,6 +578,221 @@ pub fn render_list_json(listing: &CacheListing) -> String {
         "repos": repos,
     });
     serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string()) + "\n"
+}
+
+/// The last `__` segment of a `repo_id` — the human-friendly member name
+/// (`github.com__acme__billing` → `billing`). A repo_id with no `__` is its own
+/// short name.
+fn short_member_name(repo_id: &str) -> String {
+    repo_id.rsplit("__").next().filter(|s| !s.is_empty()).unwrap_or(repo_id).to_string()
+}
+
+/// Resolve a collision-free member name with the workspace `-2`/`-3` convention
+/// (the first taker keeps the bare name; see `workspace::detect_members`).
+fn dedup_member_name(base: &str, used: &BTreeSet<String>) -> String {
+    if !used.contains(base) {
+        return base.to_string();
+    }
+    let mut n = 2usize;
+    loop {
+        let candidate = format!("{base}-{n}");
+        if !used.contains(&candidate) {
+            return candidate;
+        }
+        n += 1;
+    }
+}
+
+/// `cce sync pull --all --into <dir>` (#54): the one-command repo-less consumer
+/// workspace. Enumerates the cache (the #53 `cmd_list` machinery), pulls every
+/// repo_id's `--latest` artifact into `<dir>/<member>/.cce/`, and synthesizes
+/// `<dir>/.cce/workspace.yml` (+ per-member and root `.cce/config`) so
+/// `cce search --workspace <dir>` and `cce mcp --workspace --dir <dir>` work
+/// immediately — no source checkout anywhere.
+///
+/// Rules:
+/// - A repo with **no latest pointer** cannot be pulled `--latest`: it is warned
+///   and skipped; the run continues (one unpullable repo never fails the rest).
+/// - **Idempotent refresh**: a member whose installed sha (the `.cce/synced.json`
+///   marker `install_artifact` writes) equals the cache's latest pointer is
+///   reported `up-to-date` and not re-fetched; a moved pointer re-pulls exactly
+///   that member; new repo_ids gain new members; a member whose repo_id vanished
+///   from the cache is warned about but never deleted.
+/// - **Naming**: member name/directory = the repo_id's last `__` segment,
+///   collision-suffixed `-2`/`-3` in repo_id order; the full repo_id lives in the
+///   member's `.cce/config` (`sync.repo_id`), so per-member `cce sync pull
+///   --latest` refreshes also work.
+/// - Members are federated **at independent shas** — there is no one-workspace-sha
+///   assumption on the pull side.
+pub fn cmd_pull_all(into: &Path, remote_override: Option<String>) -> Result<String, String> {
+    std::fs::create_dir_all(into).map_err(|e| format!("cannot create {}: {e}", into.display()))?;
+    let listing = cmd_list(into, remote_override)?;
+    let mut out = format!("remote        : {}\n", listing.remote);
+    if listing.repos.is_empty() {
+        out.push_str("\nThe cache is empty — nothing has been pushed yet.\n");
+        return Ok(out);
+    }
+    // The same read-only open `cmd_list` uses: never write LFS attributes into
+    // the cache from a consumer.
+    let remote = GitRemote::open(&listing.remote, false)?;
+    let ver = SYNC_FORMAT_VERSION.to_string();
+
+    // A refresh run starts from the existing synthesized manifest; members map to
+    // cache repos via the `sync.repo_id` their `.cce/config` records.
+    let existing_manifest = Manifest::load(into).ok();
+    let workspace_name = existing_manifest
+        .as_ref()
+        .map(|m| m.name.clone())
+        .or_else(|| {
+            into.canonicalize()
+                .ok()
+                .and_then(|p| p.file_name().map(|s| s.to_string_lossy().to_string()))
+        })
+        .unwrap_or_else(|| ".".to_string());
+    let mut members: Vec<Member> = existing_manifest.map(|m| m.members).unwrap_or_default();
+    let mut used_names: BTreeSet<String> = members.iter().map(|m| m.name.clone()).collect();
+    let mut by_repo_id: BTreeMap<String, usize> = BTreeMap::new();
+    for (i, m) in members.iter().enumerate() {
+        if let Some(id) = SyncConfig::load(&into.join(&m.path)).repo_id {
+            by_repo_id.insert(id, i);
+        }
+    }
+
+    let (mut pulled, mut up_to_date, mut skipped) = (0usize, 0usize, 0usize);
+    let mut seen: BTreeSet<String> = BTreeSet::new();
+    out.push('\n');
+    for r in &listing.repos {
+        seen.insert(r.repo_id.clone());
+        // A repo without a latest pointer (rendered `-` by `sync list`) has
+        // nothing `--latest` can resolve: warn, count, continue.
+        let Some(sha) = &r.latest_sha else {
+            out.push_str(&format!(
+                "  warning: skipped {} — no latest pointer on `{}` (nothing pushed for the ref yet)\n",
+                r.repo_id,
+                crate::sync::DEFAULT_REF
+            ));
+            skipped += 1;
+            continue;
+        };
+        let existing = by_repo_id.get(&r.repo_id).copied();
+        let name = match existing {
+            Some(i) => members[i].name.clone(),
+            None => dedup_member_name(&short_member_name(&r.repo_id), &used_names),
+        };
+        let member_dir = match existing {
+            Some(i) => into.join(&members[i].path),
+            None => into.join(&name),
+        };
+        // The member config a later per-member `cce sync pull --latest`/`--commit`
+        // needs: the remote and the full repo_id. `lfs: false` keeps every
+        // consumer read from writing `.gitattributes` into the cache.
+        let member_cfg = SyncConfig {
+            remote: Some(listing.remote.clone()),
+            lfs: false,
+            repo_id: Some(r.repo_id.clone()),
+            auto_pull: false,
+            retention: crate::sync::config::Retention::All,
+        };
+
+        // Idempotent refresh: `install_artifact` records the installed sha in the
+        // `.cce/synced.json` marker; an unmoved latest pointer means no fetch.
+        let installed_sha = SyncState::load(&member_dir).map(|s| s.sha);
+        if installed_sha.as_deref() == Some(sha.as_str()) {
+            member_cfg
+                .save(&member_dir)
+                .map_err(|e| format!("could not write {} config: {e}", member_dir.display()))?;
+            if existing.is_none() {
+                used_names.insert(name.clone());
+                by_repo_id.insert(r.repo_id.clone(), members.len());
+                members.push(Member {
+                    name: name.clone(),
+                    path: name.clone(),
+                    member_type: MemberType::StoreOnly,
+                    package: name.clone(),
+                });
+            }
+            out.push_str(&format!("  {name:<16} up-to-date  {}@{sha}\n", r.repo_id));
+            up_to_date += 1;
+            continue;
+        }
+
+        let key = content_address(HASH_EMBEDDER, &ver, &r.repo_id, sha);
+        let installed = remote.get(&key).and_then(|bytes| install_artifact(&member_dir, &bytes));
+        match installed {
+            Ok(artifact) => {
+                member_cfg
+                    .save(&member_dir)
+                    .map_err(|e| format!("could not write {} config: {e}", member_dir.display()))?;
+                if existing.is_none() {
+                    used_names.insert(name.clone());
+                    by_repo_id.insert(r.repo_id.clone(), members.len());
+                    members.push(Member {
+                        name: name.clone(),
+                        path: name.clone(),
+                        member_type: MemberType::StoreOnly,
+                        package: name.clone(),
+                    });
+                }
+                out.push_str(&format!(
+                    "  {name:<16} pulled      {}@{sha}  chunks {}  ({})\n",
+                    r.repo_id,
+                    artifact.manifest.chunk_count,
+                    &artifact.manifest.checksum[..12]
+                ));
+                pulled += 1;
+            }
+            Err(e) => {
+                out.push_str(&format!("  warning: skipped {} — {e}\n", r.repo_id));
+                skipped += 1;
+            }
+        }
+    }
+
+    // Warn — never delete — for members whose repo_id vanished from the cache.
+    for m in &members {
+        if let Some(id) = SyncConfig::load(&into.join(&m.path)).repo_id {
+            if !seen.contains(&id) {
+                out.push_str(&format!(
+                    "  warning: {} ({id}) is no longer in the cache — left in place\n",
+                    m.name
+                ));
+            }
+        }
+    }
+
+    // Synthesize the workspace manifest + root config. Members sort by path (the
+    // manifest's deterministic order); the root config records the remote so a
+    // refresh run needs no `--remote`.
+    if members.is_empty() {
+        out.push_str("\nNothing pullable — no workspace written.\n");
+        return Ok(out);
+    }
+    members.sort_by(|a, b| a.path.cmp(&b.path));
+    let manifest = Manifest { version: 1, name: workspace_name, members };
+    manifest.save(into).map_err(|e| format!("could not write workspace manifest: {e}"))?;
+    let mut root_cfg = std::fs::read_to_string(crate::sync::config::config_path(into))
+        .ok()
+        .and_then(|t| SyncConfig::from_yaml(&t).ok())
+        .unwrap_or(SyncConfig {
+            remote: None,
+            lfs: false,
+            repo_id: None,
+            auto_pull: false,
+            retention: crate::sync::config::Retention::All,
+        });
+    root_cfg.remote = Some(listing.remote.clone());
+    root_cfg.save(into).map_err(|e| format!("could not write root config: {e}"))?;
+
+    out.push_str(&format!(
+        "\nworkspace     : {} ({} member{})\n",
+        crate::workspace::manifest_path(into).display(),
+        manifest.members.len(),
+        if manifest.members.len() == 1 { "" } else { "s" }
+    ));
+    out.push_str(&format!(
+        "summary       : {pulled} pulled · {up_to_date} up-to-date · {skipped} skipped\n"
+    ));
+    Ok(out)
 }
 
 /// `cce sync verify` (SPEC-SYNC §5): re-index locally and confirm the pulled
@@ -1361,6 +1581,120 @@ total         : 2 repos, 4 artifacts, 125504 bytes
             s,
             "remote        : file:///srv/cache.git\n\nThe cache is empty — nothing has been pushed yet.\n"
         );
+    }
+
+    // --- cmd_pull_all: the `cce sync pull --all` contract (#54) ---
+
+    #[test]
+    fn short_member_name_and_dedup_follow_the_workspace_convention() {
+        assert_eq!(short_member_name("github.com__acme__billing"), "billing");
+        assert_eq!(short_member_name("plain-id"), "plain-id");
+        assert_eq!(short_member_name("trailing__"), "trailing__");
+        let mut used: BTreeSet<String> = BTreeSet::new();
+        assert_eq!(dedup_member_name("demo", &used), "demo");
+        used.insert("demo".to_string());
+        assert_eq!(dedup_member_name("demo", &used), "demo-2");
+        used.insert("demo-2".to_string());
+        assert_eq!(dedup_member_name("demo", &used), "demo-3");
+    }
+
+    #[test]
+    fn pull_all_skips_pointerless_repos_pulls_the_rest_and_is_idempotent() {
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        // One real pushed repo (with a latest pointer)…
+        let src = source_repo();
+        init_cfg(src.path(), &url);
+        cmd_push(src.path(), None, false).unwrap();
+        let sha = git::head_sha(src.path()).unwrap();
+        // …and one repo_id with an artifact but NO latest pointer (real caches
+        // have these; `sync list` renders them `-`).
+        GitRemote::open(&url, false)
+            .unwrap()
+            .put("hash/2.3/example.com__acme__nolatest/1234567.cce", b"raw\n")
+            .unwrap();
+
+        let into = tempfile::tempdir().unwrap();
+        let out = cmd_pull_all(into.path(), Some(url.clone())).unwrap();
+        assert!(
+            out.contains("warning: skipped example.com__acme__nolatest — no latest pointer"),
+            "got: {out}"
+        );
+        assert!(
+            out.contains(&format!("demo             pulled      example.com__acme__demo@{sha}")),
+            "got: {out}"
+        );
+        assert!(out.contains("summary       : 1 pulled · 0 up-to-date · 1 skipped"), "got: {out}");
+
+        // The synthesized workspace: short-named member dir + store + config +
+        // manifest that round-trips through the ordinary parser.
+        let member = into.path().join("demo");
+        assert!(member.join(".cce/index.json").exists());
+        let mc = SyncConfig::load(&member);
+        assert_eq!(mc.repo_id.as_deref(), Some("example.com__acme__demo"));
+        assert_eq!(mc.remote.as_deref(), Some(url.as_str()));
+        assert!(!mc.lfs, "consumer configs must never write LFS attributes into the cache");
+        let manifest = Manifest::load(into.path()).unwrap();
+        assert_eq!(manifest.members.len(), 1);
+        assert_eq!(manifest.members[0].name, "demo");
+        assert_eq!(manifest.members[0].path, "demo");
+        assert_eq!(manifest.members[0].member_type, MemberType::StoreOnly);
+        // The skipped repo left no member and no directory.
+        assert!(!into.path().join("nolatest").exists());
+
+        // Second run: nothing moved — everything reports up-to-date, no re-pull.
+        let out2 = cmd_pull_all(into.path(), None).unwrap();
+        assert!(
+            out2.contains(&format!("demo             up-to-date  example.com__acme__demo@{sha}")),
+            "got: {out2}"
+        );
+        assert!(
+            out2.contains("summary       : 0 pulled · 1 up-to-date · 1 skipped"),
+            "got: {out2}"
+        );
+        std::env::remove_var("CCE_HOME");
+    }
+
+    #[test]
+    fn pull_all_warns_but_keeps_members_whose_repo_id_vanished() {
+        let _home = set_home();
+        let (_bare_a, url_a) = bare_remote();
+        let src = source_repo();
+        init_cfg(src.path(), &url_a);
+        cmd_push(src.path(), None, false).unwrap();
+
+        let into = tempfile::tempdir().unwrap();
+        cmd_pull_all(into.path(), Some(url_a)).unwrap();
+        assert!(into.path().join("demo/.cce/index.json").exists());
+
+        // Point the same consumer dir at a different (empty-of-this-repo) cache:
+        // the member is warned about, never deleted.
+        let (_bare_b, url_b) = bare_remote();
+        let src_b = source_repo();
+        SyncConfig {
+            remote: Some(url_b.clone()),
+            lfs: false,
+            repo_id: Some("example.com__acme__other".to_string()),
+            auto_pull: false,
+            retention: crate::sync::config::Retention::All,
+        }
+        .save(src_b.path())
+        .unwrap();
+        cmd_push(src_b.path(), None, false).unwrap();
+
+        let out = cmd_pull_all(into.path(), Some(url_b)).unwrap();
+        assert!(
+            out.contains(
+                "warning: demo (example.com__acme__demo) is no longer in the cache — left in place"
+            ),
+            "got: {out}"
+        );
+        assert!(into.path().join("demo/.cce/index.json").exists(), "vanished members are kept");
+        // The new cache's repo joined the same workspace.
+        let manifest = Manifest::load(into.path()).unwrap();
+        let names: Vec<&str> = manifest.members.iter().map(|m| m.name.as_str()).collect();
+        assert_eq!(names, vec!["demo", "other"]);
+        std::env::remove_var("CCE_HOME");
     }
 
     #[test]

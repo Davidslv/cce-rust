@@ -162,6 +162,7 @@ v1.
 cce sync init  --remote <git-url> [--lfs|--no-lfs] [--repo-id <id>] [--dir <path>]
 cce sync push  [--commit <sha>] [--workspace] [--dir <path>]
 cce sync pull  [--commit <sha> | --latest] [--force] [--workspace] [--dir <path>]
+cce sync pull  --all --into <dir> [--remote <url>]
 cce sync list  [--remote <url>] [--json] [--dir <path>]
 cce sync status [--dir <path>]
 cce sync verify [--commit <sha>] [--dir <path>]
@@ -189,6 +190,9 @@ Rules:
   friendly message, not an error. `--json` emits the stable `cce.synclist/v1`
   shape for scripting:
   `{"remote": …, "repos": [{"artifacts": N, "bytes": N, "latest_sha": sha|null, "repo_id": …}, …], "schema": "cce.synclist/v1"}`.
+- `pull --all --into <dir>` is **consumer mode** (§7): enumerate the cache, pull
+  every repo_id's latest artifact, and synthesize a ready-to-search workspace —
+  no source checkout anywhere.
 - Offline / no remote / auth failure → a clear message; local indexing and search
   continue to work.
 - **Workspace-aware:** `--workspace` iterates the manifest's members, each keyed by
@@ -200,7 +204,76 @@ Config keys (`<root>/.cce/config`, or global `~/.cce/config.yml`):
 
 ---
 
-## 7. Permissions — delegated to git
+## 7. Consumer mode — repo-less pull (no source checkout)
+
+A machine with only the `cce` binary and git read access to the cache can get
+full search + MCP over everything in it, **with zero source checkouts**. The
+artifact is a complete, self-contained corpus: search, `expand_chunk` (whole-file
+reconstruction), and the import graph all come from the pulled index alone.
+
+**Single repo.** A `--latest`/`--commit` pull needs no git checkout — only a
+config naming the remote and the repo_id:
+
+```console
+$ mkdir billing && cce sync init --remote <url> --no-lfs --repo-id github.com__acme__billing --dir billing
+$ cce sync pull --latest --dir billing
+Pulled github.com__acme__billing@<sha>
+  …
+  tree     : (no source checkout — consumer mode; the pulled index is the corpus)
+$ cce search "charge invoice" --dir billing        # or: cce mcp --dir billing
+```
+
+To refresh after the pointer moves, pass `--force` (the different-sha guard is
+protecting a *source* workflow; in consumer mode the pulled index is all there is).
+
+**The whole cache, one command.** `cce sync pull --all --into <dir>` enumerates
+the cache (the `cce sync list` machinery), pulls every repo_id's latest artifact,
+and synthesizes the workspace metadata, leaving `<dir>` immediately usable:
+
+```console
+$ cce sync pull --all --into ctx --remote <url>
+remote        : <url>
+
+  billing          pulled      github.com__acme__billing@<sha>  chunks 812  (18ca676d989d)
+  web              pulled      github.com__acme__web@<sha>  chunks 240  (f00dfeed0123)
+  warning: skipped github.com__acme__legacy — no latest pointer on `main` (nothing pushed for the ref yet)
+
+workspace     : ctx/.cce/workspace.yml (2 members)
+summary       : 2 pulled · 0 up-to-date · 1 skipped
+
+$ cce search "charge invoice" ctx --workspace      # member-tagged, federated
+$ cce mcp --workspace --dir ctx                    # federated context_search
+```
+
+Behaviour:
+
+- **Naming.** The member name *and* directory are the repo_id's last `__` segment
+  (`github.com__acme__billing` → `ctx/billing/`); collisions get the workspace
+  `-2`/`-3` suffix in repo_id order. The full repo_id lives in the member's
+  `.cce/config` (`sync.repo_id`), so a per-member `cce sync pull --latest
+  --dir ctx/billing` keeps working, and refresh runs never re-derive names.
+- **Synthesized manifest.** Members are written with `type: store-only` — the
+  neutral `MemberType` for a member with no source to classify. Detection never
+  emits it; hand-written manifests are untouched and stay byte-compatible.
+- **Idempotent refresh.** Re-running the same command re-pulls **only** members
+  whose latest pointer moved (the installed sha is the `.cce/synced.json` marker)
+  and reports `up-to-date` for the rest; new repo_ids in the cache become new
+  members; a member whose repo_id vanished from the cache is **warned about,
+  never deleted**.
+- **Skips are not failures.** A repo with no latest pointer (rendered `-` by
+  `sync list`) cannot be pulled `--latest`: it is warned and skipped, the run
+  continues, and the summary counts it. Exit code stays 0.
+- **Independent shas are the supported shape.** Each member federates at its own
+  latest sha — there is no monorepo one-sha assumption on the pull side (that
+  assumption exists only in `push --workspace`, which pushes a single checkout).
+- **Read-only towards the cache.** Consumer configs are written with
+  `lfs: false`, so no consumer ever commits `.gitattributes` into the cache
+  repo. (Reading an LFS-enabled cache still works — the smudge comes from the
+  cache's own committed attributes — but needs `git-lfs` installed.)
+
+---
+
+## 8. Permissions — delegated to git
 
 Access control is **whoever can pull the CCE Sync git repo**. Guidance:
 
@@ -214,7 +287,7 @@ Access control is **whoever can pull the CCE Sync git repo**. Guidance:
 
 ---
 
-## 8. CI recipe (GitHub Actions)
+## 9. CI recipe (GitHub Actions)
 
 Index `main` and push the cache on every merge. See
 [`docs/ci/cce-sync.yml`](ci/cce-sync.yml) for a ready-to-copy workflow.
@@ -256,7 +329,7 @@ access to the cache repo to `pull`; members with write access may also push
 
 ---
 
-## 9. Troubleshooting
+## 10. Troubleshooting
 
 | Symptom | Cause | Fix |
 | --- | --- | --- |
@@ -275,7 +348,7 @@ local-only state.
 
 ---
 
-## 10. See also
+## 11. See also
 
 - [`SPEC-SYNC.md`](../SPEC-SYNC.md) — the design specification.
 - [`docs/VERIFIED.md`](VERIFIED.md) — the cold-start verification transcript.

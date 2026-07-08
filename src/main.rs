@@ -289,6 +289,18 @@ enum SyncCmd {
         /// Pull every workspace member from its own cache.
         #[arg(long)]
         workspace: bool,
+        /// Consumer mode (#54): pull EVERY repo_id's latest artifact from the
+        /// cache and synthesize a ready-to-search workspace under `--into <dir>`.
+        /// Re-running refreshes only members whose latest pointer moved.
+        #[arg(long, requires = "into", conflicts_with_all = ["commit", "latest", "force", "workspace", "dir"])]
+        all: bool,
+        /// The consumer workspace directory `--all` creates or refreshes.
+        #[arg(long, requires = "all")]
+        into: Option<PathBuf>,
+        /// Pull from this cache URL (with `--all`; else the `--into` dir's
+        /// configured `sync.remote`).
+        #[arg(long, requires = "all")]
+        remote: Option<String>,
         /// Project/workspace root (default: current directory).
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -1163,7 +1175,14 @@ fn cmd_sync(cmd: SyncCmd) -> Result<(), String> {
             print!("{report}");
             Ok(())
         }
-        SyncCmd::Pull { commit, latest, force, workspace, dir } => {
+        SyncCmd::Pull { commit, latest, force, workspace, all, into, remote, dir } => {
+            if all {
+                // clap enforces `--all requires --into`.
+                let into = into.ok_or_else(|| "--all requires --into <dir>".to_string())?;
+                let report = sync_cmd::cmd_pull_all(&into, remote)?;
+                print!("{report}");
+                return Ok(());
+            }
             let root = sync_root(dir);
             let target = if latest {
                 sync_cmd::PullTarget::Latest

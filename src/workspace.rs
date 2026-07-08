@@ -31,6 +31,11 @@ pub enum MemberType {
     RubyGem,
     Typescript,
     Javascript,
+    /// A member with no source checkout — only a pulled `.cce/` store (consumer
+    /// mode, issue #54). Never produced by detection (there is no source to
+    /// classify); synthesized manifests (`cce sync pull --all`) write it, and
+    /// hand-written manifests may use it.
+    StoreOnly,
 }
 
 impl MemberType {
@@ -42,6 +47,7 @@ impl MemberType {
             MemberType::RubyGem => "ruby-gem",
             MemberType::Typescript => "typescript",
             MemberType::Javascript => "javascript",
+            MemberType::StoreOnly => "store-only",
         }
     }
 
@@ -53,6 +59,7 @@ impl MemberType {
             "ruby-gem" => Some(MemberType::RubyGem),
             "typescript" => Some(MemberType::Typescript),
             "javascript" => Some(MemberType::Javascript),
+            "store-only" => Some(MemberType::StoreOnly),
             _ => None,
         }
     }
@@ -727,6 +734,45 @@ mod tests {
         let parsed = Manifest::from_yaml(&yaml).unwrap();
         assert_eq!(parsed.members, m.members);
         assert_eq!(parsed.version, 1);
+    }
+
+    #[test]
+    fn store_only_member_type_round_trips_and_detection_never_emits_it() {
+        // The #54 consumer-mode variant: writer/parser round-trip through the
+        // canonical YAML, byte-identically.
+        assert_eq!(MemberType::StoreOnly.as_str(), "store-only");
+        assert_eq!(MemberType::parse("store-only"), Some(MemberType::StoreOnly));
+        let m = Manifest {
+            version: 1,
+            name: "ctx".to_string(),
+            members: vec![Member {
+                name: "billing".to_string(),
+                path: "billing".to_string(),
+                member_type: MemberType::StoreOnly,
+                package: "billing".to_string(),
+            }],
+        };
+        let yaml = m.to_yaml();
+        assert!(yaml.contains("    type: store-only\n"), "got: {yaml}");
+        let parsed = Manifest::from_yaml(&yaml).unwrap();
+        assert_eq!(parsed, m);
+        assert_eq!(parsed.to_yaml(), yaml, "round-trip must be byte-identical");
+
+        // Detection classifies source markers only — a store-only member can never
+        // be detected (there is no source), so detected manifests are unaffected
+        // by the new variant.
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join("bare").join(".cce")).unwrap();
+        assert!(detect_members(tmp.path()).is_empty());
+    }
+
+    #[test]
+    fn hand_written_manifest_with_known_types_round_trips_byte_identically() {
+        // Golden: the pre-#54 manifest grammar is untouched — a hand-written
+        // manifest re-serializes to its exact input bytes.
+        let golden = "version: 1\nname: shop\nmembers:\n  - name: api\n    path: api\n    type: rails-app\n    package: api\n  - name: web\n    path: web\n    type: javascript\n    package: web\n";
+        let m = Manifest::from_yaml(golden).unwrap();
+        assert_eq!(m.to_yaml(), golden);
     }
 
     #[test]
