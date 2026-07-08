@@ -339,6 +339,33 @@ mod tests {
     }
 
     #[test]
+    fn list_skips_non_artifact_listing_entries_gracefully() {
+        // Issue #37: a cache repo can accumulate entries that are not artifacts
+        // (a README, a file with no extension) beside the `<sha>.cce` blobs, so
+        // the real `ls-tree` listing contains lines the parser must treat as
+        // malformed. Pinned behavior: those lines are skipped silently — the
+        // listing still succeeds and returns every real artifact (graceful
+        // skip, not an error). Also pinned: a `.cce` blob in a nested
+        // subdirectory is listed by its basename (`ls-tree -r` recurses).
+        // Unit-level on purpose: no CLI command calls `SyncRemote::list` today,
+        // so the binary cannot reach this parser.
+        let _home = with_home();
+        let (_bare, url) = bare_remote();
+        let remote = GitRemote::open(&url, false).unwrap();
+        remote
+            .put_many(&[
+                ("hash/2.3/x/abc123.cce".to_string(), b"A\n".to_vec()),
+                ("hash/2.3/x/README.md".to_string(), b"not an artifact\n".to_vec()),
+                ("hash/2.3/x/no-extension".to_string(), b"junk\n".to_vec()),
+                ("hash/2.3/x/nested/deadbeef.cce".to_string(), b"B\n".to_vec()),
+            ])
+            .unwrap();
+        let shas = remote.list("hash/2.3/x").unwrap();
+        assert_eq!(shas, vec!["abc123".to_string(), "deadbeef".to_string()]);
+        std::env::remove_var("CCE_HOME");
+    }
+
+    #[test]
     fn open_fails_on_unreachable_remote() {
         let _home = with_home();
         // A file:// URL to a path that is not a repo fails to clone.

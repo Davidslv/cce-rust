@@ -257,6 +257,30 @@ fn search_workspace_without_manifest_errors_clearly() {
     assert!(String::from_utf8_lossy(&out.stderr).contains("workspace init"));
 }
 
+#[test]
+fn search_workspace_with_malformed_manifest_errors_clearly() {
+    // Issue #37: a syntactically broken workspace.yml (unclosed flow sequence)
+    // must surface src/workspace.rs's friendly `invalid workspace.yml: …` error
+    // from both federated read commands — non-zero exit, no panic.
+    let tmp = copy_fixture();
+    let root = tmp.path().to_str().unwrap();
+    std::fs::create_dir_all(tmp.path().join(".cce")).unwrap();
+    std::fs::write(tmp.path().join(".cce/workspace.yml"), "version: 1\nmembers: [\n").unwrap();
+
+    for args in
+        [["search", "q", root, "--workspace"].as_slice(), ["stats", root, "--workspace"].as_slice()]
+    {
+        let out = run(args);
+        assert!(!out.status.success(), "{args:?} with a broken manifest must exit non-zero");
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        assert!(
+            stderr.contains("error: invalid workspace.yml:"),
+            "{args:?} must surface the friendly manifest error, got: {stderr}"
+        );
+        assert!(!stderr.contains("panicked"), "{args:?} must not panic, got: {stderr}");
+    }
+}
+
 /// Re-assert the single-repo conformance output is byte-identical to the checked-in
 /// `conformance.json` (workspace mode must not perturb it — SPEC-V2.2 §10).
 #[test]

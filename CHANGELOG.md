@@ -30,6 +30,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   same friendly guidance instead of silent no-results. Valid scopes are byte-identical.
 
 ### Added
+- **Binary-level error-path tests: corrupt store, malformed manifest, garbage remote listing,
+  dashboard CLI (#37).** Four real-world corruption scenarios are now pinned by driving the real
+  `cce` binary: a truncated-JSON or binary-junk store makes `search`/`stats` exit non-zero with the
+  friendly `could not load store …` message (never a panic); a syntactically broken
+  `.cce/workspace.yml` surfaces `invalid workspace.yml: …` from `search --workspace` and
+  `stats --workspace`; non-artifact entries in a sync remote's ref listing are skipped gracefully
+  by `SyncRemote::list` (unit-level — no CLI command reaches the listing parser today); and
+  `cce dashboard --port 0 --no-open` (plus the `--workspace` variant) binds an ephemeral loopback
+  port, prints the URL, and answers `/api/health` with 200 + valid JSON. Test-only — no behavior
+  change.
 - **Tests for `src/main.rs` and a byte-pinned `search --json` golden (#32).** The CLI entry point
   (~1,300 lines) previously had zero tests. It now has a unit suite pinning current behavior of the
   pure helpers — `parse_scope` comma/whitespace/empty-segment edges, `resolve_read_store` /
