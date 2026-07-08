@@ -24,10 +24,12 @@ use crate::sync::artifact::{Artifact, ManifestMeta};
 use crate::sync::config::SyncConfig;
 use crate::sync::remote::{GitRemote, SyncRemote};
 use crate::sync::{
-    content_address, git, normalize_repo_id, pointer_address, HASH_EMBEDDER, SYNC_FORMAT_VERSION,
+    content_address, git, hex_lower, normalize_repo_id, pointer_address, workspace_graph_address,
+    workspace_manifest_address, HASH_EMBEDDER, SYNC_FORMAT_VERSION,
 };
 use crate::workspace::{Manifest, Member, MemberType};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -48,6 +50,17 @@ pub struct SyncState {
     pub repo_id: String,
     pub sha: String,
     pub checksum: String,
+    /// SHA-256 (lowercase hex) of the exact `index.json` bytes written at
+    /// install time (#55, `verify --checksum-only`). Recorded from the
+    /// **installed file on disk**, not re-derived through any export path, so
+    /// the later re-hash is version-independent: an artifact pushed by an
+    /// older cce verifies against what THIS pull actually wrote, never against
+    /// a byte shape the current code would produce. **Additive:** markers
+    /// written by older binaries lack it (`verify --checksum-only` then
+    /// reports a clear re-pull notice, not a false failure), and older
+    /// binaries reading a new marker ignore the extra field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_sha256: Option<String>,
 }
 
 impl SyncState {
@@ -224,7 +237,16 @@ pub fn cmd_push(root: &Path, commit: Option<String>, workspace: bool) -> Result<
     Ok(format!("Pushed {repo_id}@{sha}\n  key      : {key}\n  checksum : {checksum}\n"))
 }
 
-/// Push every workspace member, each keyed by its own `repo_id@sha`.
+/// Push every workspace member, each keyed by its own `repo_id@sha`, then
+/// publish the workspace metadata under the **base** repo_id (#55, the
+/// self-describing cache): the canonical `workspace.yml` bytes and a freshly
+/// derived `workspace-graph.json` at the well-known
+/// `workspace_manifest_address`/`workspace_graph_address` keys. Publishing is
+/// **additive** — neither key is a `<sha>.cce` artifact nor a `refs/<ref>`
+/// pointer, so existing artifact keys, ref pointers, and old-client pulls are
+/// untouched. The graph is re-derived from the source manifests on disk (the
+/// same `build_graph` `cce index --workspace` uses) rather than re-uploading a
+/// possibly stale `.cce/workspace-graph.json`.
 fn push_workspace(
     root: &Path,
     cfg: &SyncConfig,
@@ -240,6 +262,17 @@ fn push_workspace(
         let (key, checksum) = push_one(&member_dir, remote, &repo_id, &sha)?;
         out.push_str(&format!("  {:<16} {key}  ({})\n", m.name, &checksum[..12]));
     }
+    let ver = SYNC_FORMAT_VERSION.to_string();
+    let graph = crate::workspace::build_graph(root, &manifest);
+    remote.put_many(&[
+        (workspace_manifest_address(HASH_EMBEDDER, &ver, &base), manifest.to_yaml().into_bytes()),
+        (workspace_graph_address(HASH_EMBEDDER, &ver, &base), graph.to_json().into_bytes()),
+    ])?;
+    out.push_str(&format!(
+        "  metadata         workspace.yml + workspace-graph.json under {base} ({} edge{})\n",
+        graph.edges.len(),
+        if graph.edges.len() == 1 { "" } else { "s" }
+    ));
     Ok(out)
 }
 
@@ -274,10 +307,17 @@ fn install_artifact(root: &Path, bytes: &[u8]) -> Result<Artifact, String> {
     let index = artifact.clone().into_index();
     let store = default_store_path(root);
     index.save(&store).map_err(|e| format!("could not write {}: {e}", store.display()))?;
+    // #55: hash the EXACT bytes just installed (read back from disk) so
+    // `verify --checksum-only` has a version-independent baseline — "has this
+    // file changed since pull", regardless of which cce version pushed the
+    // artifact. Best-effort: an unreadable store leaves the field absent and
+    // verify reports the re-pull notice.
+    let installed_sha256 = std::fs::read(&store).ok().map(|b| hex_lower(&Sha256::digest(&b)));
     SyncState {
         repo_id: artifact.manifest.repo_id.clone(),
         sha: artifact.manifest.sha.clone(),
         checksum: artifact.manifest.checksum.clone(),
+        installed_sha256,
     }
     .save(root)
     .map_err(|e| format!("could not write sync marker: {e}"))?;
@@ -367,17 +407,75 @@ pub fn cmd_pull(
     Ok(out)
 }
 
-/// Pull every workspace member from its own `repo_id@sha` cache.
+/// Fetch the published workspace metadata for `base` — the manifest and (when
+/// present) the cross-member graph — if the cache carries them (#55, the
+/// self-describing cache). **Best-effort by design:** an old cache that never
+/// published metadata returns `None` and the caller proceeds exactly as before
+/// (#55 is additive); unparsable metadata is treated the same as absent.
+fn fetch_published_workspace(
+    remote: &dyn SyncRemote,
+    ver: &str,
+    base: &str,
+) -> Option<(Manifest, Option<crate::workspace::WorkspaceGraph>)> {
+    let yaml = remote.get(&workspace_manifest_address(HASH_EMBEDDER, ver, base)).ok()?;
+    let manifest = Manifest::from_yaml(std::str::from_utf8(&yaml).ok()?).ok()?;
+    let graph = remote
+        .get(&workspace_graph_address(HASH_EMBEDDER, ver, base))
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+        .and_then(|t| crate::workspace::WorkspaceGraph::from_json(&t).ok());
+    Some((manifest, graph))
+}
+
+/// Merge the published member metadata into the local manifest (#55). Members
+/// are matched **by name**; the local `path` — the consumer's actual on-disk
+/// layout — always wins, while `type` and `package` adopt the published truth
+/// (a repo-less consumer has no source to re-detect them from). Returns how
+/// many members were enriched.
+fn merge_published_members(local: &mut Manifest, published: &Manifest) -> usize {
+    let mut merged = 0usize;
+    for m in &mut local.members {
+        if let Some(p) = published.member(&m.name) {
+            m.member_type = p.member_type;
+            m.package = p.package.clone();
+            merged += 1;
+        }
+    }
+    merged
+}
+
+/// Pull every workspace member from its own `repo_id@sha` cache, then install
+/// the published workspace metadata (#55) so a repo-less consumer keeps the
+/// real member types/packages AND the cross-member dependency edges that drive
+/// federated graph expansion. With no local manifest at all, the published one
+/// bootstraps the layout (its member paths become the consumer directories).
 fn pull_workspace(
     root: &Path,
     cfg: &SyncConfig,
     remote: &dyn SyncRemote,
     target: &PullTarget,
 ) -> Result<String, String> {
-    let manifest = Manifest::load(root)?;
     let base = resolve_repo_id(root, cfg)?;
     let ver = SYNC_FORMAT_VERSION.to_string();
+    let published = fetch_published_workspace(remote, &ver, &base);
+    let (manifest, bootstrapped) = match Manifest::load(root) {
+        Ok(m) => (m, false),
+        // #55: a repo-less consumer with only a config — bootstrap the layout
+        // from the published manifest. Without one, the original error stands.
+        Err(load_err) => match &published {
+            Some((p, _)) => {
+                p.save(root).map_err(|e| format!("could not write workspace manifest: {e}"))?;
+                (p.clone(), true)
+            }
+            None => return Err(load_err),
+        },
+    };
     let mut out = format!("Pulling workspace {}\n", manifest.name);
+    if bootstrapped {
+        out.push_str(&format!(
+            "  manifest         installed from the published metadata under {base}\n"
+        ));
+    }
     for m in &manifest.members {
         let member_dir = root.join(&m.path);
         let repo_id = format!("{base}__{}", m.name);
@@ -391,6 +489,25 @@ fn pull_workspace(
             artifact.manifest.chunk_count,
             &artifact.manifest.checksum[..12]
         ));
+    }
+    // #55: adopt the published member metadata and install the published graph.
+    // Absent metadata (an old cache) changes nothing — the pre-#55 behaviour.
+    if let Some((p, graph)) = published {
+        let mut merged_manifest = manifest;
+        merge_published_members(&mut merged_manifest, &p);
+        merged_manifest
+            .save(root)
+            .map_err(|e| format!("could not write workspace manifest: {e}"))?;
+        if let Some(g) = graph {
+            g.save(root).map_err(|e| format!("could not write workspace graph: {e}"))?;
+            out.push_str(&format!(
+                "  metadata         workspace.yml + workspace-graph.json installed ({} cross-member edge{})\n",
+                g.edges.len(),
+                if g.edges.len() == 1 { "" } else { "s" }
+            ));
+        } else {
+            out.push_str("  metadata         workspace.yml installed (no published graph)\n");
+        }
     }
     Ok(out)
 }
@@ -470,6 +587,13 @@ pub struct RepoListing {
 pub struct CacheListing {
     pub remote: String,
     pub repos: Vec<RepoListing>,
+    /// Base repo_ids carrying **published workspace metadata** (#55): a
+    /// `workspace.yml` blob at the well-known `workspace_manifest_address`.
+    /// Sorted (repo_id order). A prefix that is *pure metadata* — no artifacts
+    /// and no latest pointer — lists here and NOT in `repos`, so the rendered
+    /// `sync list` output (byte-pinned `cce.synclist/v1`) is unchanged and
+    /// `pull --all` never warn-skips a metadata prefix as an unpullable repo.
+    pub workspaces: Vec<String>,
 }
 
 /// `cce sync list` (#53): enumerate what a cache holds — one row per `repo_id`
@@ -494,6 +618,7 @@ pub fn cmd_list(root: &Path, remote_override: Option<String>) -> Result<CacheLis
     let ver = SYNC_FORMAT_VERSION.to_string();
     let base = format!("{HASH_EMBEDDER}/{ver}");
     let mut repos = Vec::new();
+    let mut workspaces = Vec::new();
     for repo_id in remote.list_dirs(&base)? {
         let prefix = format!("{base}/{repo_id}");
         // The pinned #37 walk: `.cce` shas only, junk entries skipped gracefully.
@@ -501,10 +626,20 @@ pub fn cmd_list(root: &Path, remote_override: Option<String>) -> Result<CacheLis
         let bytes = remote.list_artifact_sizes(&prefix)?.iter().map(|(_, b)| b).sum();
         let pointer = pointer_address(HASH_EMBEDDER, &ver, &repo_id, crate::sync::DEFAULT_REF);
         let latest_sha = remote.read_blob_text(&pointer).ok().filter(|s| !s.is_empty());
+        // #55: a prefix carrying published workspace metadata is a workspace base.
+        let has_manifest =
+            remote.has(&workspace_manifest_address(HASH_EMBEDDER, &ver, &repo_id)).unwrap_or(false);
+        if has_manifest {
+            workspaces.push(repo_id.clone());
+            if shas.is_empty() && latest_sha.is_none() {
+                // Pure metadata — nothing pullable lives here; not a repo row.
+                continue;
+            }
+        }
         repos.push(RepoListing { repo_id, latest_sha, artifacts: shas.len(), bytes });
     }
-    // `list_dirs` already sorts, so the rows are deterministic by repo_id.
-    Ok(CacheListing { remote: url, repos })
+    // `list_dirs` already sorts, so rows and workspaces are deterministic by repo_id.
+    Ok(CacheListing { remote: url, repos, workspaces })
 }
 
 /// Render a cache listing as the human table: a `remote` header line in the
@@ -674,7 +809,26 @@ pub fn cmd_pull_all(into: &Path, remote_override: Option<String>) -> Result<Stri
             skipped += 1;
             continue;
         };
-        let existing = by_repo_id.get(&r.repo_id).copied();
+        // The member this repo maps to: the config-recorded repo_id (the stable
+        // mapping), else — live-review finding — RE-ADOPT an orphaned member: a
+        // manifest entry with this repo's short name whose directory lost its
+        // `.cce/config` (e.g. the store dir was deleted by hand). Without this
+        // a refresh would create `<name>-2` beside the orphaned `<name>` dir.
+        let existing = by_repo_id.get(&r.repo_id).copied().or_else(|| {
+            let short = short_member_name(&r.repo_id);
+            let orphan = members.iter().position(|m| {
+                m.name == short && SyncConfig::load(&into.join(&m.path)).repo_id.is_none()
+            });
+            if let Some(i) = orphan {
+                out.push_str(&format!(
+                    "  note: re-adopting existing member `{}` for {} (its config was missing — \
+                     rewritten)\n",
+                    members[i].name, r.repo_id
+                ));
+                by_repo_id.insert(r.repo_id.clone(), i);
+            }
+            orphan
+        });
         let name = match existing {
             Some(i) => members[i].name.clone(),
             None => dedup_member_name(&short_member_name(&r.repo_id), &used_names),
@@ -760,6 +914,47 @@ pub fn cmd_pull_all(into: &Path, remote_override: Option<String>) -> Result<Stri
         }
     }
 
+    // #55: apply the published workspace metadata (the self-describing cache).
+    // Each published manifest applies only to its OWN members — the ones whose
+    // repo_id is `<base>__<published-name>` — enriching the synthesized entries
+    // with the real type/package. Members covered by no manifest keep the #54
+    // synthesis. Consumer names/paths never change (the #54 short-name layout is
+    // the stable, refresh-idempotent one), so the published graphs' member
+    // references are REWRITTEN to the consumer names; the collision rule is
+    // therefore #54's: the first taker in repo_id order keeps the bare name, a
+    // later workspace's same-named member stays at its `-2`/`-3` name — warned.
+    let mut edge_set: BTreeSet<(String, String, String)> = BTreeSet::new();
+    let mut manifests_applied = 0usize;
+    for ws_base in &listing.workspaces {
+        let Some((published, graph)) = fetch_published_workspace(&remote, &ver, ws_base) else {
+            continue; // unparsable — treated as absent (best-effort, additive)
+        };
+        manifests_applied += 1;
+        // This workspace's mapping: published member name -> consumer member name.
+        let mut name_map: BTreeMap<String, String> = BTreeMap::new();
+        for pm in &published.members {
+            let repo_id = format!("{ws_base}__{}", pm.name);
+            let Some(&i) = by_repo_id.get(&repo_id) else { continue };
+            members[i].member_type = pm.member_type;
+            members[i].package = pm.package.clone();
+            name_map.insert(pm.name.clone(), members[i].name.clone());
+            if members[i].name != pm.name {
+                out.push_str(&format!(
+                    "  warning: workspace {ws_base}: member name `{}` was taken by an earlier \
+                     repo — kept as `{}` (first in repo_id order wins)\n",
+                    pm.name, members[i].name
+                ));
+            }
+        }
+        if let Some(g) = graph {
+            for e in &g.edges {
+                if let (Some(from), Some(to)) = (name_map.get(&e.from), name_map.get(&e.to)) {
+                    edge_set.insert((from.clone(), to.clone(), e.via.clone()));
+                }
+            }
+        }
+    }
+
     // Synthesize the workspace manifest + root config. Members sort by path (the
     // manifest's deterministic order); the root config records the remote so a
     // refresh run needs no `--remote`.
@@ -770,6 +965,26 @@ pub fn cmd_pull_all(into: &Path, remote_override: Option<String>) -> Result<Stri
     members.sort_by(|a, b| a.path.cmp(&b.path));
     let manifest = Manifest { version: 1, name: workspace_name, members };
     manifest.save(into).map_err(|e| format!("could not write workspace manifest: {e}"))?;
+
+    // #55: install the merged cross-member graph when any manifest was applied.
+    // With none published this writes nothing — exactly the #54 behaviour.
+    if manifests_applied > 0 {
+        let graph = crate::workspace::WorkspaceGraph {
+            members: manifest.members.iter().map(|m| m.name.clone()).collect(),
+            edges: edge_set
+                .into_iter()
+                .map(|(from, to, via)| crate::workspace::Edge { from, to, via })
+                .collect(),
+        };
+        graph.save(into).map_err(|e| format!("could not write workspace graph: {e}"))?;
+        out.push_str(&format!(
+            "\nmetadata      : {manifests_applied} published workspace manifest{} applied · {} \
+             cross-member edge{} installed",
+            if manifests_applied == 1 { "" } else { "s" },
+            graph.edges.len(),
+            if graph.edges.len() == 1 { "" } else { "s" }
+        ));
+    }
     let mut root_cfg = std::fs::read_to_string(crate::sync::config::config_path(into))
         .ok()
         .and_then(|t| SyncConfig::from_yaml(&t).ok())
@@ -837,6 +1052,141 @@ pub fn cmd_verify(root: &Path, commit: Option<String>) -> Result<String, String>
              The pulled cache does not match a local rebuild (working tree differs from the sha, \
              or the cache is not trustworthy)."
         ))
+    }
+}
+
+/// One pulled store's checksum-only outcome (#55): verified against the
+/// recorded install hash, or no hash recorded (a marker written by an older
+/// cce) — the latter is a clear re-pull notice, never a false failure.
+enum ChecksumVerify {
+    /// The on-disk bytes match the recorded install hash (carried for the report).
+    Ok(SyncState, String),
+    /// The marker predates `installed_sha256`; verification is unavailable
+    /// until a re-pull records it.
+    NoRecord(SyncState),
+}
+
+/// Verify one pulled store by re-hash alone (#55): SHA-256 the on-disk
+/// `index.json` bytes and compare against the `installed_sha256` the pull
+/// recorded in `.cce/synced.json`. **No export path is involved**, so the check
+/// is version-independent — an artifact pushed by ANY older cce version
+/// verifies against what this machine's pull actually wrote ("has this file
+/// changed since pull"), never against a byte shape the current code would
+/// produce. `label` names the store in messages (a member name, or the repo_id
+/// for a single pull).
+fn verify_store_checksum(dir: &Path, label: &str) -> Result<ChecksumVerify, String> {
+    let state = SyncState::load(dir).ok_or_else(|| {
+        format!("nothing to verify for {label}: no `.cce/synced.json` marker (not a pulled store)")
+    })?;
+    let Some(expected) = state.installed_sha256.clone() else {
+        return Ok(ChecksumVerify::NoRecord(state));
+    };
+    let store = default_store_path(dir);
+    let bytes = std::fs::read(&store).map_err(|e| {
+        format!(
+            "verify FAILED (checksum-only) for {label} ({}@{})\n  the pulled store could not \
+             be read: {e}\n  Re-pull it with `cce sync pull --force`.",
+            state.repo_id, state.sha
+        )
+    })?;
+    let actual = hex_lower(&Sha256::digest(&bytes));
+    if actual != expected {
+        return Err(format!(
+            "verify FAILED (checksum-only) for {label} ({}@{})\n  expected : {expected}\n  \
+             actual   : {actual}\n  The pulled store does not match the bytes recorded at pull \
+             time — corruption or local modification of the store. Re-pull with `cce sync pull \
+             --force`.\n  (Checksum-only detects corruption, not a malicious build — true \
+             `artifact == build(sha)` verification needs the source and stays with the \
+             source-holders/CI: `cce sync verify`.)",
+            state.repo_id, state.sha
+        ));
+    }
+    Ok(ChecksumVerify::Ok(state, actual))
+}
+
+/// The re-pull notice for a marker without an install hash (written by an
+/// older cce). A notice, not a failure: the store is not known-bad, it is
+/// unverifiable until a re-pull records the hash.
+const NO_RECORD_NOTICE: &str =
+    "no install checksum recorded (pulled by an older cce) — re-pull with `cce sync pull \
+     --force` to enable checksum verification";
+
+/// `cce sync verify --checksum-only` (#55): re-hash the PULLED store's on-disk
+/// bytes against the SHA-256 **recorded from the installed bytes at pull time**
+/// (`installed_sha256` in `.cce/synced.json`) — zero source checkout, zero
+/// rebuild, zero remote access, so it works for repo-less consumers, where full
+/// `verify` (which rebuilds from the working tree) inherently cannot.
+///
+/// **Version-independent by construction:** the baseline is hashed from the
+/// exact file the pull wrote, so artifacts pushed by older cce versions verify
+/// exactly like current ones. (An earlier design re-exported the installed
+/// index with the CURRENT code and compared against the artifact-manifest
+/// checksum computed at PUSH time — any byte-level difference between the two
+/// versions' export shapes false-failed intact pulls. Live-verified against a
+/// mixed-version cache.)
+///
+/// **Old markers:** a `.cce/synced.json` written before `installed_sha256`
+/// existed cannot be verified; that is reported as an explicit *notice* with
+/// **exit 0** — the store is not known-bad, it is unverifiable until a re-pull
+/// records the hash. Only a real mismatch (or unreadable store) is a non-zero
+/// failure, naming the member.
+///
+/// **Honest caveat (documented):** this detects *corruption, not a malicious
+/// build*. `artifact == build(sha)` verification requires the source and stays
+/// with source-holders (CI); the repo-less trust posture is CI-as-canonical-
+/// pusher plus the git host's access control.
+///
+/// Workspace-aware: with a workspace manifest at `root`, every member's pulled
+/// store is verified and a failure names the member; without one, the root
+/// store is verified. Exit codes and message shapes mirror full `verify`.
+pub fn cmd_verify_checksum_only(root: &Path) -> Result<String, String> {
+    match Manifest::load(root) {
+        Ok(manifest) => {
+            let mut out = String::new();
+            let (mut verified, mut unrecorded) = (0usize, 0usize);
+            for m in &manifest.members {
+                let label = format!("member `{}`", m.name);
+                match verify_store_checksum(&root.join(&m.path), &label)? {
+                    ChecksumVerify::Ok(state, checksum) => {
+                        out.push_str(&format!(
+                            "  {:<16} {}@{}  ({})\n",
+                            m.name,
+                            state.repo_id,
+                            state.sha,
+                            &checksum[..12]
+                        ));
+                        verified += 1;
+                    }
+                    ChecksumVerify::NoRecord(_) => {
+                        out.push_str(&format!("  {:<16} {NO_RECORD_NOTICE}\n", m.name));
+                        unrecorded += 1;
+                    }
+                }
+            }
+            let header = if unrecorded == 0 {
+                format!(
+                    "verify OK (checksum-only): {verified} member{}",
+                    if verified == 1 { "" } else { "s" }
+                )
+            } else {
+                format!(
+                    "verify OK (checksum-only): {verified} member{} verified · {unrecorded} \
+                     without a recorded install checksum (re-pull to enable)",
+                    if verified == 1 { "" } else { "s" }
+                )
+            };
+            Ok(format!("{header}\n{out}"))
+        }
+        Err(_) => match verify_store_checksum(root, "this store")? {
+            ChecksumVerify::Ok(state, checksum) => Ok(format!(
+                "verify OK (checksum-only): {}@{}\n  checksum : {checksum}\n",
+                state.repo_id, state.sha
+            )),
+            ChecksumVerify::NoRecord(state) => Ok(format!(
+                "verify (checksum-only): {}@{}: {NO_RECORD_NOTICE}\n",
+                state.repo_id, state.sha
+            )),
+        },
     }
 }
 
@@ -1117,6 +1467,7 @@ mod tests {
     }
 
     /// A git workspace with two detectable JS members, committed on `main`.
+    /// `alpha` declares a dependency on `beta` (one cross-member edge, #55).
     fn workspace_repo() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
@@ -1124,7 +1475,12 @@ mod tests {
         for name in ["alpha", "beta"] {
             let m = d.join(name);
             std::fs::create_dir_all(m.join("src")).unwrap();
-            std::fs::write(m.join("package.json"), format!("{{\"name\":\"{name}\"}}")).unwrap();
+            let pkg = if name == "alpha" {
+                format!("{{\"name\":\"{name}\",\"dependencies\":{{\"beta\":\"1.0.0\"}}}}")
+            } else {
+                format!("{{\"name\":\"{name}\"}}")
+            };
+            std::fs::write(m.join("package.json"), pkg).unwrap();
             std::fs::write(m.join("src/index.js"), format!("function {name}() {{ return 1; }}\n"))
                 .unwrap();
         }
@@ -1173,6 +1529,169 @@ mod tests {
         // Each member now has its own store.
         assert!(dst.path().join("alpha/.cce/index.json").exists());
         assert!(dst.path().join("beta/.cce/index.json").exists());
+        std::env::remove_var("CCE_HOME");
+    }
+
+    /// #55 Part 2: `pull --workspace` installs the published metadata into the
+    /// root `.cce/` — the graph verbatim (names resolve against the manifest)
+    /// and the manifest's member types/packages merged over the local one.
+    #[test]
+    fn workspace_pull_installs_published_manifest_and_graph() {
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let src = workspace_repo();
+        let cfg = SyncConfig {
+            remote: Some(url.clone()),
+            lfs: false,
+            repo_id: Some("example.com__acme__mono".to_string()),
+            auto_pull: false,
+            retention: crate::sync::config::Retention::All,
+        };
+        cfg.save(src.path()).unwrap();
+        cmd_push(src.path(), None, true).unwrap();
+
+        let dst = source_repo_clone(&src);
+        cfg.save(dst.path()).unwrap();
+        let out = cmd_pull(dst.path(), PullTarget::Head, false, true).unwrap();
+        assert!(
+            out.contains("workspace.yml + workspace-graph.json installed (1 cross-member edge)"),
+            "got: {out}"
+        );
+        // The installed graph is the published one — cross-member expansion has
+        // its alpha -> beta edge without any source derivation.
+        let manifest = Manifest::load(dst.path()).unwrap();
+        let graph = crate::workspace::WorkspaceGraph::load_or_empty(dst.path(), &manifest);
+        assert_eq!(graph.targets_from("alpha"), vec!["beta"]);
+        // The merged manifest carries the real (published) types/packages.
+        assert_eq!(manifest.member("alpha").unwrap().member_type, MemberType::Javascript);
+        assert_eq!(manifest.member("alpha").unwrap().package, "alpha");
+        std::env::remove_var("CCE_HOME");
+    }
+
+    /// #55 Part 2: a REPO-LESS `pull --workspace --latest` — a bare directory
+    /// with only a `.cce/config` — bootstraps the layout from the published
+    /// manifest (its member paths become the consumer directories).
+    #[test]
+    fn workspace_pull_bootstraps_repo_less_from_the_published_manifest() {
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let src = workspace_repo();
+        let cfg = SyncConfig {
+            remote: Some(url.clone()),
+            lfs: false,
+            repo_id: Some("example.com__acme__mono".to_string()),
+            auto_pull: false,
+            retention: crate::sync::config::Retention::All,
+        };
+        cfg.save(src.path()).unwrap();
+        cmd_push(src.path(), None, true).unwrap();
+
+        // A bare consumer dir: no git checkout, no manifest — only the config.
+        let bare_dir = tempfile::tempdir().unwrap();
+        cfg.save(bare_dir.path()).unwrap();
+        let out = cmd_pull(bare_dir.path(), PullTarget::Latest, false, true).unwrap();
+        assert!(
+            out.contains("manifest         installed from the published metadata"),
+            "got: {out}"
+        );
+        assert!(bare_dir.path().join("alpha/.cce/index.json").exists());
+        assert!(bare_dir.path().join("beta/.cce/index.json").exists());
+        let manifest = Manifest::load(bare_dir.path()).unwrap();
+        let graph = crate::workspace::WorkspaceGraph::load_or_empty(bare_dir.path(), &manifest);
+        assert_eq!(graph.targets_from("alpha"), vec!["beta"]);
+        std::env::remove_var("CCE_HOME");
+    }
+
+    /// #55 additivity: against a cache with NO published metadata (seeded the
+    /// pre-#55 way), `pull --workspace` behaves exactly as before — no metadata
+    /// lines, no graph file, and a missing local manifest is still the original
+    /// clear error.
+    #[test]
+    fn workspace_pull_without_published_metadata_is_the_pre_55_behaviour() {
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let src = workspace_repo();
+        let cfg = SyncConfig {
+            remote: Some(url.clone()),
+            lfs: false,
+            repo_id: Some("example.com__acme__mono".to_string()),
+            auto_pull: false,
+            retention: crate::sync::config::Retention::All,
+        };
+        cfg.save(src.path()).unwrap();
+        // Seed the cache the pre-#55 way: member artifacts + pointers only.
+        let sha = git::head_sha(src.path()).unwrap();
+        let manifest = Manifest::load(src.path()).unwrap();
+        let remote = GitRemote::open(&url, false).unwrap();
+        for m in &manifest.members {
+            let repo_id = format!("example.com__acme__mono__{}", m.name);
+            push_one(&src.path().join(&m.path), &remote, &repo_id, &sha).unwrap();
+        }
+
+        let dst = source_repo_clone(&src);
+        cfg.save(dst.path()).unwrap();
+        let out = cmd_pull(dst.path(), PullTarget::Head, false, true).unwrap();
+        assert!(!out.contains("metadata"), "got: {out}");
+        assert!(!crate::workspace::graph_path(dst.path()).exists());
+
+        // Repo-less with no manifest and no published metadata: the original error.
+        let bare_dir = tempfile::tempdir().unwrap();
+        cfg.save(bare_dir.path()).unwrap();
+        let err = cmd_pull(bare_dir.path(), PullTarget::Latest, false, true).unwrap_err();
+        assert!(err.contains("no workspace manifest"), "got: {err}");
+        std::env::remove_var("CCE_HOME");
+    }
+
+    /// #55 Part 1: `push --workspace` additionally publishes the canonical
+    /// workspace manifest + a freshly derived cross-member graph at the
+    /// well-known keys under the **base** repo_id — additively (the member
+    /// artifact keys and ref pointers are exactly the pre-#55 ones).
+    #[test]
+    fn workspace_push_publishes_manifest_and_graph_under_the_base_repo_id() {
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let src = workspace_repo();
+        let base = "example.com__acme__mono";
+        SyncConfig {
+            remote: Some(url.clone()),
+            lfs: false,
+            repo_id: Some(base.to_string()),
+            auto_pull: false,
+            retention: crate::sync::config::Retention::All,
+        }
+        .save(src.path())
+        .unwrap();
+
+        let report = cmd_push(src.path(), None, true).unwrap();
+        assert!(report.contains("metadata"), "got: {report}");
+
+        let ver = SYNC_FORMAT_VERSION.to_string();
+        let remote = GitRemote::open(&url, false).unwrap();
+        // The published manifest is the canonical serialization of the root
+        // manifest, byte-for-byte.
+        let yaml = remote.get(&workspace_manifest_address(HASH_EMBEDDER, &ver, base)).unwrap();
+        let manifest = Manifest::load(src.path()).unwrap();
+        assert_eq!(String::from_utf8(yaml).unwrap(), manifest.to_yaml());
+        // The published graph carries the alpha -> beta edge.
+        let json = remote.get(&workspace_graph_address(HASH_EMBEDDER, &ver, base)).unwrap();
+        let graph =
+            crate::workspace::WorkspaceGraph::from_json(&String::from_utf8(json).unwrap()).unwrap();
+        assert_eq!(graph.members, vec!["alpha", "beta"]);
+        assert_eq!(graph.edges.len(), 1);
+        assert_eq!(graph.edges[0].from, "alpha");
+        assert_eq!(graph.edges[0].to, "beta");
+        // Additive: the member keys and pointers are exactly the pre-#55 shape.
+        let sha = git::head_sha(src.path()).unwrap();
+        for m in ["alpha", "beta"] {
+            let repo_id = format!("{base}__{m}");
+            assert!(remote.has(&content_address(HASH_EMBEDDER, &ver, &repo_id, &sha)).unwrap());
+            assert_eq!(
+                remote
+                    .read_blob_text(&pointer_address(HASH_EMBEDDER, &ver, &repo_id, "main"))
+                    .unwrap(),
+                sha
+            );
+        }
         std::env::remove_var("CCE_HOME");
     }
 
@@ -1514,6 +2033,7 @@ mod tests {
                     bytes: 2048,
                 },
             ],
+            workspaces: vec![],
         }
     }
 
@@ -1551,6 +2071,7 @@ mod tests {
         let s = render_list_json(&CacheListing {
             remote: "file:///srv/cache.git".to_string(),
             repos: vec![],
+            workspaces: vec![],
         });
         let golden = "{\n  \"remote\": \"file:///srv/cache.git\",\n  \"repos\": [],\n  \"schema\": \"cce.synclist/v1\"\n}\n";
         assert_eq!(s, golden);
@@ -1576,6 +2097,7 @@ total         : 2 repos, 4 artifacts, 125504 bytes
         let s = render_list_human(&CacheListing {
             remote: "file:///srv/cache.git".to_string(),
             repos: vec![],
+            workspaces: vec![],
         });
         assert_eq!(
             s,
@@ -1694,6 +2216,314 @@ total         : 2 repos, 4 artifacts, 125504 bytes
         let manifest = Manifest::load(into.path()).unwrap();
         let names: Vec<&str> = manifest.members.iter().map(|m| m.name.as_str()).collect();
         assert_eq!(names, vec!["demo", "other"]);
+        std::env::remove_var("CCE_HOME");
+    }
+
+    // --- #55: published-metadata discovery + `pull --all` enrichment ---
+
+    /// The #53 listing, extended (#55): a prefix carrying a `workspace.yml` is
+    /// recorded in `workspaces`; a PURE metadata prefix (no artifacts, no
+    /// pointer) is hidden from `repos`, so the rendered listing (byte-pinned)
+    /// and `pull --all`'s warn-skip behaviour are unchanged by publication.
+    #[test]
+    fn cmd_list_records_workspace_prefixes_and_hides_pure_metadata_rows() {
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let remote = GitRemote::open(&url, false).unwrap();
+        remote
+            .put_many(&[
+                ("hash/2.3/acme__mono/workspace.yml".to_string(), b"version: 1\n".to_vec()),
+                ("hash/2.3/acme__mono__demo/1111111.cce".to_string(), b"AA\n".to_vec()),
+                ("hash/2.3/acme__mono__demo/refs/main".to_string(), b"1111111\n".to_vec()),
+            ])
+            .unwrap();
+        let bare_dir = tempfile::tempdir().unwrap();
+        let listing = cmd_list(bare_dir.path(), Some(url)).unwrap();
+        assert_eq!(listing.workspaces, vec!["acme__mono".to_string()]);
+        // The metadata prefix is not a repo row; the member repo is.
+        let ids: Vec<&str> = listing.repos.iter().map(|r| r.repo_id.as_str()).collect();
+        assert_eq!(ids, vec!["acme__mono__demo"]);
+        std::env::remove_var("CCE_HOME");
+    }
+
+    /// #55: `pull --all` applies the published manifest to the members it covers
+    /// (real types/packages) and installs the published graph rewritten to the
+    /// consumer member names — idempotently across a refresh run.
+    #[test]
+    fn pull_all_applies_published_metadata_and_installs_the_graph() {
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let src = workspace_repo();
+        SyncConfig {
+            remote: Some(url.clone()),
+            lfs: false,
+            repo_id: Some("example.com__acme__mono".to_string()),
+            auto_pull: false,
+            retention: crate::sync::config::Retention::All,
+        }
+        .save(src.path())
+        .unwrap();
+        cmd_push(src.path(), None, true).unwrap();
+
+        let into = tempfile::tempdir().unwrap();
+        let out = cmd_pull_all(into.path(), Some(url.clone())).unwrap();
+        assert!(
+            out.contains(
+                "metadata      : 1 published workspace manifest applied · 1 cross-member edge installed"
+            ),
+            "got: {out}"
+        );
+        // Enriched members: the real published type/package, consumer layout paths.
+        let manifest = Manifest::load(into.path()).unwrap();
+        let alpha = manifest.member("alpha").unwrap();
+        assert_eq!(alpha.member_type, MemberType::Javascript);
+        assert_eq!(alpha.package, "alpha");
+        assert_eq!(alpha.path, "alpha", "the #54 consumer layout is kept");
+        // The installed graph resolves by consumer member names.
+        let graph = crate::workspace::WorkspaceGraph::load_or_empty(into.path(), &manifest);
+        assert_eq!(graph.targets_from("alpha"), vec!["beta"]);
+
+        // Refresh run: byte-identical manifest + graph, everything up-to-date.
+        let yaml1 = std::fs::read_to_string(crate::workspace::manifest_path(into.path())).unwrap();
+        let graph1 = std::fs::read_to_string(crate::workspace::graph_path(into.path())).unwrap();
+        let out2 = cmd_pull_all(into.path(), None).unwrap();
+        assert!(
+            out2.contains("summary       : 0 pulled · 2 up-to-date · 0 skipped"),
+            "got: {out2}"
+        );
+        assert_eq!(
+            std::fs::read_to_string(crate::workspace::manifest_path(into.path())).unwrap(),
+            yaml1
+        );
+        assert_eq!(
+            std::fs::read_to_string(crate::workspace::graph_path(into.path())).unwrap(),
+            graph1
+        );
+        std::env::remove_var("CCE_HOME");
+    }
+
+    /// A single-member workspace source repo whose member is named `demo`.
+    fn demo_workspace(package: &str) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        let d = tmp.path();
+        git::run_commit(d, &["init", "-q", "-b", "main"]).unwrap();
+        let m = d.join("demo");
+        std::fs::create_dir_all(m.join("src")).unwrap();
+        std::fs::write(m.join("package.json"), format!("{{\"name\":\"{package}\"}}")).unwrap();
+        std::fs::write(m.join("src/index.js"), format!("function {package}() {{ return 1; }}\n"))
+            .unwrap();
+        crate::workspace::build_manifest(d).save(d).unwrap();
+        git::run_commit(d, &["add", "-A"]).unwrap();
+        git::run_commit(d, &["commit", "-q", "-m", "init"]).unwrap();
+        tmp
+    }
+
+    /// #55, the documented multi-workspace rule: each published manifest applies
+    /// to its OWN members; on a member-NAME collision across manifests the first
+    /// (repo_id order) keeps the bare name and the later one stays at its
+    /// deduped `-2` name, with a warning.
+    #[test]
+    fn pull_all_member_name_collision_across_workspaces_first_wins_with_warning() {
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        for (base, package) in
+            [("example.com__acme__mono", "demo_acme"), ("example.com__zeta__mono", "demo_zeta")]
+        {
+            let src = demo_workspace(package);
+            SyncConfig {
+                remote: Some(url.clone()),
+                lfs: false,
+                repo_id: Some(base.to_string()),
+                auto_pull: false,
+                retention: crate::sync::config::Retention::All,
+            }
+            .save(src.path())
+            .unwrap();
+            cmd_push(src.path(), None, true).unwrap();
+        }
+
+        let into = tempfile::tempdir().unwrap();
+        let out = cmd_pull_all(into.path(), Some(url)).unwrap();
+        assert!(
+            out.contains(
+                "warning: workspace example.com__zeta__mono: member name `demo` was taken by an \
+                 earlier repo — kept as `demo-2` (first in repo_id order wins)"
+            ),
+            "got: {out}"
+        );
+        // Each manifest enriched exactly its own member.
+        let manifest = Manifest::load(into.path()).unwrap();
+        assert_eq!(manifest.member("demo").unwrap().package, "demo_acme");
+        assert_eq!(manifest.member("demo-2").unwrap().package, "demo_zeta");
+        std::env::remove_var("CCE_HOME");
+    }
+
+    // --- #55: `verify --checksum-only` — integrity with zero source checkout ---
+
+    #[test]
+    fn verify_checksum_only_passes_on_an_intact_pull_and_fails_on_corruption() {
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let src = source_repo();
+        init_cfg(src.path(), &url);
+        cmd_push(src.path(), None, false).unwrap();
+        let sha = git::head_sha(src.path()).unwrap();
+
+        // A repo-less consumer: bare dir + config only, `--latest` pull.
+        let consumer = tempfile::tempdir().unwrap();
+        init_cfg(consumer.path(), &url);
+        cmd_pull(consumer.path(), PullTarget::Latest, false, false).unwrap();
+        let out = cmd_verify_checksum_only(consumer.path()).unwrap();
+        assert!(
+            out.contains(&format!("verify OK (checksum-only): example.com__acme__demo@{sha}")),
+            "got: {out}"
+        );
+
+        // Corrupt the pulled store (mutate one chunk's bytes) → loud failure.
+        let store = default_store_path(consumer.path());
+        let mut idx = Index::load(&store).unwrap();
+        idx.chunks[0].content.push_str("\n# flipped bytes\n");
+        idx.save(&store).unwrap();
+        let err = cmd_verify_checksum_only(consumer.path()).unwrap_err();
+        assert!(err.contains("verify FAILED (checksum-only)"), "got: {err}");
+        assert!(err.contains("corruption"), "got: {err}");
+        std::env::remove_var("CCE_HOME");
+    }
+
+    #[test]
+    fn verify_checksum_only_names_the_corrupted_member_in_a_workspace() {
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let src = workspace_repo();
+        SyncConfig {
+            remote: Some(url.clone()),
+            lfs: false,
+            repo_id: Some("example.com__acme__mono".to_string()),
+            auto_pull: false,
+            retention: crate::sync::config::Retention::All,
+        }
+        .save(src.path())
+        .unwrap();
+        cmd_push(src.path(), None, true).unwrap();
+
+        let into = tempfile::tempdir().unwrap();
+        cmd_pull_all(into.path(), Some(url)).unwrap();
+        let out = cmd_verify_checksum_only(into.path()).unwrap();
+        assert!(out.contains("verify OK (checksum-only): 2 members"), "got: {out}");
+        assert!(out.contains("alpha") && out.contains("beta"), "got: {out}");
+
+        // Corrupt exactly beta → the failure names the member.
+        let store = default_store_path(&into.path().join("beta"));
+        let mut idx = Index::load(&store).unwrap();
+        idx.chunks[0].content.push('!');
+        idx.save(&store).unwrap();
+        let err = cmd_verify_checksum_only(into.path()).unwrap_err();
+        assert!(err.contains("verify FAILED (checksum-only) for member `beta`"), "got: {err}");
+        std::env::remove_var("CCE_HOME");
+    }
+
+    /// #55, the cross-version shape (live-review finding): a `.cce/synced.json`
+    /// written by an OLDER cce has no `installed_sha256`. That is a clear,
+    /// actionable NOTICE with exit-0 semantics (`Ok`), never a false failure —
+    /// the earlier export-based design false-failed intact pulls of artifacts
+    /// pushed by older versions.
+    #[test]
+    fn verify_checksum_only_old_marker_is_a_notice_not_a_false_failure() {
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let src = source_repo();
+        init_cfg(src.path(), &url);
+        cmd_push(src.path(), None, false).unwrap();
+
+        let consumer = tempfile::tempdir().unwrap();
+        init_cfg(consumer.path(), &url);
+        cmd_pull(consumer.path(), PullTarget::Latest, false, false).unwrap();
+        // Rewrite the marker to the pre-#55 shape (no installed_sha256).
+        let mut state = SyncState::load(consumer.path()).unwrap();
+        assert!(state.installed_sha256.is_some(), "a fresh pull records the hash");
+        state.installed_sha256 = None;
+        state.save(consumer.path()).unwrap();
+
+        let out = cmd_verify_checksum_only(consumer.path()).unwrap();
+        assert!(
+            out.contains("no install checksum recorded (pulled by an older cce)"),
+            "got: {out}"
+        );
+        assert!(out.contains("re-pull"), "the notice must be actionable: {out}");
+
+        // Workspace-mixed: one member verified, one on the notice path (a
+        // fresh cache so only the two workspace members are pulled).
+        let (_bare_ws, url_ws) = bare_remote();
+        let src_ws = workspace_repo();
+        SyncConfig {
+            remote: Some(url_ws.clone()),
+            lfs: false,
+            repo_id: Some("example.com__acme__mono".to_string()),
+            auto_pull: false,
+            retention: crate::sync::config::Retention::All,
+        }
+        .save(src_ws.path())
+        .unwrap();
+        cmd_push(src_ws.path(), None, true).unwrap();
+        let into = tempfile::tempdir().unwrap();
+        cmd_pull_all(into.path(), Some(url_ws)).unwrap();
+        let beta = into.path().join("beta");
+        let mut state = SyncState::load(&beta).unwrap();
+        state.installed_sha256 = None;
+        state.save(&beta).unwrap();
+        let out = cmd_verify_checksum_only(into.path()).unwrap();
+        assert!(
+            out.contains(
+                "verify OK (checksum-only): 1 member verified · 1 without a recorded install \
+                 checksum (re-pull to enable)"
+            ),
+            "got: {out}"
+        );
+        assert!(out.contains("beta"), "the notice names the member: {out}");
+        std::env::remove_var("CCE_HOME");
+    }
+
+    /// Live-review finding: a member directory whose `.cce` (config + marker)
+    /// was deleted must be RE-ADOPTED by the next `pull --all` — matched by its
+    /// short name — not duplicated as `<name>-2` beside the orphan.
+    #[test]
+    fn pull_all_re_adopts_an_orphaned_member_dir_instead_of_duplicating() {
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let src = source_repo();
+        init_cfg(src.path(), &url);
+        cmd_push(src.path(), None, false).unwrap();
+
+        let into = tempfile::tempdir().unwrap();
+        cmd_pull_all(into.path(), Some(url)).unwrap();
+        assert!(into.path().join("demo/.cce/index.json").exists());
+        // Kill the member's whole .cce dir: config, marker, and store gone.
+        std::fs::remove_dir_all(into.path().join("demo/.cce")).unwrap();
+
+        let out = cmd_pull_all(into.path(), None).unwrap();
+        assert!(
+            out.contains("note: re-adopting existing member `demo` for example.com__acme__demo"),
+            "got: {out}"
+        );
+        assert!(out.contains("summary       : 1 pulled · 0 up-to-date · 0 skipped"), "got: {out}");
+        assert!(into.path().join("demo/.cce/index.json").exists(), "re-pulled into the same dir");
+        assert_eq!(
+            SyncConfig::load(&into.path().join("demo")).repo_id.as_deref(),
+            Some("example.com__acme__demo"),
+            "the config is rewritten"
+        );
+        assert!(!into.path().join("demo-2").exists(), "no duplicate member dir");
+        let manifest = Manifest::load(into.path()).unwrap();
+        assert_eq!(manifest.members.len(), 1, "no duplicate manifest entry");
+        std::env::remove_var("CCE_HOME");
+    }
+
+    #[test]
+    fn verify_checksum_only_without_a_marker_is_a_clear_error() {
+        let _home = set_home();
+        let dir = tempfile::tempdir().unwrap();
+        let err = cmd_verify_checksum_only(dir.path()).unwrap_err();
+        assert!(err.contains("no `.cce/synced.json` marker"), "got: {err}");
         std::env::remove_var("CCE_HOME");
     }
 

@@ -35,6 +35,34 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the repo-less single-member `--latest`/`--commit` pull) is now documented in
   `docs/sync.md`. `SYNC_FORMAT_VERSION`, `conformance.json`, and every existing golden are
   untouched.
+- **The self-describing cache — published workspace metadata + `cce sync verify
+  --checksum-only` (#55).** Consumer mode 3/3. `cce sync push --workspace` now also publishes
+  the canonical `workspace.yml` and the derived cross-member `workspace-graph.json` at
+  well-known keys under the workspace's **base** repo_id
+  (`hash/<ver>/<base>/workspace.yml` / `…/workspace-graph.json`) — additive by construction
+  (neither an artifact nor a `refs/` pointer; SPEC-SYNC §3 now states the additive-keys rule
+  normatively). The pull paths consume it: `pull --workspace` installs the published graph,
+  merges the real member types/packages into the local manifest (matched by name; the local
+  path wins), and can bootstrap a repo-less consumer with no manifest at all; `pull --all`
+  discovers every published manifest via the extended `sync list` machinery, enriches exactly
+  the members each manifest covers, and installs the merged graphs rewritten to the consumer
+  member names (member-name collisions across workspaces: first in repo_id order keeps the
+  bare name, later ones stay at their `-2`/`-3` names, warned). Result: a repo-less federated
+  search regains **cross-member graph expansion**, byte-identical to the source-side
+  workspace. `cce sync verify --checksum-only` gives consumers a real integrity check with
+  zero source checkout: `pull` records the SHA-256 of the exact `index.json` bytes it
+  installs (an additive `installed_sha256` field in `.cce/synced.json`), and verify re-hashes
+  the on-disk file against it — **version-independent** ("has this file changed since
+  pull"), so artifacts pushed by older cce versions verify exactly like current ones
+  (live-verified against a mixed-version cache; an export-based comparison would false-fail
+  them). Failures are loud and name the member; a marker written by an older cce (no
+  recorded hash) is an explicit exit-0 re-pull notice, never a false failure. Documented
+  caveat: detects corruption, not a malicious build (true `artifact == build(sha)`
+  verification stays with source-holders/CI). Also from live review: a `pull --all` refresh
+  now **re-adopts** a member directory whose `.cce/config` went missing (matched by name,
+  noted in the report) instead of duplicating it as `<name>-2`. Caches without
+  published metadata, plain single-member pulls, `SYNC_FORMAT_VERSION`, `conformance.json`,
+  and every existing golden are untouched.
 
 ## [2.6.8] - 2026-07-08
 

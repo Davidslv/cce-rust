@@ -90,6 +90,25 @@ Distinct shas are distinct files → concurrent pushes for different shas never
 conflict in content (only git-ref advancement can race — handle with
 fetch-rebase-retry).
 
+**Adding new keys is additive (normative).** Beside the `<sha>.cce` artifact
+keys and the `refs/<ref>` pointer files, a repo_id prefix MAY carry other
+well-known keys. The first such keys are the **published workspace metadata**
+(the self-describing cache): `cce sync push --workspace` also puts
+
+```
+<embedder_id>/<cce_version_major.minor>/<base_repo_id>/workspace.yml
+<embedder_id>/<cce_version_major.minor>/<base_repo_id>/workspace-graph.json
+```
+
+under the workspace's **base** repo_id (the prefix its members'
+`<base>__<member>` repo_ids derive from), so repo-less consumers can recover
+the real member metadata and the cross-member dependency edges. Introducing a
+key of this kind is **not** a format change: it is neither an artifact nor a
+ref pointer, so existing artifact keys, pointer semantics,
+`SYNC_FORMAT_VERSION`, and old-client pulls of code artifacts are all
+unaffected — clients MUST ignore keys they do not understand. Only a change to
+the **artifact bytes' shape** moves `SYNC_FORMAT_VERSION`.
+
 ---
 
 ## 4. Remote backend (pluggable; git first)
@@ -121,6 +140,7 @@ cce sync push  [--commit <sha>]        # ensure local hash-index for HEAD/sha, e
 cce sync pull  [--commit <sha> | --latest]  # fetch cache for sha (default HEAD; else latest main) → install into .cce/
 cce sync status                        # remote, local cache sha vs remote latest, working-tree match
 cce sync verify [--commit <sha>]       # re-index locally and confirm the pulled artifact's checksum
+cce sync verify --checksum-only        # consumer integrity: re-hash the pulled store against the recorded checksum (no source)
 ```
 
 Rules:

@@ -579,36 +579,41 @@ impl WorkspaceGraph {
         std::fs::write(path, self.to_json())
     }
 
+    /// Parse a graph from its JSON text (the shape `to_json` writes; `members`
+    /// and `edges` both default to empty). The inverse used by the sync layer
+    /// when a *published* graph arrives as cache bytes rather than a local file
+    /// (#55, the self-describing cache).
+    pub fn from_json(text: &str) -> Result<WorkspaceGraph, String> {
+        #[derive(Deserialize)]
+        struct Raw {
+            #[serde(default)]
+            members: Vec<String>,
+            #[serde(default)]
+            edges: Vec<RawEdge>,
+        }
+        #[derive(Deserialize)]
+        struct RawEdge {
+            from: String,
+            to: String,
+            via: String,
+        }
+        let raw: Raw =
+            serde_json::from_str(text).map_err(|e| format!("invalid workspace-graph.json: {e}"))?;
+        let edges =
+            raw.edges.into_iter().map(|e| Edge { from: e.from, to: e.to, via: e.via }).collect();
+        Ok(WorkspaceGraph { members: raw.members, edges })
+    }
+
     /// Load the graph from `<root>/.cce/workspace-graph.json`, or an empty graph
     /// (members from the manifest) when absent.
     pub fn load_or_empty(root: &Path, manifest: &Manifest) -> WorkspaceGraph {
         let path = graph_path(root);
         if let Ok(text) = std::fs::read_to_string(&path) {
-            #[derive(Deserialize)]
-            struct Raw {
-                #[serde(default)]
-                members: Vec<String>,
-                #[serde(default)]
-                edges: Vec<RawEdge>,
-            }
-            #[derive(Deserialize)]
-            struct RawEdge {
-                from: String,
-                to: String,
-                via: String,
-            }
-            if let Ok(raw) = serde_json::from_str::<Raw>(&text) {
-                let members = if raw.members.is_empty() {
-                    manifest.members.iter().map(|m| m.name.clone()).collect()
-                } else {
-                    raw.members
-                };
-                let edges = raw
-                    .edges
-                    .into_iter()
-                    .map(|e| Edge { from: e.from, to: e.to, via: e.via })
-                    .collect();
-                return WorkspaceGraph { members, edges };
+            if let Ok(mut graph) = WorkspaceGraph::from_json(&text) {
+                if graph.members.is_empty() {
+                    graph.members = manifest.members.iter().map(|m| m.name.clone()).collect();
+                }
+                return graph;
             }
         }
         WorkspaceGraph {
@@ -816,6 +821,22 @@ mod tests {
             graph.edges[0],
             Edge { from: "app".to_string(), to: "billing".to_string(), via: "gemfile".to_string() }
         );
+    }
+
+    #[test]
+    fn graph_from_json_round_trips_and_rejects_bad_input() {
+        // The published-graph parse (#55): `to_json` → `from_json` is the identity.
+        let root = fixture();
+        let manifest = build_manifest(&root);
+        let graph = build_graph(&root, &manifest);
+        let parsed = WorkspaceGraph::from_json(&graph.to_json()).unwrap();
+        assert_eq!(parsed, graph);
+        assert_eq!(parsed.to_json(), graph.to_json());
+        // Absent fields default empty; junk is a clear error, not a panic.
+        let empty = WorkspaceGraph::from_json("{}").unwrap();
+        assert!(empty.members.is_empty() && empty.edges.is_empty());
+        let err = WorkspaceGraph::from_json("not json").unwrap_err();
+        assert!(err.contains("invalid workspace-graph.json"), "got: {err}");
     }
 
     #[test]

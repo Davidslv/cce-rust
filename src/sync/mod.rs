@@ -136,6 +136,23 @@ pub fn pointer_address(embedder: &str, cce_ver: &str, repo_id: &str, git_ref: &s
     format!("{embedder}/{cce_ver}/{repo_id}/refs/{}", sanitize_id(git_ref))
 }
 
+/// The published workspace-manifest address (#55, self-describing cache):
+/// `<embedder>/<cce_ver>/<base_repo_id>/workspace.yml`. `push --workspace` puts the
+/// root `.cce/workspace.yml` bytes here, under the workspace's **base** repo_id — the
+/// prefix its members' `<base>__<member>` repo_ids are derived from. **Additive by
+/// construction**: the key is neither a `<sha>.cce` artifact nor a `refs/<ref>`
+/// pointer, so no existing key or old-client read path can collide with it.
+pub fn workspace_manifest_address(embedder: &str, cce_ver: &str, base_repo_id: &str) -> String {
+    format!("{embedder}/{cce_ver}/{base_repo_id}/workspace.yml")
+}
+
+/// The published workspace-graph address (#55):
+/// `<embedder>/<cce_ver>/<base_repo_id>/workspace-graph.json` — the cross-member
+/// dependency edges beside the published manifest (same additivity argument).
+pub fn workspace_graph_address(embedder: &str, cce_ver: &str, base_repo_id: &str) -> String {
+    format!("{embedder}/{cce_ver}/{base_repo_id}/workspace-graph.json")
+}
+
 /// The base directory that holds every remote's local working clone. It is
 /// `$CCE_HOME/sync` when `CCE_HOME` is set (used by hermetic tests), else
 /// `~/.cce/sync` (SPEC-SYNC §4). Falls back to `./.cce/sync` if no home is known.

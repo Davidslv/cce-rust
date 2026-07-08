@@ -165,7 +165,7 @@ cce sync pull  [--commit <sha> | --latest] [--force] [--workspace] [--dir <path>
 cce sync pull  --all --into <dir> [--remote <url>]
 cce sync list  [--remote <url>] [--json] [--dir <path>]
 cce sync status [--dir <path>]
-cce sync verify [--commit <sha>] [--dir <path>]
+cce sync verify [--commit <sha> | --checksum-only] [--dir <path>]
 ```
 
 Rules:
@@ -193,10 +193,21 @@ Rules:
 - `pull --all --into <dir>` is **consumer mode** (§7): enumerate the cache, pull
   every repo_id's latest artifact, and synthesize a ready-to-search workspace —
   no source checkout anywhere.
+- `verify --checksum-only` re-hashes the **pulled** store against the SHA-256
+  **recorded from the installed bytes at pull time** — no source checkout, no
+  rebuild, no remote, and no version coupling (§7, the consumer integrity
+  check). Full `verify` (rebuild-and-compare) remains the source-holders'
+  check.
 - Offline / no remote / auth failure → a clear message; local indexing and search
   continue to work.
 - **Workspace-aware:** `--workspace` iterates the manifest's members, each keyed by
   its own `repo_id@sha` (a member is keyed `<repo_id>__<member-name>`).
+  `push --workspace` additionally **publishes the workspace metadata** — the
+  canonical `workspace.yml` and the derived `workspace-graph.json` — at
+  well-known keys under the workspace's **base** repo_id
+  (`hash/<ver>/<base>/workspace.yml`, `…/workspace-graph.json`), making the
+  cache **self-describing** for repo-less consumers (§7). Publishing is purely
+  additive: artifact keys, ref pointers, and old-client pulls are unchanged.
 
 Config keys (`<root>/.cce/config`, or global `~/.cce/config.yml`):
 `sync.remote`, `sync.lfs` (default `true`), `sync.repo_id`, `sync.auto_pull`,
@@ -252,6 +263,9 @@ Behaviour:
   `-2`/`-3` suffix in repo_id order. The full repo_id lives in the member's
   `.cce/config` (`sync.repo_id`), so a per-member `cce sync pull --latest
   --dir ctx/billing` keeps working, and refresh runs never re-derive names.
+  A member directory whose config went missing (e.g. its `.cce/` was deleted
+  by hand) is **re-adopted by name** on the next run — noted in the report,
+  its config rewritten — rather than duplicated with a `-2` suffix.
 - **Synthesized manifest.** Members are written with `type: store-only` — the
   neutral `MemberType` for a member with no source to classify. Detection never
   emits it; hand-written manifests are untouched and stay byte-compatible.
@@ -270,6 +284,70 @@ Behaviour:
   `lfs: false`, so no consumer ever commits `.gitattributes` into the cache
   repo. (Reading an LFS-enabled cache still works — the smudge comes from the
   cache's own committed attributes — but needs `git-lfs` installed.)
+
+**The self-describing cache (published workspace metadata).** `cce sync push
+--workspace` also publishes the workspace's `workspace.yml` and its
+cross-member `workspace-graph.json` under the **base** repo_id (§4's additive
+well-known keys). Consumers use them so a repo-less workspace loses nothing
+versus a source-holding one — in particular the **cross-member graph
+expansion** edges, which are otherwise derived from source manifests a
+consumer does not have:
+
+- **`pull --workspace`** installs the published graph into the root `.cce/`
+  and merges the published member metadata (real `type:`/`package:`) into the
+  local manifest — members are matched **by name**, and the local `path:` (the
+  consumer's actual layout) always wins. A consumer with **no manifest at
+  all** (a bare directory plus a config naming the remote and the base
+  repo_id) bootstraps its whole layout from the published manifest: its member
+  paths become the consumer directories.
+- **`pull --all`** discovers every published manifest in the cache and applies
+  each one to **its own members** (the repos keyed `<base>__<member-name>`),
+  enriching the synthesized entries with the real type/package; members
+  covered by no manifest keep the store-only synthesis. The consumer layout
+  stays the short-name one above — it is the refresh-stable layout — so the
+  published graphs are installed with their member references **rewritten to
+  the consumer member names**. With several published workspaces in one
+  cache, a member-NAME collision follows the same rule as the directory
+  naming: **the first taker in repo_id order keeps the bare name**; a later
+  workspace's same-named member stays at its `-2`/`-3` name, with a warning.
+- Caches that never published metadata behave exactly as before — the
+  metadata is additive, best-effort, and its absence is not an error.
+
+**Consumer integrity: `cce sync verify --checksum-only`.** Full `cce sync
+verify` rebuilds the index from the working tree, which inherently needs the
+source. Repo-less consumers instead re-hash the **pulled** store's on-disk
+bytes against the SHA-256 **recorded from the installed bytes at pull time**
+(the `installed_sha256` field `pull` writes into `.cce/synced.json`, hashed
+from the exact `index.json` file it just installed) — zero source checkout,
+zero rebuild, zero network. Because the baseline is the installed file itself,
+never a re-export through the current code, the check is
+**version-independent**: artifacts pushed by any older cce verify exactly like
+current ones ("has this file changed since pull"):
+
+```console
+$ cce sync verify --checksum-only --dir ctx
+verify OK (checksum-only): 2 members
+  billing          github.com__acme__billing@<sha>  (18ca676d989d)
+  web              github.com__acme__web@<sha>  (f00dfeed0123)
+```
+
+A corrupted or truncated store fails loudly, naming the member; exit codes
+mirror full `verify` (non-zero only on a real mismatch or an unreadable
+store). A store whose marker was written by an **older cce** (no
+`installed_sha256` recorded) is reported as an explicit notice with **exit
+0** — it is not known-bad, it is unverifiable until a re-pull records the
+hash:
+
+```
+  legacy           no install checksum recorded (pulled by an older cce) — re-pull with `cce sync pull --force` to enable checksum verification
+```
+
+**The honest caveat:** checksum-only detects *corruption, not a malicious
+build*. True `artifact == build(sha)` verification requires the source and
+stays where the source lives (CI / source-holders, via full `verify`). The
+trust posture for repo-less consumers is **CI as the canonical pusher + the
+git host's access control** (a signed-manifest scheme would be a future
+spec).
 
 ---
 
