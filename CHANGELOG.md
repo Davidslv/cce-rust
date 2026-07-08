@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.7.0] - 2026-07-08
+
 ### Added
 - **Knowledge-corpus sync M5.1+M5.2 — the `.cck` artifact and `cce knowledge push` / `pull`
   (#56, per SPEC-SYNC-KNOWLEDGE).** A built knowledge store now travels through the same
