@@ -537,7 +537,10 @@ $ cce search "authenticate user password" --no-metrics
 The pull checksum equals the push checksum, bit-for-bit — that is content
 addressing. `cce sync status` shows the remote, the local cache sha, the remote
 `--latest` pointer, and whether your working tree matches. `cce sync pull --latest`
-grabs the newest sha CI pushed for `main`.
+grabs the newest sha CI pushed for `main`. `cce sync list [--remote <url>] [--json]`
+enumerates what a cache holds — one row per repo_id with its latest sha, artifact
+count, and total bytes — read-only, and from a bare directory if you pass
+`--remote` (handy for auditing that every repo's CI is actually pushing).
 
 **CI (GitHub Actions):** index `main` and push on every merge with the ready-to-copy
 [`docs/ci/cce-sync.yml`](docs/ci/cce-sync.yml). The token it uses needs **write**
@@ -718,6 +721,7 @@ real offline cold-start run in [`docs/VERIFIED.md`](docs/VERIFIED.md):
 | `cce savings` / `cce eval` | ✅ fully offline | log-derived ledger + A/B aggregation; embedded pricing, no network |
 | `cce knowledge index` | ✅ fully offline | reads a local NDJSON feed; writes the local `.cce/knowledge/` store |
 | `cce feedback` / `cce conformance` / `cce packs` / `cce bench` | ✅ fully offline | pure local operations |
+| `cce sync list` | ❌ needs the cache remote | read-only enumeration of what a cache holds (repo_ids, latest shas, artifact counts/bytes); works from a bare directory with just `--remote <url>` |
 
 The **only** things that ever touch the network are, explicitly:
 
@@ -725,8 +729,9 @@ The **only** things that ever touch the network are, explicitly:
    unreachable ⇒ indexing fails loud (no store written) and `cce search` on an
    ollama-built index refuses with guidance (#30); the MCP `context_search`
    degrades to BM25-only under an explicit notice.
-2. **`cce sync push` / `cce sync pull`** — the git cache transport. Everything else,
-   including reading a *previously* pulled index, is offline.
+2. **`cce sync push` / `cce sync pull` / `cce sync list`** — the git cache
+   transport. Everything else, including reading a *previously* pulled index, is
+   offline.
 3. **Installing the binary** (`cargo install`, `git clone`) — a one-time step.
 
 Everything else is fully offline by construction. The default test suite makes **no
