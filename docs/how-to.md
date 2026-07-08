@@ -97,6 +97,44 @@ cce stats --dir ./my-project        # or --store <path>
 Reports chunk count, file count, average tokens per chunk, on-disk size, a
 per-language breakdown, and a per-`kind` breakdown (the exact node types).
 
+## Troubleshoot a store (doctor)
+
+```bash
+cce doctor                      # current directory (workspace-aware)
+cce doctor --dir ./my-project   # a specific root
+cce doctor --store <path>       # one explicit store file
+```
+
+Every `cce index` (and every `cce sync pull` install) writes a small **build
+fingerprint** (`.cce/fingerprint.json`, schema `cce.fingerprint/v1`) beside the
+store: the engine version, embedder id + dimensions, the chunker identity
+(language-pack set, markdown split budget, nesting limit), the tokenizer rule
+id, and whether redaction was on — plus a SHA-256 self-checksum and a SHA-256
+of the exact store bytes it describes. `cce doctor` is the read-only check
+that catches **config drift before it degrades retrieval** — "this index was
+built by a different configuration than the binary reading it":
+
+- **fingerprint vs this binary** — every mismatch is explained: a changed pack
+  set means chunk_ids may not be reproducible (re-index to realign); a
+  different embedder or dimension count means vector scores would compare
+  across embedding spaces (the #30 failure mode); a changed tokenizer rule
+  drifts token counts and the savings ledger.
+- **store parse health** — chunk/file counts, plus the #30 tripwire: any chunk
+  with an empty embedding is a definite failure.
+- **installed-bytes check** — for pulled stores, the same re-hash
+  `cce sync verify --checksum-only` performs (`installed_sha256` in
+  `.cce/synced.json`): corruption or local modification since the pull.
+- **knowledge store** — the contract version (`cce.knowledge/v1`), snapshot
+  id, record/chunk counts, and the data's as-of date.
+- **workspace mode** — with a workspace manifest at the root, every member is
+  checked (store-only consumer members included) and summarized.
+
+Doctor never mutates anything and needs no network. It exits **non-zero only
+on definite corruption or config mismatch**; soft findings render as distinct
+`advisory` lines and keep exit 0. A store built before fingerprints existed
+gets a graceful notice — `no fingerprint recorded (store built before cce
+v2.8) — re-index to enable drift detection` — and exit 0.
+
 ## List or validate the language packs
 
 ```bash

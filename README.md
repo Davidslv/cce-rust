@@ -811,6 +811,7 @@ real offline cold-start run in [`docs/VERIFIED.md`](docs/VERIFIED.md):
 | `cce index` | ✅ fully offline | walk → AST-chunk → hash-embed → write local JSON |
 | `cce search` | ✅ fully offline | reopens the local store; no re-embedding of the corpus |
 | `cce stats` | ✅ fully offline | reads the local store |
+| `cce doctor` | ✅ fully offline | read-only store health + config-drift check: the recorded build fingerprint (embedder, chunker pack set, tokenizer rule, redaction) vs this binary, the #30 empty-embedding tripwire, the #55 installed-bytes re-hash for pulled stores, and the knowledge contract/freshness; non-zero exit only on definite corruption/mismatch (#62) |
 | `cce dashboard` | ✅ fully offline | loopback-only, read-only; inlines all CSS/JS/SVG; **every panel is purely log-derived, so it makes zero network calls** (behind-remote is answered by `cce sync status`) |
 | `cce workspace` / `--workspace` | ✅ fully offline | detection, federated index/search/stats/dashboard |
 | `cce mcp` | ✅ fully offline | serves the **local** index (nine tools) to the agent; auto-pull is a soft dependency that no-ops with no remote |
