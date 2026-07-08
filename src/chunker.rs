@@ -208,46 +208,49 @@ fn fallback_chunk(file_path: &str, content: &str, language: &str) -> Chunk {
 
 /// Depth-first pre-order walk: emit a chunk for every node whose type is in the
 /// pack's function/class sets. `kind` is the exact node type (SPEC-V2 §3).
+///
+/// The walk is iterative (via `visit_pre`'s `TreeCursor` loop), never recursive:
+/// a deeply nested input — thousands of `(((…)))` or `{ { … } }` — would blow
+/// the stack of a per-node recursive walk and SIGSEGV the process (issue #49).
+/// Pre-order emission is preserved exactly, so chunk output is byte-identical.
 fn collect_chunks(
-    node: Node,
+    root: Node,
     src: &[u8],
     file_path: &str,
     pack: &dyn LanguagePack,
     out: &mut Vec<Chunk>,
 ) {
-    let kind = node.kind();
-    // Only named AST nodes are chunk candidates. Some grammars name a definition
-    // node the same string as its keyword token (e.g. Ruby's `class` node vs the
-    // anonymous `class` keyword); the `is_named` guard excludes the keyword token
-    // so a class/method is not double-counted.
-    let named = node.is_named();
-    let is_fn = named && pack.function_types().contains(&kind);
-    let is_cls = named && pack.class_types().contains(&kind);
-    if is_fn || is_cls {
-        let start = node.start_byte();
-        let end = node.end_byte();
-        let content_bytes = &src[start..end];
-        let content = String::from_utf8_lossy(content_bytes).to_string();
-        let start_line = node.start_position().row + 1;
-        let end_line = node.end_position().row + 1;
-        let chunk_type = if is_cls { "class" } else { "function" };
-        out.push(Chunk {
-            chunk_id: chunk_id(file_path, start_line, end_line, content_bytes),
-            file_path: file_path.to_string(),
-            start_line,
-            end_line,
-            chunk_type: chunk_type.to_string(),
-            kind: kind.to_string(),
-            language: pack.name().to_string(),
-            content,
-            token_count: token_count(&String::from_utf8_lossy(content_bytes)),
-            embedding: Vec::new(),
-        });
-    }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_chunks(child, src, file_path, pack, out);
-    }
+    crate::packs::visit_pre(root, &mut |node| {
+        let kind = node.kind();
+        // Only named AST nodes are chunk candidates. Some grammars name a definition
+        // node the same string as its keyword token (e.g. Ruby's `class` node vs the
+        // anonymous `class` keyword); the `is_named` guard excludes the keyword token
+        // so a class/method is not double-counted.
+        let named = node.is_named();
+        let is_fn = named && pack.function_types().contains(&kind);
+        let is_cls = named && pack.class_types().contains(&kind);
+        if is_fn || is_cls {
+            let start = node.start_byte();
+            let end = node.end_byte();
+            let content_bytes = &src[start..end];
+            let content = String::from_utf8_lossy(content_bytes).to_string();
+            let start_line = node.start_position().row + 1;
+            let end_line = node.end_position().row + 1;
+            let chunk_type = if is_cls { "class" } else { "function" };
+            out.push(Chunk {
+                chunk_id: chunk_id(file_path, start_line, end_line, content_bytes),
+                file_path: file_path.to_string(),
+                start_line,
+                end_line,
+                chunk_type: chunk_type.to_string(),
+                kind: kind.to_string(),
+                language: pack.name().to_string(),
+                content,
+                token_count: token_count(&String::from_utf8_lossy(content_bytes)),
+                embedding: Vec::new(),
+            });
+        }
+    });
 }
 
 #[cfg(test)]
