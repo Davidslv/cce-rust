@@ -1,6 +1,6 @@
 //! # tests/knowledge_sync — end-to-end knowledge corpus sync (SPEC-SYNC-KNOWLEDGE §11)
 //!
-//! **Why this file exists:** M5.1/M5.2 move knowledge corpora through the
+//! **Why this file exists:** M5 moves knowledge corpora through the
 //! content-addressed cache, and the spec's acceptance bar is process-level:
 //! fixture NDJSON → `cce knowledge index` → `push` to a `file://` bare remote →
 //! wipe → `pull` → a store **byte-identical** to the pre-push one, with
@@ -13,13 +13,17 @@
 //! dirs, sets `CCE_HOME` to a temp dir so working clones never touch `~/.cce`,
 //! and drives the binary: index, push, pull, the guards (missing/invalid
 //! corpus_id, embedding-less Phase-A store, planted secret), retention pruning,
-//! and the MCP search parity between producer and pulled consumer. Hermetic: no
-//! network, LFS off (the tests/sync.rs rule — no `git-lfs` binary needed).
+//! and the MCP search parity between producer and pulled consumer. The M5.3
+//! section covers the consumer surface: the `sync list` knowledge section
+//! (byte-pinned human + JSON goldens), `pull --all` corpus install (selection,
+//! byte-identity to a direct pull, idempotent refresh), the
+//! `verify --checksum-only` knowledge row, the MCP `index_status` knowledge
+//! block, and the §7 bare-directory end-to-end story. Hermetic: no network, LFS
+//! off (the tests/sync.rs rule — no `git-lfs` binary needed).
 //!
 //! **Responsibilities:**
-//! - Own the process-level M5.1+M5.2 acceptance tests.
-//! - It does NOT cover `sync list`/`pull --all`/`verify --checksum-only`
-//!   knowledge surfaces (M5.3) or docs (M5.4).
+//! - Own the process-level M5 acceptance tests (M5.1–M5.3).
+//! - It does NOT cover the code-artifact sync surfaces (tests/sync.rs).
 
 use std::io::Write;
 use std::path::{Path, PathBuf};
@@ -139,8 +143,17 @@ fn knowledge_dir(root: &Path) -> PathBuf {
 
 /// Drive an MCP session with `input` on stdin, returning stdout.
 fn drive(args: &[&str], input: &str) -> String {
+    drive_env(args, input, &[])
+}
+
+/// `drive` with extra environment variables (e.g. a hermetic `CCE_HOME` so the
+/// server's best-effort remote lookups use the test's working clone).
+fn drive_env(args: &[&str], input: &str, envs: &[(&str, &str)]) -> String {
     let mut cmd = Command::new(bin());
     cmd.args(args).stdin(Stdio::piped()).stdout(Stdio::piped()).stderr(Stdio::piped());
+    for (k, v) in envs {
+        cmd.env(k, v);
+    }
     let mut child = cmd.spawn().unwrap();
     child.stdin.take().unwrap().write_all(input.as_bytes()).unwrap();
     let out = child.wait_with_output().unwrap();
@@ -518,4 +531,692 @@ fn knowledge_keys_are_additive_beside_code_artifacts() {
     let out =
         cce(home.path(), &["sync", "pull", "--latest", "--force", "--dir", d.to_str().unwrap()]);
     assert_ok(&out, "code pull beside a knowledge corpus");
+}
+
+// --- M5.3: the consumer surface (SPEC-SYNC-KNOWLEDGE §6/§7) ---
+
+/// Run a git command in `dir`, asserting success (the tests/sync.rs helper).
+fn git(dir: &Path, args: &[&str]) {
+    let out = Command::new("git")
+        .arg("-C")
+        .arg(dir)
+        .args(["-c", "user.name=test", "-c", "user.email=t@e"])
+        .args(args)
+        .output()
+        .unwrap();
+    assert!(
+        out.status.success(),
+        "git {:?} failed: {}",
+        args,
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// Seed a cache repo with arbitrary `(path, bytes)` entries via plain git — a
+/// hermetic stand-in for pushes (fixed bytes ⇒ byte-pinnable listings).
+fn seed_cache(url: &str, files: &[(&str, &[u8])]) {
+    let work = tempfile::tempdir().unwrap();
+    let d = work.path();
+    git(d, &["init", "-q", "-b", "main"]);
+    git(d, &["remote", "add", "origin", url]);
+    let _ = Command::new("git").arg("-C").arg(d).args(["fetch", "-q", "origin"]).output();
+    let _ = Command::new("git")
+        .arg("-C")
+        .arg(d)
+        .args(["reset", "-q", "--hard", "origin/main"])
+        .output();
+    for (path, bytes) in files {
+        let p = d.join(path);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, bytes).unwrap();
+    }
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-q", "-m", "seed"]);
+    git(d, &["push", "-q", "origin", "HEAD:main"]);
+}
+
+/// A tiny one-file git repo with the given content, committed on `main`.
+fn tiny_repo(file: &str, content: &str) -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    git(d, &["init", "-q", "-b", "main"]);
+    std::fs::write(d.join(file), content).unwrap();
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-q", "-m", "init"]);
+    tmp
+}
+
+/// `cce sync init` + `cce sync push` for a code repo (LFS off — hermetic).
+fn init_and_push_code(home: &Path, url: &str, dir: &Path, repo_id: &str) {
+    let out = cce(
+        home,
+        &[
+            "sync",
+            "init",
+            "--remote",
+            url,
+            "--no-lfs",
+            "--repo-id",
+            repo_id,
+            "--dir",
+            dir.to_str().unwrap(),
+        ],
+    );
+    assert_ok(&out, "sync init");
+    let out = cce(home, &["sync", "push", "--dir", dir.to_str().unwrap()]);
+    assert_ok(&out, "sync push");
+}
+
+/// The `modified` time of the consumer's installed knowledge snapshot.
+fn knowledge_store_mtime(root: &Path, snapshot: &str) -> std::time::SystemTime {
+    std::fs::metadata(knowledge_dir(root).join(format!("{snapshot}.json")))
+        .unwrap()
+        .modified()
+        .unwrap()
+}
+
+/// §6, byte-pinned end to end: a cache seeded with fixed bytes — one code repo
+/// plus two corpora (one fully published, one bare `.cck` with no pointer and
+/// no corpus.json) — renders the EXACT human knowledge section and the EXACT
+/// `cce.synclist/v1` + optional `knowledge` JSON, nullable fields as `null`.
+#[test]
+fn sync_list_knowledge_section_is_byte_pinned_human_and_json() {
+    let home = tempfile::tempdir().unwrap();
+    let (_bare, url) = bare_remote();
+    let corpus_meta = br#"{
+  "chunk_count": 9,
+  "corpus_id": "internal-tickets",
+  "current": "9f1c2a3b4c5d6e7f",
+  "data_as_of": "2026-07-01T09:00:00Z",
+  "pushed_at": "2026-07-08T03:00:00Z",
+  "records": 2,
+  "schema": "cce.knowledgemeta/v1"
+}
+"#;
+    seed_cache(
+        &url,
+        &[
+            ("hash/2.3/aaa__one/1111111.cce", b"AA\n"),
+            ("hash/2.3/aaa__one/refs/main", b"1111111\n"),
+            ("knowledge/v1/internal-tickets/9f1c2a3b4c5d6e7f.cck", b"NEWCORPUS\n"),
+            ("knowledge/v1/internal-tickets/0000000011111111.cck", b"OLD\n"),
+            ("knowledge/v1/internal-tickets/current", b"9f1c2a3b4c5d6e7f\n"),
+            ("knowledge/v1/internal-tickets/corpus.json", corpus_meta),
+            ("knowledge/v1/runbooks/aaaabbbbccccdddd.cck", b"R\n"),
+        ],
+    );
+
+    let consumer = tempfile::tempdir().unwrap();
+    let out = cce(
+        home.path(),
+        &["sync", "list", "--remote", &url, "--dir", consumer.path().to_str().unwrap()],
+    );
+    let human = assert_ok(&out, "sync list");
+    let golden_human = format!(
+        "remote        : {url}\n\
+         \n\
+         repo_id   latest   artifacts  bytes\n\
+         aaa__one  1111111          1      3\n\
+         \n\
+         total         : 1 repo, 1 artifact, 3 bytes\n\
+         \n\
+         knowledge:\n\
+         corpus_id         current           snapshots  bytes  data as-of\n\
+         internal-tickets  9f1c2a3b4c5d6e7f          2     14  2026-07-01T09:00:00Z\n\
+         runbooks          -                         1      2  -\n"
+    );
+    assert_eq!(human, golden_human);
+
+    let out = cce(
+        home.path(),
+        &["sync", "list", "--remote", &url, "--json", "--dir", consumer.path().to_str().unwrap()],
+    );
+    let json = assert_ok(&out, "sync list --json");
+    let golden_json = format!(
+        r#"{{
+  "knowledge": [
+    {{
+      "bytes": 14,
+      "corpus_id": "internal-tickets",
+      "current": "9f1c2a3b4c5d6e7f",
+      "data_as_of": "2026-07-01T09:00:00Z",
+      "pushed_at": "2026-07-08T03:00:00Z",
+      "snapshots": 2
+    }},
+    {{
+      "bytes": 2,
+      "corpus_id": "runbooks",
+      "current": null,
+      "data_as_of": null,
+      "pushed_at": null,
+      "snapshots": 1
+    }}
+  ],
+  "remote": "{url}",
+  "repos": [
+    {{
+      "artifacts": 1,
+      "bytes": 3,
+      "latest_sha": "1111111",
+      "repo_id": "aaa__one"
+    }}
+  ],
+  "schema": "cce.synclist/v1"
+}}
+"#
+    );
+    assert_eq!(json, golden_json);
+}
+
+/// §6 both ways at the CLI level: a knowledge-free cache prints no knowledge
+/// section (human OR JSON) — the pre-M5 bytes exactly — and a real
+/// `knowledge push` makes the corpus appear with the real pointer + metadata.
+#[test]
+fn sync_list_knowledge_section_appears_only_when_a_corpus_exists() {
+    let home = tempfile::tempdir().unwrap();
+    let (_bare, url) = bare_remote();
+    seed_cache(
+        &url,
+        &[
+            ("hash/2.3/aaa__one/1111111.cce", b"AA\n"),
+            ("hash/2.3/aaa__one/refs/main", b"1111111\n"),
+        ],
+    );
+
+    // Knowledge-free: byte-identical to the pre-M5 listing (no knowledge key).
+    let human = assert_ok(&cce(home.path(), &["sync", "list", "--remote", &url]), "list");
+    assert!(!human.contains("knowledge:"), "got: {human}");
+    let json = assert_ok(&cce(home.path(), &["sync", "list", "--remote", &url, "--json"]), "list");
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    assert!(v.get("knowledge").is_none(), "got: {json}");
+
+    // A real push: the corpus appears, with the real current + corpus.json fields.
+    let producer = project_root(&url, "fixture", "all");
+    let snapshot = index_knowledge(home.path(), producer.path(), &feed());
+    assert_ok(
+        &cce(home.path(), &["knowledge", "push", "--dir", producer.path().to_str().unwrap()]),
+        "push",
+    );
+    let json = assert_ok(&cce(home.path(), &["sync", "list", "--remote", &url, "--json"]), "list");
+    let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+    let k = &v["knowledge"][0];
+    assert_eq!(k["corpus_id"], "fixture");
+    assert_eq!(k["current"], snapshot);
+    assert_eq!(k["snapshots"], 1);
+    assert_eq!(k["data_as_of"], "2026-02-01T10:00:00Z");
+    assert!(k["pushed_at"].as_str().unwrap().ends_with('Z'));
+    assert!(k["bytes"].as_u64().unwrap() > 0);
+    let human = assert_ok(&cce(home.path(), &["sync", "list", "--remote", &url]), "list");
+    assert!(human.contains("\nknowledge:\n"), "got: {human}");
+    assert!(human.contains("fixture"), "got: {human}");
+}
+
+/// §7: `pull --all` on a cache carrying code members AND a corpus gives the
+/// consumer both — and the installed knowledge store, `current` pointer, and
+/// sync marker are BYTE-IDENTICAL to a direct `cce knowledge pull`.
+#[test]
+fn pull_all_installs_the_corpus_byte_identical_to_a_direct_knowledge_pull() {
+    let home = tempfile::tempdir().unwrap();
+    let (_bare, url) = bare_remote();
+    let alpha = tiny_repo("rocket.py", "def alpha_rocket_launch(thrust):\n    return thrust * 2\n");
+    init_and_push_code(home.path(), &url, alpha.path(), "example.com__team__alpha");
+    let producer = project_root(&url, "fixture", "all");
+    let snapshot = index_knowledge(home.path(), producer.path(), &feed());
+    assert_ok(
+        &cce(home.path(), &["knowledge", "push", "--dir", producer.path().to_str().unwrap()]),
+        "knowledge push",
+    );
+
+    let consumer = tempfile::tempdir().unwrap();
+    let ctx = consumer.path().join("ctx");
+    let out = cce(
+        home.path(),
+        &["sync", "pull", "--all", "--into", ctx.to_str().unwrap(), "--remote", &url],
+    );
+    let report = assert_ok(&out, "pull --all");
+    assert!(
+        report.contains(&format!("knowledge        pulled      fixture@{snapshot}")),
+        "got: {report}"
+    );
+    assert!(ctx.join("alpha/.cce/index.json").exists(), "code member missing");
+    assert!(knowledge_dir(&ctx).join(format!("{snapshot}.json")).exists(), "corpus missing");
+
+    // The reference: a direct `knowledge pull` into a fresh root.
+    let direct = tempfile::tempdir().unwrap();
+    assert_ok(
+        &cce(
+            home.path(),
+            &[
+                "knowledge",
+                "pull",
+                "--corpus",
+                "fixture",
+                "--remote",
+                &url,
+                "--dir",
+                direct.path().to_str().unwrap(),
+            ],
+        ),
+        "direct knowledge pull",
+    );
+    for name in [format!("{snapshot}.json"), "current".to_string(), "synced.json".to_string()] {
+        assert_eq!(
+            std::fs::read(knowledge_dir(&ctx).join(&name)).unwrap(),
+            std::fs::read(knowledge_dir(direct.path()).join(&name)).unwrap(),
+            "{name} must be byte-identical to a direct knowledge pull"
+        );
+    }
+}
+
+/// §7 idempotent refresh, the member rule applied to knowledge: an unmoved
+/// corpus `current` is `up-to-date` (nothing re-fetched, nothing re-written);
+/// a moved `current` refreshes EXACTLY the corpus while up-to-date members
+/// stay untouched.
+#[test]
+fn pull_all_knowledge_refresh_is_idempotent_and_moved_current_refreshes_only_the_corpus() {
+    let home = tempfile::tempdir().unwrap();
+    let (_bare, url) = bare_remote();
+    let alpha = tiny_repo("a.py", "def alpha_one():\n    return 1\n");
+    init_and_push_code(home.path(), &url, alpha.path(), "example.com__team__alpha");
+    let producer = project_root(&url, "fixture", "all");
+    let first = index_knowledge(home.path(), producer.path(), &feed());
+    assert_ok(
+        &cce(home.path(), &["knowledge", "push", "--dir", producer.path().to_str().unwrap()]),
+        "push",
+    );
+
+    let consumer = tempfile::tempdir().unwrap();
+    let ctx = consumer.path().join("ctx");
+    let run = || {
+        cce(
+            home.path(),
+            &["sync", "pull", "--all", "--into", ctx.to_str().unwrap(), "--remote", &url],
+        )
+    };
+    assert_ok(&run(), "first pull --all");
+    let member_t1 =
+        std::fs::metadata(ctx.join("alpha/.cce/index.json")).unwrap().modified().unwrap();
+    let corpus_t1 = knowledge_store_mtime(&ctx, &first);
+
+    // Second run: everything up-to-date; the corpus is NOT re-fetched.
+    let report = assert_ok(&run(), "second pull --all");
+    assert!(
+        report.contains(&format!("knowledge        up-to-date  fixture@{first}")),
+        "got: {report}"
+    );
+    assert!(
+        report.contains("summary       : 0 pulled · 1 up-to-date · 0 skipped"),
+        "got: {report}"
+    );
+    assert_eq!(
+        knowledge_store_mtime(&ctx, &first),
+        corpus_t1,
+        "an unmoved current must not re-write"
+    );
+
+    // Move the corpus `current` (a newer snapshot) — the member stays put.
+    let newer_feed = feed().replace("Password hashing policy", "Password hashing policy v2");
+    let second = index_knowledge(home.path(), producer.path(), &newer_feed);
+    assert_ne!(first, second);
+    assert_ok(
+        &cce(home.path(), &["knowledge", "push", "--dir", producer.path().to_str().unwrap()]),
+        "re-push",
+    );
+    let report = assert_ok(&run(), "third pull --all");
+    assert!(
+        report.contains(&format!("knowledge        pulled      fixture@{second}")),
+        "got: {report}"
+    );
+    assert!(report.contains("alpha            up-to-date"), "got: {report}");
+    assert_eq!(
+        std::fs::metadata(ctx.join("alpha/.cce/index.json")).unwrap().modified().unwrap(),
+        member_t1,
+        "an up-to-date member must not be re-written by a corpus refresh"
+    );
+    assert_eq!(
+        std::fs::read_to_string(knowledge_dir(&ctx).join("current")).unwrap().trim(),
+        second,
+        "the consumer's current must follow the moved pointer"
+    );
+}
+
+/// §7 corpus selection: with SEVERAL corpora and no flag the run warns and
+/// skips knowledge — naming the ids — and never fails the member pulls;
+/// `--corpus <id>` installs exactly the named one; an unknown id warns.
+#[test]
+fn pull_all_multi_corpus_warns_and_skips_and_corpus_flag_selects() {
+    let home = tempfile::tempdir().unwrap();
+    let (_bare, url) = bare_remote();
+    let alpha = tiny_repo("a.py", "def alpha_one():\n    return 1\n");
+    init_and_push_code(home.path(), &url, alpha.path(), "example.com__team__alpha");
+    for corpus in ["tickets", "runbooks"] {
+        let producer = project_root(&url, corpus, "all");
+        index_knowledge(home.path(), producer.path(), &feed());
+        assert_ok(
+            &cce(home.path(), &["knowledge", "push", "--dir", producer.path().to_str().unwrap()]),
+            "push",
+        );
+    }
+
+    let consumer = tempfile::tempdir().unwrap();
+    let ctx = consumer.path().join("ctx");
+    let out = cce(
+        home.path(),
+        &["sync", "pull", "--all", "--into", ctx.to_str().unwrap(), "--remote", &url],
+    );
+    let report = assert_ok(&out, "pull --all (multi-corpus)");
+    assert!(
+        report.contains(
+            "warning: skipped knowledge — the cache carries 2 corpora (runbooks, tickets)"
+        ),
+        "got: {report}"
+    );
+    assert!(report.contains("pass --corpus <id>"), "got: {report}");
+    assert!(report.contains("summary       : 1 pulled"), "member pulls must succeed: {report}");
+    assert!(!knowledge_dir(&ctx).exists(), "skipped knowledge must install nothing");
+
+    // An unknown corpus id: warned, never fatal.
+    let out = cce(
+        home.path(),
+        &[
+            "sync",
+            "pull",
+            "--all",
+            "--into",
+            ctx.to_str().unwrap(),
+            "--remote",
+            &url,
+            "--corpus",
+            "nope",
+        ],
+    );
+    let report = assert_ok(&out, "pull --all --corpus nope");
+    assert!(
+        report.contains("warning: skipped knowledge — corpus `nope` is not in the cache"),
+        "got: {report}"
+    );
+
+    // --corpus selects: exactly the named corpus installs.
+    let out = cce(
+        home.path(),
+        &[
+            "sync",
+            "pull",
+            "--all",
+            "--into",
+            ctx.to_str().unwrap(),
+            "--remote",
+            &url,
+            "--corpus",
+            "runbooks",
+        ],
+    );
+    let report = assert_ok(&out, "pull --all --corpus runbooks");
+    assert!(report.contains("knowledge        pulled      runbooks@"), "got: {report}");
+    let marker: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(knowledge_dir(&ctx).join("synced.json")).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(marker["corpus_id"], "runbooks");
+}
+
+/// §7: `verify --checksum-only` covers the pulled knowledge store — a pass row
+/// naming the corpus; a byte-flip fails LOUDLY naming the corpus (with the
+/// sharpened no-escalation caveat); a marker without `installed_sha256` is an
+/// explicit notice with exit 0.
+#[test]
+fn verify_checksum_only_knowledge_row_pass_flip_fail_and_markerless_notice() {
+    let home = tempfile::tempdir().unwrap();
+    let (_bare, url) = bare_remote();
+    let alpha = tiny_repo("a.py", "def alpha_one():\n    return 1\n");
+    init_and_push_code(home.path(), &url, alpha.path(), "example.com__team__alpha");
+    let producer = project_root(&url, "fixture", "all");
+    let snapshot = index_knowledge(home.path(), producer.path(), &feed());
+    assert_ok(
+        &cce(home.path(), &["knowledge", "push", "--dir", producer.path().to_str().unwrap()]),
+        "push",
+    );
+    let consumer = tempfile::tempdir().unwrap();
+    let ctx = consumer.path().join("ctx");
+    assert_ok(
+        &cce(
+            home.path(),
+            &["sync", "pull", "--all", "--into", ctx.to_str().unwrap(), "--remote", &url],
+        ),
+        "pull --all",
+    );
+
+    // Intact: the knowledge row passes beside the member row.
+    let out =
+        cce(home.path(), &["sync", "verify", "--checksum-only", "--dir", ctx.to_str().unwrap()]);
+    let stdout = assert_ok(&out, "verify intact");
+    assert!(stdout.contains("verify OK (checksum-only): 1 member"), "got: {stdout}");
+    assert!(stdout.contains(&format!("knowledge        fixture@{snapshot}")), "got: {stdout}");
+
+    // Flip one byte in the pulled knowledge store: a loud failure naming the corpus.
+    let store = knowledge_dir(&ctx).join(format!("{snapshot}.json"));
+    let intact = std::fs::read(&store).unwrap();
+    let mut bytes = intact.clone();
+    let idx = bytes.iter().position(|&b| b == b'a').unwrap();
+    bytes[idx] = b'b';
+    std::fs::write(&store, &bytes).unwrap();
+    let out =
+        cce(home.path(), &["sync", "verify", "--checksum-only", "--dir", ctx.to_str().unwrap()]);
+    assert!(!out.status.success(), "a corrupted knowledge store must fail verify");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("verify FAILED (checksum-only) for knowledge corpus `fixture`"),
+        "got: {stderr}"
+    );
+    assert!(stderr.contains("NO rebuild-verify escalation path"), "got: {stderr}");
+
+    // Restore the store; strip installed_sha256 (an older-cce marker) ⇒ notice, exit 0.
+    std::fs::write(&store, &intact).unwrap();
+    let marker_path = knowledge_dir(&ctx).join("synced.json");
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&marker_path).unwrap()).unwrap();
+    assert!(v.as_object_mut().unwrap().remove("installed_sha256").is_some());
+    std::fs::write(&marker_path, v.to_string()).unwrap();
+    let out =
+        cce(home.path(), &["sync", "verify", "--checksum-only", "--dir", ctx.to_str().unwrap()]);
+    let stdout = assert_ok(&out, "verify with an old marker is a notice, not a failure");
+    assert!(
+        stdout.contains("knowledge        no install checksum recorded (pulled by an older cce)"),
+        "got: {stdout}"
+    );
+    assert!(stdout.contains("re-pull with `cce knowledge pull`"), "got: {stdout}");
+}
+
+/// §7: a root with ONLY a pulled corpus (no code store, no manifest) still
+/// verifies — and a knowledge-free root verifies exactly as today.
+#[test]
+fn verify_checksum_only_on_a_knowledge_only_root() {
+    let home = tempfile::tempdir().unwrap();
+    let (_bare, url) = bare_remote();
+    let producer = project_root(&url, "fixture", "all");
+    let snapshot = index_knowledge(home.path(), producer.path(), &feed());
+    assert_ok(
+        &cce(home.path(), &["knowledge", "push", "--dir", producer.path().to_str().unwrap()]),
+        "push",
+    );
+    let consumer = tempfile::tempdir().unwrap();
+    assert_ok(
+        &cce(
+            home.path(),
+            &[
+                "knowledge",
+                "pull",
+                "--corpus",
+                "fixture",
+                "--remote",
+                &url,
+                "--dir",
+                consumer.path().to_str().unwrap(),
+            ],
+        ),
+        "knowledge pull",
+    );
+    let out = cce(
+        home.path(),
+        &["sync", "verify", "--checksum-only", "--dir", consumer.path().to_str().unwrap()],
+    );
+    let stdout = assert_ok(&out, "knowledge-only verify");
+    assert!(
+        stdout.contains(&format!("verify OK (checksum-only): knowledge corpus fixture@{snapshot}")),
+        "got: {stdout}"
+    );
+
+    // A root with neither marker keeps the original clear error.
+    let empty = tempfile::tempdir().unwrap();
+    let out = cce(
+        home.path(),
+        &["sync", "verify", "--checksum-only", "--dir", empty.path().to_str().unwrap()],
+    );
+    assert_err(&out, "nothing to verify", "verify on an empty root");
+}
+
+/// §4.4: MCP `index_status` gains the knowledge block with the exact pinned
+/// fields — and stays byte-free of it when no knowledge store exists. The
+/// remote lines are best-effort: reachable ⇒ `remote current` + behind-status;
+/// a moved remote pointer flips `behind remote` to the actionable `yes`.
+#[test]
+fn mcp_index_status_knowledge_block_is_pinned_and_absent_without_a_store() {
+    let home = tempfile::tempdir().unwrap();
+    let home_str = home.path().to_string_lossy().to_string();
+    let (_bare, url) = bare_remote();
+    let alpha = tiny_repo("a.py", "def alpha_one():\n    return 1\n");
+    init_and_push_code(home.path(), &url, alpha.path(), "example.com__team__alpha");
+    let producer = project_root(&url, "fixture", "all");
+    let snapshot = index_knowledge(home.path(), producer.path(), &feed());
+    assert_ok(
+        &cce(home.path(), &["knowledge", "push", "--dir", producer.path().to_str().unwrap()]),
+        "push",
+    );
+
+    let consumer = tempfile::tempdir().unwrap();
+    let ctx = consumer.path().join("ctx");
+    assert_ok(
+        &cce(
+            home.path(),
+            &["sync", "pull", "--all", "--into", ctx.to_str().unwrap(), "--remote", &url],
+        ),
+        "pull --all",
+    );
+
+    // The exact §4.4 block, byte-pinned (records/chunks read from the store).
+    let store: serde_json::Value = serde_json::from_str(
+        &std::fs::read_to_string(knowledge_dir(&ctx).join(format!("{snapshot}.json"))).unwrap(),
+    )
+    .unwrap();
+    let (records, chunks) =
+        (store["records"].as_u64().unwrap(), store["chunks"].as_array().unwrap().len());
+    let input = "{\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"index_status\"}}\n";
+    let text = tool_text(
+        &drive_env(
+            &["mcp", "--workspace", "--dir", ctx.to_str().unwrap()],
+            input,
+            &[("CCE_HOME", &home_str)],
+        ),
+        1,
+    );
+    let expected = format!(
+        "  knowledge :\n    corpus         : fixture\n    snapshot       : {snapshot}\n    \
+         records/chunks : {records} / {chunks}\n    data as-of     : 2026-02-01T10:00:00Z\n    \
+         remote current : {snapshot}\n    behind remote  : no\n"
+    );
+    assert!(text.contains(&expected), "expected pinned block:\n{expected}\nin:\n{text}");
+
+    // The remote pointer moves ⇒ behind remote flips to the actionable `yes`.
+    let newer = feed().replace("Password hashing policy", "Password hashing policy v2");
+    let second = index_knowledge(home.path(), producer.path(), &newer);
+    assert_ok(
+        &cce(home.path(), &["knowledge", "push", "--dir", producer.path().to_str().unwrap()]),
+        "re-push",
+    );
+    let text = tool_text(
+        &drive_env(
+            &["mcp", "--workspace", "--dir", ctx.to_str().unwrap()],
+            input,
+            &[("CCE_HOME", &home_str)],
+        ),
+        1,
+    );
+    assert!(text.contains(&format!("remote current : {second}")), "got: {text}");
+    assert!(text.contains("behind remote  : yes — run `cce knowledge pull`"), "got: {text}");
+
+    // Without a knowledge store the report carries NO knowledge block at all.
+    let bare_consumer = tempfile::tempdir().unwrap();
+    let ctx2 = bare_consumer.path().join("ctx");
+    let (_bare2, url2) = bare_remote();
+    let beta = tiny_repo("b.py", "def beta_two():\n    return 2\n");
+    init_and_push_code(home.path(), &url2, beta.path(), "example.com__team__beta");
+    assert_ok(
+        &cce(
+            home.path(),
+            &["sync", "pull", "--all", "--into", ctx2.to_str().unwrap(), "--remote", &url2],
+        ),
+        "pull --all (knowledge-free)",
+    );
+    let text = tool_text(
+        &drive_env(
+            &["mcp", "--workspace", "--dir", ctx2.to_str().unwrap()],
+            input,
+            &[("CCE_HOME", &home_str)],
+        ),
+        1,
+    );
+    assert!(!text.contains("knowledge :"), "knowledge-free status must be unchanged: {text}");
+}
+
+/// The whole M5 promise in one test (§7 acceptance): a BARE directory →
+/// `cce sync pull --all` → `cce mcp --workspace` → `context_search source:
+/// both` blends a code hit and the knowledge hit with its full provenance —
+/// no source checkout, no adapter, no prior state anywhere.
+#[test]
+fn end_to_end_bare_dir_pull_all_then_context_search_both_blends_knowledge_with_provenance() {
+    let home = tempfile::tempdir().unwrap();
+    let home_str = home.path().to_string_lossy().to_string();
+    let (_bare, url) = bare_remote();
+    // A code repo whose content shares the query vocabulary…
+    let app = tiny_repo(
+        "auth.py",
+        "def hash_password(password):\n    return slow_salted_hash(password)\n",
+    );
+    init_and_push_code(home.path(), &url, app.path(), "example.com__team__auth");
+    // …and the corpus carrying the WHY (the policy record from `feed()`).
+    let producer = project_root(&url, "fixture", "all");
+    index_knowledge(home.path(), producer.path(), &feed());
+    assert_ok(
+        &cce(home.path(), &["knowledge", "push", "--dir", producer.path().to_str().unwrap()]),
+        "knowledge push",
+    );
+
+    // The consumer story: one command from a bare directory.
+    let consumer = tempfile::tempdir().unwrap();
+    let ctx = consumer.path().join("ctx");
+    assert_ok(
+        &cce(
+            home.path(),
+            &["sync", "pull", "--all", "--into", ctx.to_str().unwrap(), "--remote", &url],
+        ),
+        "pull --all",
+    );
+
+    let input = "{\"id\":1,\"method\":\"tools/call\",\"params\":{\"name\":\"context_search\",\"arguments\":{\"query\":\"password hashing policy\",\"source\":\"both\",\"no_graph\":true}}}\n";
+    let text = tool_text(
+        &drive_env(
+            &["mcp", "--workspace", "--dir", ctx.to_str().unwrap()],
+            input,
+            &[("CCE_HOME", &home_str)],
+        ),
+        1,
+    );
+    // The knowledge hit, with the byte-pinned provenance grammar
+    // (`[knowledge] <title> — <state> · <updated_at> · <url>`).
+    assert!(
+        text.contains("[knowledge] Password hashing policy — closed · 2026-02-01T10:00:00Z · https://example.test/1"),
+        "missing the knowledge hit with provenance: {text}"
+    );
+    // Blended with a code hit from the pulled member.
+    assert!(text.contains("auth.py"), "missing the blended code hit: {text}");
 }
