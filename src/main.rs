@@ -239,6 +239,27 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Self-update from the project's GitHub Releases (issue #75).
+    ///
+    /// Explicit-invocation network only — this is the ONLY cce command that
+    /// downloads over HTTP (via curl), and nothing here runs automatically.
+    /// The tarball is verified against the release's SHA256SUMS before the
+    /// running binary is atomically replaced; any failure leaves the current
+    /// install untouched. SHA256SUMS protects integrity (corrupt/truncated
+    /// downloads), not authenticity beyond GitHub's TLS — the same trust
+    /// posture as the README's manual install.
+    #[command(visible_alias = "upgrade")]
+    Update {
+        /// Compare the current version with the latest release and exit
+        /// without downloading: exit 0 = up to date, exit 10 = update
+        /// available, exit 1 = error. One line of output, script-friendly.
+        #[arg(long)]
+        check: bool,
+        /// Install a specific release (e.g. `v2.6.9`) — a pin, or the
+        /// rollback path. Downgrades warn but proceed.
+        #[arg(long, value_name = "vX.Y.Z", conflicts_with = "check")]
+        version: Option<String>,
+    },
 }
 
 /// Subcommands of `cce sync` (SPEC-SYNC §5). All are workspace-aware and
@@ -506,6 +527,16 @@ fn main() -> ExitCode {
             }
         },
         Command::Eval { runs, questions, json } => cmd_eval(&runs, &questions, json),
+        // `update --check` has a third outcome beside ok/error: "behind",
+        // reported as the pinned exit code 10 (update::EXIT_UPDATE_AVAILABLE)
+        // so scripts can branch on it — hence the early return.
+        Command::Update { check, version } => match cce::update::cmd_update(check, version) {
+            Ok(code) => return ExitCode::from(code),
+            Err(msg) => {
+                eprintln!("error: {msg}");
+                return ExitCode::FAILURE;
+            }
+        },
     };
     match result {
         Ok(()) => ExitCode::SUCCESS,

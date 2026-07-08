@@ -254,6 +254,32 @@ cce index ./my-project --embedder ollama
 - Ollama vectors are model-dependent, so an Ollama-built index is **not** covered
   by the conformance guarantee.
 
+## Update the installed binary (self-update)
+
+```bash
+cce update                    # → latest release: download, verify, atomic in-place swap
+cce update --check            # no download; exit 0 = up to date, exit 10 = update available
+cce update --version v2.6.9   # pin a release — the rollback path (downgrades warn but proceed)
+cce upgrade                   # alias for all of the above
+```
+
+- Downloads the platform tarball from the project's GitHub Releases with `curl`
+  and verifies it against the release's `SHA256SUMS` **before** replacing the
+  running binary (an atomic rename — any failure leaves the current install
+  untouched). This is the only cce command that talks HTTP, and only when
+  invoked; there is no auto-check.
+- `--check` is built for scripts and cron: one line of output and pinned exit
+  codes (`0` up to date, `10` update available, `1` error).
+- After an update, the CHANGELOG sections between your old and new version are
+  printed (newest first, capped at 5, then a link to the releases page).
+- Long-lived `cce mcp` / `cce dashboard` processes keep the old binary until
+  restarted.
+- Releases cover macOS (Apple Silicon + Intel) and Linux (x86_64 + arm64); on
+  anything else, or with no `curl` on PATH, the command errors with a pointer to
+  the manual install (README → Installation). If the install location isn't
+  writable, re-run with `sudo` or install manually — cce never escalates
+  privileges itself.
+
 ## Run the quality gates locally
 
 ```bash

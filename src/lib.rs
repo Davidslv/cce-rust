@@ -44,6 +44,7 @@ pub mod workspace;
 pub mod federation;
 pub mod sync;
 pub mod mcp;
+pub mod update;
 
 pub use chunker::Chunk;
 pub use retriever::SearchResult;

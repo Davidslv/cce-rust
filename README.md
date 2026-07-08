@@ -127,6 +127,32 @@ cargo install --path .    # installs `cce` into ~/.cargo/bin
 cce --version             # prints the version you built (see CHANGELOG.md)
 ```
 
+### Upgrading
+
+An installed binary updates itself from the Releases page — no toolchain, no
+manual tarball dance:
+
+```bash
+cce update                    # latest release: download, verify against SHA256SUMS, swap in place
+cce update --check            # scriptable: exit 0 = up to date, exit 10 = update available; no download
+cce update --version v2.6.9   # install a specific release — also the rollback path (downgrades warn but proceed)
+cce upgrade                   # the same command, other spelling
+```
+
+`cce update` is the **only** cce command that talks HTTP (it shells out to
+`curl`), and only when you invoke it — nothing ever auto-checks in the
+background. The tarball is verified against the release's `SHA256SUMS` before
+the running binary is atomically replaced, so any failure — corrupt download,
+checksum mismatch, unwritable install directory — leaves the current install
+untouched. The checksum protects **integrity** (truncated/corrupt downloads),
+not authenticity beyond GitHub's TLS: the same trust posture as the manual
+install above (detached signatures are a possible future hardening, not a
+current feature). After updating, it prints the CHANGELOG sections you jumped
+across; long-lived `cce mcp` / `cce dashboard` processes keep the old version
+until restarted. If cce lives somewhere you can't write (e.g.
+`/usr/local/bin`), re-run as `sudo cce update` or install manually — cce never
+escalates privileges itself.
+
 ### Optional: the semantic embedder (Ollama)
 
 The default **hashing** embedder needs no setup and makes **no network calls**.
@@ -765,6 +791,7 @@ real offline cold-start run in [`docs/VERIFIED.md`](docs/VERIFIED.md):
 | `cce sync list` | ❌ needs the cache remote | read-only enumeration of what a cache holds (repo_ids, latest shas, artifact counts/bytes — plus a knowledge section when the cache carries corpora); works from a bare directory with just `--remote <url>` |
 | `cce sync pull --all` | ❌ needs the cache remote | consumer mode: pulls every repo_id's latest artifact into `--into <dir>`, synthesizes the workspace (enriched from the published workspace metadata when the cache carries it), and installs the cache's knowledge corpus at the workspace root — the resulting search/MCP over it is then fully offline |
 | `cce sync verify --checksum-only` | ✅ fully offline | re-hashes the pulled store against the checksum recorded from the installed bytes at pull time (pulled knowledge stores included); version-independent — no source checkout, no rebuild, no remote |
+| `cce update` / `upgrade` | ❌ explicit network | self-update from GitHub Releases via `curl`, ONLY when invoked (no auto-check, ever); the tarball is verified against `SHA256SUMS` before the atomic in-place swap, and no other command gained any network behavior for it (#75) |
 
 The **only** things that ever touch the network are, explicitly:
 
@@ -775,7 +802,10 @@ The **only** things that ever touch the network are, explicitly:
 2. **`cce sync push` / `cce sync pull` / `cce sync list`** — the git cache
    transport. Everything else, including reading a *previously* pulled index, is
    offline.
-3. **Installing the binary** (`cargo install`, `git clone`) — a one-time step.
+3. **`cce update` / `cce upgrade`** — an explicit-invocation `curl` download of a
+   release tarball, checksum-verified, confined to the one `update` module. Same
+   class as `cce sync pull`: network only when you ask for it.
+4. **Installing the binary** (`cargo install`, `git clone`) — a one-time step.
 
 Everything else is fully offline by construction. The default test suite makes **no
 network calls** (the metrics clock/id source are injected; dashboard tests bind an

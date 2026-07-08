@@ -45,6 +45,16 @@ SHA256SUMS
 
 Each tarball holds the `cce` binary plus `LICENSE`, `README.md`, and `CHANGELOG.md`.
 
+> **The asset layout is a compatibility contract.** `cce update` (#75) consumes
+> exactly these assets from released binaries in the field: it discovers the
+> latest version by fetching `releases/latest/download/SHA256SUMS` and parsing
+> the `cce-vX.Y.Z-<target>.tar.gz` names, verifies the tarball against that
+> file, and extracts `cce-vX.Y.Z-<target>/cce` (it also reads the tarball's
+> `CHANGELOG.md` to print the post-update delta). Renaming the assets, the
+> `SHA256SUMS` file, the tarball's inner directory, or the target triples breaks
+> the upgrade path for every already-shipped binary — change them only with a
+> migration plan (`src/update.rs` documents the consuming side).
+
 ## Fixing a bad release
 
 Delete the release and the tag, fix the problem on `main`, and cut the **next**
