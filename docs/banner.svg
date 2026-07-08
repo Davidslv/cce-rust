@@ -1,0 +1,84 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1280" height="400" viewBox="0 0 1280 400" role="img" aria-label="Code Context Engine — one engine for every source of truth, focusing scattered context into the right context.">
+<defs>
+<radialGradient id="core" cx="50%" cy="50%" r="50%">
+  <stop offset="0%"  stop-color="#FFE3A6" stop-opacity="0.95"/>
+  <stop offset="20%" stop-color="#F2B43C"     stop-opacity="0.80"/>
+  <stop offset="46%" stop-color="#F2B43C"     stop-opacity="0.22"/>
+  <stop offset="100%" stop-color="#F2B43C"    stop-opacity="0"/>
+</radialGradient>
+<radialGradient id="hexcore" cx="50%" cy="42%" r="62%">
+  <stop offset="0%"  stop-color="#FFE3A6"/>
+  <stop offset="55%" stop-color="#F2B43C"/>
+  <stop offset="100%" stop-color="#B9781E"/>
+</radialGradient>
+<radialGradient id="blade" gradientUnits="userSpaceOnUse"
+  fx="612.0" fy="250.0" cx="612.0" cy="250.0" r="84.0">
+  <stop offset="0%"  stop-color="#F2B43C"     stop-opacity="0.30"/>
+  <stop offset="60%" stop-color="#B9781E" stop-opacity="0.12"/>
+  <stop offset="100%" stop-color="#B9781E" stop-opacity="0.02"/>
+</radialGradient>
+<radialGradient id="vig" gradientUnits="userSpaceOnUse"
+  fx="612.0" fy="250.0" cx="612.0" cy="250.0" r="620">
+  <stop offset="0%"  stop-color="#0C0E15"/>
+  <stop offset="100%" stop-color="#0A0B10"/>
+</radialGradient>
+<linearGradient id="beam" x1="0" y1="0" x2="1" y2="0">
+  <stop offset="0%"  stop-color="#F2B43C" stop-opacity="0.0"/>
+  <stop offset="18%" stop-color="#F2B43C" stop-opacity="0.9"/>
+  <stop offset="100%" stop-color="#F2B43C" stop-opacity="0.9"/>
+</linearGradient>
+<linearGradient id="ray" x1="0" y1="0" x2="1" y2="0">
+  <stop offset="0%"  stop-color="#8A90A0" stop-opacity="0.02"/>
+  <stop offset="100%" stop-color="#8A90A0" stop-opacity="0.30"/>
+</linearGradient>
+</defs>
+<rect x="0" y="0" width="1280" height="400" rx="20" fill="#0A0B10"/>
+<rect x="0" y="0" width="1280" height="400" rx="20" fill="url(#vig)"/>
+<rect x="0.75" y="0.75" width="1278.5" height="398.5" rx="19.25" fill="none" stroke="#242833" stroke-width="1.5"/>
+<rect x="4.5" y="4.5" width="1271" height="391" rx="16" fill="none" stroke="#171A22" stroke-width="1"/>
+<line x1="220.5" y1="182.0" x2="523.3" y2="234.6" stroke="url(#ray)" stroke-width="1"/>
+<line x1="323.5" y1="170.0" x2="525.3" y2="226.0" stroke="url(#ray)" stroke-width="1"/>
+<line x1="180.0" y1="228.0" x2="522.1" y2="245.4" stroke="url(#ray)" stroke-width="1"/>
+<line x1="348.0" y1="228.0" x2="522.3" y2="242.5" stroke="url(#ray)" stroke-width="1"/>
+<line x1="160.5" y1="282.0" x2="522.2" y2="256.4" stroke="url(#ray)" stroke-width="1"/>
+<line x1="344.0" y1="296.0" x2="523.3" y2="265.2" stroke="url(#ray)" stroke-width="1"/>
+<line x1="433.5" y1="264.0" x2="522.3" y2="257.0" stroke="url(#ray)" stroke-width="1"/>
+<circle cx="87.0" cy="182.0" r="1.7" fill="#8A90A0" opacity="0.54"/>
+<text x="96" y="186" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" letter-spacing="0.02em" fill="#8A90A0" opacity="0.42">conversations</text>
+<circle cx="241.0" cy="170.0" r="1.7" fill="#8A90A0" opacity="0.67"/>
+<text x="250" y="174" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" letter-spacing="0.02em" fill="#8A90A0" opacity="0.55">tickets</text>
+<circle cx="123.0" cy="228.0" r="1.7" fill="#8A90A0" opacity="0.74"/>
+<text x="132" y="232" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" letter-spacing="0.02em" fill="#8A90A0" opacity="0.62">code</text>
+<circle cx="291.0" cy="228.0" r="1.7" fill="#8A90A0" opacity="0.62"/>
+<text x="300" y="232" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" letter-spacing="0.02em" fill="#8A90A0" opacity="0.50">docs</text>
+<circle cx="95.0" cy="282.0" r="1.7" fill="#8A90A0" opacity="0.58"/>
+<text x="104" y="286" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" letter-spacing="0.02em" fill="#8A90A0" opacity="0.46">epics</text>
+<circle cx="253.0" cy="296.0" r="1.7" fill="#8A90A0" opacity="0.64"/>
+<text x="262" y="300" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" letter-spacing="0.02em" fill="#8A90A0" opacity="0.52">runbooks</text>
+<circle cx="351.0" cy="264.0" r="1.7" fill="#8A90A0" opacity="0.52"/>
+<text x="360" y="268" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="14" letter-spacing="0.02em" fill="#8A90A0" opacity="0.40">reviews</text>
+<circle cx="612.0" cy="250.0" r="126.0" fill="url(#core)"/>
+<circle cx="612.0" cy="250.0" r="84.0" fill="none" stroke="#3A4150" stroke-width="1.25" opacity="0.95"/>
+<circle cx="612.0" cy="250.0" r="95.8" fill="none" stroke="#2C313E" stroke-width="1.25" opacity="0.6"/>
+<circle cx="612.0" cy="250.0" r="67.2" fill="none" stroke="#F2B43C" stroke-width="1.25" opacity="0.22"/>
+<polygon points="612.00,220.00 684.75,208.00 637.98,235.00" fill="url(#blade)"/>
+<polygon points="637.98,235.00 684.75,292.00 637.98,265.00" fill="url(#blade)"/>
+<polygon points="637.98,265.00 612.00,334.00 612.00,280.00" fill="url(#blade)"/>
+<polygon points="612.00,280.00 539.25,292.00 586.02,265.00" fill="url(#blade)"/>
+<polygon points="586.02,265.00 539.25,208.00 586.02,235.00" fill="url(#blade)"/>
+<polygon points="586.02,235.00 612.00,166.00 612.00,220.00" fill="url(#blade)"/>
+<line x1="612.00" y1="220.00" x2="684.75" y2="208.00" stroke="#F2B43C" stroke-width="1.5" opacity="0.72" stroke-linecap="round"/>
+<line x1="637.98" y1="235.00" x2="684.75" y2="292.00" stroke="#F2B43C" stroke-width="1.5" opacity="0.72" stroke-linecap="round"/>
+<line x1="637.98" y1="265.00" x2="612.00" y2="334.00" stroke="#F2B43C" stroke-width="1.5" opacity="0.72" stroke-linecap="round"/>
+<line x1="612.00" y1="280.00" x2="539.25" y2="292.00" stroke="#F2B43C" stroke-width="1.5" opacity="0.72" stroke-linecap="round"/>
+<line x1="586.02" y1="265.00" x2="539.25" y2="208.00" stroke="#F2B43C" stroke-width="1.5" opacity="0.72" stroke-linecap="round"/>
+<line x1="586.02" y1="235.00" x2="612.00" y2="166.00" stroke="#F2B43C" stroke-width="1.5" opacity="0.72" stroke-linecap="round"/>
+<polygon points="612.00,220.00 637.98,235.00 637.98,265.00 612.00,280.00 586.02,265.00 586.02,235.00" fill="url(#hexcore)" stroke="#FFE3A6" stroke-width="1.25"/>
+<circle cx="612.0" cy="250.0" r="4.2" fill="#FFE3A6"/>
+<rect x="648.0" y="248.6" width="100.0" height="2.8" rx="1.4" fill="url(#beam)"/>
+<circle cx="748.0" cy="250.0" r="3.4" fill="#F2B43C"/>
+<text x="766" y="259" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="34" font-weight="600" letter-spacing="-0.01em" fill="#F2B43C">the right context.</text>
+<text x="74" y="66" font-family="ui-monospace, SFMono-Regular, Menlo, Consolas, monospace" font-size="12.5" letter-spacing="0.34em" fill="#8A90A0">CONTEXT&#160;&#183;&#160;RETRIEVAL&#160;ENGINE</text>
+<text x="72" y="112" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="46" font-weight="650" letter-spacing="-0.02em" fill="#ECEDF2">Code Context Engine</text>
+<text x="74" y="360" font-family="-apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif" font-size="17" font-weight="400" letter-spacing="0.005em" fill="#8A90A0">One engine for every source of truth &#8212; not just code.</text>
+</svg>

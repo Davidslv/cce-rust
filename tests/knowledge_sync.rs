@@ -495,13 +495,24 @@ fn knowledge_keys_are_additive_beside_code_artifacts() {
         "knowledge push",
     );
 
-    // Old-client views are unaffected: the repo listing is byte-identical
-    // (the knowledge section is M5.3; today's walk ignores the new prefix).
+    // Additivity, the M5.3 shape (SPEC-SYNC-KNOWLEDGE §6): the listing stays
+    // `cce.synclist/v1` and every pre-existing field is byte-stable — the
+    // corpus appears ONLY as the new optional `knowledge` array. (Before M5.3
+    // this test pinned full-byte equality; the knowledge section landing is
+    // exactly the anticipated change.)
     let list_after = assert_ok(
         &cce(home.path(), &["sync", "list", "--remote", &url, "--json"]),
         "sync list after",
     );
-    assert_eq!(list_before, list_after, "the knowledge key space must be invisible to old walks");
+    let before: serde_json::Value = serde_json::from_str(&list_before).unwrap();
+    let mut after: serde_json::Value = serde_json::from_str(&list_after).unwrap();
+    assert!(before.get("knowledge").is_none(), "no knowledge key before a corpus exists");
+    let corpora = after.as_object_mut().unwrap().remove("knowledge").expect("knowledge array");
+    assert_eq!(corpora[0]["corpus_id"], "fixture");
+    assert_eq!(
+        before, after,
+        "every pre-existing field of the listing must be byte-stable beside a corpus"
+    );
 
     // And the code pull still works untouched.
     let out =

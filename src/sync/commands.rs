@@ -581,6 +581,27 @@ pub struct RepoListing {
     pub bytes: u64,
 }
 
+/// One knowledge corpus's aggregate row in a cache listing
+/// (SPEC-SYNC-KNOWLEDGE §6). `current`, `data_as_of`, and `pushed_at` are
+/// nullable — a field never disappears within a row; the latter two come from
+/// the best-effort published `corpus.json` and degrade to `None` when it is
+/// absent or unparsable (§4.4).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnowledgeListing {
+    pub corpus_id: String,
+    /// The corpus `current` pointer's snapshot — the same source of truth
+    /// `knowledge pull` resolves. `None` when no pointer exists yet.
+    pub current: Option<String>,
+    /// Distinct `<snapshot>.cck` keys cached for this corpus.
+    pub snapshots: usize,
+    /// Total artifact bytes (LFS-aware: the pointer's recorded size).
+    pub bytes: u64,
+    /// The corpus's deterministic data age, from `corpus.json`.
+    pub data_as_of: Option<String>,
+    /// When the corpus was last published, from `corpus.json`.
+    pub pushed_at: Option<String>,
+}
+
 /// The whole cache listing: the resolved remote plus one row per `repo_id`,
 /// sorted by `repo_id` (deterministic output).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -594,6 +615,10 @@ pub struct CacheListing {
     /// `sync list` output (byte-pinned `cce.synclist/v1`) is unchanged and
     /// `pull --all` never warn-skips a metadata prefix as an unpullable repo.
     pub workspaces: Vec<String>,
+    /// Knowledge corpora the cache carries (SPEC-SYNC-KNOWLEDGE §6), sorted by
+    /// `corpus_id`. Empty on a knowledge-free cache — the rendered listing is
+    /// then byte-identical to the pre-M5 shape (human and JSON alike).
+    pub knowledge: Vec<KnowledgeListing>,
 }
 
 /// `cce sync list` (#53): enumerate what a cache holds — one row per `repo_id`
@@ -638,8 +663,48 @@ pub fn cmd_list(root: &Path, remote_override: Option<String>) -> Result<CacheLis
         }
         repos.push(RepoListing { repo_id, latest_sha, artifacts: shas.len(), bytes });
     }
-    // `list_dirs` already sorts, so rows and workspaces are deterministic by repo_id.
-    Ok(CacheListing { remote: url, repos, workspaces })
+    let knowledge = list_knowledge(&remote)?;
+    // `list_dirs` already sorts, so rows, workspaces, and corpora are
+    // deterministic (repo_id / corpus_id order).
+    Ok(CacheListing { remote: url, repos, workspaces, knowledge })
+}
+
+/// Enumerate the cache's knowledge corpora (SPEC-SYNC-KNOWLEDGE §6): the
+/// `knowledge/<contract_version>/<corpus_id>/` prefixes, each with its `current`
+/// pointer, distinct `.cck` count, LFS-aware bytes, and the best-effort
+/// `corpus.json` freshness fields. Reading stays cheap and read-only: only plain
+/// text blobs (`current`, `corpus.json`) plus key/size enumeration — no LFS
+/// smudge, no cache mutation (the same no-mutation posture as `cmd_list`).
+fn list_knowledge(remote: &GitRemote) -> Result<Vec<KnowledgeListing>, String> {
+    let kver = crate::sync::knowledge_contract_version();
+    let base = format!("knowledge/{kver}");
+    let mut out = Vec::new();
+    for corpus_id in remote.list_dirs(&base)? {
+        let prefix = format!("{base}/{corpus_id}");
+        let snapshots = remote.list_keys_with_suffix(&prefix, ".cck")?.len();
+        let bytes = remote.list_sizes_with_suffix(&prefix, ".cck")?.iter().map(|(_, b)| b).sum();
+        let current = remote
+            .read_blob_text(&crate::sync::knowledge_pointer_address(kver, &corpus_id))
+            .ok()
+            .filter(|s| !s.is_empty());
+        // corpus.json is best-effort display metadata: absent or unparsable
+        // degrades to null fields, never an error (§4.4).
+        let meta: Option<serde_json::Value> = remote
+            .read_blob_text(&crate::sync::knowledge_corpus_meta_address(kver, &corpus_id))
+            .ok()
+            .and_then(|t| serde_json::from_str(&t).ok());
+        let meta_str =
+            |k: &str| -> Option<String> { meta.as_ref()?.get(k)?.as_str().map(str::to_string) };
+        out.push(KnowledgeListing {
+            corpus_id,
+            current,
+            snapshots,
+            bytes,
+            data_as_of: meta_str("data_as_of"),
+            pushed_at: meta_str("pushed_at"),
+        });
+    }
+    Ok(out)
 }
 
 /// Render a cache listing as the human table: a `remote` header line in the
@@ -649,7 +714,12 @@ pub fn cmd_list(root: &Path, remote_override: Option<String>) -> Result<CacheLis
 pub fn render_list_human(listing: &CacheListing) -> String {
     let mut out = format!("remote        : {}\n", listing.remote);
     if listing.repos.is_empty() {
-        out.push_str("\nThe cache is empty — nothing has been pushed yet.\n");
+        if listing.knowledge.is_empty() {
+            out.push_str("\nThe cache is empty — nothing has been pushed yet.\n");
+        } else {
+            out.push_str("\nNo code repos cached — the cache carries only knowledge corpora.\n");
+            out.push_str(&render_knowledge_section(&listing.knowledge));
+        }
         return out;
     }
     let latest_of = |r: &RepoListing| r.latest_sha.clone().unwrap_or_else(|| "-".to_string());
@@ -687,6 +757,38 @@ pub fn render_list_human(listing: &CacheListing) -> String {
         if repos_n == 1 { "" } else { "s" },
         if total_artifacts == 1 { "" } else { "s" },
     ));
+    out.push_str(&render_knowledge_section(&listing.knowledge));
+    out
+}
+
+/// The human knowledge block (SPEC-SYNC-KNOWLEDGE §6): one aligned row per
+/// corpus after the repos table, rendered ONLY when the cache carries at least
+/// one corpus — a knowledge-free cache's listing stays byte-identical.
+fn render_knowledge_section(corpora: &[KnowledgeListing]) -> String {
+    if corpora.is_empty() {
+        return String::new();
+    }
+    let current_of = |k: &KnowledgeListing| k.current.clone().unwrap_or_else(|| "-".to_string());
+    let as_of = |k: &KnowledgeListing| k.data_as_of.clone().unwrap_or_else(|| "-".to_string());
+    let id_w = corpora.iter().map(|k| k.corpus_id.len()).chain(["corpus_id".len()]).max().unwrap();
+    let cur_w = corpora.iter().map(|k| current_of(k).len()).chain(["current".len()]).max().unwrap();
+    let bytes_w =
+        corpora.iter().map(|k| k.bytes.to_string().len()).chain(["bytes".len()]).max().unwrap();
+    let mut out = String::from("\nknowledge:\n");
+    out.push_str(&format!(
+        "{:<id_w$}  {:<cur_w$}  {:>9}  {:>bytes_w$}  {}\n",
+        "corpus_id", "current", "snapshots", "bytes", "data as-of"
+    ));
+    for k in corpora {
+        out.push_str(&format!(
+            "{:<id_w$}  {:<cur_w$}  {:>9}  {:>bytes_w$}  {}\n",
+            k.corpus_id,
+            current_of(k),
+            k.snapshots,
+            k.bytes,
+            as_of(k)
+        ));
+    }
     out
 }
 
@@ -707,11 +809,35 @@ pub fn render_list_json(listing: &CacheListing) -> String {
             })
         })
         .collect();
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "schema": "cce.synclist/v1",
         "remote": listing.remote,
         "repos": repos,
     });
+    // SPEC-SYNC-KNOWLEDGE §6: the schema STAYS `cce.synclist/v1` and gains an
+    // OPTIONAL `knowledge` array, emitted only when the cache carries at least
+    // one corpus — a knowledge-free listing is byte-identical to the pre-M5
+    // shape (tolerant-reader additivity, the SPEC-SYNC §3 rule). Nullable
+    // fields stay present as JSON `null` — a field never disappears in a row.
+    if !listing.knowledge.is_empty() {
+        let corpora: Vec<serde_json::Value> = listing
+            .knowledge
+            .iter()
+            .map(|k| {
+                serde_json::json!({
+                    "corpus_id": k.corpus_id,
+                    "current": k.current,
+                    "snapshots": k.snapshots,
+                    "bytes": k.bytes,
+                    "data_as_of": k.data_as_of,
+                    "pushed_at": k.pushed_at,
+                })
+            })
+            .collect();
+        body.as_object_mut()
+            .expect("synclist body is an object")
+            .insert("knowledge".to_string(), serde_json::Value::Array(corpora));
+    }
     serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string()) + "\n"
 }
 
@@ -759,12 +885,30 @@ fn dedup_member_name(base: &str, used: &BTreeSet<String>) -> String {
 ///   --latest` refreshes also work.
 /// - Members are federated **at independent shas** — there is no one-workspace-sha
 ///   assumption on the pull side.
-pub fn cmd_pull_all(into: &Path, remote_override: Option<String>) -> Result<String, String> {
+/// - **Knowledge** (SPEC-SYNC-KNOWLEDGE §7): after the member pulls, the cache's
+///   corpus (if any) is installed into the consumer root's `.cce/knowledge/` —
+///   `--corpus <id>` wins; a cache carrying exactly one corpus installs it; with
+///   several and no flag the run warns and skips knowledge, naming the ids. The
+///   install reuses `cce knowledge pull` verbatim, so the store is byte-identical
+///   to a direct pull, and the marker makes the refresh idempotent (an unmoved
+///   remote `current` is `up-to-date`, not re-fetched — the member rule).
+pub fn cmd_pull_all(
+    into: &Path,
+    remote_override: Option<String>,
+    corpus: Option<String>,
+) -> Result<String, String> {
     std::fs::create_dir_all(into).map_err(|e| format!("cannot create {}: {e}", into.display()))?;
     let listing = cmd_list(into, remote_override)?;
     let mut out = format!("remote        : {}\n", listing.remote);
     if listing.repos.is_empty() {
-        out.push_str("\nThe cache is empty — nothing has been pushed yet.\n");
+        if listing.knowledge.is_empty() {
+            out.push_str("\nThe cache is empty — nothing has been pushed yet.\n");
+        } else {
+            // A knowledge-only cache: no members to pull, but the corpus still
+            // installs (a knowledge-only consumer is a valid §7 shape).
+            out.push_str("\nNo code repos cached — the cache carries only knowledge corpora.\n\n");
+            pull_all_knowledge(into, &listing, corpus.as_deref(), &mut out);
+        }
         return Ok(out);
     }
     // The same read-only open `cmd_list` uses: never write LFS attributes into
@@ -914,6 +1058,12 @@ pub fn cmd_pull_all(into: &Path, remote_override: Option<String>) -> Result<Stri
         }
     }
 
+    // SPEC-SYNC-KNOWLEDGE §7: install the cache's corpus into the consumer ROOT
+    // (`<into>/.cce/knowledge/` — where the MCP server loads knowledge from).
+    // Best-effort like every other row: a knowledge problem warns, never fails
+    // the member pulls.
+    pull_all_knowledge(into, &listing, corpus.as_deref(), &mut out);
+
     // #55: apply the published workspace metadata (the self-describing cache).
     // Each published manifest applies only to its OWN members — the ones whose
     // repo_id is `<base>__<published-name>` — enriching the synthesized entries
@@ -1008,6 +1158,87 @@ pub fn cmd_pull_all(into: &Path, remote_override: Option<String>) -> Result<Stri
         "summary       : {pulled} pulled · {up_to_date} up-to-date · {skipped} skipped\n"
     ));
     Ok(out)
+}
+
+/// The `pull --all` knowledge step (SPEC-SYNC-KNOWLEDGE §7). Selection: an
+/// explicit `--corpus` wins; a cache carrying exactly ONE corpus installs it;
+/// with several and no flag the run warns and skips knowledge, listing the
+/// corpus ids so the user can choose (one active corpus per root is the v1
+/// invariant — blending is deferred). Every failure is a warning line: knowledge
+/// never fails the member pulls. The install itself is `cmd_knowledge_pull`
+/// verbatim, so the store bytes and marker are identical to a direct
+/// `cce knowledge pull`, and an unmoved remote `current` short-circuits to
+/// `up-to-date` with no fetch (the #54 member-refresh rule, via the marker).
+fn pull_all_knowledge(into: &Path, listing: &CacheListing, corpus: Option<&str>, out: &mut String) {
+    if listing.knowledge.is_empty() {
+        return;
+    }
+    let ids =
+        || listing.knowledge.iter().map(|k| k.corpus_id.as_str()).collect::<Vec<_>>().join(", ");
+    let selected = match corpus {
+        Some(id) => match listing.knowledge.iter().find(|k| k.corpus_id == id) {
+            Some(k) => k,
+            None => {
+                out.push_str(&format!(
+                    "  warning: skipped knowledge — corpus `{id}` is not in the cache (it \
+                     carries: {})\n",
+                    ids()
+                ));
+                return;
+            }
+        },
+        None if listing.knowledge.len() == 1 => &listing.knowledge[0],
+        None => {
+            out.push_str(&format!(
+                "  warning: skipped knowledge — the cache carries {} corpora ({}); one active \
+                 corpus per root — pass --corpus <id> to install one\n",
+                listing.knowledge.len(),
+                ids()
+            ));
+            return;
+        }
+    };
+    let Some(current) = selected.current.as_deref() else {
+        out.push_str(&format!(
+            "  warning: skipped knowledge corpus {} — no `current` pointer on the remote\n",
+            selected.corpus_id
+        ));
+        return;
+    };
+    // Idempotent refresh: the knowledge sync marker records what was installed;
+    // an unmoved `current` means nothing to fetch.
+    if let Some(marker) = crate::sync::knowledge_commands::KnowledgeSyncState::load(into) {
+        if marker.corpus_id == selected.corpus_id && marker.snapshot == current {
+            out.push_str(&format!(
+                "  {:<16} up-to-date  {}@{current}\n",
+                "knowledge", selected.corpus_id
+            ));
+            return;
+        }
+    }
+    match crate::sync::knowledge_commands::cmd_knowledge_pull(
+        into,
+        Some(selected.corpus_id.to_string()),
+        None,
+        false,
+        Some(listing.remote.clone()),
+    ) {
+        Ok(_) => {
+            let snapshot = crate::sync::knowledge_commands::KnowledgeSyncState::load(into)
+                .map(|s| s.snapshot)
+                .unwrap_or_else(|| current.to_string());
+            out.push_str(&format!(
+                "  {:<16} pulled      {}@{snapshot}  → .cce/knowledge/\n",
+                "knowledge", selected.corpus_id
+            ));
+        }
+        Err(e) => {
+            out.push_str(&format!(
+                "  warning: skipped knowledge corpus {} — {e}\n",
+                selected.corpus_id
+            ));
+        }
+    }
 }
 
 /// `cce sync verify` (SPEC-SYNC §5): re-index locally and confirm the pulled
@@ -1111,6 +1342,63 @@ const NO_RECORD_NOTICE: &str =
     "no install checksum recorded (pulled by an older cce) — re-pull with `cce sync pull \
      --force` to enable checksum verification";
 
+/// The knowledge analogue of [`NO_RECORD_NOTICE`] (SPEC-SYNC-KNOWLEDGE §7): a
+/// knowledge sync marker without `installed_sha256` is the same explicit
+/// notice + exit 0, never a false failure.
+const KNOWLEDGE_NO_RECORD_NOTICE: &str =
+    "no install checksum recorded (pulled by an older cce) — re-pull with `cce knowledge pull` \
+     to enable checksum verification";
+
+/// One pulled knowledge store's checksum-only outcome (SPEC-SYNC-KNOWLEDGE §7)
+/// — the knowledge sibling of [`ChecksumVerify`].
+enum KnowledgeChecksumVerify {
+    /// The on-disk snapshot bytes match the recorded install hash.
+    Ok(crate::sync::knowledge_commands::KnowledgeSyncState, String),
+    /// The marker predates `installed_sha256`; unverifiable until a re-pull.
+    NoRecord(crate::sync::knowledge_commands::KnowledgeSyncState),
+}
+
+/// Verify the root's pulled knowledge store by re-hash alone (SPEC-SYNC-KNOWLEDGE
+/// §7): SHA-256 the on-disk `.cce/knowledge/<snapshot>.json` bytes and compare
+/// against the `installed_sha256` the pull recorded in the knowledge sync
+/// marker — the exact #55 mechanism, version-independent by construction.
+/// Returns `None` when the root carries no marker at all (a knowledge-free or
+/// local-ingest-only root verifies exactly as today — no knowledge row, no
+/// error). A mismatch names the corpus and carries the sharpened §4.2 caveat:
+/// knowledge has NO full-`verify` escalation path at all.
+fn verify_knowledge_checksum(root: &Path) -> Option<Result<KnowledgeChecksumVerify, String>> {
+    let state = crate::sync::knowledge_commands::KnowledgeSyncState::load(root)?;
+    let Some(expected) = state.installed_sha256.clone() else {
+        return Some(Ok(KnowledgeChecksumVerify::NoRecord(state)));
+    };
+    let store = crate::knowledge::store::KnowledgeStore::snapshot_path(root, &state.snapshot);
+    let bytes = match std::fs::read(&store) {
+        Ok(b) => b,
+        Err(e) => {
+            return Some(Err(format!(
+                "verify FAILED (checksum-only) for knowledge corpus `{}` (@{})\n  the pulled \
+                 knowledge store could not be read: {e}\n  Re-pull it with `cce knowledge pull \
+                 --corpus {}`.",
+                state.corpus_id, state.snapshot, state.corpus_id
+            )))
+        }
+    };
+    let actual = hex_lower(&Sha256::digest(&bytes));
+    if actual != expected {
+        return Some(Err(format!(
+            "verify FAILED (checksum-only) for knowledge corpus `{}` (@{})\n  expected : \
+             {expected}\n  actual   : {actual}\n  The pulled knowledge store does not match the \
+             bytes recorded at pull time — corruption or local modification. Re-pull with `cce \
+             knowledge pull --corpus {}`.\n  (Checksum-only detects corruption, not a malicious \
+             build — and a knowledge corpus has NO rebuild-verify escalation path at all: the \
+             puller lacks the source feed. Trust stays with the pusher and the git host's \
+             access control.)",
+            state.corpus_id, state.snapshot, state.corpus_id
+        )));
+    }
+    Some(Ok(KnowledgeChecksumVerify::Ok(state, actual)))
+}
+
 /// `cce sync verify --checksum-only` (#55): re-hash the PULLED store's on-disk
 /// bytes against the SHA-256 **recorded from the installed bytes at pull time**
 /// (`installed_sha256` in `.cce/synced.json`) — zero source checkout, zero
@@ -1140,6 +1428,23 @@ const NO_RECORD_NOTICE: &str =
 /// store is verified and a failure names the member; without one, the root
 /// store is verified. Exit codes and message shapes mirror full `verify`.
 pub fn cmd_verify_checksum_only(root: &Path) -> Result<String, String> {
+    // SPEC-SYNC-KNOWLEDGE §7: when the verified root carries a knowledge sync
+    // marker, the report gains a knowledge row — same pass/fail/notice
+    // semantics as members. A hard mismatch propagates here (non-zero, naming
+    // the corpus); a root without a marker gains nothing.
+    let knowledge = verify_knowledge_checksum(root).transpose()?;
+    let knowledge_row = |k: &KnowledgeChecksumVerify| match k {
+        KnowledgeChecksumVerify::Ok(state, checksum) => format!(
+            "  {:<16} {}@{}  ({})\n",
+            "knowledge",
+            state.corpus_id,
+            state.snapshot,
+            &checksum[..12]
+        ),
+        KnowledgeChecksumVerify::NoRecord(_) => {
+            format!("  {:<16} {KNOWLEDGE_NO_RECORD_NOTICE}\n", "knowledge")
+        }
+    };
     match Manifest::load(root) {
         Ok(manifest) => {
             let mut out = String::new();
@@ -1163,6 +1468,12 @@ pub fn cmd_verify_checksum_only(root: &Path) -> Result<String, String> {
                     }
                 }
             }
+            if let Some(k) = &knowledge {
+                out.push_str(&knowledge_row(k));
+                if matches!(k, KnowledgeChecksumVerify::NoRecord(_)) {
+                    unrecorded += 1;
+                }
+            }
             let header = if unrecorded == 0 {
                 format!(
                     "verify OK (checksum-only): {verified} member{}",
@@ -1177,16 +1488,41 @@ pub fn cmd_verify_checksum_only(root: &Path) -> Result<String, String> {
             };
             Ok(format!("{header}\n{out}"))
         }
-        Err(_) => match verify_store_checksum(root, "this store")? {
-            ChecksumVerify::Ok(state, checksum) => Ok(format!(
-                "verify OK (checksum-only): {}@{}\n  checksum : {checksum}\n",
-                state.repo_id, state.sha
-            )),
-            ChecksumVerify::NoRecord(state) => Ok(format!(
-                "verify (checksum-only): {}@{}: {NO_RECORD_NOTICE}\n",
-                state.repo_id, state.sha
-            )),
-        },
+        Err(_) => {
+            // A root with ONLY a pulled knowledge corpus (no code store, no
+            // manifest) still verifies its knowledge (§7); with neither marker
+            // the original clear error stands.
+            if SyncState::load(root).is_none() {
+                if let Some(k) = &knowledge {
+                    return Ok(match k {
+                        KnowledgeChecksumVerify::Ok(state, checksum) => format!(
+                            "verify OK (checksum-only): knowledge corpus {}@{}\n  checksum : \
+                             {checksum}\n",
+                            state.corpus_id, state.snapshot
+                        ),
+                        KnowledgeChecksumVerify::NoRecord(state) => format!(
+                            "verify (checksum-only): knowledge corpus {}@{}: \
+                             {KNOWLEDGE_NO_RECORD_NOTICE}\n",
+                            state.corpus_id, state.snapshot
+                        ),
+                    });
+                }
+            }
+            let mut out = match verify_store_checksum(root, "this store")? {
+                ChecksumVerify::Ok(state, checksum) => format!(
+                    "verify OK (checksum-only): {}@{}\n  checksum : {checksum}\n",
+                    state.repo_id, state.sha
+                ),
+                ChecksumVerify::NoRecord(state) => format!(
+                    "verify (checksum-only): {}@{}: {NO_RECORD_NOTICE}\n",
+                    state.repo_id, state.sha
+                ),
+            };
+            if let Some(k) = &knowledge {
+                out.push_str(&knowledge_row(k));
+            }
+            Ok(out)
+        }
     }
 }
 
@@ -2034,6 +2370,7 @@ mod tests {
                 },
             ],
             workspaces: vec![],
+            knowledge: vec![],
         }
     }
 
@@ -2072,6 +2409,7 @@ mod tests {
             remote: "file:///srv/cache.git".to_string(),
             repos: vec![],
             workspaces: vec![],
+            knowledge: vec![],
         });
         let golden = "{\n  \"remote\": \"file:///srv/cache.git\",\n  \"repos\": [],\n  \"schema\": \"cce.synclist/v1\"\n}\n";
         assert_eq!(s, golden);
@@ -2098,6 +2436,7 @@ total         : 2 repos, 4 artifacts, 125504 bytes
             remote: "file:///srv/cache.git".to_string(),
             repos: vec![],
             workspaces: vec![],
+            knowledge: vec![],
         });
         assert_eq!(
             s,
@@ -2137,7 +2476,7 @@ total         : 2 repos, 4 artifacts, 125504 bytes
             .unwrap();
 
         let into = tempfile::tempdir().unwrap();
-        let out = cmd_pull_all(into.path(), Some(url.clone())).unwrap();
+        let out = cmd_pull_all(into.path(), Some(url.clone()), None).unwrap();
         assert!(
             out.contains("warning: skipped example.com__acme__nolatest — no latest pointer"),
             "got: {out}"
@@ -2165,7 +2504,7 @@ total         : 2 repos, 4 artifacts, 125504 bytes
         assert!(!into.path().join("nolatest").exists());
 
         // Second run: nothing moved — everything reports up-to-date, no re-pull.
-        let out2 = cmd_pull_all(into.path(), None).unwrap();
+        let out2 = cmd_pull_all(into.path(), None, None).unwrap();
         assert!(
             out2.contains(&format!("demo             up-to-date  example.com__acme__demo@{sha}")),
             "got: {out2}"
@@ -2186,7 +2525,7 @@ total         : 2 repos, 4 artifacts, 125504 bytes
         cmd_push(src.path(), None, false).unwrap();
 
         let into = tempfile::tempdir().unwrap();
-        cmd_pull_all(into.path(), Some(url_a)).unwrap();
+        cmd_pull_all(into.path(), Some(url_a), None).unwrap();
         assert!(into.path().join("demo/.cce/index.json").exists());
 
         // Point the same consumer dir at a different (empty-of-this-repo) cache:
@@ -2204,7 +2543,7 @@ total         : 2 repos, 4 artifacts, 125504 bytes
         .unwrap();
         cmd_push(src_b.path(), None, false).unwrap();
 
-        let out = cmd_pull_all(into.path(), Some(url_b)).unwrap();
+        let out = cmd_pull_all(into.path(), Some(url_b), None).unwrap();
         assert!(
             out.contains(
                 "warning: demo (example.com__acme__demo) is no longer in the cache — left in place"
@@ -2266,7 +2605,7 @@ total         : 2 repos, 4 artifacts, 125504 bytes
         cmd_push(src.path(), None, true).unwrap();
 
         let into = tempfile::tempdir().unwrap();
-        let out = cmd_pull_all(into.path(), Some(url.clone())).unwrap();
+        let out = cmd_pull_all(into.path(), Some(url.clone()), None).unwrap();
         assert!(
             out.contains(
                 "metadata      : 1 published workspace manifest applied · 1 cross-member edge installed"
@@ -2286,7 +2625,7 @@ total         : 2 repos, 4 artifacts, 125504 bytes
         // Refresh run: byte-identical manifest + graph, everything up-to-date.
         let yaml1 = std::fs::read_to_string(crate::workspace::manifest_path(into.path())).unwrap();
         let graph1 = std::fs::read_to_string(crate::workspace::graph_path(into.path())).unwrap();
-        let out2 = cmd_pull_all(into.path(), None).unwrap();
+        let out2 = cmd_pull_all(into.path(), None, None).unwrap();
         assert!(
             out2.contains("summary       : 0 pulled · 2 up-to-date · 0 skipped"),
             "got: {out2}"
@@ -2343,7 +2682,7 @@ total         : 2 repos, 4 artifacts, 125504 bytes
         }
 
         let into = tempfile::tempdir().unwrap();
-        let out = cmd_pull_all(into.path(), Some(url)).unwrap();
+        let out = cmd_pull_all(into.path(), Some(url), None).unwrap();
         assert!(
             out.contains(
                 "warning: workspace example.com__zeta__mono: member name `demo` was taken by an \
@@ -2407,7 +2746,7 @@ total         : 2 repos, 4 artifacts, 125504 bytes
         cmd_push(src.path(), None, true).unwrap();
 
         let into = tempfile::tempdir().unwrap();
-        cmd_pull_all(into.path(), Some(url)).unwrap();
+        cmd_pull_all(into.path(), Some(url), None).unwrap();
         let out = cmd_verify_checksum_only(into.path()).unwrap();
         assert!(out.contains("verify OK (checksum-only): 2 members"), "got: {out}");
         assert!(out.contains("alpha") && out.contains("beta"), "got: {out}");
@@ -2466,7 +2805,7 @@ total         : 2 repos, 4 artifacts, 125504 bytes
         .unwrap();
         cmd_push(src_ws.path(), None, true).unwrap();
         let into = tempfile::tempdir().unwrap();
-        cmd_pull_all(into.path(), Some(url_ws)).unwrap();
+        cmd_pull_all(into.path(), Some(url_ws), None).unwrap();
         let beta = into.path().join("beta");
         let mut state = SyncState::load(&beta).unwrap();
         state.installed_sha256 = None;
@@ -2495,12 +2834,12 @@ total         : 2 repos, 4 artifacts, 125504 bytes
         cmd_push(src.path(), None, false).unwrap();
 
         let into = tempfile::tempdir().unwrap();
-        cmd_pull_all(into.path(), Some(url)).unwrap();
+        cmd_pull_all(into.path(), Some(url), None).unwrap();
         assert!(into.path().join("demo/.cce/index.json").exists());
         // Kill the member's whole .cce dir: config, marker, and store gone.
         std::fs::remove_dir_all(into.path().join("demo/.cce")).unwrap();
 
-        let out = cmd_pull_all(into.path(), None).unwrap();
+        let out = cmd_pull_all(into.path(), None, None).unwrap();
         assert!(
             out.contains("note: re-adopting existing member `demo` for example.com__acme__demo"),
             "got: {out}"
