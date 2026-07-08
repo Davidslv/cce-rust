@@ -34,7 +34,7 @@ name: <workspace name = root dir basename>
 members:
   - name: <unique member id>
     path: <path relative to the root, / separators>
-    type: rails-app | ruby-engine | ruby-gem | typescript | javascript
+    type: rails-app | ruby-engine | ruby-gem | typescript | javascript | store-only
     package: <the dependency name others use to require it>
 ```
 
@@ -43,6 +43,12 @@ directory basename; on collision, `-2`, `-3`, … are appended in path-sorted or
 `cce workspace init` generates the manifest; a hand-written one is honoured as-is.
 CCE emits the file with a byte-deterministic writer, and parses it back with a
 YAML reader so edits round-trip.
+
+`type: store-only` is the one member type **detection never emits**: it is the
+neutral classification for a member with **no source to classify** — a pulled
+index with no checkout. It is written only by the consumer-mode synthesizer
+(`cce sync pull --all`, below); hand-written and detected manifests are
+unaffected.
 
 ## Detection rules
 
@@ -138,6 +144,20 @@ only cross-member links are the declared dependency edges.
   searches span members, so they stay **out of `by_package`**, which remains
   per-member. Loopback-only, read-only, and self-contained, exactly as the
   single-repo dashboard.
+
+## Repo-less workspaces (consumer mode, via CCE Sync)
+
+A workspace does not have to hold any source. `cce sync pull --all --into <dir>`
+pulls every repo in a CCE Sync cache and **synthesizes** the two metadata files —
+a `workspace.yml` whose members are `type: store-only` (each member directory
+holds only a pulled `.cce/`), federated by the same semantics as above. And the
+cache is **self-describing**: `cce sync push --workspace` publishes the source
+workspace's canonical `workspace.yml` and derived `workspace-graph.json` at
+well-known cache keys, so a repo-less consumer recovers the **real** member
+types/packages and the **cross-member dependency edges** — federated search over
+a consumer workspace expands across members exactly like the source-side one.
+See [`sync.md`](sync.md) §7 for the full flow, naming/refresh rules, and the
+`verify --checksum-only` integrity check.
 
 ## Where this would strain
 

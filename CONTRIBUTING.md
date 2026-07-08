@@ -59,13 +59,13 @@ This codebase was built test-first (SPEC §12) and expects to stay that way — 
 - Tests must be **deterministic and hermetic**: no network, no reliance on wall
   clock or ambient filesystem. The single Ollama integration test is marked
   `#[ignore]` for exactly this reason.
-- Keep or improve coverage. The suite is **113 tests at 95.44% line coverage**
+- Keep or improve coverage. The suite is **605 tests at ~94% line coverage**
   (`cargo llvm-cov`); a change that drops coverage should add tests, not lower
   the bar.
 
 ## Spec conformance must not drift
 
-`cce conformance test/fixture` produces a byte-stable [`conformance.json`](conformance.json)
+`cce conformance test/fixture/samples` produces a byte-stable [`conformance.json`](conformance.json)
 that is designed to match the Ruby sibling on the same fixture. If your change
 alters that output, that is a significant, deliberate act: call it out
 explicitly in the PR, explain why it is correct against `SPEC.md`, and expect it

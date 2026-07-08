@@ -64,6 +64,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   published metadata, plain single-member pulls, `SYNC_FORMAT_VERSION`, `conformance.json`,
   and every existing golden are untouched.
 
+### Documentation
+- **Consumer-mode documentation sweep (pre-v2.6.9).** The whole doc surface now tells the
+  #53/#54/#55 story coherently: a "consume a team cache" recipe in `docs/how-to.md` (the
+  flagship repo-less flow), consumer-mode/`store-only` coverage in `docs/workspace.md`, a
+  repo-less agent-context note in `docs/mcp.md`, the `list`/`pull --all` CLI surface in
+  SPEC-SYNC §5, a "consumer mode over a server" decision entry in `docs/DECISIONS.md`,
+  refreshed module-map/`llms.txt`/README index rows, the `Cargo.toml` description, and
+  current test counts (605) in README/AGENTS/CONTRIBUTING/getting-started/llms.txt.
+
 ## [2.6.8] - 2026-07-08
 
 ### Changed

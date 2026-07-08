@@ -70,7 +70,7 @@ ambient filesystem state. The only test needing a real server (live Ollama) is
 (via `CCE_OLLAMA_URL`) or a closed local port, never a real server.
 The metrics tests inject a fixed clock/id source, and the dashboard's socket test
 binds an **ephemeral loopback port** and serves a bounded number of connections.
-Keep coverage at or above the baseline (**540 tests, ~94% line coverage** via
+Keep coverage at or above the baseline (**605 tests, ~94% line coverage** via
 `cargo llvm-cov`); a change that lowers coverage should add tests. The CI test
 gate also runs the three-layer validators over every language pack.
 
@@ -112,7 +112,12 @@ scores are compared, sorted, or emitted.
   `cce.knowledge/v1` contract, the `source: code|knowledge|both` blend on
   `context_search` — still nine tools) and the committed-`.gitignore`-aware walk in
   `src/walker.rs`; all fully additive — `conformance.json` and the Sync artifact
-  stay byte-identical.
+  stay byte-identical. The **Sync consumer mode** (#53–#55: `cce sync list`,
+  `cce sync pull --all` with the synthesized `store-only` member type, the
+  published workspace metadata at additive well-known cache keys, and
+  `cce sync verify --checksum-only` against the `installed_sha256` recorded in
+  `.cce/synced.json`) is likewise fully additive — `SYNC_FORMAT_VERSION` stays
+  `2.3` and every existing golden is untouched.
 - [`docs/mcp.md`](docs/mcp.md) · [`docs/savings.md`](docs/savings.md) ·
   [`docs/sync.md`](docs/sync.md) · [`docs/knowledge.md`](docs/knowledge.md) — the
   MCP (nine tools), Savings Layers, Sync, and Knowledge Sources user docs;

@@ -38,7 +38,7 @@ sudo apt-get update && sudo apt-get install -y build-essential
 git clone https://github.com/davidslv/cce-rust
 cd cce-rust
 cargo build --release     # binary at target/release/cce
-cargo test                # confirms a green build (540 tests)
+cargo test                # confirms a green build (605 tests)
 ```
 
 Prefer not to build at all? Every release ships **prebuilt binaries** for macOS
@@ -136,6 +136,9 @@ endpoint or model.
 
 - [`how-to.md`](how-to.md) — task recipes for every command.
 - [`mcp.md`](mcp.md) — wire CCE into an agent (Claude Code) as nine MCP tools.
+- [`sync.md`](sync.md) — share the index through a git-backed cache: pull the
+  CI-built index in seconds, or consume a whole team cache with **no source
+  checkout at all** (consumer mode: `cce sync pull --all`).
 - [`savings.md`](savings.md) — the seven Savings Layers, `cce savings`, and the
   honest "vs full-file baseline" framing.
 - [`knowledge.md`](knowledge.md) — feed issues/epics/policy docs in with

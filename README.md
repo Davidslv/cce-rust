@@ -833,12 +833,12 @@ node type in a `kind` field alongside the coarse `chunk_type`
 ## Tests & coverage
 
 ```bash
-cargo test                                                  # 540 tests
+cargo test                                                  # 605 tests
 cargo clippy --all-targets --all-features -- -D warnings    # lint gate
 cargo fmt --check                                           # format gate
 ```
 
-The suite is **540 passing tests** (+1 `#[ignore]` live-Ollama integration test)
+The suite is **605 passing tests** (+1 `#[ignore]` live-Ollama integration test)
 and measures **~94% line coverage** via `cargo llvm-cov`. The default suite is
 fully deterministic and makes no network calls — including the metrics subsystem,
 whose clock and id source are injected and whose dashboard tests bind an
@@ -857,7 +857,7 @@ language pack, and a guard test asserts the core chunker names no language.
 | [`SPEC-SYNC.md`](SPEC-SYNC.md) | The CCE Sync design spec (v2.3) |
 | [`SPEC-MCP.md`](SPEC-MCP.md) | The CCE MCP design spec (v2.4) |
 | [`SPEC-V2.5-SAVINGS.md`](SPEC-V2.5-SAVINGS.md) | The Savings Layers spec (v2.5) — the seven layers, the ledger, the nine tools |
-| [`docs/sync.md`](docs/sync.md) | CCE Sync: model, artifact format, content address, permissions, troubleshooting |
+| [`docs/sync.md`](docs/sync.md) | CCE Sync: model, artifact format, content address, consumer mode (repo-less), permissions, troubleshooting |
 | [`docs/mcp.md`](docs/mcp.md) | CCE MCP: the server, the **nine tools**, `cce init`, sync freshness, and how to confirm agent use |
 | [`docs/savings.md`](docs/savings.md) | The seven Savings Layers, the ledger, `cce savings`, the token estimator, and the `cce eval` A/B harness |
 | [`docs/knowledge.md`](docs/knowledge.md) | Knowledge sources (v2.6): the markdown-heading chunker, the `cce.knowledge/v1` contract, `cce knowledge index`, and the `source:` retrieval blend |
@@ -869,7 +869,7 @@ language pack, and a guard test asserts the core chunker names no language.
 | [`docs/architecture.md`](docs/architecture.md) | Design goals, pipeline, language packs, and where it strains |
 | [`docs/workspace.md`](docs/workspace.md) | Workspace model, manifest, detection, federation semantics |
 | [`docs/dashboard.md`](docs/dashboard.md) | Metrics pipeline, event schema, aggregation formulas |
-| [`docs/how-to.md`](docs/how-to.md) | Task recipes: index, search, feedback, dashboard, bench, conformance |
+| [`docs/how-to.md`](docs/how-to.md) | Task recipes: index, search, feedback, dashboard, sync (incl. consuming a team cache), bench, conformance |
 | [`docs/DECISIONS.md`](docs/DECISIONS.md) | How each spec ambiguity was resolved |
 | [`docs/TDD.md`](docs/TDD.md) | The red → green log and coverage |
 | [`docs/BENCHMARKS.md`](docs/BENCHMARKS.md) | Measured numbers on a real corpus |
