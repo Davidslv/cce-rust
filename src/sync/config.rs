@@ -174,6 +174,73 @@ impl SyncConfig {
     }
 }
 
+/// The resolved `knowledge.sync.*` configuration (SPEC-SYNC-KNOWLEDGE §8). All
+/// keys optional; absent ⇒ knowledge sync off, pure local knowledge exactly as
+/// today. These keys are written by hand or by the adapter job — there is no
+/// `cce knowledge init` (`cce sync init` owns the remote clone setup).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct KnowledgeSyncConfig {
+    /// The §4.1 corpus identity; required to push (or pass `--corpus`).
+    pub corpus_id: Option<String>,
+    /// Per-corpus remote override (§4.3); default = the project's `sync.remote`.
+    pub remote: Option<String>,
+    /// Per-corpus retention (§4.5): `all` | `keep-last-<n>`; default `all`.
+    pub retention: Retention,
+}
+
+impl Default for KnowledgeSyncConfig {
+    fn default() -> Self {
+        KnowledgeSyncConfig { corpus_id: None, remote: None, retention: Retention::All }
+    }
+}
+
+// The `knowledge: sync:` YAML shape. Reading is tolerant: a missing block, or a
+// `knowledge:` block without `sync:`, yields the default. Sibling keys the
+// runtime `KnowledgeConfig` owns (`enabled`, `min_score`, …) are untouched.
+#[derive(Deserialize)]
+struct RawKnowledgeSync {
+    corpus_id: Option<String>,
+    remote: Option<String>,
+    retention: Option<String>,
+}
+
+#[derive(Deserialize)]
+struct RawKnowledgeBlock {
+    sync: Option<RawKnowledgeSync>,
+}
+
+#[derive(Deserialize)]
+struct RawKnowledgeRoot {
+    knowledge: Option<RawKnowledgeBlock>,
+}
+
+impl KnowledgeSyncConfig {
+    /// Parse from `.cce/config` YAML text. Tolerant: no `knowledge:` block, no
+    /// `sync:` sub-block, or unparsable YAML all yield the default (sync off).
+    pub fn from_yaml(text: &str) -> KnowledgeSyncConfig {
+        let mut cfg = KnowledgeSyncConfig::default();
+        let Ok(raw) = serde_yaml::from_str::<RawKnowledgeRoot>(text) else {
+            return cfg;
+        };
+        if let Some(s) = raw.knowledge.and_then(|k| k.sync) {
+            cfg.corpus_id = s.corpus_id.filter(|c| !c.is_empty());
+            cfg.remote = s.remote.filter(|r| !r.is_empty());
+            if let Some(r) = s.retention {
+                cfg.retention = Retention::parse(&r);
+            }
+        }
+        cfg
+    }
+
+    /// Load the knowledge sync config for `root` from the per-project
+    /// `.cce/config`; absent file ⇒ default.
+    pub fn load(root: &Path) -> KnowledgeSyncConfig {
+        std::fs::read_to_string(config_path(root))
+            .map(|t| KnowledgeSyncConfig::from_yaml(&t))
+            .unwrap_or_default()
+    }
+}
+
 /// Quote a YAML scalar only when needed (mirrors the workspace manifest writer).
 fn yaml_scalar(s: &str) -> String {
     let safe = !s.is_empty()
@@ -247,6 +314,47 @@ mod tests {
         std::env::remove_var("CCE_HOME");
         assert_eq!(loaded.remote, c.remote);
         assert!(loaded.lfs);
+    }
+
+    #[test]
+    fn knowledge_sync_defaults_to_off() {
+        let c = KnowledgeSyncConfig::default();
+        assert_eq!(c.corpus_id, None);
+        assert_eq!(c.remote, None);
+        assert_eq!(c.retention, Retention::All);
+    }
+
+    #[test]
+    fn knowledge_sync_reads_the_nested_block_and_tolerates_junk() {
+        let c = KnowledgeSyncConfig::from_yaml(
+            "knowledge:\n  enabled: true\n  sync:\n    corpus_id: internal-tickets\n    remote: file:///tmp/k.git\n    retention: keep-last-10\n",
+        );
+        assert_eq!(c.corpus_id.as_deref(), Some("internal-tickets"));
+        assert_eq!(c.remote.as_deref(), Some("file:///tmp/k.git"));
+        assert_eq!(c.retention, Retention::KeepLast(10));
+        // Tolerant reading: absent/partial/unparsable blocks yield the default.
+        assert_eq!(KnowledgeSyncConfig::from_yaml("sync:\n  lfs: true\n"), Default::default());
+        assert_eq!(
+            KnowledgeSyncConfig::from_yaml("knowledge:\n  enabled: false\n"),
+            Default::default()
+        );
+        assert_eq!(KnowledgeSyncConfig::from_yaml("not: yaml: ["), Default::default());
+        // Empty strings are treated as unset.
+        let empty = KnowledgeSyncConfig::from_yaml("knowledge:\n  sync:\n    corpus_id: \"\"\n");
+        assert_eq!(empty.corpus_id, None);
+    }
+
+    #[test]
+    fn knowledge_sync_coexists_with_the_runtime_knowledge_config() {
+        // The same `.cce/config` text parses for BOTH readers: the runtime
+        // `knowledge.*` keys and the nested `knowledge.sync.*` keys (§8: the
+        // existing keys are untouched).
+        let text = "knowledge:\n  enabled: false\n  min_score: 0.5\n  sync:\n    corpus_id: c1\n";
+        let sync = KnowledgeSyncConfig::from_yaml(text);
+        assert_eq!(sync.corpus_id.as_deref(), Some("c1"));
+        let runtime = crate::config::KnowledgeConfig::from_yaml(text);
+        assert!(!runtime.enabled);
+        assert_eq!(runtime.min_score, 0.5);
     }
 
     #[test]
