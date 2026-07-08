@@ -315,11 +315,12 @@ enum Command {
         /// (default: all three).
         #[arg(long)]
         backend: Option<String>,
-        /// Compare exactly two backends side by side with per-query deltas,
+        /// Compare exactly two backends side by side with per-query deltas
+        /// plus paired significance per metric (t, two-sided p, 95% CI, n),
         /// e.g. `--compare bm25,hybrid`.
         #[arg(long, value_name = "A,B", conflicts_with = "backend")]
         compare: Option<String>,
-        /// Emit the full report as JSON (the stable `cce.relevance.report/v1` shape).
+        /// Emit the full report as JSON (the stable `cce.relevance.report/v2` shape).
         #[arg(long)]
         json: bool,
     },
@@ -1240,13 +1241,24 @@ fn cmd_relevance(
         .map(|b| rel::evaluate_backend(&index, emb.as_ref(), *b, &set.cases))
         .collect();
 
+    // In compare mode, the paired significance per metric (issue #84) rides
+    // along in both renderings.
+    let stats = if compare.is_some() {
+        Some(rel::compare_stats(&reports[0], &reports[1]))
+    } else {
+        None
+    };
+
     if json {
-        print!("{}", rel::render_json(&corpus_display, &index.embedder_name, &reports));
+        print!(
+            "{}",
+            rel::render_json(&corpus_display, &index.embedder_name, &reports, stats.as_ref())
+        );
         return Ok(());
     }
     print!("{}", rel::render_human(&corpus_display, &index.embedder_name, &reports));
-    if compare.is_some() {
-        print!("{}", rel::render_compare_human(&reports[0], &reports[1]));
+    if let Some(stats) = &stats {
+        print!("{}", rel::render_compare_human(&reports[0], &reports[1], stats));
     }
     Ok(())
 }

@@ -398,21 +398,32 @@ $ cce relevance eval/relevance/code.jsonl
 CCE relevance — ranking quality vs labeled fixtures (cce.relevance/v1)
   corpus  : eval/relevance/../../test/fixture/samples
   embedder: hash
-  queries : 6
+  queries : 7
 
   backend            P@k      recall         MRR          F1
-  bm25          0.500000    1.000000    0.888889    0.623016
-  vector        0.533333    1.000000    1.000000    0.646164
-  hybrid        0.500000    1.000000    0.916667    0.623016
+  bm25          0.457143    1.000000    0.904762    0.581633
+  vector        0.485714    1.000000    1.000000    0.601474
+  hybrid        0.457143    1.000000    0.928571    0.581633
+
+  token-level span metrics (1 of 7 queries carry ranged anchors)
+  backend          tok-P  tok-recall     tok-IoU
+  bm25          0.294118    1.000000    0.294118
+  vector        0.238095    1.000000    0.238095
+  hybrid        0.223881    1.000000    0.223881
 ```
 
-`--compare A,B` diffs two backends with **per-query deltas**, so a proposed
-ranking change shows exactly which queries it helps or hurts before it merges.
+`--compare A,B` diffs two backends with **per-query deltas** plus a **paired
+t-test per metric** (t, two-sided p, 95% CI on the mean delta, n), so a
+proposed ranking change shows exactly which queries it helps or hurts — and
+whether the mean delta is evidence or noise — before it merges. Anchors with a
+line-range facet (`auth.py@10-42`) are additionally scored at **token
+resolution** (token-level recall/precision/IoU, `cce.tokens/v1`-weighted).
 Two starter fixture sets ship in [`eval/relevance/`](eval/relevance/) (code +
-markdown corpora), the hash-path `--json` report is byte-pinned like
-`conformance.json`, and the fixture format (`cce.relevance/v1` NDJSON —
-`{query, expected: [file or file#kind anchors], k}` per line) is a documented
-contract, so teams can point the harness at their own private fixture sets. See
+markdown corpora), the hash-path `--json` report (`cce.relevance.report/v2`)
+is byte-pinned like `conformance.json`, and the fixture format
+(`cce.relevance/v1` NDJSON — `{query, expected: [file, file#kind, or
+file@a-b anchors], k}` per line) is a documented contract, so teams can point
+the harness at their own private fixture sets. See
 [`docs/relevance.md`](docs/relevance.md).
 
 ## Dashboard & observability
@@ -954,7 +965,7 @@ language pack, and a guard test asserts the core chunker names no language.
 | [`docs/mcp.md`](docs/mcp.md) | CCE MCP: the server, the **nine tools**, `cce init`, sync freshness, and how to confirm agent use |
 | [`docs/savings.md`](docs/savings.md) | The seven Savings Layers, the ledger, `cce savings`, the token estimator, and the `cce eval` A/B harness |
 | [`docs/knowledge.md`](docs/knowledge.md) | Knowledge sources (v2.6): the markdown-heading chunker, the `cce.knowledge/v1` contract, `cce knowledge index`, the `source:` retrieval blend, and corpus sync (`cce knowledge push`/`pull` + the consumer surface) |
-| [`docs/relevance.md`](docs/relevance.md) | Measuring retrieval quality: the `cce.relevance/v1` fixture contract, the IR metrics (precision@k/recall/MRR/F1), per-backend runs, and the `--compare` workflow for gating ranking changes |
+| [`docs/relevance.md`](docs/relevance.md) | Measuring retrieval quality: the `cce.relevance/v1` fixture contract (file, `file#kind`, and `file@a-b` anchors), the IR metrics (precision@k/recall/MRR/F1 + token-level recall/precision/IoU), per-backend runs, and the `--compare` workflow — per-query deltas with paired significance (t/p/95% CI) — for gating ranking changes |
 | [`docs/VERIFIED.md`](docs/VERIFIED.md) | Offline + online cold-start verification transcripts (index/search/stats/dashboard/workspace/MCP offline; Sync online) |
 | [`docs/ci/cce-sync.yml`](docs/ci/cce-sync.yml) | Ready-to-copy GitHub Actions cache-push workflow |
 | [`docs/getting-started.md`](docs/getting-started.md) | Install → first index + search |

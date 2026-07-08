@@ -5,3 +5,4 @@
 {"id":"code-loader-class","query":"class Loader load","expected":["python.py","ruby.rb","javascript.js","typescript.ts"],"k":5}
 {"id":"code-sum-node","query":"sum node value struct","expected":["c.c"],"k":5}
 {"id":"code-interface-kind","query":"interface Config typescript","expected":["typescript.ts#interface_declaration"],"k":5}
+{"id":"code-read-config-span","query":"read_config path config.yml","expected":["python.py@3-4"],"k":5}
