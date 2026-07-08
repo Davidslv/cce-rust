@@ -54,6 +54,11 @@ pub struct SyncConfig {
     pub remote: Option<String>,
     pub lfs: bool,
     pub repo_id: Option<String>,
+    /// The `refs/<name>` pointer `pull --latest` resolves for this project
+    /// (`sync.ref`, #72) — for repos whose CI pushes from a non-`main` default
+    /// branch. Absent (the default) ⇒ the `main`-else-single-fallback rule.
+    /// Written only when set, so existing configs stay byte-identical.
+    pub git_ref: Option<String>,
     pub auto_pull: bool,
     pub retention: Retention,
 }
@@ -64,6 +69,7 @@ impl Default for SyncConfig {
             remote: None,
             lfs: true,
             repo_id: None,
+            git_ref: None,
             auto_pull: false,
             retention: Retention::All,
         }
@@ -90,6 +96,8 @@ struct RawSync {
     remote: Option<String>,
     lfs: Option<bool>,
     repo_id: Option<String>,
+    #[serde(rename = "ref")]
+    git_ref: Option<String>,
     auto_pull: Option<bool>,
     retention: Option<String>,
 }
@@ -112,6 +120,7 @@ impl SyncConfig {
                 cfg.lfs = lfs;
             }
             cfg.repo_id = s.repo_id.filter(|r| !r.is_empty());
+            cfg.git_ref = s.git_ref.filter(|r| !r.is_empty());
             if let Some(ap) = s.auto_pull {
                 cfg.auto_pull = ap;
             }
@@ -134,6 +143,11 @@ impl SyncConfig {
         match &self.repo_id {
             Some(r) => s.push_str(&format!("  repo_id: {}\n", yaml_scalar(r))),
             None => s.push_str("  repo_id: null\n"),
+        }
+        // `ref` is additive (#72): written only when set, so a config without
+        // one — every pre-#72 config — round-trips byte-identically.
+        if let Some(r) = &self.git_ref {
+            s.push_str(&format!("  ref: {}\n", yaml_scalar(r)));
         }
         s.push_str(&format!("  auto_pull: {}\n", self.auto_pull));
         s.push_str(&format!("  retention: {}\n", self.retention.as_str()));
@@ -282,12 +296,29 @@ mod tests {
             remote: Some("file:///tmp/remote.git".to_string()),
             lfs: false,
             repo_id: Some("example.com__acme__demo".to_string()),
+            git_ref: None,
             auto_pull: true,
             retention: Retention::KeepLast(10),
         };
         let yaml = c.to_yaml();
         let parsed = SyncConfig::from_yaml(&yaml).unwrap();
         assert_eq!(parsed, c);
+    }
+
+    #[test]
+    fn sync_ref_is_additive_written_only_when_set() {
+        // #72: an unset `sync.ref` never appears in the canonical YAML, so every
+        // pre-#72 config round-trips byte-identically.
+        let mut c = SyncConfig::default();
+        assert_eq!(c.git_ref, None);
+        assert!(!c.to_yaml().contains("ref:"), "unset sync.ref must not be written");
+        c.git_ref = Some("master".to_string());
+        let yaml = c.to_yaml();
+        assert!(yaml.contains("  ref: master\n"), "got: {yaml}");
+        assert_eq!(SyncConfig::from_yaml(&yaml).unwrap().git_ref.as_deref(), Some("master"));
+        // An empty string is treated as unset (the remote/repo_id rule).
+        let e = SyncConfig::from_yaml("sync:\n  ref: \"\"\n").unwrap();
+        assert_eq!(e.git_ref, None);
     }
 
     #[test]
@@ -306,6 +337,7 @@ mod tests {
             remote: Some("file:///tmp/r.git".to_string()),
             lfs: true,
             repo_id: None,
+            git_ref: None,
             auto_pull: false,
             retention: Retention::All,
         };

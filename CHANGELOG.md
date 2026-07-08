@@ -7,6 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Fixed
+- **Repos pushed from a non-`main` default branch are no longer invisible to consumer
+  mode (#72).** `cce sync list`, `pull --latest`, and `pull --all` resolved the latest
+  pointer at `refs/main` only, so a repo whose CI pushes from e.g. `master` showed
+  `latest = -` and was warned-and-skipped despite a valid artifact + pointer. Now, when
+  `refs/main` is absent and **exactly one** other `refs/<name>` pointer exists, it
+  resolves the latest sha — annotated on every surface (`<sha> (master)` in the human
+  listing, an optional `ref` field on the `cce.synclist/v1` JSON row, `ref : master` /
+  `(ref master)` in pull reports); with **several** non-main refs the skip/`-` behaviour
+  stays but the warning names the available refs. Explicit control: `cce sync pull
+  --latest --ref <name>` (rejected with `--all`, where repos have different default
+  branches) and a per-member `sync.ref` config key that `pull --all` refreshes honor and
+  preserve across the config rewrite. All of a repo's refs enumerate in ONE listing call,
+  never N pointer reads. `refs/main`-resolved outputs stay byte-identical everywhere
+  (the existing pinned goldens pass unchanged); `SYNC_FORMAT_VERSION`,
+  `conformance.json`, and the knowledge `current` pointer family (a different key space)
+  are untouched — asserted, not assumed.
+
 ## [2.7.0] - 2026-07-08
 
 ### Added

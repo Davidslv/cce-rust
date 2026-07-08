@@ -191,6 +191,11 @@ Rules:
 - `list` enumerates what the cache holds: one row per `repo_id` with its **latest
   sha** (the `refs/<branch>` pointer `pull --latest` reads; `-` when a repo has no
   pointer yet), **artifact count**, and **total artifact bytes** (LFS-aware).
+  When `refs/main` is absent and a repo carries **exactly one** other
+  `refs/<name>` pointer, that ref resolves the latest sha (#72) and the row is
+  annotated — `<sha> (master)` in the human table, an **optional `"ref"` field**
+  in the JSON row (main-resolved rows are byte-identical to before). With
+  several non-main refs nothing is silently picked: the row stays `-`/null.
   **Read-only** — it never writes to the cache or the local `.cce/` — and
   **repo-less**: a bare directory plus `--remote <url>` is enough (no local store,
   source checkout, or config). Rows are sorted by `repo_id`; an empty cache is a
@@ -228,7 +233,9 @@ Rules:
   additive: artifact keys, ref pointers, and old-client pulls are unchanged.
 
 Config keys (`<root>/.cce/config`, or global `~/.cce/config.yml`):
-`sync.remote`, `sync.lfs` (default `true`), `sync.repo_id`, `sync.auto_pull`,
+`sync.remote`, `sync.lfs` (default `true`), `sync.repo_id`, `sync.ref` (the
+`refs/<name>` pointer `pull --latest` resolves for this project — for repos
+whose CI pushes from a non-`main` default branch; #72), `sync.auto_pull`,
 `sync.retention` (`all` | `keep-last-<n>`). All optional; absent ⇒ pure local CCE.
 
 ---
@@ -295,6 +302,20 @@ Behaviour:
 - **Skips are not failures.** A repo with no latest pointer (rendered `-` by
   `sync list`) cannot be pulled `--latest`: it is warned and skipped, the run
   continues, and the summary counts it. Exit code stays 0.
+- **Non-`main` default branches resolve too (#72).** A repo whose CI pushes
+  from another branch (e.g. `master`) writes `refs/master`, not `refs/main`.
+  When `refs/main` is absent and **exactly one** other ref pointer exists,
+  `--latest` (single pull and `pull --all` alike) resolves it and **notes the
+  ref** in the report (`(ref master)`; `sync list` annotates the row the same
+  way). With **several** non-main refs nothing is silently picked: the repo is
+  skipped with the available refs named — resolve it explicitly with
+  `cce sync pull --latest --ref <name> --dir ctx/<member>`, or set `sync.ref:
+  <name>` in the member's `.cce/config` so every later `pull --all` refresh
+  resolves that pointer (the refresh rewrite preserves the key). `--ref` is
+  **rejected with `--all`** — the repos in a cache have different default
+  branches, so a global ref would be wrong for most of them; `sync.ref` is the
+  per-member tool. `refs/main`, when present, always wins — byte-identical to
+  before.
 - **Independent shas are the supported shape.** Each member federates at its own
   latest sha — there is no monorepo one-sha assumption on the pull side (that
   assumption exists only in `push --workspace`, which pushes a single checkout).

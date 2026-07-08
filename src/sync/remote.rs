@@ -45,6 +45,11 @@ pub trait SyncRemote {
     fn put_many(&self, entries: &[(String, Vec<u8>)]) -> Result<(), String>;
     /// List the shas cached under `<prefix>` (the `<embedder>/<ver>/<repo_id>/` dir).
     fn list(&self, prefix: &str) -> Result<Vec<String>, String>;
+    /// The full keys under `prefix` (recursive) whose basename ends with
+    /// `suffix`, sorted. The knowledge walk (SPEC-SYNC-KNOWLEDGE §3/§4.5) uses
+    /// it with `.cck`; the #72 ref fallback uses it with `""` to enumerate a
+    /// repo's `refs/*` pointers in ONE listing call (never N pointer reads).
+    fn list_keys_with_suffix(&self, prefix: &str, suffix: &str) -> Result<Vec<String>, String>;
 }
 
 /// The git-backed remote: a local working clone that mirrors the cache repo.
@@ -256,26 +261,6 @@ impl GitRemote {
         text.lines().find_map(|l| l.strip_prefix("size ")).and_then(|s| s.trim().parse().ok())
     }
 
-    /// The full keys under `prefix` (recursive) whose basename ends with
-    /// `suffix`, sorted. The knowledge walk (SPEC-SYNC-KNOWLEDGE §3/§4.5) uses
-    /// this to enumerate a corpus's `<snapshot>.cck` keys; junk entries are
-    /// skipped silently (the #37 graceful-skip rule). An unborn branch or a
-    /// missing prefix lists as empty.
-    pub fn list_keys_with_suffix(&self, prefix: &str, suffix: &str) -> Result<Vec<String>, String> {
-        self.fetch()?;
-        let treeish = format!("origin/{}", self.branch);
-        let listing = match git::run(&self.dir, &["ls-tree", "-r", "--name-only", &treeish, prefix])
-        {
-            Ok(l) => l,
-            Err(_) => return Ok(Vec::new()),
-        };
-        let mut keys: Vec<String> =
-            listing.lines().filter(|l| l.ends_with(suffix)).map(str::to_string).collect();
-        keys.sort();
-        keys.dedup();
-        Ok(keys)
-    }
-
     /// The keys under `prefix` in FIRST-ADDED commit order, oldest first
     /// (SPEC-SYNC-KNOWLEDGE §4.5): corpora have no sha ordering, so the cache
     /// repo's commit history is the only order the cache itself carries. Commit
@@ -402,6 +387,25 @@ impl SyncRemote for GitRemote {
             Err(_) => { /* fall through: still attempt push in case of prior commit */ }
         }
         self.push_with_retry()
+    }
+
+    /// Keys ending in `suffix` under `prefix` (moved verbatim from the former
+    /// inherent method — SPEC-SYNC-KNOWLEDGE §3/§4.5 corpus walk, #72 ref walk).
+    /// Junk entries are skipped silently (the #37 graceful-skip rule); an unborn
+    /// branch or a missing prefix lists as empty.
+    fn list_keys_with_suffix(&self, prefix: &str, suffix: &str) -> Result<Vec<String>, String> {
+        self.fetch()?;
+        let treeish = format!("origin/{}", self.branch);
+        let listing = match git::run(&self.dir, &["ls-tree", "-r", "--name-only", &treeish, prefix])
+        {
+            Ok(l) => l,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let mut keys: Vec<String> =
+            listing.lines().filter(|l| l.ends_with(suffix)).map(str::to_string).collect();
+        keys.sort();
+        keys.dedup();
+        Ok(keys)
     }
 
     fn list(&self, prefix: &str) -> Result<Vec<String>, String> {
