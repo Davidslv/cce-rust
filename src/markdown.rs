@@ -79,6 +79,17 @@ pub fn chunk_markdown(
     content: &str,
     max_section_tokens: usize,
 ) -> Vec<MarkdownChunk> {
+    // Fail-loud nesting guard (issue #49): tree-sitter-md's external scanner
+    // serializes its open-block stack into tree-sitter's fixed 1024-byte buffer
+    // WITHOUT a bounds check (scanner.c `serialize`: 5 state bytes + 4 bytes per
+    // open block). At ~255 simultaneously open blocks — e.g. one line of 255 `>`
+    // characters — a debug build dies on the parser.c assert and a release build
+    // overruns the buffer (memory corruption / SIGSEGV). This cannot be caught
+    // from Rust, so pathological nesting is detected UP FRONT and the document
+    // degrades to the existing whole-doc fallback chunk instead of being parsed.
+    if block_nesting_estimate(content) > MAX_BLOCK_NESTING {
+        return whole_doc_fallback(file_path, content);
+    }
     let mut parser = Parser::new();
     // The block grammar shares the engine's tree-sitter ABI; loading cannot fail for
     // a pinned grammar, but on any trouble we degrade to a single whole-doc chunk.
@@ -239,33 +250,82 @@ fn whole_doc_fallback(file_path: &str, content: &str) -> Vec<MarkdownChunk> {
     .collect()
 }
 
-/// Collect every `atx_heading` / `setext_heading` in source order with its level,
-/// byte offset, 1-based line, and trimmed inline text.
-fn collect_headings(root: Node, src: &[u8]) -> Vec<Heading> {
-    let mut headings: Vec<Heading> = Vec::new();
-    collect_rec(root, src, &mut headings);
-    headings.sort_by_key(|h| h.start_byte);
-    headings
+/// The maximum conservatively-estimated open-block nesting depth handed to the
+/// tree-sitter-md parser. Its external scanner's serialization buffer hard-fails
+/// (corrupts, in release) at ~255 simultaneously open blocks; 192 leaves a wide
+/// safety margin (heading sections, estimate slack) while being far beyond any
+/// real document. Estimated-deeper input degrades to the whole-doc fallback.
+const MAX_BLOCK_NESTING: usize = 192;
+
+/// A conservative UPPER BOUND on the deepest open-block stack the tree-sitter-md
+/// scanner could reach for `content`. Per CommonMark, opening a container block
+/// (blockquote/list) at depth D requires the opening line to carry the full
+/// prefix for all D levels: each blockquote is at least one `>` and each list
+/// level at least two columns of marker/indentation (a tab is four columns).
+/// So the bound is per-line: `(count of '>') + (other prefix columns)/2 + 1`,
+/// maximised over all lines. It over-counts (e.g. long `---` rules, marker-like
+/// text inside code fences) — an over-count only sends a pathological-looking
+/// document down the deterministic whole-doc fallback; it can never under-count
+/// and let a crashing input through.
+fn block_nesting_estimate(content: &str) -> usize {
+    content
+        .lines()
+        .map(|line| {
+            let mut quotes = 0usize;
+            let mut columns = 0usize;
+            for ch in line.chars() {
+                match ch {
+                    '>' => quotes += 1,
+                    '\t' => columns += 4,
+                    ' ' | '-' | '+' | '*' | '.' | ')' | '0'..='9' => columns += 1,
+                    _ => break,
+                }
+            }
+            quotes + columns / 2 + 1
+        })
+        .max()
+        .unwrap_or(0)
 }
 
-fn collect_rec(node: Node, src: &[u8], out: &mut Vec<Heading>) {
-    let kind = node.kind();
-    if kind == "atx_heading" || kind == "setext_heading" {
-        if let Some(level) = heading_level(node) {
-            out.push(Heading {
-                level,
-                start_byte: node.start_byte(),
-                start_line: node.start_position().row + 1,
-                text: heading_text(node, src),
-            });
+/// Collect every `atx_heading` / `setext_heading` in source order with its level,
+/// byte offset, 1-based line, and trimmed inline text.
+///
+/// Iterative `TreeCursor` walk (issue #49): a recursive per-node walk overflows
+/// the stack on deeply nested trees (nested blockquotes/lists). Headings are
+/// never descended into — a heading cannot contain another heading.
+fn collect_headings(root: Node, src: &[u8]) -> Vec<Heading> {
+    let mut headings: Vec<Heading> = Vec::new();
+    let mut cursor = root.walk();
+    'outer: loop {
+        let node = cursor.node();
+        let kind = node.kind();
+        let mut descend = true;
+        if kind == "atx_heading" || kind == "setext_heading" {
+            if let Some(level) = heading_level(node) {
+                headings.push(Heading {
+                    level,
+                    start_byte: node.start_byte(),
+                    start_line: node.start_position().row + 1,
+                    text: heading_text(node, src),
+                });
+            }
+            // A heading never contains another heading; do not descend into it.
+            descend = false;
         }
-        // A heading never contains another heading; do not descend into it.
-        return;
+        if descend && cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                continue 'outer;
+            }
+            if !cursor.goto_parent() {
+                break 'outer;
+            }
+        }
     }
-    let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        collect_rec(child, src, out);
-    }
+    headings.sort_by_key(|h| h.start_byte);
+    headings
 }
 
 /// The heading level (1..=6): from the `atx_hN_marker` child for ATX headings, or
@@ -289,27 +349,26 @@ fn heading_level(node: Node) -> Option<usize> {
 }
 
 /// The heading's text: the first `inline` descendant's raw source, trimmed. An empty
-/// heading (`##` with nothing after) yields `""`.
+/// heading (`##` with nothing after) yields `""`. Iterative pre-order search
+/// (issue #49): no walk in this module recurses per node.
 fn heading_text(node: Node, src: &[u8]) -> String {
-    let mut found: Option<String> = None;
-    find_inline(node, src, &mut found);
-    found.unwrap_or_default()
-}
-
-fn find_inline(node: Node, src: &[u8], out: &mut Option<String>) {
-    if out.is_some() {
-        return;
-    }
-    if node.kind() == "inline" {
-        let text = std::str::from_utf8(&src[node.start_byte()..node.end_byte()]).unwrap_or("");
-        *out = Some(text.trim().to_string());
-        return;
-    }
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        find_inline(child, src, out);
-        if out.is_some() {
-            return;
+    'outer: loop {
+        let n = cursor.node();
+        if n.kind() == "inline" {
+            let text = std::str::from_utf8(&src[n.start_byte()..n.end_byte()]).unwrap_or("");
+            return text.trim().to_string();
+        }
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                continue 'outer;
+            }
+            if !cursor.goto_parent() {
+                return String::new();
+            }
         }
     }
 }
