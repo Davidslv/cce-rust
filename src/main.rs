@@ -239,6 +239,38 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Score ranking quality against labeled fixtures (issue #63).
+    ///
+    /// The third leg of the measurement story: `cce conformance` proves output
+    /// stability, `cce bench`/`cce eval` measure latency and token savings —
+    /// this measures RANKING QUALITY. Each fixture case runs through the real
+    /// retrieval pipeline at a named backend and is scored with standard IR
+    /// metrics (precision@k, recall, MRR, F1). Deterministic for deterministic
+    /// backends (the hash embedder), so the JSON report is byte-pinnable.
+    Relevance {
+        /// The `cce.relevance/v1` fixture set (NDJSON; see docs/relevance.md).
+        fixtures: PathBuf,
+        /// Corpus directory to index in-memory (hash embedder). Overrides the
+        /// fixture header's `corpus`; one of the two must name a directory
+        /// unless `--store` is given.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Evaluate against an existing persisted store instead of indexing a
+        /// corpus directory.
+        #[arg(long, conflicts_with = "dir")]
+        store: Option<PathBuf>,
+        /// Comma-separated backends to score: bm25, vector, hybrid
+        /// (default: all three).
+        #[arg(long)]
+        backend: Option<String>,
+        /// Compare exactly two backends side by side with per-query deltas,
+        /// e.g. `--compare bm25,hybrid`.
+        #[arg(long, value_name = "A,B", conflicts_with = "backend")]
+        compare: Option<String>,
+        /// Emit the full report as JSON (the stable `cce.relevance.report/v1` shape).
+        #[arg(long)]
+        json: bool,
+    },
     /// Self-update from the project's GitHub Releases (issue #75).
     ///
     /// Explicit-invocation network only — this is the ONLY cce command that
@@ -527,6 +559,9 @@ fn main() -> ExitCode {
             }
         },
         Command::Eval { runs, questions, json } => cmd_eval(&runs, &questions, json),
+        Command::Relevance { fixtures, dir, store, backend, compare, json } => {
+            cmd_relevance(&fixtures, dir, store, backend, compare, json)
+        }
         // `update --check` has a third outcome beside ok/error: "behind",
         // reported as the pinned exit code 10 (update::EXIT_UPDATE_AVAILABLE)
         // so scripts can branch on it — hence the early return.
@@ -981,6 +1016,97 @@ fn cmd_eval(runs: &Path, questions: &Path, json: bool) -> Result<(), String> {
         report.cost_delta_usd,
         report.cost_saved_ratio * 100.0
     );
+    Ok(())
+}
+
+/// `cce relevance` (issue #63): score ranking quality against a labeled
+/// `cce.relevance/v1` fixture set, per retrieval backend. Measurement only —
+/// this command never changes ranking behavior.
+fn cmd_relevance(
+    fixtures: &Path,
+    dir: Option<PathBuf>,
+    store: Option<PathBuf>,
+    backend: Option<String>,
+    compare: Option<String>,
+    json: bool,
+) -> Result<(), String> {
+    use cce::relevance as rel;
+
+    let text = std::fs::read_to_string(fixtures)
+        .map_err(|e| format!("could not read fixtures {}: {e}", fixtures.display()))?;
+    let set = rel::parse_fixtures(&text)?;
+
+    // The index under evaluation: an explicit persisted store, else an
+    // in-memory hash-embedder index of the corpus directory (--dir, else the
+    // fixture header's `corpus`, resolved relative to the fixture file).
+    let (index, corpus_display): (Index, String) = if let Some(store_path) = store {
+        let index = Index::load(&store_path)
+            .map_err(|e| format!("could not load store {}: {e}", store_path.display()))?;
+        // Mirror `cce search` (issue #30): an ollama-built store with Ollama
+        // down would cosine across mismatched embedding spaces — refuse.
+        if index.embedder_name == "ollama" && !OllamaEmbedder::default().healthy() {
+            return Err(
+                "this store was built with the ollama embedder but Ollama is unreachable — \
+                 refusing to score across mismatched embedding spaces. Start Ollama, or \
+                 evaluate a corpus directory with the deterministic hash embedder (--dir)."
+                    .to_string(),
+            );
+        }
+        (index, store_path.display().to_string())
+    } else {
+        let corpus = match dir {
+            Some(d) => d,
+            None => {
+                let rel_dir = set.corpus.clone().ok_or_else(|| {
+                    "no corpus: pass --dir <corpus>, or declare \"corpus\" in the fixture \
+                     header line"
+                        .to_string()
+                })?;
+                fixtures.parent().unwrap_or_else(|| Path::new(".")).join(rel_dir)
+            }
+        };
+        if !corpus.is_dir() {
+            return Err(format!("corpus is not a directory: {}", corpus.display()));
+        }
+        let (index, _) = Index::build_from_dir(&corpus, &HashEmbedder)?;
+        (index, corpus.display().to_string())
+    };
+
+    // The query embedder matches the store's recorded backend (hash for the
+    // in-memory path; a healthy Ollama was verified above for ollama stores).
+    let emb: Box<dyn Embedder> = if index.embedder_name == "ollama" {
+        Box::new(OllamaEmbedder::default())
+    } else {
+        Box::new(HashEmbedder)
+    };
+
+    let backends: Vec<rel::Backend> = if let Some(pair) = &compare {
+        let list = rel::parse_backends(pair)?;
+        if list.len() != 2 {
+            return Err(
+                "--compare requires exactly two distinct backends, e.g. bm25,hybrid".to_string()
+            );
+        }
+        list
+    } else if let Some(list) = &backend {
+        rel::parse_backends(list)?
+    } else {
+        rel::Backend::all().to_vec()
+    };
+
+    let reports: Vec<rel::BackendReport> = backends
+        .iter()
+        .map(|b| rel::evaluate_backend(&index, emb.as_ref(), *b, &set.cases))
+        .collect();
+
+    if json {
+        print!("{}", rel::render_json(&corpus_display, &index.embedder_name, &reports));
+        return Ok(());
+    }
+    print!("{}", rel::render_human(&corpus_display, &index.embedder_name, &reports));
+    if compare.is_some() {
+        print!("{}", rel::render_compare_human(&reports[0], &reports[1]));
+    }
     Ok(())
 }
 

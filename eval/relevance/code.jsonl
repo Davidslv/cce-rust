@@ -1,0 +1,7 @@
+{"schema":"cce.relevance/v1","corpus":"../../test/fixture/samples"}
+{"id":"code-read-config","query":"where is the read_config function","expected":["python.py"],"k":5}
+{"id":"code-parse-json","query":"parse json config text","expected":["ruby.rb"],"k":5}
+{"id":"code-build-index","query":"build index hashmap store","expected":["rust.rs"],"k":5}
+{"id":"code-loader-class","query":"class Loader load","expected":["python.py","ruby.rb","javascript.js","typescript.ts"],"k":5}
+{"id":"code-sum-node","query":"sum node value struct","expected":["c.c"],"k":5}
+{"id":"code-interface-kind","query":"interface Config typescript","expected":["typescript.ts#interface_declaration"],"k":5}
