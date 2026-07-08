@@ -39,8 +39,8 @@ use crate::compress::{compress, DetailLevel};
 use crate::config::{KnowledgeConfig, MemoryConfig, OutputLevel, RetrievalConfig, CHARS_PER_TOKEN};
 use crate::embedder::{format6, score_key, Embedder, HashEmbedder, OllamaEmbedder};
 use crate::federation::{
-    federated_bm25_only_search, federated_search_over, load_member_stores, workspace_stats,
-    CachedWorkspace, MemberStore,
+    federated_bm25_only_search, federated_search_over, load_member_stores, parse_scope,
+    workspace_stats, CachedWorkspace, MemberStore,
 };
 use crate::knowledge::{same_document_sections, KnowledgeHit};
 use crate::mcp::server::McpServer;
@@ -418,9 +418,12 @@ fn context_search_workspace(
         Ok(m) => m,
         Err(_) => return ToolOutput::ok(missing_index_message(true)),
     };
-    let scope = package.map(|p| {
-        p.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>()
-    });
+    // An empty-but-present `package` ("" / "," / whitespace) is a user mistake
+    // (issue #45): surface the guidance, never a silent zero-member federation.
+    let scope = match parse_scope(package) {
+        Ok(s) => s,
+        Err(e) => return ToolOutput::ok(e),
+    };
     // Cached federated union (issue #26): built once per scope, reused across calls, and
     // shared as the metrics baseline below — so a warm workspace search matches the CLI.
     let bundle = match server.workspace_bundle(&manifest, scope.as_deref()) {
@@ -649,9 +652,12 @@ fn gather_code_hits_workspace(server: &McpServer, query: &str, p: &SearchParams)
         Ok(m) => m,
         Err(_) => return (Vec::new(), None, 0, None),
     };
-    let scope = p.package.as_ref().map(|p| {
-        p.split(',').map(|s| s.trim().to_string()).filter(|s| !s.is_empty()).collect::<Vec<_>>()
-    });
+    // An empty-but-present `package` is invalid (issue #45); in this path a scope
+    // error yields no code rows, exactly like an unknown package below.
+    let scope = match parse_scope(p.package.clone()) {
+        Ok(s) => s,
+        Err(_) => return (Vec::new(), None, 0, None),
+    };
     // Cached federated union (issue #26): same bundle the code-only path uses.
     let bundle = match server.workspace_bundle(&manifest, scope.as_deref()) {
         Ok(b) => b,

@@ -176,6 +176,28 @@ fn unknown_package_scope_exits_nonzero() {
 }
 
 #[test]
+fn empty_package_scope_exits_nonzero() {
+    // Issue #45: `--package ""` (e.g. an unset shell variable) must error loudly,
+    // never federate over zero members and silently print no results.
+    let tmp = copy_fixture();
+    let root = tmp.path().to_str().unwrap();
+    run(&["workspace", "init", root]);
+    run(&["index", "--workspace", root]);
+    for empty in ["", "  ", ","] {
+        let out = run(&["search", "q", root, "--workspace", "--package", empty]);
+        assert!(!out.status.success(), "--package {empty:?} must exit non-zero");
+        assert!(
+            String::from_utf8_lossy(&out.stderr).contains(
+                "--package requires at least one member or package name \
+                 (e.g. --package app,billing)"
+            ),
+            "--package {empty:?} stderr: {}",
+            String::from_utf8_lossy(&out.stderr)
+        );
+    }
+}
+
+#[test]
 fn graph_hop_pulls_billing_into_an_app_result() {
     let tmp = copy_fixture();
     let root = tmp.path().to_str().unwrap();
