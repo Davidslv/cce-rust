@@ -255,7 +255,9 @@ fn whole_doc_fallback(file_path: &str, content: &str) -> Vec<MarkdownChunk> {
 /// (corrupts, in release) at ~255 simultaneously open blocks; 192 leaves a wide
 /// safety margin (heading sections, estimate slack) while being far beyond any
 /// real document. Estimated-deeper input degrades to the whole-doc fallback.
-const MAX_BLOCK_NESTING: usize = 192;
+/// Public so the store fingerprint (issue #62) records it as part of the
+/// chunker identity.
+pub const MAX_BLOCK_NESTING: usize = 192;
 
 /// A conservative UPPER BOUND on the deepest open-block stack the tree-sitter-md
 /// scanner could reach for `content`. Per CommonMark, opening a container block
