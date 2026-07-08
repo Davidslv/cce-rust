@@ -224,11 +224,28 @@ pub fn node_text<'a>(node: Node, src: &'a [u8]) -> &'a str {
 }
 
 /// Depth-first pre-order visit: call `f` on `node`, then each child in order.
+///
+/// Deliberately iterative (a `TreeCursor` loop, not recursion): a pathological
+/// input — thousands of nested parens/braces — yields a tree deep enough to
+/// overflow the stack of a per-node recursive walk (a 2 MiB test thread dies
+/// around depth 1–2k), killing the process with SIGSEGV (issue #49). tree-sitter
+/// itself parses such input fine; only the walk must not recurse.
 pub fn visit_pre<'a>(node: Node<'a>, f: &mut impl FnMut(Node<'a>)) {
-    f(node);
     let mut cursor = node.walk();
-    for child in node.children(&mut cursor) {
-        visit_pre(child, f);
+    'outer: loop {
+        f(cursor.node());
+        if cursor.goto_first_child() {
+            continue;
+        }
+        loop {
+            if cursor.goto_next_sibling() {
+                continue 'outer;
+            }
+            if !cursor.goto_parent() {
+                // Back at the walk root: every node has been visited.
+                break 'outer;
+            }
+        }
     }
 }
 

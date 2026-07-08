@@ -40,6 +40,24 @@ const LANGS: &[(&str, &str)] = &[
     ("typescript", "gen/src.ts"),
 ];
 
+/// Run one property case's chunk-and-check on a thread with a known-large stack
+/// (issue #49). The chunker walks are iterative now, but if a regression (or a
+/// grammar's own C code) ever overflows again, the 2 MiB proptest thread would
+/// SIGSEGV and kill the process BEFORE the failing seed is persisted — exactly
+/// how the original CI crash left no counterexample. A 16 MiB stack turns that
+/// class of failure back into an ordinary panic proptest can shrink and persist;
+/// `resume_unwind` re-raises the case's own panic payload unchanged.
+fn on_big_stack<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    std::thread::scope(|s| {
+        std::thread::Builder::new()
+            .stack_size(16 * 1024 * 1024)
+            .spawn_scoped(s, f)
+            .expect("spawn big-stack property thread")
+            .join()
+            .unwrap_or_else(|e| std::panic::resume_unwind(e))
+    })
+}
+
 fn newline_count(s: &str) -> usize {
     s.bytes().filter(|&b| b == b'\n').count()
 }
@@ -503,11 +521,13 @@ proptest! {
         trailing_ws in any::<bool>(),
         no_final_nl in any::<bool>(),
     ) {
-        let mut chunker = Chunker::new();
-        for (lang, path) in LANGS {
-            let input = mutate(&render(lang, &frags), crlf, trailing_ws, no_final_nl);
-            check_code_invariants(&mut chunker, path, lang, &input);
-        }
+        on_big_stack(|| {
+            let mut chunker = Chunker::new();
+            for (lang, path) in LANGS {
+                let input = mutate(&render(lang, &frags), crlf, trailing_ws, no_final_nl);
+                check_code_invariants(&mut chunker, path, lang, &input);
+            }
+        });
     }
 }
 
@@ -524,7 +544,7 @@ proptest! {
         no_final_nl in any::<bool>(),
     ) {
         let input = mutate(&render_md(&frags), crlf, false, no_final_nl);
-        check_markdown_invariants("knowledge/doc.md", &input, budget);
+        on_big_stack(|| check_markdown_invariants("knowledge/doc.md", &input, budget));
     }
 
     /// The pinned `cce.tokens/v1` estimator rule holds for ANY string, and

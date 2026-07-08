@@ -20,6 +20,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   embed over each batch), so all goldens and `conformance.json` are byte-identical.
 
 ### Fixed
+- **The chunkers survive pathologically nested input — iterative tree walks, no SIGSEGV (#49).**
+  A property-suite CI run died with SIGSEGV before proptest could persist the failing seed. Two
+  crash classes were reproduced deterministically and fixed. (1) The code and markdown chunkers'
+  per-node **recursive** AST walks (`collect_chunks`, `visit_pre`, the heading/inline walks)
+  overflowed the thread stack on deeply nested input — measured crash at depth ~219 on a 256 KiB
+  stack and ~875–1748 (grammar-dependent) at the 2 MiB Rust test-thread default, while tree-sitter
+  itself parses the same input fine at depth 500k. All walks are now **iterative `TreeCursor`
+  loops** with identical pre-order emission, so chunk output is byte-identical for every input.
+  (2) tree-sitter-md's external scanner serializes its open-block stack into tree-sitter's fixed
+  1024-byte buffer **without a bounds check**: ~255 simultaneously open blocks (e.g. one line of
+  255 `>` characters) is an assert-abort in debug and a buffer overrun (SIGSEGV) in release,
+  independent of stack size and uncatchable from Rust. `chunk_markdown` now computes a conservative
+  per-line upper bound on open-block depth **before parsing** and degrades estimated-deeper-than-192
+  input to the existing deterministic whole-doc fallback chunk — fail-safe, never crash. A
+  deterministic regression suite (`tests/deep_nesting.rs`) chunks nesting just under and far past
+  the old thresholds on a 256 KiB thread, and each chunker property case now runs on a 16 MiB
+  thread so any future crash becomes a persistable proptest counterexample instead of a process
+  kill. All goldens and `conformance.json` are byte-identical.
 - **`cce search --workspace --package ""` now errors loudly instead of silently returning no
   results (#45).** An empty-but-present `--package` value (`""`, `","`, whitespace — e.g. an unset
   shell variable in `--package "$PKG"`) used to parse to an empty scope, federate over zero members,
