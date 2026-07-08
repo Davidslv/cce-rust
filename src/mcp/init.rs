@@ -137,7 +137,7 @@ fn ensure_index(opts: &InitOptions, is_workspace: bool) -> Result<String, String
         if let Some(remote) = &opts.remote {
             sync_init(dir, remote, true, None)?;
         }
-        match cmd_pull(dir, PullTarget::Latest, opts.force, is_workspace) {
+        match cmd_pull(dir, PullTarget::Latest, opts.force, is_workspace, None) {
             Ok(_) => {
                 return Ok(
                     "index     : pulled from sync remote (cce sync pull --latest)".to_string()

@@ -276,27 +276,88 @@ fn push_workspace(
     Ok(out)
 }
 
-/// Resolve the sha a pull should install.
+/// The names of every `refs/<name>` pointer a repo carries, sorted — ONE
+/// listing call over the repo's `refs/` directory (#72), never N pointer
+/// reads. Nested junk under `refs/` is skipped (the #37 graceful-skip rule);
+/// a repo with no pointers lists as empty.
+fn list_ref_names(
+    remote: &dyn SyncRemote,
+    ver: &str,
+    repo_id: &str,
+) -> Result<Vec<String>, String> {
+    let prefix = format!("{HASH_EMBEDDER}/{ver}/{repo_id}/refs");
+    let dir = format!("{prefix}/");
+    Ok(remote
+        .list_keys_with_suffix(&prefix, "")?
+        .iter()
+        .filter_map(|k| k.strip_prefix(dir.as_str()))
+        .filter(|n| !n.is_empty() && !n.contains('/'))
+        .map(str::to_string)
+        .collect())
+}
+
+/// Read a `refs/<name>` pointer's sha via the artifact-read path (`get`, which
+/// any `SyncRemote` backend supports). The sha comes back trimmed; an absent
+/// pointer is the clear per-ref "no `--latest` pointer" error.
+fn read_pointer(
+    remote: &dyn SyncRemote,
+    ver: &str,
+    repo_id: &str,
+    name: &str,
+) -> Result<String, String> {
+    let pointer = pointer_address(HASH_EMBEDDER, ver, repo_id, name);
+    let bytes = remote
+        .get(&pointer)
+        .map_err(|_| format!("no `--latest` pointer for {repo_id} on `{name}`"))?;
+    Ok(String::from_utf8_lossy(&bytes).trim().to_string())
+}
+
+/// Resolve the sha a pull should install. For `--latest` the resolution order
+/// is (#72): an explicit ref (the CLI `--ref`, else the project's `sync.ref`
+/// config), else `refs/main`, else the **single-fallback rule** — when exactly
+/// one other `refs/<name>` pointer exists it wins; several are an error naming
+/// them (the operator must choose a ref); none keeps today's error verbatim.
+/// The second tuple element is the ref the sha came from, `Some` ONLY when it
+/// is not `main` — so every `refs/main`-resolved report stays byte-identical.
 fn resolve_pull_sha(
     root: &Path,
     cfg: &SyncConfig,
     remote: &dyn SyncRemote,
     repo_id: &str,
     target: &PullTarget,
-) -> Result<String, String> {
+    ref_override: Option<&str>,
+) -> Result<(String, Option<String>), String> {
     match target {
-        PullTarget::Commit(sha) => Ok(sha.clone()),
-        PullTarget::Head => git::head_sha(root).ok_or_else(|| {
+        PullTarget::Commit(sha) => Ok((sha.clone(), None)),
+        PullTarget::Head => git::head_sha(root).map(|sha| (sha, None)).ok_or_else(|| {
             "cannot determine HEAD sha — pass --commit <sha> or --latest".to_string()
         }),
         PullTarget::Latest => {
             let ver = SYNC_FORMAT_VERSION.to_string();
-            let pointer = pointer_address(HASH_EMBEDDER, &ver, repo_id, crate::sync::DEFAULT_REF);
-            let bytes = remote.get(&pointer).map_err(|_| {
-                format!("no `--latest` pointer for {repo_id} on `{}`", crate::sync::DEFAULT_REF)
-            })?;
-            let _ = cfg;
-            Ok(String::from_utf8_lossy(&bytes).trim().to_string())
+            // Explicit ref: the CLI `--ref` wins, else the `sync.ref` config (#72).
+            if let Some(name) = ref_override.map(str::to_string).or_else(|| cfg.git_ref.clone()) {
+                let sha = read_pointer(remote, &ver, repo_id, &name)?;
+                let noted = (name != crate::sync::DEFAULT_REF).then_some(name);
+                return Ok((sha, noted));
+            }
+            if let Ok(sha) = read_pointer(remote, &ver, repo_id, crate::sync::DEFAULT_REF) {
+                return Ok((sha, None));
+            }
+            // refs/main is absent — the #72 single-fallback rule.
+            let refs = list_ref_names(remote, &ver, repo_id)?;
+            match refs.as_slice() {
+                [only] => Ok((read_pointer(remote, &ver, repo_id, only)?, Some(only.clone()))),
+                [] => Err(format!(
+                    "no `--latest` pointer for {repo_id} on `{}`",
+                    crate::sync::DEFAULT_REF
+                )),
+                several => Err(format!(
+                    "no `--latest` pointer for {repo_id} on `{}`; available refs: {} — pass \
+                     --ref <name> (or set `sync.ref` in .cce/config)",
+                    crate::sync::DEFAULT_REF,
+                    several.join(", ")
+                )),
+            }
         }
     }
 }
@@ -349,21 +410,25 @@ fn install_artifact(root: &Path, bytes: &[u8]) -> Result<Artifact, String> {
 }
 
 /// `cce sync pull` (SPEC-SYNC §5): fetch the cache for a sha and install it.
+/// `git_ref` is the explicit `--ref <name>` a `--latest` pull resolves against
+/// (#72); `None` uses the `sync.ref` config, else main-else-single-fallback.
 pub fn cmd_pull(
     root: &Path,
     target: PullTarget,
     force: bool,
     workspace: bool,
+    git_ref: Option<String>,
 ) -> Result<String, String> {
     let cfg = SyncConfig::load(root);
     let remote = open_remote(&cfg)?;
 
     if workspace {
-        return pull_workspace(root, &cfg, &remote, &target);
+        return pull_workspace(root, &cfg, &remote, &target, git_ref.as_deref());
     }
 
     let repo_id = resolve_repo_id(root, &cfg)?;
-    let sha = resolve_pull_sha(root, &cfg, &remote, &repo_id, &target)?;
+    let (sha, noted_ref) =
+        resolve_pull_sha(root, &cfg, &remote, &repo_id, &target, git_ref.as_deref())?;
 
     // §9.4: do not silently overwrite a newer local index for a different sha.
     if !force {
@@ -382,12 +447,18 @@ pub fn cmd_pull(
     let bytes = remote.get(&key)?;
     let artifact = install_artifact(root, &bytes)?;
 
-    let mut out = format!(
-        "Pulled {repo_id}@{sha}\n  chunks   : {}\n  checksum : {}\n  store    : {}\n",
+    let mut out = format!("Pulled {repo_id}@{sha}\n");
+    // #72: a `--latest` resolved off `refs/main` (single-fallback, `--ref`, or
+    // `sync.ref`) names the ref; a main-resolved pull stays byte-identical.
+    if let Some(name) = &noted_ref {
+        out.push_str(&format!("  ref      : {name}\n"));
+    }
+    out.push_str(&format!(
+        "  chunks   : {}\n  checksum : {}\n  store    : {}\n",
         artifact.manifest.chunk_count,
         artifact.manifest.checksum,
         default_store_path(root).display()
-    );
+    ));
     // §7 v1: if the working tree differs from the pulled sha, note the fallback.
     match git::head_sha(root) {
         Some(head) if head == sha && !git::is_dirty(root) => {
@@ -454,6 +525,7 @@ fn pull_workspace(
     cfg: &SyncConfig,
     remote: &dyn SyncRemote,
     target: &PullTarget,
+    git_ref: Option<&str>,
 ) -> Result<String, String> {
     let base = resolve_repo_id(root, cfg)?;
     let ver = SYNC_FORMAT_VERSION.to_string();
@@ -479,12 +551,15 @@ fn pull_workspace(
     for m in &manifest.members {
         let member_dir = root.join(&m.path);
         let repo_id = format!("{base}__{}", m.name);
-        let sha = resolve_pull_sha(&member_dir, cfg, remote, &repo_id, target)?;
+        let (sha, noted_ref) =
+            resolve_pull_sha(&member_dir, cfg, remote, &repo_id, target, git_ref)?;
         let key = content_address(HASH_EMBEDDER, &ver, &repo_id, &sha);
         let bytes = remote.get(&key)?;
         let artifact = install_artifact(&member_dir, &bytes)?;
+        // #72: note a non-main ref per member; main rows stay byte-identical.
+        let note = noted_ref.map(|n| format!("  (ref {n})")).unwrap_or_default();
         out.push_str(&format!(
-            "  {:<16} {sha}  chunks {}  ({})\n",
+            "  {:<16} {sha}  chunks {}  ({}){note}\n",
             m.name,
             artifact.manifest.chunk_count,
             &artifact.manifest.checksum[..12]
@@ -572,9 +647,16 @@ pub fn cmd_status(root: &Path) -> Result<String, String> {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RepoListing {
     pub repo_id: String,
-    /// The cache's `refs/<DEFAULT_REF>` latest pointer — the same source of truth
-    /// `pull --latest` resolves. `None` when the repo has no pointer yet.
+    /// The repo's latest pointer — the same source of truth `pull --latest`
+    /// resolves: `refs/<DEFAULT_REF>`, else the #72 single-fallback ref. `None`
+    /// when no pointer resolves (none pushed yet, or several non-main refs).
     pub latest_sha: Option<String>,
+    /// The ref `latest_sha` came from, `Some` ONLY when it is not `main` (the
+    /// #72 single-fallback) — a main-resolved row renders byte-identically.
+    pub latest_ref: Option<String>,
+    /// Every `refs/<name>` pointer present, sorted — the multi-ref skip warning
+    /// names these so the operator can pick one (`--ref` / `sync.ref`).
+    pub refs: Vec<String>,
     /// Distinct artifact shas cached for this repo.
     pub artifacts: usize,
     /// Total artifact bytes (LFS-aware: the pointer's recorded size, not the pointer).
@@ -649,8 +731,26 @@ pub fn cmd_list(root: &Path, remote_override: Option<String>) -> Result<CacheLis
         // The pinned #37 walk: `.cce` shas only, junk entries skipped gracefully.
         let shas = remote.list(&prefix)?;
         let bytes = remote.list_artifact_sizes(&prefix)?.iter().map(|(_, b)| b).sum();
-        let pointer = pointer_address(HASH_EMBEDDER, &ver, &repo_id, crate::sync::DEFAULT_REF);
-        let latest_sha = remote.read_blob_text(&pointer).ok().filter(|s| !s.is_empty());
+        // #72: `refs/main` when present, else the sole other ref (annotated),
+        // else no latest (0 or several refs) — the same rule `pull --latest`
+        // applies, so `list` and consumer pulls can never disagree.
+        let refs = list_ref_names(&remote, &ver, &repo_id)?;
+        let chosen: Option<&str> = if refs.iter().any(|r| r == crate::sync::DEFAULT_REF) {
+            Some(crate::sync::DEFAULT_REF)
+        } else {
+            match refs.as_slice() {
+                [only] => Some(only.as_str()),
+                _ => None,
+            }
+        };
+        let latest_sha = chosen.and_then(|name| {
+            let pointer = pointer_address(HASH_EMBEDDER, &ver, &repo_id, name);
+            remote.read_blob_text(&pointer).ok().filter(|s| !s.is_empty())
+        });
+        let latest_ref = match (&latest_sha, chosen) {
+            (Some(_), Some(name)) if name != crate::sync::DEFAULT_REF => Some(name.to_string()),
+            _ => None,
+        };
         // #55: a prefix carrying published workspace metadata is a workspace base.
         let has_manifest =
             remote.has(&workspace_manifest_address(HASH_EMBEDDER, &ver, &repo_id)).unwrap_or(false);
@@ -661,7 +761,14 @@ pub fn cmd_list(root: &Path, remote_override: Option<String>) -> Result<CacheLis
                 continue;
             }
         }
-        repos.push(RepoListing { repo_id, latest_sha, artifacts: shas.len(), bytes });
+        repos.push(RepoListing {
+            repo_id,
+            latest_sha,
+            latest_ref,
+            refs,
+            artifacts: shas.len(),
+            bytes,
+        });
     }
     let knowledge = list_knowledge(&remote)?;
     // `list_dirs` already sorts, so rows, workspaces, and corpora are
@@ -722,7 +829,14 @@ pub fn render_list_human(listing: &CacheListing) -> String {
         }
         return out;
     }
-    let latest_of = |r: &RepoListing| r.latest_sha.clone().unwrap_or_else(|| "-".to_string());
+    // #72: a single-fallback row annotates its ref — `<sha> (master)` — inside
+    // the `latest` column, so alignment stays deterministic (the column widths
+    // are computed over the rendered values). Main-resolved rows are unchanged.
+    let latest_of = |r: &RepoListing| match (&r.latest_sha, &r.latest_ref) {
+        (Some(sha), Some(name)) => format!("{sha} ({name})"),
+        (Some(sha), None) => sha.clone(),
+        (None, _) => "-".to_string(),
+    };
     let id_w =
         listing.repos.iter().map(|r| r.repo_id.len()).chain(["repo_id".len()]).max().unwrap();
     let sha_w =
@@ -801,12 +915,22 @@ pub fn render_list_json(listing: &CacheListing) -> String {
         .repos
         .iter()
         .map(|r| {
-            serde_json::json!({
+            let mut row = serde_json::json!({
                 "repo_id": r.repo_id,
                 "latest_sha": r.latest_sha,
                 "artifacts": r.artifacts,
                 "bytes": r.bytes,
-            })
+            });
+            // #72: an OPTIONAL `ref` field, present ONLY when the latest sha
+            // was resolved via the single-ref fallback — every main-resolved
+            // row stays byte-identical (tolerant-reader additivity, the
+            // SPEC-SYNC §3 rule; the schema stays `cce.synclist/v1`).
+            if let Some(name) = &r.latest_ref {
+                row.as_object_mut()
+                    .expect("repo row is an object")
+                    .insert("ref".to_string(), serde_json::json!(name));
+            }
+            row
         })
         .collect();
     let mut body = serde_json::json!({
@@ -942,9 +1066,43 @@ pub fn cmd_pull_all(
     out.push('\n');
     for r in &listing.repos {
         seen.insert(r.repo_id.clone());
-        // A repo without a latest pointer (rendered `-` by `sync list`) has
-        // nothing `--latest` can resolve: warn, count, continue.
-        let Some(sha) = &r.latest_sha else {
+        // #72: an existing member whose `.cce/config` names a `sync.ref`
+        // resolves against THAT pointer — the per-member override the multi-ref
+        // warning points at — instead of the listing's main-else-fallback sha.
+        let member_ref = by_repo_id
+            .get(&r.repo_id)
+            .and_then(|&i| SyncConfig::load(&into.join(&members[i].path)).git_ref);
+        let (sha, noted_ref) = if let Some(name) = &member_ref {
+            let pointer = pointer_address(HASH_EMBEDDER, &ver, &r.repo_id, name);
+            match remote.read_blob_text(&pointer).ok().filter(|s| !s.is_empty()) {
+                Some(sha) => (sha, (name != crate::sync::DEFAULT_REF).then(|| name.clone())),
+                None => {
+                    out.push_str(&format!(
+                        "  warning: skipped {} — no pointer on `{name}` (the member's \
+                         `sync.ref`)\n",
+                        r.repo_id
+                    ));
+                    skipped += 1;
+                    continue;
+                }
+            }
+        } else if let Some(sha) = &r.latest_sha {
+            (sha.clone(), r.latest_ref.clone())
+        } else if r.refs.len() > 1 {
+            // #72 multi-ref rule: no refs/main and SEVERAL other pointers —
+            // skip as before, but NAME the refs so the operator can choose.
+            out.push_str(&format!(
+                "  warning: skipped {} — no refs/{}; available refs: {} — set `sync.ref` in \
+                 the member's .cce/config or pull it with `cce sync pull --latest --ref <name>`\n",
+                r.repo_id,
+                crate::sync::DEFAULT_REF,
+                r.refs.join(", ")
+            ));
+            skipped += 1;
+            continue;
+        } else {
+            // A repo without a latest pointer (rendered `-` by `sync list`) has
+            // nothing `--latest` can resolve: warn, count, continue.
             out.push_str(&format!(
                 "  warning: skipped {} — no latest pointer on `{}` (nothing pushed for the ref yet)\n",
                 r.repo_id,
@@ -953,6 +1111,10 @@ pub fn cmd_pull_all(
             skipped += 1;
             continue;
         };
+        // The per-member ref note (#72): empty for main-resolved rows, so the
+        // pre-#72 report stays byte-identical.
+        let note = noted_ref.map(|n| format!("  (ref {n})")).unwrap_or_default();
+        let sha = &sha;
         // The member this repo maps to: the config-recorded repo_id (the stable
         // mapping), else — live-review finding — RE-ADOPT an orphaned member: a
         // manifest entry with this repo's short name whose directory lost its
@@ -988,7 +1150,8 @@ pub fn cmd_pull_all(
             remote: Some(listing.remote.clone()),
             lfs: false,
             repo_id: Some(r.repo_id.clone()),
-            git_ref: None,
+            // #72: a hand-set `sync.ref` survives every refresh rewrite.
+            git_ref: member_ref.clone(),
             auto_pull: false,
             retention: crate::sync::config::Retention::All,
         };
@@ -1010,7 +1173,7 @@ pub fn cmd_pull_all(
                     package: name.clone(),
                 });
             }
-            out.push_str(&format!("  {name:<16} up-to-date  {}@{sha}\n", r.repo_id));
+            out.push_str(&format!("  {name:<16} up-to-date  {}@{sha}{note}\n", r.repo_id));
             up_to_date += 1;
             continue;
         }
@@ -1033,7 +1196,7 @@ pub fn cmd_pull_all(
                     });
                 }
                 out.push_str(&format!(
-                    "  {name:<16} pulled      {}@{sha}  chunks {}  ({})\n",
+                    "  {name:<16} pulled      {}@{sha}  chunks {}  ({}){note}\n",
                     r.repo_id,
                     artifact.manifest.chunk_count,
                     &artifact.manifest.checksum[..12]
@@ -1650,7 +1813,7 @@ mod tests {
         // A fresh consumer checkout (same sha) pulls it.
         let dst = source_repo_clone(&src);
         init_cfg(dst.path(), &url);
-        let out = cmd_pull(dst.path(), PullTarget::Head, false, false).unwrap();
+        let out = cmd_pull(dst.path(), PullTarget::Head, false, false, None).unwrap();
         assert!(out.contains("Pulled example.com__acme__demo@"));
         assert!(out.contains("matches — pulled index used as-is"), "got: {out}");
 
@@ -1682,7 +1845,7 @@ mod tests {
 
         let dst = source_repo_clone(&src);
         init_cfg(dst.path(), &url);
-        let out = cmd_pull(dst.path(), PullTarget::Latest, false, false).unwrap();
+        let out = cmd_pull(dst.path(), PullTarget::Latest, false, false, None).unwrap();
         assert!(out.contains(&sha), "latest should resolve to {sha}: {out}");
         std::env::remove_var("CCE_HOME");
     }
@@ -1697,7 +1860,7 @@ mod tests {
 
         let dst = source_repo_clone(&src);
         init_cfg(dst.path(), &url);
-        cmd_pull(dst.path(), PullTarget::Head, false, false).unwrap();
+        cmd_pull(dst.path(), PullTarget::Head, false, false, None).unwrap();
         let out = cmd_verify(dst.path(), None).unwrap();
         assert!(out.contains("verify OK"), "got: {out}");
         std::env::remove_var("CCE_HOME");
@@ -1741,11 +1904,12 @@ mod tests {
         cmd_push(src.path(), None, false).unwrap();
         let dst = source_repo_clone(&src);
         init_cfg(dst.path(), &url);
-        cmd_pull(dst.path(), PullTarget::Head, false, false).unwrap();
+        cmd_pull(dst.path(), PullTarget::Head, false, false, None).unwrap();
 
         // Now pretend to pull a different sha: should refuse without --force.
-        let err = cmd_pull(dst.path(), PullTarget::Commit("deadbeef".to_string()), false, false)
-            .unwrap_err();
+        let err =
+            cmd_pull(dst.path(), PullTarget::Commit("deadbeef".to_string()), false, false, None)
+                .unwrap_err();
         assert!(err.contains("--force to overwrite"), "got: {err}");
         std::env::remove_var("CCE_HOME");
     }
@@ -1768,7 +1932,7 @@ mod tests {
         let src = source_repo();
         init_cfg(src.path(), &url);
         // No push happened, so the artifact is absent.
-        let err = cmd_pull(src.path(), PullTarget::Head, false, false).unwrap_err();
+        let err = cmd_pull(src.path(), PullTarget::Head, false, false, None).unwrap_err();
         assert!(err.contains("cache miss"), "got: {err}");
         std::env::remove_var("CCE_HOME");
     }
@@ -1782,7 +1946,7 @@ mod tests {
         cmd_push(src.path(), None, false).unwrap();
         let dst = source_repo_clone(&src);
         init_cfg(dst.path(), &url);
-        cmd_pull(dst.path(), PullTarget::Head, false, false).unwrap();
+        cmd_pull(dst.path(), PullTarget::Head, false, false, None).unwrap();
         let s = cmd_status(dst.path()).unwrap();
         assert!(s.contains("remote        : file://"));
         assert!(s.contains("local cache   :"));
@@ -1865,7 +2029,7 @@ mod tests {
         }
         .save(dst.path())
         .unwrap();
-        let out = cmd_pull(dst.path(), PullTarget::Head, false, true).unwrap();
+        let out = cmd_pull(dst.path(), PullTarget::Head, false, true, None).unwrap();
         assert!(out.contains("Pulling workspace"));
         // Each member now has its own store.
         assert!(dst.path().join("alpha/.cce/index.json").exists());
@@ -1894,7 +2058,7 @@ mod tests {
 
         let dst = source_repo_clone(&src);
         cfg.save(dst.path()).unwrap();
-        let out = cmd_pull(dst.path(), PullTarget::Head, false, true).unwrap();
+        let out = cmd_pull(dst.path(), PullTarget::Head, false, true, None).unwrap();
         assert!(
             out.contains("workspace.yml + workspace-graph.json installed (1 cross-member edge)"),
             "got: {out}"
@@ -1932,7 +2096,7 @@ mod tests {
         // A bare consumer dir: no git checkout, no manifest — only the config.
         let bare_dir = tempfile::tempdir().unwrap();
         cfg.save(bare_dir.path()).unwrap();
-        let out = cmd_pull(bare_dir.path(), PullTarget::Latest, false, true).unwrap();
+        let out = cmd_pull(bare_dir.path(), PullTarget::Latest, false, true, None).unwrap();
         assert!(
             out.contains("manifest         installed from the published metadata"),
             "got: {out}"
@@ -1974,14 +2138,14 @@ mod tests {
 
         let dst = source_repo_clone(&src);
         cfg.save(dst.path()).unwrap();
-        let out = cmd_pull(dst.path(), PullTarget::Head, false, true).unwrap();
+        let out = cmd_pull(dst.path(), PullTarget::Head, false, true, None).unwrap();
         assert!(!out.contains("metadata"), "got: {out}");
         assert!(!crate::workspace::graph_path(dst.path()).exists());
 
         // Repo-less with no manifest and no published metadata: the original error.
         let bare_dir = tempfile::tempdir().unwrap();
         cfg.save(bare_dir.path()).unwrap();
-        let err = cmd_pull(bare_dir.path(), PullTarget::Latest, false, true).unwrap_err();
+        let err = cmd_pull(bare_dir.path(), PullTarget::Latest, false, true, None).unwrap_err();
         assert!(err.contains("no workspace manifest"), "got: {err}");
         std::env::remove_var("CCE_HOME");
     }
@@ -2049,7 +2213,7 @@ mod tests {
         cmd_push(src.path(), None, false).unwrap();
         let dst = source_repo_clone(&src);
         init_cfg(dst.path(), &url);
-        cmd_pull(dst.path(), PullTarget::Head, false, false).unwrap();
+        cmd_pull(dst.path(), PullTarget::Head, false, false, None).unwrap();
 
         // Mutate a tracked file so the local rebuild no longer matches the cache.
         std::fs::write(dst.path().join("auth.py"), "def login(u):\n    return 999\n").unwrap();
@@ -2248,7 +2412,7 @@ mod tests {
         // Consumer B pulls the stale cache (installs the stale index + marker)...
         let b = source_repo_clone(&src);
         init_cfg(b.path(), &url);
-        let pulled = cmd_pull(b.path(), PullTarget::Head, false, false).unwrap();
+        let pulled = cmd_pull(b.path(), PullTarget::Head, false, false, None).unwrap();
         assert!(pulled.contains(&stale_checksum), "B pulled the stale cache: {pulled}");
         // ...then B pushes: must REBUILD and republish build(sha), not the stale file.
         cmd_push(b.path(), None, false).unwrap();
@@ -2265,7 +2429,7 @@ mod tests {
         // A fresh consumer C pulls the republished artifact → verify is GREEN.
         let c = source_repo_clone(&src);
         init_cfg(c.path(), &url);
-        cmd_pull(c.path(), PullTarget::Head, false, false).unwrap();
+        cmd_pull(c.path(), PullTarget::Head, false, false, None).unwrap();
         let out = cmd_verify(c.path(), None).unwrap();
         assert!(out.contains("verify OK"), "pull→push→verify must be green: {out}");
         std::env::remove_var("CCE_HOME");
@@ -2303,12 +2467,16 @@ mod tests {
                 RepoListing {
                     repo_id: "aaa__one".to_string(),
                     latest_sha: Some("2222222".to_string()),
+                    latest_ref: None,
+                    refs: vec!["main".to_string()],
                     artifacts: 2,
                     bytes: 8,
                 },
                 RepoListing {
                     repo_id: "bbb__two".to_string(),
                     latest_sha: None,
+                    latest_ref: None,
+                    refs: Vec::new(),
                     artifacts: 1,
                     bytes: 2,
                 },
@@ -2370,12 +2538,16 @@ mod tests {
                 RepoListing {
                     repo_id: "github.com__acme__billing".to_string(),
                     latest_sha: Some("7b9dec7dcbe86ca35b2b4ddeb8386d0595e3362f".to_string()),
+                    latest_ref: None,
+                    refs: Vec::new(),
                     artifacts: 3,
                     bytes: 123456,
                 },
                 RepoListing {
                     repo_id: "github.com__acme__web".to_string(),
                     latest_sha: None,
+                    latest_ref: None,
+                    refs: Vec::new(),
                     artifacts: 1,
                     bytes: 2048,
                 },
@@ -2725,7 +2897,7 @@ total         : 2 repos, 4 artifacts, 125504 bytes
         // A repo-less consumer: bare dir + config only, `--latest` pull.
         let consumer = tempfile::tempdir().unwrap();
         init_cfg(consumer.path(), &url);
-        cmd_pull(consumer.path(), PullTarget::Latest, false, false).unwrap();
+        cmd_pull(consumer.path(), PullTarget::Latest, false, false, None).unwrap();
         let out = cmd_verify_checksum_only(consumer.path()).unwrap();
         assert!(
             out.contains(&format!("verify OK (checksum-only): example.com__acme__demo@{sha}")),
@@ -2791,7 +2963,7 @@ total         : 2 repos, 4 artifacts, 125504 bytes
 
         let consumer = tempfile::tempdir().unwrap();
         init_cfg(consumer.path(), &url);
-        cmd_pull(consumer.path(), PullTarget::Latest, false, false).unwrap();
+        cmd_pull(consumer.path(), PullTarget::Latest, false, false, None).unwrap();
         // Rewrite the marker to the pre-#55 shape (no installed_sha256).
         let mut state = SyncState::load(consumer.path()).unwrap();
         assert!(state.installed_sha256.is_some(), "a fresh pull records the hash");

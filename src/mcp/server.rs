@@ -368,7 +368,7 @@ impl McpServer {
         let cfg = SyncConfig::load(&root);
         if cfg.remote.is_some() && cfg.auto_pull {
             // force = false: never clobber a WIP local cache; a mismatch just no-ops.
-            let _ = cmd_pull(&root, PullTarget::Latest, false, self.workspace);
+            let _ = cmd_pull(&root, PullTarget::Latest, false, self.workspace, None);
         }
     }
 

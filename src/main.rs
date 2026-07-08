@@ -283,6 +283,12 @@ enum SyncCmd {
         /// Pull the remote's latest pushed sha for the default ref.
         #[arg(long, conflicts_with = "commit")]
         latest: bool,
+        /// With `--latest`: resolve against this `refs/<name>` pointer instead
+        /// of the default rule (`refs/main`, else the sole other ref — #72).
+        /// Rejected with `--all` (repos have different default branches); set
+        /// the per-member `sync.ref` config key for `--all` refreshes instead.
+        #[arg(long = "ref", value_name = "NAME", requires = "latest")]
+        git_ref: Option<String>,
         /// Overwrite a local cache for a different sha (SPEC-SYNC §9.4).
         #[arg(long)]
         force: bool,
@@ -292,7 +298,7 @@ enum SyncCmd {
         /// Consumer mode (#54): pull EVERY repo_id's latest artifact from the
         /// cache and synthesize a ready-to-search workspace under `--into <dir>`.
         /// Re-running refreshes only members whose latest pointer moved.
-        #[arg(long, requires = "into", conflicts_with_all = ["commit", "latest", "force", "workspace", "dir"])]
+        #[arg(long, requires = "into", conflicts_with_all = ["commit", "latest", "force", "workspace", "dir", "git_ref"])]
         all: bool,
         /// The consumer workspace directory `--all` creates or refreshes.
         #[arg(long, requires = "all")]
@@ -1242,7 +1248,18 @@ fn cmd_sync(cmd: SyncCmd) -> Result<(), String> {
             print!("{report}");
             Ok(())
         }
-        SyncCmd::Pull { commit, latest, force, workspace, all, into, remote, corpus, dir } => {
+        SyncCmd::Pull {
+            commit,
+            latest,
+            git_ref,
+            force,
+            workspace,
+            all,
+            into,
+            remote,
+            corpus,
+            dir,
+        } => {
             if all {
                 // clap enforces `--all requires --into`.
                 let into = into.ok_or_else(|| "--all requires --into <dir>".to_string())?;
@@ -1258,7 +1275,7 @@ fn cmd_sync(cmd: SyncCmd) -> Result<(), String> {
             } else {
                 sync_cmd::PullTarget::Head
             };
-            let report = sync_cmd::cmd_pull(&root, target, force, workspace)?;
+            let report = sync_cmd::cmd_pull(&root, target, force, workspace, git_ref)?;
             print!("{report}");
             Ok(())
         }
