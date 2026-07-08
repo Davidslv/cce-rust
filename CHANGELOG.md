@@ -19,6 +19,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   an empty cache is a friendly message (exit 0); an unreachable remote is a clear non-zero
   error. `--json` emits the stable, byte-pinned `cce.synclist/v1` shape.
   `SYNC_FORMAT_VERSION`, `conformance.json`, and every existing golden are untouched.
+- **`cce sync pull --all --into <dir> [--remote <url>]` — the one-command repo-less consumer
+  workspace (#54).** From a bare directory: enumerates the cache (the #53 `sync list`
+  machinery), pulls every `repo_id`'s latest artifact into `<dir>/<member>/.cce/`, and
+  synthesizes `<dir>/.cce/workspace.yml` plus the root and per-member `.cce/config`, so
+  `cce search --workspace <dir>` and `cce mcp --workspace --dir <dir>` work immediately —
+  zero source checkouts, each member federated at its own independent sha. Members are
+  short-named from the repo_id's last `__` segment (`-2`/`-3` on collision); the full
+  repo_id lives in the member's config so per-member pulls keep working. Repos without a
+  latest pointer are warned and skipped, never fatal. Re-runs are idempotent refreshes:
+  only members whose latest pointer moved are re-pulled, new repo_ids join the workspace,
+  and vanished ones are warned about but never deleted. Synthesized manifests use the new
+  neutral `type: store-only` member type (a member with no source to classify); detection
+  never emits it and hand-written manifests stay byte-identical. Consumer mode (including
+  the repo-less single-member `--latest`/`--commit` pull) is now documented in
+  `docs/sync.md`. `SYNC_FORMAT_VERSION`, `conformance.json`, and every existing golden are
+  untouched.
 
 ## [2.6.8] - 2026-07-08
 

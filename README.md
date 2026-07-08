@@ -542,6 +542,14 @@ enumerates what a cache holds — one row per repo_id with its latest sha, artif
 count, and total bytes — read-only, and from a bare directory if you pass
 `--remote` (handy for auditing that every repo's CI is actually pushing).
 
+**Consumer mode:** `cce sync pull --all --into ctx --remote <url>` turns a bare
+directory into a ready-to-search federated workspace — it pulls every repo_id's
+latest artifact and synthesizes the workspace metadata, so `cce search --workspace
+ctx` and `cce mcp --workspace --dir ctx` work immediately with **zero source
+checkouts**, each member at its own independent sha. Re-running refreshes only the
+members whose latest pointer moved. See the consumer-mode section of
+[`docs/sync.md`](docs/sync.md).
+
 **CI (GitHub Actions):** index `main` and push on every merge with the ready-to-copy
 [`docs/ci/cce-sync.yml`](docs/ci/cce-sync.yml). The token it uses needs **write**
 access to the *cache* repo only; developers need only **read** to pull.
@@ -722,6 +730,7 @@ real offline cold-start run in [`docs/VERIFIED.md`](docs/VERIFIED.md):
 | `cce knowledge index` | ✅ fully offline | reads a local NDJSON feed; writes the local `.cce/knowledge/` store |
 | `cce feedback` / `cce conformance` / `cce packs` / `cce bench` | ✅ fully offline | pure local operations |
 | `cce sync list` | ❌ needs the cache remote | read-only enumeration of what a cache holds (repo_ids, latest shas, artifact counts/bytes); works from a bare directory with just `--remote <url>` |
+| `cce sync pull --all` | ❌ needs the cache remote | consumer mode: pulls every repo_id's latest artifact into `--into <dir>` and synthesizes the workspace — the resulting search/MCP over it is then fully offline |
 
 The **only** things that ever touch the network are, explicitly:
 
