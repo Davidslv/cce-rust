@@ -51,6 +51,14 @@ pub const DEFAULT_TOP_K: usize = 10;
 /// Maximum file size (bytes) we will index. Files larger than this are skipped.
 pub const MAX_FILE_SIZE: u64 = 2 * 1024 * 1024;
 
+/// Chunks embedded per fallible batch call on the index path (issue #38).
+/// Bounds the request size for HTTP backends (Ollama `POST /api/embed`), so
+/// indexing issues ceil(chunks / EMBED_BATCH_SIZE) requests instead of one
+/// per chunk. Purely an execution detail: vectors, chunk ids, and conformance
+/// output are identical for any positive value (the hash backend's default
+/// batch impl still maps its pure per-text embed over the inputs).
+pub const EMBED_BATCH_SIZE: usize = 64;
+
 /// Spec version tag stamped on the persisted index file (internal).
 pub const SPEC_VERSION: &str = "1.0";
 

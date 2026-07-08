@@ -7,6 +7,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Changed
+- **Index-time embedding now batches chunks through `try_embed_batch` (#38).** The store build
+  path used to embed one chunk per call — one HTTP request per chunk on the Ollama backend, so a
+  repo with tens of thousands of chunks cost tens of thousands of sequential round-trips. Chunks
+  are now embedded in bounded batches of `EMBED_BATCH_SIZE` (64, pinned in `src/config.rs`), so
+  indexing issues `ceil(chunks / 64)` requests instead of one per chunk (measured on a 300-file /
+  600-chunk synthetic repo against a 10 ms-latency stub: 601 → 11 requests, ~10.2 s → ~0.2 s).
+  The fail-loud policy (#30) holds at batch granularity: a failed or count-mismatched batch aborts
+  the index naming the batch's file span, and nothing is persisted — never empty or misaligned
+  vectors. The hash embedder is untouched (its default batch impl maps the same pure per-text
+  embed over each batch), so all goldens and `conformance.json` are byte-identical.
+
 ### Fixed
 - **`cce search --workspace --package ""` now errors loudly instead of silently returning no
   results (#45).** An empty-but-present `--package` value (`""`, `","`, whitespace — e.g. an unset

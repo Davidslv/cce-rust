@@ -161,10 +161,12 @@ impl Index {
     /// chunked, embedded, and stored. When false (`--allow-secrets`), both layers
     /// are off and content is indexed verbatim.
     ///
-    /// Embedding is fallible (issue #30): a failed embed — e.g. Ollama dying
-    /// mid-index — aborts the whole build with an `Err`, so a store can never
-    /// silently persist empty/dead embeddings. Nothing is written by this
-    /// function; callers only `save` an `Ok` index.
+    /// Embedding runs in bounded batches of [`crate::config::EMBED_BATCH_SIZE`]
+    /// chunks via [`Embedder::try_embed_batch`] (issue #38) and is fallible
+    /// (issue #30): a failed batch — e.g. Ollama dying mid-index — aborts the
+    /// whole build with an `Err`, so a store can never silently persist
+    /// empty/dead embeddings. Nothing is written by this function; callers only
+    /// `save` an `Ok` index.
     pub fn build_protected(
         root: &Path,
         embedder: &dyn Embedder,
@@ -201,20 +203,44 @@ impl Index {
             if !fc.imports.is_empty() {
                 file_imports.insert(rel_path.clone(), fc.imports);
             }
-            for mut chunk in fc.chunks {
-                // Fail loud (#30): propagate an embedding failure instead of
-                // storing an empty vector that would score cosine 0 forever.
-                chunk.embedding = embedder.try_embed(&chunk.content).map_err(|e| {
-                    format!(
-                        "embedding failed at {rel_path}:{} ({}): {e}. Aborting the index — a \
-                         store must never contain empty embeddings. Fix the `{}` backend or \
-                         re-index with the default hash embedder.",
-                        chunk.start_line,
-                        chunk.chunk_id,
-                        embedder.name()
-                    )
-                })?;
-                chunks.push(chunk);
+            chunks.extend(fc.chunks);
+        }
+
+        // Embed in bounded batches through the fallible batch API (#38), so an
+        // HTTP backend (Ollama `POST /api/embed`) issues
+        // ceil(chunks / EMBED_BATCH_SIZE) requests instead of one per chunk.
+        // For the hash backend the default trait impl still maps the pure
+        // per-text embed over each batch, so its vectors are byte-identical to
+        // the old per-chunk path. Fail loud (#30): a failed batch — including a
+        // response with the wrong number of vectors — aborts the whole build
+        // with an `Err` naming the batch's file range; nothing is persisted,
+        // never an empty vector.
+        for batch in chunks.chunks_mut(crate::config::EMBED_BATCH_SIZE) {
+            let texts: Vec<String> = batch.iter().map(|c| c.content.clone()).collect();
+            let vectors = embedder.try_embed_batch(&texts).map_err(|e| {
+                format!(
+                    "embedding failed for {} ({e}). Aborting the index — a store must never \
+                     contain empty embeddings. Fix the `{}` backend or re-index with the \
+                     default hash embedder.",
+                    batch_span(batch),
+                    embedder.name()
+                )
+            })?;
+            // Per-batch count guard (#30): a misaligned response must never be
+            // zipped silently onto the wrong chunks.
+            if vectors.len() != batch.len() {
+                return Err(format!(
+                    "embedding failed for {}: the `{}` backend returned {} vector(s) for {} \
+                     chunk(s). Aborting the index — a store must never contain misaligned or \
+                     empty embeddings.",
+                    batch_span(batch),
+                    embedder.name(),
+                    vectors.len(),
+                    batch.len()
+                ));
+            }
+            for (chunk, vector) in batch.iter_mut().zip(vectors) {
+                chunk.embedding = vector;
             }
         }
 
@@ -275,6 +301,26 @@ impl Index {
     }
 }
 
+/// Human-readable span of an embedding batch for error context (#38): the
+/// first and last chunk's `file:line`, so a batch failure still names where in
+/// the walk it happened even though the request covered many chunks.
+fn batch_span(batch: &[Chunk]) -> String {
+    match (batch.first(), batch.last()) {
+        (Some(first), Some(last)) if batch.len() > 1 => format!(
+            "a batch of {} chunks ({}:{} .. {}:{})",
+            batch.len(),
+            first.file_path,
+            first.start_line,
+            last.file_path,
+            last.start_line
+        ),
+        (Some(only), _) => {
+            format!("chunk {}:{} ({})", only.file_path, only.start_line, only.chunk_id)
+        }
+        _ => "an empty batch".to_string(),
+    }
+}
+
 /// Default store path for an indexed root: `<root>/.cce/index.json`.
 pub fn default_store_path(root: &Path) -> PathBuf {
     root.join(".cce").join("index.json")
@@ -303,6 +349,44 @@ mod tests {
         assert_eq!(idx.chunks.len(), 7);
         // payments.py -> auth edge present
         assert_eq!(idx.file_imports.get("payments.py"), Some(&vec!["auth".to_string()]));
+    }
+
+    #[test]
+    fn batched_hash_embeddings_match_per_chunk_embed() {
+        // #38: the batched build path must leave the hash backend's output
+        // byte-identical to embedding each chunk individually — batching is an
+        // execution detail, never a semantic one.
+        use crate::embedder::Embedder;
+        let e = HashEmbedder;
+        let (idx, _) = Index::build_from_dir(&fixture_dir(), &e).unwrap();
+        for c in &idx.chunks {
+            assert_eq!(c.embedding, e.embed(&c.content), "chunk {}", c.chunk_id);
+        }
+    }
+
+    #[test]
+    fn batch_count_mismatch_aborts_the_build() {
+        // #38: the store-level per-batch count guard — a backend returning the
+        // wrong number of vectors must abort the build, never be zipped
+        // silently onto the wrong chunks.
+        struct ShortBatchEmbedder;
+        impl crate::embedder::Embedder for ShortBatchEmbedder {
+            fn embed(&self, _text: &str) -> Vec<f64> {
+                vec![1.0]
+            }
+            fn try_embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f64>>, String> {
+                Ok(vec![vec![1.0]; texts.len().saturating_sub(1)])
+            }
+            fn name(&self) -> &'static str {
+                "short-batch"
+            }
+        }
+        let err = match Index::build_from_dir(&fixture_dir(), &ShortBatchEmbedder) {
+            Ok(_) => panic!("a count-mismatched batch must abort the build"),
+            Err(e) => e,
+        };
+        assert!(err.contains("vector(s) for"), "must name the mismatch: {err}");
+        assert!(err.contains("Aborting the index"), "must say it aborted: {err}");
     }
 
     #[test]
