@@ -25,10 +25,13 @@
 //!   changes ranking behavior.
 
 use crate::config::DEFAULT_TOP_K;
+use crate::chunker::Chunk;
 use crate::embedder::{format6, Embedder};
 use crate::retriever::{bm25_only_search, result_from, search, SearchResult};
 use crate::store::Index;
+use crate::tokenizer::estimate_tokens;
 use crate::vector_store::rank_by_cosine;
+use std::collections::{BTreeMap, BTreeSet};
 
 /// The pinned schema id for the fixture contract. A bump is a compatibility event.
 pub const RELEVANCE_SCHEMA_ID: &str = "cce.relevance/v1";
@@ -39,24 +42,43 @@ pub const RELEVANCE_REPORT_SCHEMA_ID: &str = "cce.relevance.report/v1";
 // --- Fixture contract (cce.relevance/v1) ---
 
 /// One expected-result anchor. A retrieved result matches an anchor when every
-/// present facet matches: `file_path` equality and/or chunk `kind` equality.
+/// present facet matches: `file_path` equality, chunk `kind` equality, and/or
+/// line-range overlap.
 ///
 /// String forms (the documented contract):
 /// - `"auth.py"` — any chunk of that file
 /// - `"auth.py#function_definition"` — a chunk of that file with that kind
 /// - `"#interface_declaration"` — any chunk of that kind, in any file
+/// - `"auth.py@10-42"` / `"auth.py#function_definition@10-42"` — additionally
+///   require the result's line span to OVERLAP the 1-based inclusive range
+///   (issue #85; a range always requires a file path)
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Anchor {
     pub file_path: Option<String>,
     pub kind: Option<String>,
+    /// Optional 1-based inclusive line range (`@a-b`), issue #85. Ranged
+    /// anchors additionally feed the token-level metrics.
+    pub range: Option<(usize, usize)>,
 }
 
+/// `Anchor::split_range`'s result: the remaining anchor body plus the parsed
+/// `@a-b` range, if one was present.
+type SplitRange<'a> = (&'a str, Option<(usize, usize)>);
+
 impl Anchor {
-    /// Parse the `path`, `path#kind`, or `#kind` string form.
+    /// Parse the `path`, `path#kind`, `#kind`, `path@a-b`, or `path#kind@a-b`
+    /// string form.
+    ///
+    /// The range facet is ADDITIVE (issue #85): text after the last `@` is a
+    /// range only when it consists solely of digits and `-` — then it must be
+    /// a valid `a-b` with `1 ≤ a ≤ b`, else the anchor is rejected. Any other
+    /// `@` stays literal path/kind content, so every pre-range fixture parses
+    /// unchanged.
     pub fn parse(s: &str) -> Result<Anchor, String> {
-        let (path, kind) = match s.split_once('#') {
+        let (body, range) = Self::split_range(s)?;
+        let (path, kind) = match body.split_once('#') {
             Some((p, k)) => (p.trim(), Some(k.trim())),
-            None => (s.trim(), None),
+            None => (body.trim(), None),
         };
         let file_path = if path.is_empty() { None } else { Some(path.to_string()) };
         let kind = match kind {
@@ -65,9 +87,41 @@ impl Anchor {
             None => None,
         };
         if file_path.is_none() && kind.is_none() {
-            return Err("anchor is empty — expected `path`, `path#kind`, or `#kind`".to_string());
+            return Err("anchor is empty — expected `path`, `path#kind`, `#kind`, or `path@a-b`"
+                .to_string());
         }
-        Ok(Anchor { file_path, kind })
+        if range.is_some() && file_path.is_none() {
+            return Err(format!(
+                "anchor {s:?} has a line range but no file path — a range needs `path@a-b` or \
+                 `path#kind@a-b`"
+            ));
+        }
+        Ok(Anchor { file_path, kind, range })
+    }
+
+    /// Split an optional trailing `@a-b` range facet off an anchor string.
+    fn split_range(s: &str) -> Result<SplitRange<'_>, String> {
+        let Some((body, tail)) = s.rsplit_once('@') else {
+            return Ok((s, None));
+        };
+        let tail = tail.trim();
+        // Only an all-[0-9-] tail is an attempted range facet; anything else
+        // (e.g. `user@host.py`) is literal anchor text, as before issue #85.
+        if tail.is_empty() || !tail.chars().all(|c| c.is_ascii_digit() || c == '-') {
+            return Ok((s, None));
+        }
+        let bad = || {
+            format!(
+                "anchor {s:?} has an invalid line range after '@' — expected `a-b` with 1 ≤ a ≤ b"
+            )
+        };
+        let (a, b) = tail.split_once('-').ok_or_else(bad)?;
+        let a: usize = a.parse().map_err(|_| bad())?;
+        let b: usize = b.parse().map_err(|_| bad())?;
+        if a == 0 || b < a {
+            return Err(bad());
+        }
+        Ok((body, Some((a, b))))
     }
 
     /// True when `result` satisfies every present facet of this anchor.
@@ -82,17 +136,27 @@ impl Anchor {
                 return false;
             }
         }
+        if let Some((a, b)) = self.range {
+            // Inclusive span overlap: the result must touch [a, b].
+            if result.end_line < a || result.start_line > b {
+                return false;
+            }
+        }
         true
     }
 
     /// The canonical string form (for reporting).
     pub fn display(&self) -> String {
-        match (&self.file_path, &self.kind) {
+        let mut out = match (&self.file_path, &self.kind) {
             (Some(p), Some(k)) => format!("{p}#{k}"),
             (Some(p), None) => p.clone(),
             (None, Some(k)) => format!("#{k}"),
             (None, None) => String::new(),
+        };
+        if let Some((a, b)) = self.range {
+            out.push_str(&format!("@{a}-{b}"));
         }
+        out
     }
 }
 
@@ -300,6 +364,110 @@ pub fn run_backend(
     }
 }
 
+// --- Token-level span metrics (issue #85) ---
+
+/// Per-line `cce.tokens/v1` weights for every file the index knows, built from
+/// the indexed chunk texts (so it works identically for `--dir` and `--store`,
+/// with zero extra file I/O).
+///
+/// Rules, all deterministic:
+/// - A line's weight is `estimate_tokens(line_text)` — the ONE `cce.tokens/v1`
+///   estimator, applied per line (newline excluded).
+/// - Where chunks overlap (a method nested in its class), the FIRST chunk in
+///   index order wins; the outer chunk carries the truer (indented) line text.
+/// - A line no chunk covers — a gap between definitions, or a range past the
+///   end of the file — weighs `estimate_tokens("") = 1`, the estimator floor.
+#[derive(Debug, Clone, Default)]
+pub struct LineWeights {
+    files: BTreeMap<String, BTreeMap<usize, u64>>,
+}
+
+impl LineWeights {
+    /// Build the per-line weight table from the index's chunks.
+    pub fn from_chunks(chunks: &[Chunk]) -> LineWeights {
+        let mut files: BTreeMap<String, BTreeMap<usize, u64>> = BTreeMap::new();
+        for c in chunks {
+            let file = files.entry(c.file_path.clone()).or_default();
+            for (i, line) in c.content.lines().enumerate() {
+                file.entry(c.start_line + i).or_insert_with(|| estimate_tokens(line));
+            }
+        }
+        LineWeights { files }
+    }
+
+    /// The `cce.tokens/v1` weight of one line (see the type docs for the
+    /// uncovered-line rule).
+    pub fn weight(&self, file: &str, line: usize) -> u64 {
+        self.files.get(file).and_then(|m| m.get(&line)).copied().unwrap_or(1)
+    }
+}
+
+/// Token-level boundary metrics for one query (issue #85): how much of the
+/// EXACT expected span was retrieved, and how much of the retrieved text was
+/// inside it — the resolution chunk-level hit/miss cannot see.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TokenScore {
+    /// Overlap tokens over retrieved tokens.
+    pub precision: f64,
+    /// Overlap tokens over expected-span tokens.
+    pub recall: f64,
+    /// Overlap tokens over the union of both (Jaccard / IoU).
+    pub iou: f64,
+}
+
+/// Collect a `file → line set` union of spans.
+type LineSets = BTreeMap<String, BTreeSet<usize>>;
+
+/// Total `cce.tokens/v1` mass of a line-set union.
+fn token_mass(sets: &LineSets, weights: &LineWeights) -> u64 {
+    sets.iter().map(|(f, lines)| lines.iter().map(|l| weights.weight(f, *l)).sum::<u64>()).sum()
+}
+
+/// Score the token-level overlap between a query's RANGED anchors and its
+/// top-k results' line spans, weighted with `cce.tokens/v1` line weights.
+/// Returns `None` when the case has no ranged anchor (chunk-level metrics
+/// only — the exact v1 behavior). Unranged anchors of a mixed case do not
+/// contribute: only spans the fixture pinned to lines can be token-scored.
+pub fn score_tokens(
+    results: &[SearchResult],
+    expected: &[Anchor],
+    k: usize,
+    weights: &LineWeights,
+) -> Option<TokenScore> {
+    let mut relevant: LineSets = BTreeMap::new();
+    for a in expected {
+        if let (Some((lo, hi)), Some(f)) = (a.range, a.file_path.as_ref()) {
+            relevant.entry(f.clone()).or_default().extend(lo..=hi);
+        }
+    }
+    if relevant.is_empty() {
+        return None;
+    }
+    let mut retrieved: LineSets = BTreeMap::new();
+    for r in &results[..results.len().min(k)] {
+        retrieved.entry(r.file_path.clone()).or_default().extend(r.start_line..=r.end_line);
+    }
+    let mut overlap: LineSets = BTreeMap::new();
+    for (f, lines) in &relevant {
+        if let Some(got) = retrieved.get(f) {
+            let inter: BTreeSet<usize> = lines.intersection(got).copied().collect();
+            if !inter.is_empty() {
+                overlap.insert(f.clone(), inter);
+            }
+        }
+    }
+    let relevant_mass = token_mass(&relevant, weights);
+    let retrieved_mass = token_mass(&retrieved, weights);
+    let overlap_mass = token_mass(&overlap, weights);
+    let union_mass = relevant_mass + retrieved_mass - overlap_mass;
+    let ratio = |num: u64, den: u64| if den == 0 { 0.0 } else { num as f64 / den as f64 };
+    Some(TokenScore {
+        precision: ratio(overlap_mass, retrieved_mass),
+        recall: ratio(overlap_mass, relevant_mass),
+        iou: ratio(overlap_mass, union_mass),
+    })
+}
+
 // --- Metrics ---
 
 /// The scored metrics for one query at one backend.
@@ -317,6 +485,8 @@ pub struct QueryScore {
     pub f1: f64,
     /// 1-based rank of the first relevant result, if any.
     pub first_relevant_rank: Option<usize>,
+    /// Token-level span metrics, when the case has ranged anchors (issue #85).
+    pub tokens: Option<TokenScore>,
 }
 
 /// Score one query's ranked results against its expected anchors (SPEC IR
@@ -331,6 +501,7 @@ pub fn score_query(
     results: &[SearchResult],
     expected: &[Anchor],
     k: usize,
+    weights: &LineWeights,
 ) -> QueryScore {
     let considered = &results[..results.len().min(k)];
     let mut relevant_retrieved = 0usize;
@@ -358,7 +529,19 @@ pub fn score_query(
     } else {
         0.0
     };
-    QueryScore { id: id.to_string(), k, precision, recall, mrr, f1, first_relevant_rank }
+    let tokens = score_tokens(results, expected, k, weights);
+    QueryScore { id: id.to_string(), k, precision, recall, mrr, f1, first_relevant_rank, tokens }
+}
+
+/// Macro-averaged token-level aggregates over the RANGED cases of one backend
+/// (issue #85). Absent from a report when no case carries a line range.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct TokenAggregate {
+    /// How many cases carried ranged anchors (the macro-average denominator).
+    pub queries: usize,
+    pub precision: f64,
+    pub recall: f64,
+    pub iou: f64,
 }
 
 /// One backend's report: macro-averaged aggregates plus the per-query scores.
@@ -369,6 +552,8 @@ pub struct BackendReport {
     pub recall: f64,
     pub mrr: f64,
     pub f1: f64,
+    /// Token-level macro averages, when any case has ranged anchors.
+    pub tokens: Option<TokenAggregate>,
     pub queries: Vec<QueryScore>,
 }
 
@@ -379,21 +564,35 @@ pub fn evaluate_backend(
     backend: Backend,
     cases: &[Case],
 ) -> BackendReport {
+    let weights = LineWeights::from_chunks(&index.chunks);
     let queries: Vec<QueryScore> = cases
         .iter()
         .map(|c| {
             let results = run_backend(index, embedder, backend, &c.query, c.k);
-            score_query(&c.id, &results, &c.expected, c.k)
+            score_query(&c.id, &results, &c.expected, c.k, &weights)
         })
         .collect();
     let n = queries.len().max(1) as f64;
     let mean = |f: fn(&QueryScore) -> f64| queries.iter().map(f).sum::<f64>() / n;
+    let ranged: Vec<TokenScore> = queries.iter().filter_map(|q| q.tokens).collect();
+    let tokens = if ranged.is_empty() {
+        None
+    } else {
+        let tn = ranged.len() as f64;
+        Some(TokenAggregate {
+            queries: ranged.len(),
+            precision: ranged.iter().map(|t| t.precision).sum::<f64>() / tn,
+            recall: ranged.iter().map(|t| t.recall).sum::<f64>() / tn,
+            iou: ranged.iter().map(|t| t.iou).sum::<f64>() / tn,
+        })
+    };
     BackendReport {
         backend,
         precision: mean(|q| q.precision),
         recall: mean(|q| q.recall),
         mrr: mean(|q| q.mrr),
         f1: mean(|q| q.f1),
+        tokens,
         queries,
     }
 }
@@ -547,17 +746,74 @@ mod tests {
     #[test]
     fn anchor_parses_path_kind_and_combined_forms() {
         let p = Anchor::parse("auth.py").unwrap();
-        assert_eq!(p, Anchor { file_path: Some("auth.py".into()), kind: None });
+        assert_eq!(p, Anchor { file_path: Some("auth.py".into()), kind: None, range: None });
         let pk = Anchor::parse("auth.py#function_definition").unwrap();
         assert_eq!(
             pk,
-            Anchor { file_path: Some("auth.py".into()), kind: Some("function_definition".into()) }
+            Anchor {
+                file_path: Some("auth.py".into()),
+                kind: Some("function_definition".into()),
+                range: None
+            }
         );
         let k = Anchor::parse("#interface_declaration").unwrap();
-        assert_eq!(k, Anchor { file_path: None, kind: Some("interface_declaration".into()) });
+        assert_eq!(
+            k,
+            Anchor { file_path: None, kind: Some("interface_declaration".into()), range: None }
+        );
         assert_eq!(p.display(), "auth.py");
         assert_eq!(pk.display(), "auth.py#function_definition");
         assert_eq!(k.display(), "#interface_declaration");
+    }
+
+    #[test]
+    fn anchor_parses_line_range_forms() {
+        // path@a-b and path#kind@a-b (issue #85).
+        let r = Anchor::parse("src/auth.py@10-42").unwrap();
+        assert_eq!(
+            r,
+            Anchor { file_path: Some("src/auth.py".into()), kind: None, range: Some((10, 42)) }
+        );
+        assert_eq!(r.display(), "src/auth.py@10-42");
+        let rk = Anchor::parse("auth.py#function_definition@3-4").unwrap();
+        assert_eq!(
+            rk,
+            Anchor {
+                file_path: Some("auth.py".into()),
+                kind: Some("function_definition".into()),
+                range: Some((3, 4))
+            }
+        );
+        assert_eq!(rk.display(), "auth.py#function_definition@3-4");
+        // A single-line span is a-a.
+        assert_eq!(Anchor::parse("f.py@7-7").unwrap().range, Some((7, 7)));
+    }
+
+    #[test]
+    fn anchor_range_grammar_is_additive_for_literal_at_signs() {
+        // An `@` whose tail is not all digits-and-dashes stays literal path
+        // text — the exact pre-#85 parse.
+        let a = Anchor::parse("user@host.py").unwrap();
+        assert_eq!(a.file_path.as_deref(), Some("user@host.py"));
+        assert_eq!(a.range, None);
+        let b = Anchor::parse("v2@latest.md#section").unwrap();
+        assert_eq!(b.file_path.as_deref(), Some("v2@latest.md"));
+        assert_eq!(b.kind.as_deref(), Some("section"));
+        assert_eq!(b.range, None);
+    }
+
+    #[test]
+    fn anchor_rejects_malformed_and_pathless_ranges() {
+        // An attempted range facet (all digits/dashes) must be a valid a-b.
+        assert!(Anchor::parse("f.py@10-").is_err());
+        assert!(Anchor::parse("f.py@-42").is_err());
+        assert!(Anchor::parse("f.py@42").is_err());
+        assert!(Anchor::parse("f.py@42-10").is_err());
+        assert!(Anchor::parse("f.py@0-4").is_err());
+        assert!(Anchor::parse("f.py@1-2-3").is_err());
+        // A range needs a file path to span.
+        assert!(Anchor::parse("#function_definition@1-5").is_err());
+        assert!(Anchor::parse("@1-5").is_err());
     }
 
     #[test]
@@ -579,6 +835,210 @@ mod tests {
         assert!(!Anchor::parse("#class_definition").unwrap().matches(&r));
     }
 
+    #[test]
+    fn ranged_anchor_matching_requires_span_overlap() {
+        // The helper's result spans lines 1-2.
+        let r = result("auth.py", "function_definition", 1);
+        assert!(Anchor::parse("auth.py@1-2").unwrap().matches(&r));
+        assert!(Anchor::parse("auth.py@2-10").unwrap().matches(&r)); // partial overlap
+        assert!(Anchor::parse("auth.py@1-1").unwrap().matches(&r)); // touches first line
+        assert!(!Anchor::parse("auth.py@3-10").unwrap().matches(&r)); // disjoint below
+        assert!(!Anchor::parse("payments.py@1-2").unwrap().matches(&r)); // wrong file
+        assert!(!Anchor::parse("auth.py#class_definition@1-2").unwrap().matches(&r));
+        // wrong kind
+    }
+
+    // --- Token-level span metrics (issue #85; hand-computed) ---
+
+    /// A result with an explicit line span.
+    fn spanned(file_path: &str, rank: usize, start_line: usize, end_line: usize) -> SearchResult {
+        SearchResult { start_line, end_line, ..result(file_path, "function_definition", rank) }
+    }
+
+    /// Uniform weights: every line weighs 1 token (the empty `LineWeights`
+    /// fallback), so masses reduce to line counts.
+    fn uniform() -> LineWeights {
+        LineWeights::default()
+    }
+
+    #[test]
+    fn score_tokens_returns_none_without_ranged_anchors() {
+        let expected = vec![Anchor::parse("auth.py").unwrap()];
+        let results = vec![spanned("auth.py", 1, 1, 10)];
+        assert_eq!(score_tokens(&results, &expected, 5, &uniform()), None);
+    }
+
+    #[test]
+    fn score_tokens_partial_overlap_hand_computed() {
+        // Anchor spans lines 10-19 (10 lines); the one retrieved chunk spans
+        // 15-24 (10 lines). Overlap = 15-19 (5 lines). Uniform weights:
+        //   recall = 5/10, precision = 5/10, IoU = 5/(10+10-5) = 1/3.
+        let expected = vec![Anchor::parse("auth.py@10-19").unwrap()];
+        let results = vec![spanned("auth.py", 1, 15, 24)];
+        let t = score_tokens(&results, &expected, 5, &uniform()).unwrap();
+        assert!((t.recall - 0.5).abs() < 1e-12);
+        assert!((t.precision - 0.5).abs() < 1e-12);
+        assert!((t.iou - 1.0 / 3.0).abs() < 1e-12);
+    }
+
+    #[test]
+    fn score_tokens_multi_anchor_union_dedupes_overlap() {
+        // Two ranged anchors on one file overlap each other: 1-6 and 4-10.
+        // Their union is lines 1-10 (10 lines), NOT 6+7=13 — the union is a
+        // set. Retrieved chunk covers 1-10 exactly → all metrics 1.0.
+        let expected =
+            vec![Anchor::parse("f.py@1-6").unwrap(), Anchor::parse("f.py@4-10").unwrap()];
+        let results = vec![spanned("f.py", 1, 1, 10)];
+        let t = score_tokens(&results, &expected, 5, &uniform()).unwrap();
+        assert_eq!(t.recall, 1.0);
+        assert_eq!(t.precision, 1.0);
+        assert_eq!(t.iou, 1.0);
+    }
+
+    #[test]
+    fn score_tokens_multi_file_union_and_wrong_file_precision_cost() {
+        // Anchors: a.py lines 1-4 and b.py lines 1-4 (8 relevant lines).
+        // Retrieved: a.py 1-4 (perfect) and c.py 1-8 (all waste).
+        //   overlap = 4, relevant = 8, retrieved = 4+8 = 12
+        //   recall = 4/8 = 0.5, precision = 4/12 = 1/3, IoU = 4/(8+12-4) = 0.25
+        let expected = vec![Anchor::parse("a.py@1-4").unwrap(), Anchor::parse("b.py@1-4").unwrap()];
+        let results = vec![spanned("a.py", 1, 1, 4), spanned("c.py", 2, 1, 8)];
+        let t = score_tokens(&results, &expected, 5, &uniform()).unwrap();
+        assert!((t.recall - 0.5).abs() < 1e-12);
+        assert!((t.precision - 1.0 / 3.0).abs() < 1e-12);
+        assert!((t.iou - 0.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn score_tokens_zero_overlap_is_all_zero() {
+        let expected = vec![Anchor::parse("f.py@1-5").unwrap()];
+        let results = vec![spanned("f.py", 1, 6, 10), spanned("g.py", 2, 1, 5)];
+        let t = score_tokens(&results, &expected, 5, &uniform()).unwrap();
+        assert_eq!(t.recall, 0.0);
+        assert_eq!(t.precision, 0.0);
+        assert_eq!(t.iou, 0.0);
+    }
+
+    #[test]
+    fn score_tokens_no_results_is_zero_precision_not_nan() {
+        let expected = vec![Anchor::parse("f.py@1-5").unwrap()];
+        let t = score_tokens(&[], &expected, 5, &uniform()).unwrap();
+        assert_eq!(t.recall, 0.0);
+        assert_eq!(t.precision, 0.0);
+        assert_eq!(t.iou, 0.0);
+    }
+
+    #[test]
+    fn score_tokens_respects_the_k_cutoff() {
+        // The only overlapping result sits past k → scores are zero.
+        let expected = vec![Anchor::parse("f.py@1-5").unwrap()];
+        let results = vec![spanned("g.py", 1, 1, 5), spanned("f.py", 2, 1, 5)];
+        let t = score_tokens(&results, &expected, 1, &uniform()).unwrap();
+        assert_eq!(t.recall, 0.0);
+    }
+
+    #[test]
+    fn score_tokens_mixed_case_only_ranged_anchors_feed_token_metrics() {
+        // One ranged + one unranged anchor: token metrics see ONLY the range.
+        // Retrieved covers the ranged span exactly → token metrics all 1.0,
+        // even though the unranged anchor's file was never retrieved.
+        let expected = vec![Anchor::parse("f.py@1-5").unwrap(), Anchor::parse("other.py").unwrap()];
+        let results = vec![spanned("f.py", 1, 1, 5)];
+        let t = score_tokens(&results, &expected, 5, &uniform()).unwrap();
+        assert_eq!(t.recall, 1.0);
+        assert_eq!(t.precision, 1.0);
+        assert_eq!(t.iou, 1.0);
+    }
+
+    #[test]
+    fn line_weights_use_the_tokens_v1_estimator_per_line() {
+        // One chunk: lines 3-4 of python.py, contents pinned below.
+        //   line 3: "def read_config(path):"  = 22 bytes → floor(22/4) = 5
+        //   line 4: "    return os.path.join(path, \"config.yml\")" = 43 bytes → 10
+        let chunk = Chunk {
+            chunk_id: "x".into(),
+            file_path: "python.py".into(),
+            start_line: 3,
+            end_line: 4,
+            chunk_type: "function".into(),
+            kind: "function_definition".into(),
+            language: "python".into(),
+            content: "def read_config(path):\n    return os.path.join(path, \"config.yml\")".into(),
+            token_count: 16,
+            embedding: Vec::new(),
+        };
+        let w = LineWeights::from_chunks(&[chunk]);
+        assert_eq!(w.weight("python.py", 3), 5);
+        assert_eq!(w.weight("python.py", 4), 10);
+        // Uncovered lines — gaps and ranges beyond the file — weigh the
+        // estimator floor of 1, same as estimate_tokens("").
+        assert_eq!(w.weight("python.py", 1), 1);
+        assert_eq!(w.weight("python.py", 999), 1);
+        assert_eq!(w.weight("missing.py", 3), 1);
+        assert_eq!(estimate_tokens(""), 1);
+    }
+
+    #[test]
+    fn score_tokens_weighted_partial_overlap_hand_computed() {
+        // Weighted version of the partial-overlap case, one file:
+        //   chunk A (retrieved): lines 1-2, texts of 8 and 4 bytes → 2 + 1 tokens
+        //   anchor range: lines 2-3; line 3 uncovered → weight 1
+        //   overlap = line 2 → 1 token; relevant = 1+1 = 2; retrieved = 2+1 = 3
+        //   recall = 1/2, precision = 1/3, IoU = 1/(2+3-1) = 0.25
+        let chunk = Chunk {
+            chunk_id: "x".into(),
+            file_path: "f.py".into(),
+            start_line: 1,
+            end_line: 2,
+            chunk_type: "function".into(),
+            kind: "function_definition".into(),
+            language: "python".into(),
+            content: "abcdefgh\nabcd".into(),
+            token_count: 3,
+            embedding: Vec::new(),
+        };
+        let w = LineWeights::from_chunks(&[chunk]);
+        let expected = vec![Anchor::parse("f.py@2-3").unwrap()];
+        let results = vec![spanned("f.py", 1, 1, 2)];
+        let t = score_tokens(&results, &expected, 5, &w).unwrap();
+        assert!((t.recall - 0.5).abs() < 1e-12);
+        assert!((t.precision - 1.0 / 3.0).abs() < 1e-12);
+        assert!((t.iou - 0.25).abs() < 1e-12);
+    }
+
+    #[test]
+    fn line_weights_overlapping_chunks_first_wins() {
+        // A class chunk covers lines 1-2 with true (indented) text; a nested
+        // method chunk re-covers line 2 without the indent. First wins.
+        let class_chunk = Chunk {
+            chunk_id: "c".into(),
+            file_path: "f.py".into(),
+            start_line: 1,
+            end_line: 2,
+            chunk_type: "class".into(),
+            kind: "class_definition".into(),
+            language: "python".into(),
+            content: "class A:\n    def m(self): pass".into(),
+            token_count: 7,
+            embedding: Vec::new(),
+        };
+        let method_chunk = Chunk {
+            chunk_id: "m".into(),
+            file_path: "f.py".into(),
+            start_line: 2,
+            end_line: 2,
+            chunk_type: "function".into(),
+            kind: "function_definition".into(),
+            language: "python".into(),
+            content: "def m(self): pass".into(),
+            token_count: 4,
+            embedding: Vec::new(),
+        };
+        let w = LineWeights::from_chunks(&[class_chunk, method_chunk]);
+        // "    def m(self): pass" = 21 bytes → 5, not the unindented 17 → 4.
+        assert_eq!(w.weight("f.py", 2), 5);
+    }
+
     // --- Metric math (hand-computed expected values) ---
 
     #[test]
@@ -598,7 +1058,7 @@ mod tests {
             result("auth.py", "class_definition", 4),
             result("payments.py", "function_definition", 5),
         ];
-        let s = score_query("q", &results, &expected, 5);
+        let s = score_query("q", &results, &expected, 5, &LineWeights::default());
         assert!((s.precision - 0.6).abs() < 1e-12);
         assert!((s.recall - 1.0).abs() < 1e-12);
         assert!((s.mrr - 0.5).abs() < 1e-12);
@@ -611,7 +1071,7 @@ mod tests {
         // k=1, one anchor, hit at rank 1 → everything 1.0.
         let expected = vec![Anchor::parse("auth.py").unwrap()];
         let results = vec![result("auth.py", "function_definition", 1)];
-        let s = score_query("q", &results, &expected, 1);
+        let s = score_query("q", &results, &expected, 1, &LineWeights::default());
         assert_eq!(s.precision, 1.0);
         assert_eq!(s.recall, 1.0);
         assert_eq!(s.mrr, 1.0);
@@ -623,7 +1083,7 @@ mod tests {
     fn score_query_no_relevant_results_is_all_zero() {
         let expected = vec![Anchor::parse("auth.py").unwrap()];
         let results = vec![result("other.py", "function_definition", 1)];
-        let s = score_query("q", &results, &expected, 5);
+        let s = score_query("q", &results, &expected, 5, &LineWeights::default());
         assert_eq!(s.precision, 0.0);
         assert_eq!(s.recall, 0.0);
         assert_eq!(s.mrr, 0.0);
@@ -640,7 +1100,7 @@ mod tests {
             result("other.py", "class_definition", 2),
             result("auth.py", "function_definition", 3),
         ];
-        let s = score_query("q", &results, &expected, 2);
+        let s = score_query("q", &results, &expected, 2, &LineWeights::default());
         assert_eq!(s.precision, 0.0);
         assert_eq!(s.recall, 0.0);
         assert_eq!(s.mrr, 0.0);
@@ -655,7 +1115,7 @@ mod tests {
             result("auth.py", "function_definition", 1),
             result("other.py", "function_definition", 2),
         ];
-        let s = score_query("q", &results, &expected, 5);
+        let s = score_query("q", &results, &expected, 5, &LineWeights::default());
         assert!((s.precision - 0.2).abs() < 1e-12);
         assert_eq!(s.recall, 1.0);
         assert_eq!(s.mrr, 1.0);
@@ -672,7 +1132,7 @@ mod tests {
             result("auth.py", "class_definition", 2),
             result("auth.py", "function_definition", 3),
         ];
-        let s = score_query("q", &results, &expected, 3);
+        let s = score_query("q", &results, &expected, 3, &LineWeights::default());
         assert_eq!(s.precision, 1.0);
         assert_eq!(s.recall, 1.0);
     }
