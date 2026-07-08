@@ -13,7 +13,9 @@ contract, retrieval — never the *integrations*.** Teams bring their own extrac
 > `cce.knowledge/v1` contract), and M3 (`cce knowledge index`). Phase B (v2.6.1)
 > covers M4 — the retrieval blend and the `source:` search filter (see
 > [Searching knowledge](#searching-knowledge-m4--the-source-blend) below). Sync of
-> the knowledge corpus and the reference adapter (M5, Phase C) are still future work.
+> the knowledge corpus and the reference adapter (M5, Phase C) are specified in
+> [SPEC-SYNC-KNOWLEDGE.md](../SPEC-SYNC-KNOWLEDGE.md); implementation is tracked
+> in [#56](https://github.com/Davidslv/cce-rust/issues/56).
 
 ## The markdown-heading chunker (M1)
 

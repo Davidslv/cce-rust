@@ -7,6 +7,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Documentation
+- **SPEC-SYNC-KNOWLEDGE.md — the normative build spec for M5, knowledge-corpus sync (#56).**
+  The SPEC-SYNC pattern reapplied to the v2.6 knowledge system: a canonical, provenance-free
+  `.cck` corpus artifact (the built, redacted store — never the raw feed) under an additive
+  `knowledge/<contract_version>/<corpus_id>/` key space in the same git+LFS cache, with a
+  `current` pointer and a published `corpus.json` per corpus. Settles the six M5 decisions
+  normatively (corpus identity, the honest trust-the-pusher posture with a code-vs-knowledge
+  comparison table, access boundary, freshness signals, per-corpus retention, index-time
+  redaction), specs `cce knowledge push/pull`, the `cce sync list` knowledge section (still
+  `cce.synclist/v1` — additive optional key, knowledge-free listings byte-identical),
+  `pull --all` corpus install at the workspace root, and `verify --checksum-only` coverage,
+  plus the CI-cron builder reference workflow and milestones M5.1–M5.4. Spec-first: no
+  implementation in this change; `SYNC_FORMAT_VERSION`, code artifacts, and all goldens
+  untouched. `docs/knowledge.md`'s M5 deferral note now points at the spec.
+
 ## [2.6.9] - 2026-07-08
 
 ### Added
