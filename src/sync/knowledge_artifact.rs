@@ -216,7 +216,10 @@ impl KnowledgeArtifact {
     /// chunks lack persisted embeddings (a pre-v2.6.1 Phase-A snapshot) — an
     /// artifact whose consumer would have to recompute embeddings is not the
     /// byte-pinned store contract.
-    pub fn from_store(store: &KnowledgeStore, corpus_id: &str) -> Result<KnowledgeArtifact, String> {
+    pub fn from_store(
+        store: &KnowledgeStore,
+        corpus_id: &str,
+    ) -> Result<KnowledgeArtifact, String> {
         if store.chunks.iter().any(|c| c.embedding.is_empty()) {
             return Err(
                 "refusing to export a knowledge store without persisted embeddings (a Phase-A \
@@ -432,8 +435,26 @@ mod tests {
         );
         assert_eq!(
             std::fs::read_to_string(KnowledgeStore::current_pointer_path(local.path())).unwrap(),
-            std::fs::read_to_string(KnowledgeStore::current_pointer_path(consumer.path()))
-                .unwrap()
+            std::fs::read_to_string(KnowledgeStore::current_pointer_path(consumer.path())).unwrap()
+        );
+    }
+
+    /// The push-path regression: `knowledge push` exports the store LOADED from
+    /// disk (there is no feed at push time to rebuild from), so a persisted f64
+    /// must parse back to the exact double that was written — serde_json's
+    /// `float_roundtrip` feature, without which the `.cck` drifts a ULP from a
+    /// local ingest and the pulled store loses byte-identity (§2).
+    #[test]
+    fn export_of_a_loaded_store_equals_export_of_the_ingested_store() {
+        let store = fixture_store();
+        let tmp = tempfile::tempdir().unwrap();
+        store.save(tmp.path()).unwrap();
+        let loaded = KnowledgeStore::load_current(tmp.path()).unwrap();
+        assert_eq!(loaded, store, "load must round-trip the store exactly (embeddings included)");
+        assert_eq!(
+            KnowledgeArtifact::from_store(&loaded, "fixture").unwrap().to_bytes(),
+            KnowledgeArtifact::from_store(&store, "fixture").unwrap().to_bytes(),
+            "the artifact must be identical whether exported from memory or from disk"
         );
     }
 
@@ -467,11 +488,8 @@ mod tests {
         let manifest_end = text.find('\n').unwrap();
         let marker = "\"content\":\"";
         let start = text[manifest_end..].find(marker).unwrap() + manifest_end + marker.len();
-        let pos = bytes[start..]
-            .iter()
-            .position(|b| b.is_ascii_lowercase())
-            .map(|p| p + start)
-            .unwrap();
+        let pos =
+            bytes[start..].iter().position(|b| b.is_ascii_lowercase()).map(|p| p + start).unwrap();
         bytes[pos] = bytes[pos].to_ascii_uppercase();
         let err = KnowledgeArtifact::from_bytes(&bytes).unwrap_err();
         assert!(err.contains("checksum mismatch"), "a flipped byte must fail loudly, got: {err}");
