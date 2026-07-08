@@ -1017,6 +1017,91 @@ pub fn cmd_verify(root: &Path, commit: Option<String>) -> Result<String, String>
     }
 }
 
+/// Verify one pulled store by re-hash alone (#55): re-export the installed
+/// index at the identity the `.cce/synced.json` marker records and compare the
+/// recomputed artifact checksum against the marker's. `label` names the store
+/// in messages (a member name, or the repo_id for a single pull).
+fn verify_store_checksum(dir: &Path, label: &str) -> Result<(SyncState, String), String> {
+    let state = SyncState::load(dir).ok_or_else(|| {
+        format!("nothing to verify for {label}: no `.cce/synced.json` marker (not a pulled store)")
+    })?;
+    let store = default_store_path(dir);
+    let index = Index::load(&store).map_err(|e| {
+        format!(
+            "verify FAILED (checksum-only) for {label} ({}@{})\n  the pulled store could not \
+             be read: {e}\n  Re-pull it with `cce sync pull --force`.",
+            state.repo_id, state.sha
+        )
+    })?;
+    let meta = ManifestMeta { repo_id: state.repo_id.clone(), sha: state.sha.clone() };
+    let actual = Artifact::from_index(&index, meta).manifest.checksum;
+    if actual != state.checksum {
+        return Err(format!(
+            "verify FAILED (checksum-only) for {label} ({}@{})\n  expected : {}\n  actual   : \
+             {actual}\n  The pulled store does not match the checksum recorded at pull time — \
+             corruption or local modification of the store. Re-pull with `cce sync pull \
+             --force`.\n  (Checksum-only detects corruption, not a malicious build — true \
+             `artifact == build(sha)` verification needs the source and stays with the \
+             source-holders/CI: `cce sync verify`.)",
+            state.repo_id, state.sha, state.checksum
+        ));
+    }
+    Ok((state, actual))
+}
+
+/// `cce sync verify --checksum-only` (#55): re-hash the PULLED store bytes
+/// against the checksum recorded by `pull` in `.cce/synced.json` — **zero
+/// source checkout, zero rebuild, zero remote access**, so it works for
+/// repo-less consumers, where full `verify` (which rebuilds from the working
+/// tree) inherently cannot.
+///
+/// The recorded checksum is the artifact-manifest checksum (SPEC-SYNC §2):
+/// SHA-256 over the canonical artifact stream. The installed store round-trips
+/// losslessly back to that stream (`Artifact::from_index` of the installed
+/// index reproduces the pulled artifact byte-for-byte — the pinned
+/// export/import guarantee), so re-exporting and re-hashing detects any
+/// corruption or truncation of the pulled bytes at rest.
+///
+/// **Honest caveat (documented):** this detects *corruption, not a malicious
+/// build*. `artifact == build(sha)` verification requires the source and stays
+/// with source-holders (CI); the repo-less trust posture is CI-as-canonical-
+/// pusher plus the git host's access control.
+///
+/// Workspace-aware: with a workspace manifest at `root`, every member's pulled
+/// store is verified and a failure names the member; without one, the root
+/// store is verified. Exit codes and message shapes mirror full `verify`.
+pub fn cmd_verify_checksum_only(root: &Path) -> Result<String, String> {
+    match Manifest::load(root) {
+        Ok(manifest) => {
+            let mut out = String::new();
+            let mut checked = 0usize;
+            for m in &manifest.members {
+                let label = format!("member `{}`", m.name);
+                let (state, checksum) = verify_store_checksum(&root.join(&m.path), &label)?;
+                out.push_str(&format!(
+                    "  {:<16} {}@{}  ({})\n",
+                    m.name,
+                    state.repo_id,
+                    state.sha,
+                    &checksum[..12]
+                ));
+                checked += 1;
+            }
+            Ok(format!(
+                "verify OK (checksum-only): {checked} member{}\n{out}",
+                if checked == 1 { "" } else { "s" }
+            ))
+        }
+        Err(_) => {
+            let (state, checksum) = verify_store_checksum(root, "this store")?;
+            Ok(format!(
+                "verify OK (checksum-only): {}@{}\n  checksum : {checksum}\n",
+                state.repo_id, state.sha
+            ))
+        }
+    }
+}
+
 /// Where the local index came from (SPEC-MCP: `index_status` freshness).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum IndexSource {
@@ -2182,6 +2267,79 @@ total         : 2 repos, 4 artifacts, 125504 bytes
         let manifest = Manifest::load(into.path()).unwrap();
         assert_eq!(manifest.member("demo").unwrap().package, "demo_acme");
         assert_eq!(manifest.member("demo-2").unwrap().package, "demo_zeta");
+        std::env::remove_var("CCE_HOME");
+    }
+
+    // --- #55: `verify --checksum-only` — integrity with zero source checkout ---
+
+    #[test]
+    fn verify_checksum_only_passes_on_an_intact_pull_and_fails_on_corruption() {
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let src = source_repo();
+        init_cfg(src.path(), &url);
+        cmd_push(src.path(), None, false).unwrap();
+        let sha = git::head_sha(src.path()).unwrap();
+
+        // A repo-less consumer: bare dir + config only, `--latest` pull.
+        let consumer = tempfile::tempdir().unwrap();
+        init_cfg(consumer.path(), &url);
+        cmd_pull(consumer.path(), PullTarget::Latest, false, false).unwrap();
+        let out = cmd_verify_checksum_only(consumer.path()).unwrap();
+        assert!(
+            out.contains(&format!("verify OK (checksum-only): example.com__acme__demo@{sha}")),
+            "got: {out}"
+        );
+
+        // Corrupt the pulled store (mutate one chunk's bytes) → loud failure.
+        let store = default_store_path(consumer.path());
+        let mut idx = Index::load(&store).unwrap();
+        idx.chunks[0].content.push_str("\n# flipped bytes\n");
+        idx.save(&store).unwrap();
+        let err = cmd_verify_checksum_only(consumer.path()).unwrap_err();
+        assert!(err.contains("verify FAILED (checksum-only)"), "got: {err}");
+        assert!(err.contains("corruption"), "got: {err}");
+        std::env::remove_var("CCE_HOME");
+    }
+
+    #[test]
+    fn verify_checksum_only_names_the_corrupted_member_in_a_workspace() {
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let src = workspace_repo();
+        SyncConfig {
+            remote: Some(url.clone()),
+            lfs: false,
+            repo_id: Some("example.com__acme__mono".to_string()),
+            auto_pull: false,
+            retention: crate::sync::config::Retention::All,
+        }
+        .save(src.path())
+        .unwrap();
+        cmd_push(src.path(), None, true).unwrap();
+
+        let into = tempfile::tempdir().unwrap();
+        cmd_pull_all(into.path(), Some(url)).unwrap();
+        let out = cmd_verify_checksum_only(into.path()).unwrap();
+        assert!(out.contains("verify OK (checksum-only): 2 members"), "got: {out}");
+        assert!(out.contains("alpha") && out.contains("beta"), "got: {out}");
+
+        // Corrupt exactly beta → the failure names the member.
+        let store = default_store_path(&into.path().join("beta"));
+        let mut idx = Index::load(&store).unwrap();
+        idx.chunks[0].content.push('!');
+        idx.save(&store).unwrap();
+        let err = cmd_verify_checksum_only(into.path()).unwrap_err();
+        assert!(err.contains("verify FAILED (checksum-only) for member `beta`"), "got: {err}");
+        std::env::remove_var("CCE_HOME");
+    }
+
+    #[test]
+    fn verify_checksum_only_without_a_marker_is_a_clear_error() {
+        let _home = set_home();
+        let dir = tempfile::tempdir().unwrap();
+        let err = cmd_verify_checksum_only(dir.path()).unwrap_err();
+        assert!(err.contains("no `.cce/synced.json` marker"), "got: {err}");
         std::env::remove_var("CCE_HOME");
     }
 

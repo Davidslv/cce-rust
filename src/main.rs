@@ -330,6 +330,11 @@ enum SyncCmd {
         /// The commit to verify (default: the pulled cache's sha, else HEAD).
         #[arg(long)]
         commit: Option<String>,
+        /// Re-hash the pulled store against the checksum recorded at pull time —
+        /// no source checkout, no rebuild, no remote (#55). Detects corruption,
+        /// not a malicious build (that needs full `verify` on a source checkout).
+        #[arg(long, conflicts_with = "commit")]
+        checksum_only: bool,
         /// Project/workspace root (default: current directory).
         #[arg(long)]
         dir: Option<PathBuf>,
@@ -1211,9 +1216,13 @@ fn cmd_sync(cmd: SyncCmd) -> Result<(), String> {
             print!("{report}");
             Ok(())
         }
-        SyncCmd::Verify { commit, dir } => {
+        SyncCmd::Verify { commit, checksum_only, dir } => {
             let root = sync_root(dir);
-            let report = sync_cmd::cmd_verify(&root, commit)?;
+            let report = if checksum_only {
+                sync_cmd::cmd_verify_checksum_only(&root)?
+            } else {
+                sync_cmd::cmd_verify(&root, commit)?
+            };
             print!("{report}");
             Ok(())
         }
