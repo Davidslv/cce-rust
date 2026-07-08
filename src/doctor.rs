@@ -409,3 +409,359 @@ fn check_knowledge(root: &Path, r: &mut Report) {
         Some(Err(e)) => r.fail(&e),
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::embedder::HashEmbedder;
+    use crate::sync::hex_lower;
+    use sha2::{Digest, Sha256};
+    use std::path::PathBuf;
+
+    fn fixture() -> PathBuf {
+        PathBuf::from(concat!(env!("CARGO_MANIFEST_DIR"), "/test/fixture/base"))
+    }
+
+    /// Index the fixture into `<root>/.cce/index.json` and stamp its
+    /// fingerprint — exactly what `cce index <root>` produces.
+    fn indexed_root(root: &Path) -> Index {
+        let (idx, _) = Index::build_from_dir(&fixture(), &HashEmbedder).unwrap();
+        let store = default_store_path(root);
+        idx.save(&store).unwrap();
+        crate::fingerprint::write_for_store(&store, &idx, true).unwrap();
+        idx
+    }
+
+    /// Load, edit, re-seal, and rewrite the fingerprint beside `root`'s store
+    /// — simulates a store recorded under a DIFFERENT build configuration
+    /// without tripping the self-integrity check.
+    fn doctor_fingerprint(root: &Path, edit: impl FnOnce(&mut Fingerprint)) {
+        let store = default_store_path(root);
+        let mut fp = Fingerprint::load_beside_store(&store).unwrap().unwrap();
+        edit(&mut fp);
+        fp.seal();
+        fp.save_beside_store(&store).unwrap();
+    }
+
+    fn run(root: &Path) -> DoctorOutcome {
+        cmd_doctor(Some(root.to_path_buf()), None).unwrap()
+    }
+
+    #[test]
+    fn healthy_store_reports_ok_and_no_failures() {
+        let tmp = tempfile::tempdir().unwrap();
+        indexed_root(tmp.path());
+        let out = run(tmp.path());
+        assert!(out.healthy(), "report:\n{}", out.report);
+        assert_eq!(out.advisories, 0, "report:\n{}", out.report);
+        assert!(out.report.contains("store parses: 7 chunks"), "{}", out.report);
+        assert!(out.report.contains("fingerprint matches this binary"), "{}", out.report);
+        assert!(out.report.contains("provenance: local build"), "{}", out.report);
+        assert!(out.report.contains("summary: 1 store checked · 0 failures"), "{}", out.report);
+    }
+
+    #[test]
+    fn pre_fingerprint_store_is_a_notice_not_a_failure() {
+        // Issue #62 acceptance: an old store without the fingerprint gets a
+        // graceful notice and exit 0.
+        let tmp = tempfile::tempdir().unwrap();
+        let (idx, _) = Index::build_from_dir(&fixture(), &HashEmbedder).unwrap();
+        idx.save(&default_store_path(tmp.path())).unwrap();
+        let out = run(tmp.path());
+        assert!(out.healthy(), "an unfingerprinted store must not fail:\n{}", out.report);
+        assert_eq!(out.advisories, 1);
+        assert!(out.report.contains(NO_FINGERPRINT_NOTICE), "{}", out.report);
+    }
+
+    #[test]
+    fn chunker_pack_set_mismatch_is_a_definite_failure() {
+        // Issue #62 acceptance: chunker-version mismatch (recorded field edited
+        // in a fixture) — chunk_ids may not be reproducible.
+        let tmp = tempfile::tempdir().unwrap();
+        indexed_root(tmp.path());
+        doctor_fingerprint(tmp.path(), |fp| fp.pack_set = "python,ruby".to_string());
+        let out = run(tmp.path());
+        assert!(!out.healthy());
+        assert!(out.report.contains("chunker changed"), "{}", out.report);
+        assert!(out.report.contains("chunk_ids may not be reproducible"), "{}", out.report);
+        assert!(out.report.contains("re-index to realign"), "{}", out.report);
+    }
+
+    #[test]
+    fn embedder_drift_hash_vs_ollama_is_a_definite_failure() {
+        // Issue #62 acceptance: store built with a different embedder. The
+        // fingerprint says `ollama`, the store declares `hash` — the vectors'
+        // provenance is unknown (#30).
+        let tmp = tempfile::tempdir().unwrap();
+        indexed_root(tmp.path());
+        doctor_fingerprint(tmp.path(), |fp| fp.embedder = "ollama".to_string());
+        let out = run(tmp.path());
+        assert!(!out.healthy());
+        assert!(out.report.contains("embedder drift"), "{}", out.report);
+        assert!(out.report.contains("#30"), "{}", out.report);
+    }
+
+    #[test]
+    fn consistent_ollama_store_is_advisory_only() {
+        // A store honestly built with ollama (fingerprint and store agree) is
+        // legitimate: doctor notes the operational caveats, exit 0. Hermetic —
+        // doctor never embeds, so no server is contacted.
+        let tmp = tempfile::tempdir().unwrap();
+        let (idx, _) = Index::build_from_dir(&fixture(), &HashEmbedder).unwrap();
+        let ollama_like = Index::from_parts(
+            idx.chunks.clone(),
+            idx.file_imports.clone(),
+            idx.file_tokens.clone(),
+            "ollama".to_string(),
+        );
+        let store = default_store_path(tmp.path());
+        ollama_like.save(&store).unwrap();
+        crate::fingerprint::write_for_store(&store, &ollama_like, true).unwrap();
+        let out = run(tmp.path());
+        assert!(out.healthy(), "report:\n{}", out.report);
+        assert!(out.report.contains("ollama-built store"), "{}", out.report);
+        assert!(out.advisories >= 1);
+    }
+
+    #[test]
+    fn embed_dim_drift_is_a_definite_failure() {
+        let tmp = tempfile::tempdir().unwrap();
+        indexed_root(tmp.path());
+        doctor_fingerprint(tmp.path(), |fp| fp.embed_dim = 128);
+        let out = run(tmp.path());
+        assert!(!out.healthy());
+        assert!(out.report.contains("embedding dimensions changed"), "{}", out.report);
+    }
+
+    #[test]
+    fn tokenizer_and_nesting_drift_are_definite_failures() {
+        let tmp = tempfile::tempdir().unwrap();
+        indexed_root(tmp.path());
+        doctor_fingerprint(tmp.path(), |fp| {
+            fp.tokenizer = "cce.tokens/v0".to_string();
+            fp.block_nesting_limit = 64;
+        });
+        let out = run(tmp.path());
+        assert!(!out.healthy());
+        assert!(out.report.contains("tokenizer rule changed"), "{}", out.report);
+        assert!(out.report.contains("markdown nesting limit changed"), "{}", out.report);
+    }
+
+    #[test]
+    fn allow_secrets_build_is_advisory_only() {
+        let tmp = tempfile::tempdir().unwrap();
+        let (idx, _) = Index::build_from_dir(&fixture(), &HashEmbedder).unwrap();
+        let store = default_store_path(tmp.path());
+        idx.save(&store).unwrap();
+        crate::fingerprint::write_for_store(&store, &idx, false).unwrap();
+        let out = run(tmp.path());
+        assert!(out.healthy(), "report:\n{}", out.report);
+        assert!(out.report.contains("--allow-secrets"), "{}", out.report);
+    }
+
+    #[test]
+    fn corrupted_store_is_a_definite_failure() {
+        // Issue #62 acceptance: corrupted store.
+        let tmp = tempfile::tempdir().unwrap();
+        indexed_root(tmp.path());
+        std::fs::write(default_store_path(tmp.path()), "{ not json").unwrap();
+        let out = run(tmp.path());
+        assert!(!out.healthy());
+        assert!(out.report.contains("store cannot be parsed"), "{}", out.report);
+        // The binding hash also flags the fingerprint as no longer matching.
+        assert!(out.report.contains("do not match the fingerprint"), "{}", out.report);
+    }
+
+    #[test]
+    fn empty_embedding_store_is_a_definite_failure() {
+        // Issue #62 acceptance: empty-embedding store — the #30 tripwire.
+        let tmp = tempfile::tempdir().unwrap();
+        let (idx, _) = Index::build_from_dir(&fixture(), &HashEmbedder).unwrap();
+        let mut chunks = idx.chunks.clone();
+        for c in chunks.iter_mut().take(2) {
+            c.embedding = Vec::new();
+        }
+        let broken = Index::from_parts(
+            chunks,
+            idx.file_imports.clone(),
+            idx.file_tokens.clone(),
+            "hash".to_string(),
+        );
+        let store = default_store_path(tmp.path());
+        broken.save(&store).unwrap();
+        crate::fingerprint::write_for_store(&store, &broken, true).unwrap();
+        let out = run(tmp.path());
+        assert!(!out.healthy());
+        assert!(out.report.contains("2 chunks carry EMPTY embeddings"), "{}", out.report);
+        assert!(out.report.contains("#30"), "{}", out.report);
+    }
+
+    #[test]
+    fn edited_fingerprint_without_reseal_fails_self_checksum() {
+        let tmp = tempfile::tempdir().unwrap();
+        indexed_root(tmp.path());
+        let store = default_store_path(tmp.path());
+        let mut fp = Fingerprint::load_beside_store(&store).unwrap().unwrap();
+        fp.pack_set = "python".to_string(); // no seal(): sha256 is now stale
+        fp.save_beside_store(&store).unwrap();
+        let out = run(tmp.path());
+        assert!(!out.healthy());
+        assert!(out.report.contains("fingerprint self-checksum mismatch"), "{}", out.report);
+    }
+
+    #[test]
+    fn stale_fingerprint_after_foreign_rebuild_is_a_definite_failure() {
+        // A store rebuilt WITHOUT updating the fingerprint (older binary, or by
+        // hand): store bytes no longer match `store_sha256`.
+        let tmp = tempfile::tempdir().unwrap();
+        let idx = indexed_root(tmp.path());
+        // Re-save the store (bytes change trivially via a different chunk order?
+        // no — identical build is byte-identical). Append whitespace instead:
+        // still-valid JSON, different bytes.
+        let store = default_store_path(tmp.path());
+        let mut bytes = std::fs::read(&store).unwrap();
+        bytes.push(b'\n');
+        std::fs::write(&store, &bytes).unwrap();
+        assert!(Index::load(&store).is_ok(), "still parses");
+        let _ = idx;
+        let out = run(tmp.path());
+        assert!(!out.healthy());
+        assert!(out.report.contains("store bytes do not match the fingerprint"), "{}", out.report);
+    }
+
+    #[test]
+    fn pulled_store_corruption_is_caught_by_the_installed_bytes_check() {
+        // REUSES the #55 verify --checksum-only machinery: a synced.json marker
+        // records the installed hash; modified store bytes are a hard failure.
+        let tmp = tempfile::tempdir().unwrap();
+        indexed_root(tmp.path());
+        let store = default_store_path(tmp.path());
+        let installed = hex_lower(&Sha256::digest(std::fs::read(&store).unwrap()));
+        std::fs::write(
+            tmp.path().join(".cce").join("synced.json"),
+            format!(
+                "{{\"repo_id\":\"example.com__acme__demo\",\"sha\":\"{}\",\"checksum\":\"{}\",\
+                 \"installed_sha256\":\"{installed}\"}}",
+                "0".repeat(40),
+                "f".repeat(64)
+            ),
+        )
+        .unwrap();
+        // Intact: doctor passes and reports the match.
+        let out = run(tmp.path());
+        assert!(out.healthy(), "report:\n{}", out.report);
+        assert!(out.report.contains("match the install record"), "{}", out.report);
+        // Corrupt the store (keep JSON valid so ONLY the byte check trips is
+        // not possible here — the fingerprint binding also trips; both are
+        // definite failures naming the same corruption).
+        let mut bytes = std::fs::read(&store).unwrap();
+        bytes.push(b' ');
+        std::fs::write(&store, &bytes).unwrap();
+        let out = run(tmp.path());
+        assert!(!out.healthy());
+        assert!(out.report.contains("verify FAILED (checksum-only)"), "{}", out.report);
+    }
+
+    #[test]
+    fn old_marker_without_install_hash_is_advisory() {
+        let tmp = tempfile::tempdir().unwrap();
+        indexed_root(tmp.path());
+        std::fs::write(
+            tmp.path().join(".cce").join("synced.json"),
+            format!(
+                "{{\"repo_id\":\"example.com__acme__demo\",\"sha\":\"{}\",\"checksum\":\"{}\"}}",
+                "0".repeat(40),
+                "f".repeat(64)
+            ),
+        )
+        .unwrap();
+        let out = run(tmp.path());
+        assert!(out.healthy(), "an old marker is a notice, not a failure:\n{}", out.report);
+        assert!(out.report.contains("no install checksum recorded"), "{}", out.report);
+    }
+
+    #[test]
+    fn workspace_mode_checks_every_member_and_summarizes() {
+        use crate::workspace::{Manifest, Member, MemberType};
+        let tmp = tempfile::tempdir().unwrap();
+        for name in ["api", "web"] {
+            let member = tmp.path().join(name);
+            std::fs::create_dir_all(&member).unwrap();
+            indexed_root(&member);
+        }
+        // `web` is a StoreOnly member (a pulled, source-less consumer member).
+        let manifest = Manifest {
+            version: 1,
+            name: "demo".to_string(),
+            members: vec![
+                Member {
+                    name: "api".to_string(),
+                    path: "api".to_string(),
+                    member_type: MemberType::RubyGem,
+                    package: "api".to_string(),
+                },
+                Member {
+                    name: "web".to_string(),
+                    path: "web".to_string(),
+                    member_type: MemberType::StoreOnly,
+                    package: "web".to_string(),
+                },
+            ],
+        };
+        manifest.save(tmp.path()).unwrap();
+        let out = run(tmp.path());
+        assert!(out.healthy(), "report:\n{}", out.report);
+        assert!(out.report.contains("workspace demo (2 members)"), "{}", out.report);
+        assert!(out.report.contains("api:"), "{}", out.report);
+        assert!(out.report.contains("web:"), "{}", out.report);
+        assert!(out.report.contains("summary: 2 stores checked · 0 failures"), "{}", out.report);
+        // One drifted member fails the whole run, naming the member section.
+        doctor_fingerprint(&tmp.path().join("web"), |fp| fp.pack_set = "ruby".to_string());
+        let out = run(tmp.path());
+        assert!(!out.healthy());
+        assert!(out.report.contains("chunker changed"), "{}", out.report);
+    }
+
+    #[test]
+    fn knowledge_store_reports_contract_and_flags_a_mismatch() {
+        use crate::knowledge::store::KnowledgeStore;
+        let tmp = tempfile::tempdir().unwrap();
+        indexed_root(tmp.path());
+        let store = KnowledgeStore {
+            schema: crate::knowledge::contract::KNOWLEDGE_SCHEMA_ID.to_string(),
+            snapshot: "abcdef0123456789".to_string(),
+            records: 0,
+            chunks: Vec::new(),
+        };
+        store.save(tmp.path()).unwrap();
+        let out = run(tmp.path());
+        assert!(out.healthy(), "report:\n{}", out.report);
+        assert!(out.report.contains("contract cce.knowledge/v1"), "{}", out.report);
+        assert!(out.report.contains("data as-of unknown"), "{}", out.report);
+        // A store speaking a different contract is a definite mismatch.
+        let alien = KnowledgeStore { schema: "cce.knowledge/v9".to_string(), ..store };
+        alien.save(tmp.path()).unwrap();
+        let out = run(tmp.path());
+        assert!(!out.healthy());
+        assert!(out.report.contains("knowledge contract mismatch"), "{}", out.report);
+    }
+
+    #[test]
+    fn missing_store_is_a_usage_error_and_store_flag_targets_one_file() {
+        let tmp = tempfile::tempdir().unwrap();
+        // No store anywhere: a clear usage error, not a report.
+        let err = cmd_doctor(Some(tmp.path().to_path_buf()), None).unwrap_err();
+        assert!(err.contains("no store at"), "{err}");
+        // --store mode: check exactly one file.
+        let (idx, _) = Index::build_from_dir(&fixture(), &HashEmbedder).unwrap();
+        let store = tmp.path().join("custom.json");
+        idx.save(&store).unwrap();
+        crate::fingerprint::write_for_store(&store, &idx, true).unwrap();
+        let out = cmd_doctor(None, Some(store.clone())).unwrap();
+        assert!(out.healthy(), "report:\n{}", out.report);
+        assert!(out.report.contains("fingerprint matches"), "{}", out.report);
+        // A missing --store path errors clearly.
+        let err = cmd_doctor(None, Some(tmp.path().join("nope.json"))).unwrap_err();
+        assert!(err.contains("no store at"), "{err}");
+    }
+}
