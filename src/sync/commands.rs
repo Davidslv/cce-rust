@@ -988,6 +988,7 @@ pub fn cmd_pull_all(
             remote: Some(listing.remote.clone()),
             lfs: false,
             repo_id: Some(r.repo_id.clone()),
+            git_ref: None,
             auto_pull: false,
             retention: crate::sync::config::Retention::All,
         };
@@ -1142,6 +1143,7 @@ pub fn cmd_pull_all(
             remote: None,
             lfs: false,
             repo_id: None,
+            git_ref: None,
             auto_pull: false,
             retention: crate::sync::config::Retention::All,
         });
@@ -1626,6 +1628,7 @@ mod tests {
             remote: Some(url.to_string()),
             lfs: false,
             repo_id: Some("example.com__acme__demo".to_string()),
+            git_ref: None,
             auto_pull: false,
             retention: crate::sync::config::Retention::All,
         }
@@ -1838,6 +1841,7 @@ mod tests {
             remote: Some(url.clone()),
             lfs: false,
             repo_id: Some("example.com__acme__mono".to_string()),
+            git_ref: None,
             auto_pull: false,
             retention: crate::sync::config::Retention::All,
         }
@@ -1855,6 +1859,7 @@ mod tests {
             remote: Some(url.clone()),
             lfs: false,
             repo_id: Some("example.com__acme__mono".to_string()),
+            git_ref: None,
             auto_pull: false,
             retention: crate::sync::config::Retention::All,
         }
@@ -1880,6 +1885,7 @@ mod tests {
             remote: Some(url.clone()),
             lfs: false,
             repo_id: Some("example.com__acme__mono".to_string()),
+            git_ref: None,
             auto_pull: false,
             retention: crate::sync::config::Retention::All,
         };
@@ -1916,6 +1922,7 @@ mod tests {
             remote: Some(url.clone()),
             lfs: false,
             repo_id: Some("example.com__acme__mono".to_string()),
+            git_ref: None,
             auto_pull: false,
             retention: crate::sync::config::Retention::All,
         };
@@ -1951,6 +1958,7 @@ mod tests {
             remote: Some(url.clone()),
             lfs: false,
             repo_id: Some("example.com__acme__mono".to_string()),
+            git_ref: None,
             auto_pull: false,
             retention: crate::sync::config::Retention::All,
         };
@@ -1992,6 +2000,7 @@ mod tests {
             remote: Some(url.clone()),
             lfs: false,
             repo_id: Some(base.to_string()),
+            git_ref: None,
             auto_pull: false,
             retention: crate::sync::config::Retention::All,
         }
@@ -2077,6 +2086,7 @@ mod tests {
             remote: Some("file:///definitely/not/here.git".to_string()),
             lfs: false,
             repo_id: Some("example.com__acme__demo".to_string()),
+            git_ref: None,
             auto_pull: false,
             retention: crate::sync::config::Retention::All,
         }
@@ -2097,6 +2107,7 @@ mod tests {
             remote: Some(url),
             lfs: false,
             repo_id: None,
+            git_ref: None,
             auto_pull: false,
             retention: crate::sync::config::Retention::All,
         }
@@ -2536,6 +2547,7 @@ total         : 2 repos, 4 artifacts, 125504 bytes
             remote: Some(url_b.clone()),
             lfs: false,
             repo_id: Some("example.com__acme__other".to_string()),
+            git_ref: None,
             auto_pull: false,
             retention: crate::sync::config::Retention::All,
         }
@@ -2597,6 +2609,7 @@ total         : 2 repos, 4 artifacts, 125504 bytes
             remote: Some(url.clone()),
             lfs: false,
             repo_id: Some("example.com__acme__mono".to_string()),
+            git_ref: None,
             auto_pull: false,
             retention: crate::sync::config::Retention::All,
         }
@@ -2673,6 +2686,7 @@ total         : 2 repos, 4 artifacts, 125504 bytes
                 remote: Some(url.clone()),
                 lfs: false,
                 repo_id: Some(base.to_string()),
+                git_ref: None,
                 auto_pull: false,
                 retention: crate::sync::config::Retention::All,
             }
@@ -2738,6 +2752,7 @@ total         : 2 repos, 4 artifacts, 125504 bytes
             remote: Some(url.clone()),
             lfs: false,
             repo_id: Some("example.com__acme__mono".to_string()),
+            git_ref: None,
             auto_pull: false,
             retention: crate::sync::config::Retention::All,
         }
@@ -2798,6 +2813,7 @@ total         : 2 repos, 4 artifacts, 125504 bytes
             remote: Some(url_ws.clone()),
             lfs: false,
             repo_id: Some("example.com__acme__mono".to_string()),
+            git_ref: None,
             auto_pull: false,
             retention: crate::sync::config::Retention::All,
         }

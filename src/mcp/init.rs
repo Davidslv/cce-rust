@@ -679,6 +679,7 @@ mod tests {
             remote: Some("file:///definitely/not/here.git".to_string()),
             lfs: false,
             repo_id: Some("example.com__acme__demo".to_string()),
+            git_ref: None,
             auto_pull: false,
             retention: crate::sync::config::Retention::All,
         }
