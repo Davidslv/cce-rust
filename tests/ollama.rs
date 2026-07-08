@@ -108,6 +108,96 @@ fn spawn_embed_stub(ok_requests: usize) -> String {
     format!("http://{addr}")
 }
 
+/// Write `files` tiny single-function Python files into `dir` — enough chunks
+/// to cross several `EMBED_BATCH_SIZE` boundaries (#38).
+fn write_many_file_repo(dir: &Path, files: usize) {
+    for i in 0..files {
+        std::fs::write(
+            dir.join(format!("mod_{i:03}.py")),
+            format!("def func_{i:03}(x):\n    return x + {i}\n"),
+        )
+        .unwrap();
+    }
+}
+
+/// The distinguishable per-input vector the batching stub returns: a pure
+/// function of the input text, so a test can recompute it per chunk and prove
+/// each vector landed on the chunk whose content produced it.
+fn stub_vector(text: &str) -> Vec<f64> {
+    let bytes = text.as_bytes();
+    vec![
+        bytes.len() as f64,
+        bytes.first().copied().unwrap_or(0) as f64,
+        bytes.last().copied().unwrap_or(0) as f64,
+    ]
+}
+
+/// What the batching stub does once `ok_requests` requests have been served.
+enum StubAfter {
+    /// Respond 500 — Ollama "dies mid-index".
+    Fail500,
+    /// Respond 200 but with one embedding fewer than there were inputs —
+    /// a count-mismatched batch that must never be zipped silently (#30/#38).
+    WrongCount,
+}
+
+/// Spawn a loopback `POST /api/embed` stub for the batching tests (#38): the
+/// first `ok_requests` requests succeed with one `stub_vector` per input; later
+/// requests do `after`. Returns the base URL and a live served-request counter.
+fn spawn_batch_stub(
+    ok_requests: usize,
+    after: StubAfter,
+) -> (String, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+    let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+    let addr = listener.local_addr().unwrap();
+    let counter = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+    let served_counter = counter.clone();
+    std::thread::spawn(move || {
+        let mut served = 0usize;
+        for stream in listener.incoming() {
+            let Ok(mut s) = stream else { continue };
+            let body = read_http_request(&mut s);
+            let inputs: Vec<String> = serde_json::from_slice::<serde_json::Value>(&body)
+                .ok()
+                .and_then(|v| serde_json::from_value(v.get("input")?.clone()).ok())
+                .unwrap_or_default();
+            served_counter.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            let respond_ok = |s: &mut TcpStream, embs: Vec<Vec<f64>>| {
+                let json = serde_json::json!({ "embeddings": embs }).to_string();
+                let _ = write!(
+                    s,
+                    "HTTP/1.1 200 OK\r\nContent-Type: application/json\r\nContent-Length: \
+                     {}\r\nConnection: close\r\n\r\n{}",
+                    json.len(),
+                    json
+                );
+            };
+            if served < ok_requests {
+                respond_ok(&mut s, inputs.iter().map(|t| stub_vector(t)).collect());
+            } else {
+                match after {
+                    StubAfter::Fail500 => {
+                        let _ = write!(
+                            s,
+                            "HTTP/1.1 500 Internal Server Error\r\nContent-Length: \
+                             0\r\nConnection: close\r\n\r\n"
+                        );
+                    }
+                    StubAfter::WrongCount => {
+                        let short = inputs.len().saturating_sub(1);
+                        respond_ok(
+                            &mut s,
+                            inputs.iter().take(short).map(|t| stub_vector(t)).collect(),
+                        );
+                    }
+                }
+            }
+            served += 1;
+        }
+    });
+    (format!("http://{addr}"), counter)
+}
+
 /// `cce index <dir> --embedder ollama` against the given Ollama URL.
 fn run_index(dir: &Path, ollama_url: &str) -> std::process::Output {
     Command::new(bin())
@@ -224,6 +314,119 @@ fn mcp_context_search_on_ollama_store_with_ollama_down_is_bm25_with_notice() {
     );
     assert!(text.contains("BM25"), "the notice must name the BM25-only mode: {text}");
     assert!(text.contains("auth.py"), "keyword recall must still serve results: {text}");
+}
+
+// --- Index-time batching (#38): request-count collapse, order, fail-loud ---
+
+/// How many files the batching tests index: enough chunks to cross several
+/// `EMBED_BATCH_SIZE` (64) boundaries.
+const MANY_FILES: usize = 130;
+
+#[test]
+fn indexing_issues_one_request_per_batch_not_per_chunk() {
+    // #38: N chunks must cost ceil(N / EMBED_BATCH_SIZE) embed requests
+    // (+ 1 health check), not N.
+    let tmp = tempfile::tempdir().unwrap();
+    write_many_file_repo(tmp.path(), MANY_FILES);
+    let (stub_url, requests) = spawn_batch_stub(usize::MAX, StubAfter::Fail500);
+
+    let out = run_index(tmp.path(), &stub_url);
+    assert!(out.status.success(), "index failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    let store = tmp.path().join(".cce").join("index.json");
+    let data: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&store).unwrap()).unwrap();
+    let n_chunks = data["chunks"].as_array().unwrap().len();
+    assert!(
+        n_chunks > cce::config::EMBED_BATCH_SIZE,
+        "need >1 batch for this test to prove anything; got {n_chunks} chunks"
+    );
+
+    let expected = 1 + n_chunks.div_ceil(cce::config::EMBED_BATCH_SIZE); // health + batches
+    let served = requests.load(std::sync::atomic::Ordering::SeqCst);
+    assert_eq!(
+        served,
+        expected,
+        "{n_chunks} chunks must cost {expected} requests (1 health + \
+         ceil({n_chunks}/{})), not {served}",
+        cce::config::EMBED_BATCH_SIZE
+    );
+}
+
+#[test]
+fn batched_vectors_land_on_the_chunks_whose_content_produced_them() {
+    // #38: the stub returns a vector that is a pure function of each input
+    // text, so a misalignment anywhere (within a batch or across batch
+    // boundaries) would leave some chunk with the wrong vector.
+    let tmp = tempfile::tempdir().unwrap();
+    write_many_file_repo(tmp.path(), MANY_FILES);
+    let (stub_url, _) = spawn_batch_stub(usize::MAX, StubAfter::Fail500);
+
+    let out = run_index(tmp.path(), &stub_url);
+    assert!(out.status.success(), "index failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    let store = tmp.path().join(".cce").join("index.json");
+    let data: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&store).unwrap()).unwrap();
+    let chunks = data["chunks"].as_array().unwrap();
+    assert!(chunks.len() > cce::config::EMBED_BATCH_SIZE);
+    for c in chunks {
+        // The embedder truncates each input to 2000 chars before sending.
+        let sent: String = c["content"].as_str().unwrap().chars().take(2000).collect();
+        let got: Vec<f64> =
+            c["embedding"].as_array().unwrap().iter().map(|x| x.as_f64().unwrap()).collect();
+        assert_eq!(
+            got,
+            stub_vector(&sent),
+            "chunk {} carries a vector produced by some other chunk's content",
+            c["chunk_id"]
+        );
+    }
+}
+
+#[test]
+fn mid_index_batch_failure_aborts_nonzero_and_persists_nothing() {
+    // The #30 invariant at batch granularity (#38): health check and the first
+    // batch succeed, the second batch 500s. The build must abort non-zero,
+    // name the failing batch's file span, and write NO store — never the
+    // first batch's vectors.
+    let tmp = tempfile::tempdir().unwrap();
+    write_many_file_repo(tmp.path(), MANY_FILES);
+    let (stub_url, _) = spawn_batch_stub(2, StubAfter::Fail500);
+
+    let out = run_index(tmp.path(), &stub_url);
+    assert!(!out.status.success(), "a mid-index batch failure must exit non-zero");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("embedding failed"), "stderr must name the failure: {stderr}");
+    assert!(stderr.contains("a batch of"), "stderr must name the batch's span: {stderr}");
+    assert!(stderr.contains("Aborting the index"), "stderr must say it aborted: {stderr}");
+    assert!(
+        !tmp.path().join(".cce").join("index.json").exists(),
+        "no store may be persisted after a batch failure"
+    );
+}
+
+#[test]
+fn count_mismatched_batch_is_an_error_not_a_silent_misalignment() {
+    // #30's count guard at batch granularity (#38): a 200 response carrying
+    // the wrong number of embeddings must abort the index, never be zipped
+    // onto the wrong chunks.
+    let tmp = tempfile::tempdir().unwrap();
+    write_many_file_repo(tmp.path(), MANY_FILES);
+    let (stub_url, _) = spawn_batch_stub(1, StubAfter::WrongCount); // health OK, then short
+
+    let out = run_index(tmp.path(), &stub_url);
+    assert!(!out.status.success(), "a count-mismatched batch must exit non-zero");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("embedding failed"), "stderr must name the failure: {stderr}");
+    assert!(
+        stderr.contains("embedding(s) for") && stderr.contains("input(s)"),
+        "stderr must name the count mismatch: {stderr}"
+    );
+    assert!(
+        !tmp.path().join(".cce").join("index.json").exists(),
+        "no store may be persisted after a count-mismatched batch"
+    );
 }
 
 #[test]

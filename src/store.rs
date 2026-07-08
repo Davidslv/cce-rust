@@ -352,6 +352,44 @@ mod tests {
     }
 
     #[test]
+    fn batched_hash_embeddings_match_per_chunk_embed() {
+        // #38: the batched build path must leave the hash backend's output
+        // byte-identical to embedding each chunk individually — batching is an
+        // execution detail, never a semantic one.
+        use crate::embedder::Embedder;
+        let e = HashEmbedder;
+        let (idx, _) = Index::build_from_dir(&fixture_dir(), &e).unwrap();
+        for c in &idx.chunks {
+            assert_eq!(c.embedding, e.embed(&c.content), "chunk {}", c.chunk_id);
+        }
+    }
+
+    #[test]
+    fn batch_count_mismatch_aborts_the_build() {
+        // #38: the store-level per-batch count guard — a backend returning the
+        // wrong number of vectors must abort the build, never be zipped
+        // silently onto the wrong chunks.
+        struct ShortBatchEmbedder;
+        impl crate::embedder::Embedder for ShortBatchEmbedder {
+            fn embed(&self, _text: &str) -> Vec<f64> {
+                vec![1.0]
+            }
+            fn try_embed_batch(&self, texts: &[String]) -> Result<Vec<Vec<f64>>, String> {
+                Ok(vec![vec![1.0]; texts.len().saturating_sub(1)])
+            }
+            fn name(&self) -> &'static str {
+                "short-batch"
+            }
+        }
+        let err = match Index::build_from_dir(&fixture_dir(), &ShortBatchEmbedder) {
+            Ok(_) => panic!("a count-mismatched batch must abort the build"),
+            Err(e) => e,
+        };
+        assert!(err.contains("vector(s) for"), "must name the mismatch: {err}");
+        assert!(err.contains("Aborting the index"), "must say it aborted: {err}");
+    }
+
+    #[test]
     fn persists_whole_file_token_counts_and_baseline_sums() {
         // DASHBOARD-SPEC §3 / SPEC-V2.5 §2+§4: the index persists each file's
         // whole-file token estimate (the "read the whole file" counterfactual) with
