@@ -365,8 +365,7 @@ fn seed_cache(url: &str, files: &[(&str, &[u8])]) {
 
 /// The sha a cache branch tip is at (to prove `list` never mutates the cache).
 fn cache_tip(bare: &Path) -> String {
-    let out =
-        Command::new("git").arg("-C").arg(bare).args(["rev-parse", "main"]).output().unwrap();
+    let out = Command::new("git").arg("-C").arg(bare).args(["rev-parse", "main"]).output().unwrap();
     assert!(out.status.success());
     String::from_utf8_lossy(&out.stdout).trim().to_string()
 }
@@ -472,12 +471,8 @@ fn sync_list_reflects_a_real_push_via_the_latest_pointer() {
     );
     let out = cce(home.path(), &["sync", "push", "--dir", src.path().to_str().unwrap()]);
     assert!(out.status.success(), "push failed: {}", String::from_utf8_lossy(&out.stderr));
-    let head = Command::new("git")
-        .arg("-C")
-        .arg(src.path())
-        .args(["rev-parse", "HEAD"])
-        .output()
-        .unwrap();
+    let head =
+        Command::new("git").arg("-C").arg(src.path()).args(["rev-parse", "HEAD"]).output().unwrap();
     let head = String::from_utf8_lossy(&head.stdout).trim().to_string();
 
     // With no --remote, list resolves the configured `.cce/config` remote —
@@ -532,8 +527,7 @@ fn sync_list_unreachable_remote_errors_clearly() {
 fn sync_list_without_a_remote_gives_the_friendly_guidance() {
     let home = tempfile::tempdir().unwrap();
     let consumer = tempfile::tempdir().unwrap();
-    let out =
-        cce(home.path(), &["sync", "list", "--dir", consumer.path().to_str().unwrap()]);
+    let out = cce(home.path(), &["sync", "list", "--dir", consumer.path().to_str().unwrap()]);
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("no sync remote configured"));
 }

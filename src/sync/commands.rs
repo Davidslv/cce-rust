@@ -513,7 +513,8 @@ pub fn render_list_human(listing: &CacheListing) -> String {
         return out;
     }
     let latest_of = |r: &RepoListing| r.latest_sha.clone().unwrap_or_else(|| "-".to_string());
-    let id_w = listing.repos.iter().map(|r| r.repo_id.len()).chain(["repo_id".len()]).max().unwrap();
+    let id_w =
+        listing.repos.iter().map(|r| r.repo_id.len()).chain(["repo_id".len()]).max().unwrap();
     let sha_w =
         listing.repos.iter().map(|r| latest_of(r).len()).chain(["latest".len()]).max().unwrap();
     let bytes_w = listing
@@ -1270,9 +1271,8 @@ mod tests {
     fn cmd_list_unreachable_remote_errors_clearly() {
         let _home = set_home();
         let dir = tempfile::tempdir().unwrap();
-        let err =
-            cmd_list(dir.path(), Some("file:///definitely/not/a/repo/here.git".to_string()))
-                .unwrap_err();
+        let err = cmd_list(dir.path(), Some("file:///definitely/not/a/repo/here.git".to_string()))
+            .unwrap_err();
         assert!(err.contains("could not clone"), "got: {err}");
         std::env::remove_var("CCE_HOME");
     }
@@ -1283,9 +1283,7 @@ mod tests {
             repos: vec![
                 RepoListing {
                     repo_id: "github.com__acme__billing".to_string(),
-                    latest_sha: Some(
-                        "7b9dec7dcbe86ca35b2b4ddeb8386d0595e3362f".to_string(),
-                    ),
+                    latest_sha: Some("7b9dec7dcbe86ca35b2b4ddeb8386d0595e3362f".to_string()),
                     artifacts: 3,
                     bytes: 123456,
                 },
