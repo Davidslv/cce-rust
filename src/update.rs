@@ -247,7 +247,7 @@ pub fn changelog_delta(changelog: &str, from: SemVer, to: SemVer) -> String {
         sections.into_iter().filter(|(v, _)| *v > from && *v <= to).collect();
     // CHANGELOG.md is newest-first already; sort descending anyway so the
     // output order is a guarantee, not a file-layout accident.
-    in_range.sort_by(|a, b| b.0.cmp(&a.0));
+    in_range.sort_by_key(|a| std::cmp::Reverse(a.0));
 
     let total = in_range.len();
     let mut out = in_range
