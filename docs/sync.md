@@ -162,6 +162,7 @@ v1.
 cce sync init  --remote <git-url> [--lfs|--no-lfs] [--repo-id <id>] [--dir <path>]
 cce sync push  [--commit <sha>] [--workspace] [--dir <path>]
 cce sync pull  [--commit <sha> | --latest] [--force] [--workspace] [--dir <path>]
+cce sync list  [--remote <url>] [--json] [--dir <path>]
 cce sync status [--dir <path>]
 cce sync verify [--commit <sha>] [--dir <path>]
 ```
@@ -179,6 +180,15 @@ Rules:
 - `pull` installs the artifact into `.cce/`. If the local working tree matches
   `sha`, the pulled index is used as-is. It never silently overwrites a local cache
   for a **different** sha without `--force`.
+- `list` enumerates what the cache holds: one row per `repo_id` with its **latest
+  sha** (the `refs/<branch>` pointer `pull --latest` reads; `-` when a repo has no
+  pointer yet), **artifact count**, and **total artifact bytes** (LFS-aware).
+  **Read-only** — it never writes to the cache or the local `.cce/` — and
+  **repo-less**: a bare directory plus `--remote <url>` is enough (no local store,
+  source checkout, or config). Rows are sorted by `repo_id`; an empty cache is a
+  friendly message, not an error. `--json` emits the stable `cce.synclist/v1`
+  shape for scripting:
+  `{"remote": …, "repos": [{"artifacts": N, "bytes": N, "latest_sha": sha|null, "repo_id": …}, …], "schema": "cce.synclist/v1"}`.
 - Offline / no remote / auth failure → a clear message; local indexing and search
   continue to work.
 - **Workspace-aware:** `--workspace` iterates the manifest's members, each keyed by

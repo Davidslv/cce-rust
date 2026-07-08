@@ -7,6 +7,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`cce sync list [--remote <url>] [--json]` — enumerate what a sync cache holds (#53).**
+  The discovery half of consumer mode: one row per `repo_id` with its **latest sha** (the
+  `refs/<branch>` pointer `pull --latest` reads — `-`/`null` when a repo has no pointer yet),
+  **artifact count**, and **total artifact bytes** (LFS-aware: an LFS pointer reports its
+  recorded artifact size, not the ~130-byte pointer file). Wires up the previously
+  CLI-unreachable `SyncRemote::list` (#37/#50), keeping its pinned graceful-skip of
+  non-artifact cache entries. Read-only — it never mutates the cache or the local `.cce/` —
+  and repo-less: a bare directory plus `--remote <url>` is sufficient. Rows sort by `repo_id`;
+  an empty cache is a friendly message (exit 0); an unreachable remote is a clear non-zero
+  error. `--json` emits the stable, byte-pinned `cce.synclist/v1` shape.
+  `SYNC_FORMAT_VERSION`, `conformance.json`, and every existing golden are untouched.
+
 ## [2.6.8] - 2026-07-08
 
 ### Changed

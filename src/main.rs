@@ -293,6 +293,20 @@ enum SyncCmd {
         #[arg(long)]
         dir: Option<PathBuf>,
     },
+    /// Enumerate what a cache holds: one row per repo_id with its latest sha,
+    /// artifact count, and total bytes. Read-only; a bare directory plus
+    /// `--remote <url>` is sufficient (no local store or source checkout).
+    List {
+        /// List this cache URL instead of the configured `sync.remote`.
+        #[arg(long)]
+        remote: Option<String>,
+        /// Emit the listing as JSON (the stable `cce.synclist/v1` shape).
+        #[arg(long)]
+        json: bool,
+        /// Project/workspace root (default: current directory).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
     /// Show the remote, local cache sha, remote latest, and working-tree match.
     Status {
         /// Project/workspace root (default: current directory).
@@ -1160,6 +1174,16 @@ fn cmd_sync(cmd: SyncCmd) -> Result<(), String> {
             };
             let report = sync_cmd::cmd_pull(&root, target, force, workspace)?;
             print!("{report}");
+            Ok(())
+        }
+        SyncCmd::List { remote, json, dir } => {
+            let root = sync_root(dir);
+            let listing = sync_cmd::cmd_list(&root, remote)?;
+            if json {
+                print!("{}", sync_cmd::render_list_json(&listing));
+            } else {
+                print!("{}", sync_cmd::render_list_human(&listing));
+            }
             Ok(())
         }
         SyncCmd::Status { dir } => {

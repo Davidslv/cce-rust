@@ -158,7 +158,91 @@ impl GitRemote {
     fn ref_path(&self, key: &str) -> String {
         format!("origin/{}:{}", self.branch, key)
     }
+
+    /// The immediate child *directories* of `prefix` on the fetched cache branch,
+    /// by basename, sorted. `cce sync list` uses this to enumerate the `repo_id`
+    /// directories under `hash/<SYNC_FORMAT_VERSION>/`. An unborn branch or a
+    /// missing prefix lists as empty — nothing cached — mirroring `list`.
+    pub fn list_dirs(&self, prefix: &str) -> Result<Vec<String>, String> {
+        self.fetch()?;
+        let treeish = format!("origin/{}", self.branch);
+        // The trailing `/` asks ls-tree for the entries *inside* the prefix; `-d`
+        // keeps only trees (a stray blob beside the repo dirs is not a repo_id).
+        let arg = format!("{}/", prefix.trim_end_matches('/'));
+        let listing = match git::run(&self.dir, &["ls-tree", "-d", "--name-only", &treeish, &arg]) {
+            Ok(l) => l,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let mut dirs: Vec<String> = listing
+            .lines()
+            .filter_map(|l| l.rsplit('/').next())
+            .filter(|n| !n.is_empty())
+            .map(str::to_string)
+            .collect();
+        dirs.sort();
+        dirs.dedup();
+        Ok(dirs)
+    }
+
+    /// The `.cce` artifacts under `prefix` (recursive) as `(path, bytes)` pairs.
+    /// Non-artifact entries are skipped silently — the same graceful-skip rule the
+    /// #37 tests pin for `list`. When a blob is a git-LFS *pointer* the pointer's
+    /// recorded `size` is reported, so bytes reflect the real artifact on an
+    /// LFS-enabled cache, not the ~130-byte pointer file.
+    pub fn list_artifact_sizes(&self, prefix: &str) -> Result<Vec<(String, u64)>, String> {
+        self.fetch()?;
+        let treeish = format!("origin/{}", self.branch);
+        // `-l` (long) adds the object size: `<mode> <type> <object> <size>\t<path>`.
+        let listing = match git::run(&self.dir, &["ls-tree", "-r", "-l", &treeish, prefix]) {
+            Ok(l) => l,
+            Err(_) => return Ok(Vec::new()),
+        };
+        let mut out: Vec<(String, u64)> = Vec::new();
+        for line in listing.lines() {
+            let Some((meta, path)) = line.split_once('\t') else { continue };
+            if !path.ends_with(".cce") {
+                continue;
+            }
+            let mut fields = meta.split_whitespace();
+            let (_mode, kind, _object, size) =
+                (fields.next(), fields.next(), fields.next(), fields.next());
+            if kind != Some("blob") {
+                continue;
+            }
+            let Some(mut bytes) = size.and_then(|s| s.parse::<u64>().ok()) else { continue };
+            // A git-LFS pointer is a tiny text stanza; only bother reading small blobs.
+            if bytes <= LFS_POINTER_MAX_BYTES {
+                if let Some(real) = self.lfs_pointer_size(path) {
+                    bytes = real;
+                }
+            }
+            out.push((path.to_string(), bytes));
+        }
+        Ok(out)
+    }
+
+    /// If the blob at `key` is a git-LFS pointer, its recorded artifact `size`.
+    fn lfs_pointer_size(&self, key: &str) -> Option<u64> {
+        let text = git::run(&self.dir, &["cat-file", "blob", &self.ref_path(key)]).ok()?;
+        if !text.starts_with("version https://git-lfs") {
+            return None;
+        }
+        text.lines().find_map(|l| l.strip_prefix("size ")).and_then(|s| s.trim().parse().ok())
+    }
+
+    /// Read a small *non-artifact* text blob (e.g. a `refs/<ref>` latest pointer)
+    /// straight out of the fetched branch — no working-tree checkout, so no LFS
+    /// smudge is involved and nothing on disk or on the remote is touched.
+    pub fn read_blob_text(&self, key: &str) -> Result<String, String> {
+        self.fetch()?;
+        git::run(&self.dir, &["cat-file", "blob", &self.ref_path(key)])
+            .map(|s| s.trim().to_string())
+    }
 }
+
+/// Blobs at or under this size are sniffed for a git-LFS pointer stanza (real
+/// pointers are ~130 bytes; real artifacts are far larger).
+const LFS_POINTER_MAX_BYTES: u64 = 512;
 
 impl SyncRemote for GitRemote {
     fn has(&self, key: &str) -> Result<bool, String> {
@@ -362,6 +446,82 @@ mod tests {
             .unwrap();
         let shas = remote.list("hash/2.3/x").unwrap();
         assert_eq!(shas, vec!["abc123".to_string(), "deadbeef".to_string()]);
+        std::env::remove_var("CCE_HOME");
+    }
+
+    #[test]
+    fn list_dirs_enumerates_repo_id_directories_sorted() {
+        let _home = with_home();
+        let (_bare, url) = bare_remote();
+        let remote = GitRemote::open(&url, false).unwrap();
+        remote
+            .put_many(&[
+                ("hash/2.3/zzz__last/a.cce".to_string(), b"Z\n".to_vec()),
+                ("hash/2.3/aaa__first/b.cce".to_string(), b"A\n".to_vec()),
+                // A stray blob beside the repo dirs is not a repo_id.
+                ("hash/2.3/README.md".to_string(), b"junk\n".to_vec()),
+            ])
+            .unwrap();
+        let dirs = remote.list_dirs("hash/2.3").unwrap();
+        assert_eq!(dirs, vec!["aaa__first".to_string(), "zzz__last".to_string()]);
+        // An absent prefix (or unborn branch) lists as empty, not an error.
+        assert!(remote.list_dirs("hash/9.9").unwrap().is_empty());
+        std::env::remove_var("CCE_HOME");
+    }
+
+    #[test]
+    fn list_artifact_sizes_skips_junk_and_reports_bytes() {
+        // The #37 fixture, extended with sizes: only `.cce` blobs are counted, by
+        // their byte size; junk entries are skipped silently.
+        let _home = with_home();
+        let (_bare, url) = bare_remote();
+        let remote = GitRemote::open(&url, false).unwrap();
+        remote
+            .put_many(&[
+                ("hash/2.3/x/abc123.cce".to_string(), b"A\n".to_vec()),
+                ("hash/2.3/x/README.md".to_string(), b"not an artifact\n".to_vec()),
+                ("hash/2.3/x/no-extension".to_string(), b"junk\n".to_vec()),
+                ("hash/2.3/x/nested/deadbeef.cce".to_string(), b"BBBB\n".to_vec()),
+            ])
+            .unwrap();
+        let mut sizes = remote.list_artifact_sizes("hash/2.3/x").unwrap();
+        sizes.sort();
+        assert_eq!(
+            sizes,
+            vec![
+                ("hash/2.3/x/abc123.cce".to_string(), 2),
+                ("hash/2.3/x/nested/deadbeef.cce".to_string(), 5),
+            ]
+        );
+        std::env::remove_var("CCE_HOME");
+    }
+
+    #[test]
+    fn list_artifact_sizes_reports_the_lfs_pointer_recorded_size() {
+        // A `.cce` blob that is a git-LFS *pointer* must report the pointer's
+        // recorded artifact size, not the ~130-byte pointer file size. Hermetic:
+        // the pointer stanza is plain text, so no git-lfs binary is needed.
+        let _home = with_home();
+        let (_bare, url) = bare_remote();
+        let remote = GitRemote::open(&url, false).unwrap();
+        let pointer = b"version https://git-lfs.github.com/spec/v1\n\
+                        oid sha256:0000000000000000000000000000000000000000000000000000000000000000\n\
+                        size 123456\n"
+            .to_vec();
+        remote.put("hash/2.3/x/abc123.cce", &pointer).unwrap();
+        let sizes = remote.list_artifact_sizes("hash/2.3/x").unwrap();
+        assert_eq!(sizes, vec![("hash/2.3/x/abc123.cce".to_string(), 123456)]);
+        std::env::remove_var("CCE_HOME");
+    }
+
+    #[test]
+    fn read_blob_text_reads_a_pointer_without_checkout() {
+        let _home = with_home();
+        let (_bare, url) = bare_remote();
+        let remote = GitRemote::open(&url, false).unwrap();
+        remote.put("hash/2.3/x/refs/main", b"abc123\n").unwrap();
+        assert_eq!(remote.read_blob_text("hash/2.3/x/refs/main").unwrap(), "abc123");
+        assert!(remote.read_blob_text("hash/2.3/x/refs/nope").is_err());
         std::env::remove_var("CCE_HOME");
     }
 

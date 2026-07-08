@@ -446,6 +446,135 @@ pub fn cmd_status(root: &Path) -> Result<String, String> {
     Ok(out)
 }
 
+/// One repo's aggregate row in a cache listing (`cce sync list`).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RepoListing {
+    pub repo_id: String,
+    /// The cache's `refs/<DEFAULT_REF>` latest pointer — the same source of truth
+    /// `pull --latest` resolves. `None` when the repo has no pointer yet.
+    pub latest_sha: Option<String>,
+    /// Distinct artifact shas cached for this repo.
+    pub artifacts: usize,
+    /// Total artifact bytes (LFS-aware: the pointer's recorded size, not the pointer).
+    pub bytes: u64,
+}
+
+/// The whole cache listing: the resolved remote plus one row per `repo_id`,
+/// sorted by `repo_id` (deterministic output).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CacheListing {
+    pub remote: String,
+    pub repos: Vec<RepoListing>,
+}
+
+/// `cce sync list` (#53): enumerate what a cache holds — one row per `repo_id`
+/// with its latest sha, artifact count, and total artifact bytes. **Read-only**:
+/// it never writes to the cache or the local `.cce/`, and it needs no local
+/// store, source checkout, or config — a bare directory plus `--remote` works.
+///
+/// The remote resolves exactly as `cce sync status` does: the explicit
+/// `remote_override` (`--remote`), else `.cce/config`'s `sync.remote`.
+pub fn cmd_list(root: &Path, remote_override: Option<String>) -> Result<CacheListing, String> {
+    let cfg = SyncConfig::load(root);
+    let url = remote_override.or_else(|| cfg.remote.clone()).ok_or_else(|| {
+        "no sync remote configured — run `cce sync init --remote <git-url>` or pass \
+         `--remote <url>`"
+            .to_string()
+    })?;
+    // Always open with LFS off: `open(url, true)` would write, commit, and push a
+    // `.gitattributes` — and `list` must never mutate the cache. Reading needs no
+    // smudge (artifact bytes are never checked out here).
+    let remote = GitRemote::open(&url, false)?;
+
+    let ver = SYNC_FORMAT_VERSION.to_string();
+    let base = format!("{HASH_EMBEDDER}/{ver}");
+    let mut repos = Vec::new();
+    for repo_id in remote.list_dirs(&base)? {
+        let prefix = format!("{base}/{repo_id}");
+        // The pinned #37 walk: `.cce` shas only, junk entries skipped gracefully.
+        let shas = remote.list(&prefix)?;
+        let bytes = remote.list_artifact_sizes(&prefix)?.iter().map(|(_, b)| b).sum();
+        let pointer = pointer_address(HASH_EMBEDDER, &ver, &repo_id, crate::sync::DEFAULT_REF);
+        let latest_sha = remote.read_blob_text(&pointer).ok().filter(|s| !s.is_empty());
+        repos.push(RepoListing { repo_id, latest_sha, artifacts: shas.len(), bytes });
+    }
+    // `list_dirs` already sorts, so the rows are deterministic by repo_id.
+    Ok(CacheListing { remote: url, repos })
+}
+
+/// Render a cache listing as the human table: a `remote` header line in the
+/// `status` label style, aligned columns sorted by repo_id (a `-` marks a repo
+/// with no latest pointer), and a total line. An empty cache is a friendly
+/// message, not an error.
+pub fn render_list_human(listing: &CacheListing) -> String {
+    let mut out = format!("remote        : {}\n", listing.remote);
+    if listing.repos.is_empty() {
+        out.push_str("\nThe cache is empty — nothing has been pushed yet.\n");
+        return out;
+    }
+    let latest_of = |r: &RepoListing| r.latest_sha.clone().unwrap_or_else(|| "-".to_string());
+    let id_w =
+        listing.repos.iter().map(|r| r.repo_id.len()).chain(["repo_id".len()]).max().unwrap();
+    let sha_w =
+        listing.repos.iter().map(|r| latest_of(r).len()).chain(["latest".len()]).max().unwrap();
+    let bytes_w = listing
+        .repos
+        .iter()
+        .map(|r| r.bytes.to_string().len())
+        .chain(["bytes".len()])
+        .max()
+        .unwrap();
+    out.push('\n');
+    out.push_str(&format!(
+        "{:<id_w$}  {:<sha_w$}  {:>9}  {:>bytes_w$}\n",
+        "repo_id", "latest", "artifacts", "bytes"
+    ));
+    let (mut total_artifacts, mut total_bytes) = (0usize, 0u64);
+    for r in &listing.repos {
+        total_artifacts += r.artifacts;
+        total_bytes += r.bytes;
+        out.push_str(&format!(
+            "{:<id_w$}  {:<sha_w$}  {:>9}  {:>bytes_w$}\n",
+            r.repo_id,
+            latest_of(r),
+            r.artifacts,
+            r.bytes
+        ));
+    }
+    let repos_n = listing.repos.len();
+    out.push_str(&format!(
+        "\ntotal         : {repos_n} repo{}, {total_artifacts} artifact{}, {total_bytes} bytes\n",
+        if repos_n == 1 { "" } else { "s" },
+        if total_artifacts == 1 { "" } else { "s" },
+    ));
+    out
+}
+
+/// Render a cache listing as the stable, versioned `cce.synclist/v1` JSON shape
+/// (`--json`). Same grammar discipline as the other `--json` surfaces: pretty-
+/// printed, two-space indent, serde_json's alphabetical key order, one trailing
+/// newline. A missing latest pointer is JSON `null` — the field never disappears.
+pub fn render_list_json(listing: &CacheListing) -> String {
+    let repos: Vec<serde_json::Value> = listing
+        .repos
+        .iter()
+        .map(|r| {
+            serde_json::json!({
+                "repo_id": r.repo_id,
+                "latest_sha": r.latest_sha,
+                "artifacts": r.artifacts,
+                "bytes": r.bytes,
+            })
+        })
+        .collect();
+    let body = serde_json::json!({
+        "schema": "cce.synclist/v1",
+        "remote": listing.remote,
+        "repos": repos,
+    });
+    serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string()) + "\n"
+}
+
 /// `cce sync verify` (SPEC-SYNC §5): re-index locally and confirm the pulled
 /// artifact's checksum by rebuilding it byte-for-byte.
 pub fn cmd_verify(root: &Path, commit: Option<String>) -> Result<String, String> {
@@ -1054,6 +1183,184 @@ mod tests {
         let out = cmd_verify(c.path(), None).unwrap();
         assert!(out.contains("verify OK"), "pull→push→verify must be green: {out}");
         std::env::remove_var("CCE_HOME");
+    }
+
+    // --- cmd_list / render_list_*: the `cce sync list` contract (#53) ---
+
+    #[test]
+    fn cmd_list_aggregates_per_repo_with_latest_pointer_and_junk_skipped() {
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        // Seed the cache directly: repo `aaa` has two artifacts + a latest pointer
+        // and junk entries (the #37 fixture); repo `bbb` has one artifact and NO
+        // pointer; a stray top-level blob is not a repo_id.
+        let remote = GitRemote::open(&url, false).unwrap();
+        remote
+            .put_many(&[
+                ("hash/2.3/aaa__one/1111111.cce".to_string(), b"AA\n".to_vec()),
+                ("hash/2.3/aaa__one/2222222.cce".to_string(), b"BBBB\n".to_vec()),
+                ("hash/2.3/aaa__one/refs/main".to_string(), b"2222222\n".to_vec()),
+                ("hash/2.3/aaa__one/README.md".to_string(), b"junk\n".to_vec()),
+                ("hash/2.3/aaa__one/no-extension".to_string(), b"junk\n".to_vec()),
+                ("hash/2.3/bbb__two/3333333.cce".to_string(), b"C\n".to_vec()),
+                ("hash/2.3/stray-blob".to_string(), b"junk\n".to_vec()),
+            ])
+            .unwrap();
+
+        // A bare directory + --remote: no config, no store, no git checkout.
+        let bare_dir = tempfile::tempdir().unwrap();
+        let listing = cmd_list(bare_dir.path(), Some(url.clone())).unwrap();
+        assert_eq!(listing.remote, url);
+        assert_eq!(
+            listing.repos,
+            vec![
+                RepoListing {
+                    repo_id: "aaa__one".to_string(),
+                    latest_sha: Some("2222222".to_string()),
+                    artifacts: 2,
+                    bytes: 8,
+                },
+                RepoListing {
+                    repo_id: "bbb__two".to_string(),
+                    latest_sha: None,
+                    artifacts: 1,
+                    bytes: 2,
+                },
+            ]
+        );
+        // Read-only: the local bare directory gained no `.cce/`.
+        assert!(!bare_dir.path().join(".cce").exists());
+        std::env::remove_var("CCE_HOME");
+    }
+
+    #[test]
+    fn cmd_list_uses_the_configured_remote_when_no_override() {
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let src = source_repo();
+        init_cfg(src.path(), &url);
+        cmd_push(src.path(), None, false).unwrap();
+        let sha = git::head_sha(src.path()).unwrap();
+
+        let listing = cmd_list(src.path(), None).unwrap();
+        assert_eq!(listing.remote, url);
+        assert_eq!(listing.repos.len(), 1);
+        assert_eq!(listing.repos[0].repo_id, "example.com__acme__demo");
+        // The latest pointer is the same source of truth `pull --latest` reads.
+        assert_eq!(listing.repos[0].latest_sha.as_deref(), Some(sha.as_str()));
+        assert_eq!(listing.repos[0].artifacts, 1);
+        assert!(listing.repos[0].bytes > 0);
+        std::env::remove_var("CCE_HOME");
+    }
+
+    #[test]
+    fn cmd_list_empty_cache_and_no_remote_cases() {
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let dir = tempfile::tempdir().unwrap();
+        // An empty cache lists zero repos (the CLI renders the friendly message).
+        let listing = cmd_list(dir.path(), Some(url)).unwrap();
+        assert!(listing.repos.is_empty());
+        // No config and no --remote: the friendly guidance, as an error.
+        let err = cmd_list(dir.path(), None).unwrap_err();
+        assert!(err.contains("no sync remote configured"), "got: {err}");
+        std::env::remove_var("CCE_HOME");
+    }
+
+    #[test]
+    fn cmd_list_unreachable_remote_errors_clearly() {
+        let _home = set_home();
+        let dir = tempfile::tempdir().unwrap();
+        let err = cmd_list(dir.path(), Some("file:///definitely/not/a/repo/here.git".to_string()))
+            .unwrap_err();
+        assert!(err.contains("could not clone"), "got: {err}");
+        std::env::remove_var("CCE_HOME");
+    }
+
+    fn sample_listing() -> CacheListing {
+        CacheListing {
+            remote: "file:///srv/cache.git".to_string(),
+            repos: vec![
+                RepoListing {
+                    repo_id: "github.com__acme__billing".to_string(),
+                    latest_sha: Some("7b9dec7dcbe86ca35b2b4ddeb8386d0595e3362f".to_string()),
+                    artifacts: 3,
+                    bytes: 123456,
+                },
+                RepoListing {
+                    repo_id: "github.com__acme__web".to_string(),
+                    latest_sha: None,
+                    artifacts: 1,
+                    bytes: 2048,
+                },
+            ],
+        }
+    }
+
+    /// Byte-pinned (the #32 discipline, same grammar rules as `results_json`):
+    /// pretty-printed, two-space indent, serde_json's alphabetical key order, a
+    /// single trailing newline, `latest_sha` present-as-null when absent. Scripts
+    /// parse this — a field rename or reshape must fail here first.
+    #[test]
+    fn render_list_json_is_byte_pinned() {
+        let s = render_list_json(&sample_listing());
+        let golden = r#"{
+  "remote": "file:///srv/cache.git",
+  "repos": [
+    {
+      "artifacts": 3,
+      "bytes": 123456,
+      "latest_sha": "7b9dec7dcbe86ca35b2b4ddeb8386d0595e3362f",
+      "repo_id": "github.com__acme__billing"
+    },
+    {
+      "artifacts": 1,
+      "bytes": 2048,
+      "latest_sha": null,
+      "repo_id": "github.com__acme__web"
+    }
+  ],
+  "schema": "cce.synclist/v1"
+}
+"#;
+        assert_eq!(s, golden);
+    }
+
+    #[test]
+    fn render_list_json_empty_cache_is_byte_pinned() {
+        let s = render_list_json(&CacheListing {
+            remote: "file:///srv/cache.git".to_string(),
+            repos: vec![],
+        });
+        let golden = "{\n  \"remote\": \"file:///srv/cache.git\",\n  \"repos\": [],\n  \"schema\": \"cce.synclist/v1\"\n}\n";
+        assert_eq!(s, golden);
+    }
+
+    #[test]
+    fn render_list_human_is_an_aligned_table_with_total() {
+        let s = render_list_human(&sample_listing());
+        let golden = "\
+remote        : file:///srv/cache.git
+
+repo_id                    latest                                    artifacts   bytes
+github.com__acme__billing  7b9dec7dcbe86ca35b2b4ddeb8386d0595e3362f          3  123456
+github.com__acme__web      -                                                 1    2048
+
+total         : 2 repos, 4 artifacts, 125504 bytes
+";
+        assert_eq!(s, golden);
+    }
+
+    #[test]
+    fn render_list_human_empty_cache_is_friendly() {
+        let s = render_list_human(&CacheListing {
+            remote: "file:///srv/cache.git".to_string(),
+            repos: vec![],
+        });
+        assert_eq!(
+            s,
+            "remote        : file:///srv/cache.git\n\nThe cache is empty — nothing has been pushed yet.\n"
+        );
     }
 
     #[test]
