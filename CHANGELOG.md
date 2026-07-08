@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`cce update` / `cce upgrade` — checksum-verified self-update from GitHub Releases
+  (#75).** The missing client for the tag-driven release pipeline: resolve the latest
+  (or a `--version vX.Y.Z`-pinned) release via one `SHA256SUMS` fetch, download the
+  platform tarball by shelling out to `curl` (the house pattern — sync shells out to
+  git; no HTTP-client dependency), verify it against `SHA256SUMS`, and atomically
+  rename the new binary over `current_exe()` (symlinks resolved; the running process
+  keeps its inode). Everything stages in a temp dir, so a corrupt download, checksum
+  mismatch, or unwritable install location leaves the current install untouched — a
+  mismatch is a loud refusal, an unwritable location suggests `sudo`/manual install
+  (never privilege escalation), an unsupported platform names the four published
+  targets, and a missing curl points at the manual install. `--check` is scriptable
+  (one line; exit 0 = up to date, exit **10** (pinned) = update available); `--version`
+  is the rollback path (downgrades warn but proceed); after updating, the CHANGELOG
+  sections between old and new print newest-first, capped at 5 with a releases-page
+  link. Per the settled offline-first posture, `update` is explicit-invocation network
+  ONLY and the sole code path that invokes curl (grep-provable: confined to
+  `src/update.rs`); no other command gained any network behavior. `SHA256SUMS`
+  verification protects integrity, not authenticity beyond GitHub's TLS — stated
+  plainly in the docs; detached signatures remain a documented future hardening. The
+  release asset naming is now a compatibility contract (noted in RELEASING.md). Tests
+  are fully hermetic: a local HTTP fixture server via the test-only
+  `CCE_UPDATE_BASE_URL`/`CCE_UPDATE_TARGET` overrides, mutating tests run a staged
+  copy of the binary, and the delta rendering is byte-pinned. No retrieval surface:
+  `conformance.json`, all goldens, and `SYNC_FORMAT_VERSION` are untouched.
+
 ### Fixed
 - **Repos pushed from a non-`main` default branch are no longer invisible to consumer
   mode (#72).** `cce sync list`, `pull --latest`, and `pull --all` resolved the latest
