@@ -137,7 +137,7 @@ dependencies = [
 
 [[package]]
 name = "cce"
-version = "2.6.7"
+version = "2.6.8"
 dependencies = [
  "base64",
  "clap",

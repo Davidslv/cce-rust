@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.6.8] - 2026-07-08
+
 ### Changed
 - **Index-time embedding now batches chunks through `try_embed_batch` (#38).** The store build
   path used to embed one chunk per call — one HTTP request per chunk on the Ollama backend, so a
