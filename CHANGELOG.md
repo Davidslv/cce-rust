@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.7.1] - 2026-07-08
+
 ### Added
 - **`cce update` / `cce upgrade` — checksum-verified self-update from GitHub Releases
   (#75).** The missing client for the tag-driven release pipeline: resolve the latest
