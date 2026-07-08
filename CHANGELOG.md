@@ -25,6 +25,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   report (`cce.relevance.report/v1`) is byte-pinned in CI against
   `test/fixture/relevance/code.golden.json`, conformance-style. Measurement
   only: zero ranking-behavior changes. See `docs/relevance.md`.
+- **Build fingerprint + `cce doctor` — detect config drift before it degrades
+  retrieval (#62).** Every store write (`cce index`, workspace indexing, the
+  `cce init` local index, and every `cce sync pull` install) now stamps a small
+  `cce.fingerprint/v1` block into `fingerprint.json` **beside** the store: engine
+  version, embedder id + dimensions, the chunker identity (language-pack set,
+  markdown split budget, nesting limit), the tokenizer rule id, and the redaction
+  flag — plus a SHA-256 self-checksum over the canonical serialization and a
+  SHA-256 binding to the exact store bytes it describes (a store rebuilt by an
+  older binary is detected as stale, never trusted). Additive by construction:
+  the fingerprint is a separate file old readers never open — the store bytes,
+  the sync artifact, `conformance.json`, and every byte-pinned golden are
+  untouched, and all recorded values derive from pinned constants so the
+  fingerprint itself is deterministic. `cce doctor [--dir|--store]` is the
+  read-only report over it: fingerprint fields vs the running binary's pinned
+  equivalents, with every mismatch explained ("chunker changed: chunk_ids may
+  not be reproducible; re-index to realign"; embedder/dimension drift = the #30
+  meaningless-cosine failure mode); store parse health with the #30
+  empty-embedding tripwire; the #55 installed-bytes corruption re-hash for
+  pulled stores (reusing the `verify --checksum-only` machinery verbatim); the
+  knowledge store's contract version, snapshot id, and data as-of; and a
+  workspace mode that checks every member (StoreOnly consumers included) and
+  summarizes. Doctor never mutates; it exits non-zero ONLY on definite
+  corruption/mismatch — soft findings are distinct `advisory` lines, and a
+  pre-fingerprint store is a graceful re-index notice with exit 0. Hermetic
+  tests only (no network, no Ollama).
 
 ## [2.7.1] - 2026-07-08
 

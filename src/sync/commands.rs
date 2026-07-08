@@ -67,7 +67,7 @@ impl SyncState {
     fn path(root: &Path) -> PathBuf {
         root.join(".cce").join("synced.json")
     }
-    fn load(root: &Path) -> Option<SyncState> {
+    pub(crate) fn load(root: &Path) -> Option<SyncState> {
         let text = std::fs::read_to_string(Self::path(root)).ok()?;
         serde_json::from_str(&text).ok()
     }
@@ -374,6 +374,14 @@ fn install_artifact(root: &Path, bytes: &[u8]) -> Result<Artifact, String> {
     // artifact. Best-effort: an unreadable store leaves the field absent and
     // verify reports the re-pull notice.
     let installed_sha256 = std::fs::read(&store).ok().map(|b| hex_lower(&Sha256::digest(&b)));
+    // #62: stamp a build fingerprint beside the installed store so `cce doctor`
+    // can drift-check pulled stores too. Shareable artifacts are always
+    // hash-embedded and redaction-protected (push refuses otherwise), and the
+    // remaining fields are pinned by the artifact format. Best-effort — a
+    // failed write only disables drift detection, never the pull.
+    if let Err(e) = crate::fingerprint::write_for_store(&store, &index, true) {
+        eprintln!("warning: could not write the store fingerprint: {e}");
+    }
     SyncState {
         repo_id: artifact.manifest.repo_id.clone(),
         sha: artifact.manifest.sha.clone(),
@@ -1454,7 +1462,7 @@ pub fn cmd_verify(root: &Path, commit: Option<String>) -> Result<String, String>
 /// One pulled store's checksum-only outcome (#55): verified against the
 /// recorded install hash, or no hash recorded (a marker written by an older
 /// cce) — the latter is a clear re-pull notice, never a false failure.
-enum ChecksumVerify {
+pub(crate) enum ChecksumVerify {
     /// The on-disk bytes match the recorded install hash (carried for the report).
     Ok(SyncState, String),
     /// The marker predates `installed_sha256`; verification is unavailable
@@ -1470,7 +1478,7 @@ enum ChecksumVerify {
 /// changed since pull"), never against a byte shape the current code would
 /// produce. `label` names the store in messages (a member name, or the repo_id
 /// for a single pull).
-fn verify_store_checksum(dir: &Path, label: &str) -> Result<ChecksumVerify, String> {
+pub(crate) fn verify_store_checksum(dir: &Path, label: &str) -> Result<ChecksumVerify, String> {
     let state = SyncState::load(dir).ok_or_else(|| {
         format!("nothing to verify for {label}: no `.cce/synced.json` marker (not a pulled store)")
     })?;
@@ -1503,20 +1511,20 @@ fn verify_store_checksum(dir: &Path, label: &str) -> Result<ChecksumVerify, Stri
 /// The re-pull notice for a marker without an install hash (written by an
 /// older cce). A notice, not a failure: the store is not known-bad, it is
 /// unverifiable until a re-pull records the hash.
-const NO_RECORD_NOTICE: &str =
+pub(crate) const NO_RECORD_NOTICE: &str =
     "no install checksum recorded (pulled by an older cce) — re-pull with `cce sync pull \
      --force` to enable checksum verification";
 
 /// The knowledge analogue of [`NO_RECORD_NOTICE`] (SPEC-SYNC-KNOWLEDGE §7): a
 /// knowledge sync marker without `installed_sha256` is the same explicit
 /// notice + exit 0, never a false failure.
-const KNOWLEDGE_NO_RECORD_NOTICE: &str =
+pub(crate) const KNOWLEDGE_NO_RECORD_NOTICE: &str =
     "no install checksum recorded (pulled by an older cce) — re-pull with `cce knowledge pull` \
      to enable checksum verification";
 
 /// One pulled knowledge store's checksum-only outcome (SPEC-SYNC-KNOWLEDGE §7)
 /// — the knowledge sibling of [`ChecksumVerify`].
-enum KnowledgeChecksumVerify {
+pub(crate) enum KnowledgeChecksumVerify {
     /// The on-disk snapshot bytes match the recorded install hash.
     Ok(crate::sync::knowledge_commands::KnowledgeSyncState, String),
     /// The marker predates `installed_sha256`; unverifiable until a re-pull.
@@ -1531,7 +1539,9 @@ enum KnowledgeChecksumVerify {
 /// local-ingest-only root verifies exactly as today — no knowledge row, no
 /// error). A mismatch names the corpus and carries the sharpened §4.2 caveat:
 /// knowledge has NO full-`verify` escalation path at all.
-fn verify_knowledge_checksum(root: &Path) -> Option<Result<KnowledgeChecksumVerify, String>> {
+pub(crate) fn verify_knowledge_checksum(
+    root: &Path,
+) -> Option<Result<KnowledgeChecksumVerify, String>> {
     let state = crate::sync::knowledge_commands::KnowledgeSyncState::load(root)?;
     let Some(expected) = state.installed_sha256.clone() else {
         return Some(Ok(KnowledgeChecksumVerify::NoRecord(state)));

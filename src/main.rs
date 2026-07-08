@@ -219,6 +219,23 @@ enum Command {
         #[arg(long)]
         json: bool,
     },
+    /// Check a store's health and detect config drift vs this binary (issue #62).
+    ///
+    /// Read-only: reports the recorded build fingerprint vs the running
+    /// binary's pinned configuration, store parse health (the #30
+    /// empty-embedding tripwire), the #55 installed-bytes corruption check for
+    /// pulled stores, and the knowledge store's contract + freshness. Exits
+    /// non-zero only on definite corruption/mismatch; soft findings are
+    /// distinct `advisory` lines. With a workspace manifest at the root, every
+    /// member is checked and summarized.
+    Doctor {
+        /// Project/workspace root (default: current directory).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Explicit store path (single-store mode; overrides `--dir`).
+        #[arg(long, conflicts_with = "dir")]
+        store: Option<PathBuf>,
+    },
     /// Ingest a `cce.knowledge/v1` feed into the knowledge store (SPEC-V2.6 §4).
     Knowledge {
         #[command(subcommand)]
@@ -543,6 +560,20 @@ fn main() -> ExitCode {
         Command::Conformance { fixture_dir, output } => cmd_conformance(&fixture_dir, &output),
         Command::Packs { validate } => cmd_packs(validate),
         Command::Savings { dir, store, metrics, json } => cmd_savings(dir, store, metrics, json),
+        // Doctor renders the SAME full report either way; only the exit code
+        // differs (non-zero on definite corruption/mismatch, #62). A usage
+        // error (no directory / no store) takes the ordinary error path.
+        Command::Doctor { dir, store } => match cce::doctor::cmd_doctor(dir, store) {
+            Ok(outcome) => {
+                print!("{}", outcome.report);
+                if outcome.healthy() {
+                    return ExitCode::SUCCESS;
+                }
+                eprintln!("error: doctor found definite corruption or config drift (see above)");
+                return ExitCode::FAILURE;
+            }
+            Err(msg) => Err(msg),
+        },
         Command::Knowledge { cmd } => match cmd {
             KnowledgeCmd::Index { file, dir } => cmd_knowledge_index(&file, dir),
             KnowledgeCmd::Push { corpus, remote, dir } => {
@@ -670,6 +701,12 @@ fn cmd_index(
     let (index, stats) = Index::build_protected(dir, emb.as_ref(), |_| true, protect_secrets)?;
     index.save(&store_path).map_err(|e| e.to_string())?;
     let elapsed = start.elapsed().as_secs_f64();
+
+    // Best-effort build fingerprint beside the store (#62): a failure only
+    // disables `cce doctor`'s drift detection; the index itself is intact.
+    if let Err(e) = cce::fingerprint::write_for_store(&store_path, &index, protect_secrets) {
+        eprintln!("warning: could not write the store fingerprint: {e}");
+    }
 
     // Best-effort metrics: an index event (DASHBOARD-SPEC §2.2). Never fatal.
     let index_bytes = std::fs::metadata(&store_path).map(|m| m.len()).unwrap_or(0);
@@ -1202,6 +1239,11 @@ fn cmd_index_workspace(
             Index::build_protected(&member_dir, emb.as_ref(), |_| true, protect_secrets)?;
         index.save(&store_path).map_err(|e| e.to_string())?;
         let elapsed = start.elapsed().as_secs_f64();
+
+        // Best-effort per-member build fingerprint (#62); never fatal.
+        if let Err(e) = cce::fingerprint::write_for_store(&store_path, &index, protect_secrets) {
+            eprintln!("warning: could not write the store fingerprint for {}: {e}", m.name);
+        }
 
         // Per-member index event, beside the member's own store (fail-open).
         let index_bytes = std::fs::metadata(&store_path).map(|md| md.len()).unwrap_or(0);

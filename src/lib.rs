@@ -46,6 +46,8 @@ pub mod federation;
 pub mod sync;
 pub mod mcp;
 pub mod update;
+pub mod fingerprint;
+pub mod doctor;
 
 pub use chunker::Chunk;
 pub use retriever::SearchResult;
