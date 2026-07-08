@@ -37,6 +37,7 @@ pub mod retriever;
 pub mod grammar;
 pub mod bench;
 pub mod conformance;
+pub mod stats;
 pub mod relevance;
 pub mod metrics;
 pub mod aggregator;
