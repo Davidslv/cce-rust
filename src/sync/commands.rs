@@ -388,17 +388,75 @@ pub fn cmd_pull(
     Ok(out)
 }
 
-/// Pull every workspace member from its own `repo_id@sha` cache.
+/// Fetch the published workspace metadata for `base` — the manifest and (when
+/// present) the cross-member graph — if the cache carries them (#55, the
+/// self-describing cache). **Best-effort by design:** an old cache that never
+/// published metadata returns `None` and the caller proceeds exactly as before
+/// (#55 is additive); unparsable metadata is treated the same as absent.
+fn fetch_published_workspace(
+    remote: &dyn SyncRemote,
+    ver: &str,
+    base: &str,
+) -> Option<(Manifest, Option<crate::workspace::WorkspaceGraph>)> {
+    let yaml = remote.get(&workspace_manifest_address(HASH_EMBEDDER, ver, base)).ok()?;
+    let manifest = Manifest::from_yaml(std::str::from_utf8(&yaml).ok()?).ok()?;
+    let graph = remote
+        .get(&workspace_graph_address(HASH_EMBEDDER, ver, base))
+        .ok()
+        .and_then(|b| String::from_utf8(b).ok())
+        .and_then(|t| crate::workspace::WorkspaceGraph::from_json(&t).ok());
+    Some((manifest, graph))
+}
+
+/// Merge the published member metadata into the local manifest (#55). Members
+/// are matched **by name**; the local `path` — the consumer's actual on-disk
+/// layout — always wins, while `type` and `package` adopt the published truth
+/// (a repo-less consumer has no source to re-detect them from). Returns how
+/// many members were enriched.
+fn merge_published_members(local: &mut Manifest, published: &Manifest) -> usize {
+    let mut merged = 0usize;
+    for m in &mut local.members {
+        if let Some(p) = published.member(&m.name) {
+            m.member_type = p.member_type;
+            m.package = p.package.clone();
+            merged += 1;
+        }
+    }
+    merged
+}
+
+/// Pull every workspace member from its own `repo_id@sha` cache, then install
+/// the published workspace metadata (#55) so a repo-less consumer keeps the
+/// real member types/packages AND the cross-member dependency edges that drive
+/// federated graph expansion. With no local manifest at all, the published one
+/// bootstraps the layout (its member paths become the consumer directories).
 fn pull_workspace(
     root: &Path,
     cfg: &SyncConfig,
     remote: &dyn SyncRemote,
     target: &PullTarget,
 ) -> Result<String, String> {
-    let manifest = Manifest::load(root)?;
     let base = resolve_repo_id(root, cfg)?;
     let ver = SYNC_FORMAT_VERSION.to_string();
+    let published = fetch_published_workspace(remote, &ver, &base);
+    let (manifest, bootstrapped) = match Manifest::load(root) {
+        Ok(m) => (m, false),
+        // #55: a repo-less consumer with only a config — bootstrap the layout
+        // from the published manifest. Without one, the original error stands.
+        Err(load_err) => match &published {
+            Some((p, _)) => {
+                p.save(root).map_err(|e| format!("could not write workspace manifest: {e}"))?;
+                (p.clone(), true)
+            }
+            None => return Err(load_err),
+        },
+    };
     let mut out = format!("Pulling workspace {}\n", manifest.name);
+    if bootstrapped {
+        out.push_str(&format!(
+            "  manifest         installed from the published metadata under {base}\n"
+        ));
+    }
     for m in &manifest.members {
         let member_dir = root.join(&m.path);
         let repo_id = format!("{base}__{}", m.name);
@@ -412,6 +470,25 @@ fn pull_workspace(
             artifact.manifest.chunk_count,
             &artifact.manifest.checksum[..12]
         ));
+    }
+    // #55: adopt the published member metadata and install the published graph.
+    // Absent metadata (an old cache) changes nothing — the pre-#55 behaviour.
+    if let Some((p, graph)) = published {
+        let mut merged_manifest = manifest;
+        merge_published_members(&mut merged_manifest, &p);
+        merged_manifest
+            .save(root)
+            .map_err(|e| format!("could not write workspace manifest: {e}"))?;
+        if let Some(g) = graph {
+            g.save(root).map_err(|e| format!("could not write workspace graph: {e}"))?;
+            out.push_str(&format!(
+                "  metadata         workspace.yml + workspace-graph.json installed ({} cross-member edge{})\n",
+                g.edges.len(),
+                if g.edges.len() == 1 { "" } else { "s" }
+            ));
+        } else {
+            out.push_str("  metadata         workspace.yml installed (no published graph)\n");
+        }
     }
     Ok(out)
 }
@@ -1200,6 +1277,116 @@ mod tests {
         // Each member now has its own store.
         assert!(dst.path().join("alpha/.cce/index.json").exists());
         assert!(dst.path().join("beta/.cce/index.json").exists());
+        std::env::remove_var("CCE_HOME");
+    }
+
+    /// #55 Part 2: `pull --workspace` installs the published metadata into the
+    /// root `.cce/` — the graph verbatim (names resolve against the manifest)
+    /// and the manifest's member types/packages merged over the local one.
+    #[test]
+    fn workspace_pull_installs_published_manifest_and_graph() {
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let src = workspace_repo();
+        let cfg = SyncConfig {
+            remote: Some(url.clone()),
+            lfs: false,
+            repo_id: Some("example.com__acme__mono".to_string()),
+            auto_pull: false,
+            retention: crate::sync::config::Retention::All,
+        };
+        cfg.save(src.path()).unwrap();
+        cmd_push(src.path(), None, true).unwrap();
+
+        let dst = source_repo_clone(&src);
+        cfg.save(dst.path()).unwrap();
+        let out = cmd_pull(dst.path(), PullTarget::Head, false, true).unwrap();
+        assert!(
+            out.contains("workspace.yml + workspace-graph.json installed (1 cross-member edge)"),
+            "got: {out}"
+        );
+        // The installed graph is the published one — cross-member expansion has
+        // its alpha -> beta edge without any source derivation.
+        let manifest = Manifest::load(dst.path()).unwrap();
+        let graph = crate::workspace::WorkspaceGraph::load_or_empty(dst.path(), &manifest);
+        assert_eq!(graph.targets_from("alpha"), vec!["beta"]);
+        // The merged manifest carries the real (published) types/packages.
+        assert_eq!(manifest.member("alpha").unwrap().member_type, MemberType::Javascript);
+        assert_eq!(manifest.member("alpha").unwrap().package, "alpha");
+        std::env::remove_var("CCE_HOME");
+    }
+
+    /// #55 Part 2: a REPO-LESS `pull --workspace --latest` — a bare directory
+    /// with only a `.cce/config` — bootstraps the layout from the published
+    /// manifest (its member paths become the consumer directories).
+    #[test]
+    fn workspace_pull_bootstraps_repo_less_from_the_published_manifest() {
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let src = workspace_repo();
+        let cfg = SyncConfig {
+            remote: Some(url.clone()),
+            lfs: false,
+            repo_id: Some("example.com__acme__mono".to_string()),
+            auto_pull: false,
+            retention: crate::sync::config::Retention::All,
+        };
+        cfg.save(src.path()).unwrap();
+        cmd_push(src.path(), None, true).unwrap();
+
+        // A bare consumer dir: no git checkout, no manifest — only the config.
+        let bare_dir = tempfile::tempdir().unwrap();
+        cfg.save(bare_dir.path()).unwrap();
+        let out = cmd_pull(bare_dir.path(), PullTarget::Latest, false, true).unwrap();
+        assert!(
+            out.contains("manifest         installed from the published metadata"),
+            "got: {out}"
+        );
+        assert!(bare_dir.path().join("alpha/.cce/index.json").exists());
+        assert!(bare_dir.path().join("beta/.cce/index.json").exists());
+        let manifest = Manifest::load(bare_dir.path()).unwrap();
+        let graph = crate::workspace::WorkspaceGraph::load_or_empty(bare_dir.path(), &manifest);
+        assert_eq!(graph.targets_from("alpha"), vec!["beta"]);
+        std::env::remove_var("CCE_HOME");
+    }
+
+    /// #55 additivity: against a cache with NO published metadata (seeded the
+    /// pre-#55 way), `pull --workspace` behaves exactly as before — no metadata
+    /// lines, no graph file, and a missing local manifest is still the original
+    /// clear error.
+    #[test]
+    fn workspace_pull_without_published_metadata_is_the_pre_55_behaviour() {
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let src = workspace_repo();
+        let cfg = SyncConfig {
+            remote: Some(url.clone()),
+            lfs: false,
+            repo_id: Some("example.com__acme__mono".to_string()),
+            auto_pull: false,
+            retention: crate::sync::config::Retention::All,
+        };
+        cfg.save(src.path()).unwrap();
+        // Seed the cache the pre-#55 way: member artifacts + pointers only.
+        let sha = git::head_sha(src.path()).unwrap();
+        let manifest = Manifest::load(src.path()).unwrap();
+        let remote = GitRemote::open(&url, false).unwrap();
+        for m in &manifest.members {
+            let repo_id = format!("example.com__acme__mono__{}", m.name);
+            push_one(&src.path().join(&m.path), &remote, &repo_id, &sha).unwrap();
+        }
+
+        let dst = source_repo_clone(&src);
+        cfg.save(dst.path()).unwrap();
+        let out = cmd_pull(dst.path(), PullTarget::Head, false, true).unwrap();
+        assert!(!out.contains("metadata"), "got: {out}");
+        assert!(!crate::workspace::graph_path(dst.path()).exists());
+
+        // Repo-less with no manifest and no published metadata: the original error.
+        let bare_dir = tempfile::tempdir().unwrap();
+        cfg.save(bare_dir.path()).unwrap();
+        let err = cmd_pull(bare_dir.path(), PullTarget::Latest, false, true).unwrap_err();
+        assert!(err.contains("no workspace manifest"), "got: {err}");
         std::env::remove_var("CCE_HOME");
     }
 
