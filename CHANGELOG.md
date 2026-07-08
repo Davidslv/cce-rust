@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.8.0] - 2026-07-08
+
 ### Added
 - **Usage visibility (v2.8): `cce usage` + the opt-in MCP result footer (#35).**
   `cce usage [--workspace] [--since 24h|7d|<ISO>] [--source mcp|cli|all] [--json]`
