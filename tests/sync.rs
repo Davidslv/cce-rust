@@ -1253,3 +1253,61 @@ fn plain_single_member_pull_latest_is_unchanged_on_a_metadata_carrying_cache() {
     let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
     assert!(!v["results"].as_array().unwrap().is_empty());
 }
+
+/// #55, cross-version shape (live-review finding): a member whose
+/// `.cce/synced.json` was written by an OLDER cce (no `installed_sha256`) gets
+/// a clear re-pull NOTICE with **exit 0** — never a false failure — and a
+/// per-member re-pull records the hash and restores full verification.
+#[test]
+fn verify_checksum_only_old_marker_is_a_notice_and_a_repull_restores_it() {
+    let home = tempfile::tempdir().unwrap();
+    let (_bare, url) = bare_remote();
+    let src = dep_workspace();
+    init_and_push_workspace(home.path(), &url, src.path());
+
+    let consumer = tempfile::tempdir().unwrap();
+    let ctx = consumer.path().join("ctx");
+    let out = cce(
+        home.path(),
+        &["sync", "pull", "--all", "--into", ctx.to_str().unwrap(), "--remote", &url],
+    );
+    assert!(out.status.success());
+
+    // Rewrite beta's marker to the pre-#55 shape older binaries wrote.
+    let marker = ctx.join("beta/.cce/synced.json");
+    let mut v: serde_json::Value =
+        serde_json::from_str(&std::fs::read_to_string(&marker).unwrap()).unwrap();
+    assert!(v.as_object_mut().unwrap().remove("installed_sha256").is_some());
+    std::fs::write(&marker, v.to_string()).unwrap();
+
+    let out =
+        cce(home.path(), &["sync", "verify", "--checksum-only", "--dir", ctx.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "an old marker is a notice, not a failure: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(
+            "verify OK (checksum-only): 1 member verified · 1 without a recorded install \
+             checksum (re-pull to enable)"
+        ),
+        "got: {stdout}"
+    );
+    assert!(
+        stdout.contains("beta             no install checksum recorded (pulled by an older cce)"),
+        "got: {stdout}"
+    );
+
+    // The advised re-pull records the hash and restores full verification.
+    let beta = ctx.join("beta");
+    let out =
+        cce(home.path(), &["sync", "pull", "--latest", "--force", "--dir", beta.to_str().unwrap()]);
+    assert!(out.status.success(), "re-pull: {}", String::from_utf8_lossy(&out.stderr));
+    let out =
+        cce(home.path(), &["sync", "verify", "--checksum-only", "--dir", ctx.to_str().unwrap()]);
+    assert!(out.status.success());
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("verify OK (checksum-only): 2 members"), "got: {stdout}");
+}

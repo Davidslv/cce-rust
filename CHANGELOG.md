@@ -50,10 +50,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   bare name, later ones stay at their `-2`/`-3` names, warned). Result: a repo-less federated
   search regains **cross-member graph expansion**, byte-identical to the source-side
   workspace. `cce sync verify --checksum-only` gives consumers a real integrity check with
-  zero source checkout: it re-hashes the pulled store against the artifact-manifest checksum
-  recorded in `.cce/synced.json` at pull time, failing loudly and naming the member — with
-  the documented caveat that it detects corruption, not a malicious build (true
-  `artifact == build(sha)` verification stays with source-holders/CI). Caches without
+  zero source checkout: `pull` records the SHA-256 of the exact `index.json` bytes it
+  installs (an additive `installed_sha256` field in `.cce/synced.json`), and verify re-hashes
+  the on-disk file against it — **version-independent** ("has this file changed since
+  pull"), so artifacts pushed by older cce versions verify exactly like current ones
+  (live-verified against a mixed-version cache; an export-based comparison would false-fail
+  them). Failures are loud and name the member; a marker written by an older cce (no
+  recorded hash) is an explicit exit-0 re-pull notice, never a false failure. Documented
+  caveat: detects corruption, not a malicious build (true `artifact == build(sha)`
+  verification stays with source-holders/CI). Also from live review: a `pull --all` refresh
+  now **re-adopts** a member directory whose `.cce/config` went missing (matched by name,
+  noted in the report) instead of duplicating it as `<name>-2`. Caches without
   published metadata, plain single-member pulls, `SYNC_FORMAT_VERSION`, `conformance.json`,
   and every existing golden are untouched.
 

@@ -24,11 +24,12 @@ use crate::sync::artifact::{Artifact, ManifestMeta};
 use crate::sync::config::SyncConfig;
 use crate::sync::remote::{GitRemote, SyncRemote};
 use crate::sync::{
-    content_address, git, normalize_repo_id, pointer_address, workspace_graph_address,
+    content_address, git, hex_lower, normalize_repo_id, pointer_address, workspace_graph_address,
     workspace_manifest_address, HASH_EMBEDDER, SYNC_FORMAT_VERSION,
 };
 use crate::workspace::{Manifest, Member, MemberType};
 use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
 use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
@@ -49,6 +50,17 @@ pub struct SyncState {
     pub repo_id: String,
     pub sha: String,
     pub checksum: String,
+    /// SHA-256 (lowercase hex) of the exact `index.json` bytes written at
+    /// install time (#55, `verify --checksum-only`). Recorded from the
+    /// **installed file on disk**, not re-derived through any export path, so
+    /// the later re-hash is version-independent: an artifact pushed by an
+    /// older cce verifies against what THIS pull actually wrote, never against
+    /// a byte shape the current code would produce. **Additive:** markers
+    /// written by older binaries lack it (`verify --checksum-only` then
+    /// reports a clear re-pull notice, not a false failure), and older
+    /// binaries reading a new marker ignore the extra field.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub installed_sha256: Option<String>,
 }
 
 impl SyncState {
@@ -295,10 +307,17 @@ fn install_artifact(root: &Path, bytes: &[u8]) -> Result<Artifact, String> {
     let index = artifact.clone().into_index();
     let store = default_store_path(root);
     index.save(&store).map_err(|e| format!("could not write {}: {e}", store.display()))?;
+    // #55: hash the EXACT bytes just installed (read back from disk) so
+    // `verify --checksum-only` has a version-independent baseline — "has this
+    // file changed since pull", regardless of which cce version pushed the
+    // artifact. Best-effort: an unreadable store leaves the field absent and
+    // verify reports the re-pull notice.
+    let installed_sha256 = std::fs::read(&store).ok().map(|b| hex_lower(&Sha256::digest(&b)));
     SyncState {
         repo_id: artifact.manifest.repo_id.clone(),
         sha: artifact.manifest.sha.clone(),
         checksum: artifact.manifest.checksum.clone(),
+        installed_sha256,
     }
     .save(root)
     .map_err(|e| format!("could not write sync marker: {e}"))?;
@@ -790,7 +809,26 @@ pub fn cmd_pull_all(into: &Path, remote_override: Option<String>) -> Result<Stri
             skipped += 1;
             continue;
         };
-        let existing = by_repo_id.get(&r.repo_id).copied();
+        // The member this repo maps to: the config-recorded repo_id (the stable
+        // mapping), else — live-review finding — RE-ADOPT an orphaned member: a
+        // manifest entry with this repo's short name whose directory lost its
+        // `.cce/config` (e.g. the store dir was deleted by hand). Without this
+        // a refresh would create `<name>-2` beside the orphaned `<name>` dir.
+        let existing = by_repo_id.get(&r.repo_id).copied().or_else(|| {
+            let short = short_member_name(&r.repo_id);
+            let orphan = members.iter().position(|m| {
+                m.name == short && SyncConfig::load(&into.join(&m.path)).repo_id.is_none()
+            });
+            if let Some(i) = orphan {
+                out.push_str(&format!(
+                    "  note: re-adopting existing member `{}` for {} (its config was missing — \
+                     rewritten)\n",
+                    members[i].name, r.repo_id
+                ));
+                by_repo_id.insert(r.repo_id.clone(), i);
+            }
+            orphan
+        });
         let name = match existing {
             Some(i) => members[i].name.clone(),
             None => dedup_member_name(&short_member_name(&r.repo_id), &used_names),
@@ -1017,50 +1055,81 @@ pub fn cmd_verify(root: &Path, commit: Option<String>) -> Result<String, String>
     }
 }
 
-/// Verify one pulled store by re-hash alone (#55): re-export the installed
-/// index at the identity the `.cce/synced.json` marker records and compare the
-/// recomputed artifact checksum against the marker's. `label` names the store
-/// in messages (a member name, or the repo_id for a single pull).
-fn verify_store_checksum(dir: &Path, label: &str) -> Result<(SyncState, String), String> {
+/// One pulled store's checksum-only outcome (#55): verified against the
+/// recorded install hash, or no hash recorded (a marker written by an older
+/// cce) — the latter is a clear re-pull notice, never a false failure.
+enum ChecksumVerify {
+    /// The on-disk bytes match the recorded install hash (carried for the report).
+    Ok(SyncState, String),
+    /// The marker predates `installed_sha256`; verification is unavailable
+    /// until a re-pull records it.
+    NoRecord(SyncState),
+}
+
+/// Verify one pulled store by re-hash alone (#55): SHA-256 the on-disk
+/// `index.json` bytes and compare against the `installed_sha256` the pull
+/// recorded in `.cce/synced.json`. **No export path is involved**, so the check
+/// is version-independent — an artifact pushed by ANY older cce version
+/// verifies against what this machine's pull actually wrote ("has this file
+/// changed since pull"), never against a byte shape the current code would
+/// produce. `label` names the store in messages (a member name, or the repo_id
+/// for a single pull).
+fn verify_store_checksum(dir: &Path, label: &str) -> Result<ChecksumVerify, String> {
     let state = SyncState::load(dir).ok_or_else(|| {
         format!("nothing to verify for {label}: no `.cce/synced.json` marker (not a pulled store)")
     })?;
+    let Some(expected) = state.installed_sha256.clone() else {
+        return Ok(ChecksumVerify::NoRecord(state));
+    };
     let store = default_store_path(dir);
-    let index = Index::load(&store).map_err(|e| {
+    let bytes = std::fs::read(&store).map_err(|e| {
         format!(
             "verify FAILED (checksum-only) for {label} ({}@{})\n  the pulled store could not \
              be read: {e}\n  Re-pull it with `cce sync pull --force`.",
             state.repo_id, state.sha
         )
     })?;
-    let meta = ManifestMeta { repo_id: state.repo_id.clone(), sha: state.sha.clone() };
-    let actual = Artifact::from_index(&index, meta).manifest.checksum;
-    if actual != state.checksum {
+    let actual = hex_lower(&Sha256::digest(&bytes));
+    if actual != expected {
         return Err(format!(
-            "verify FAILED (checksum-only) for {label} ({}@{})\n  expected : {}\n  actual   : \
-             {actual}\n  The pulled store does not match the checksum recorded at pull time — \
-             corruption or local modification of the store. Re-pull with `cce sync pull \
+            "verify FAILED (checksum-only) for {label} ({}@{})\n  expected : {expected}\n  \
+             actual   : {actual}\n  The pulled store does not match the bytes recorded at pull \
+             time — corruption or local modification of the store. Re-pull with `cce sync pull \
              --force`.\n  (Checksum-only detects corruption, not a malicious build — true \
              `artifact == build(sha)` verification needs the source and stays with the \
              source-holders/CI: `cce sync verify`.)",
-            state.repo_id, state.sha, state.checksum
+            state.repo_id, state.sha
         ));
     }
-    Ok((state, actual))
+    Ok(ChecksumVerify::Ok(state, actual))
 }
 
-/// `cce sync verify --checksum-only` (#55): re-hash the PULLED store bytes
-/// against the checksum recorded by `pull` in `.cce/synced.json` — **zero
-/// source checkout, zero rebuild, zero remote access**, so it works for
-/// repo-less consumers, where full `verify` (which rebuilds from the working
-/// tree) inherently cannot.
+/// The re-pull notice for a marker without an install hash (written by an
+/// older cce). A notice, not a failure: the store is not known-bad, it is
+/// unverifiable until a re-pull records the hash.
+const NO_RECORD_NOTICE: &str =
+    "no install checksum recorded (pulled by an older cce) — re-pull with `cce sync pull \
+     --force` to enable checksum verification";
+
+/// `cce sync verify --checksum-only` (#55): re-hash the PULLED store's on-disk
+/// bytes against the SHA-256 **recorded from the installed bytes at pull time**
+/// (`installed_sha256` in `.cce/synced.json`) — zero source checkout, zero
+/// rebuild, zero remote access, so it works for repo-less consumers, where full
+/// `verify` (which rebuilds from the working tree) inherently cannot.
 ///
-/// The recorded checksum is the artifact-manifest checksum (SPEC-SYNC §2):
-/// SHA-256 over the canonical artifact stream. The installed store round-trips
-/// losslessly back to that stream (`Artifact::from_index` of the installed
-/// index reproduces the pulled artifact byte-for-byte — the pinned
-/// export/import guarantee), so re-exporting and re-hashing detects any
-/// corruption or truncation of the pulled bytes at rest.
+/// **Version-independent by construction:** the baseline is hashed from the
+/// exact file the pull wrote, so artifacts pushed by older cce versions verify
+/// exactly like current ones. (An earlier design re-exported the installed
+/// index with the CURRENT code and compared against the artifact-manifest
+/// checksum computed at PUSH time — any byte-level difference between the two
+/// versions' export shapes false-failed intact pulls. Live-verified against a
+/// mixed-version cache.)
+///
+/// **Old markers:** a `.cce/synced.json` written before `installed_sha256`
+/// existed cannot be verified; that is reported as an explicit *notice* with
+/// **exit 0** — the store is not known-bad, it is unverifiable until a re-pull
+/// records the hash. Only a real mismatch (or unreadable store) is a non-zero
+/// failure, naming the member.
 ///
 /// **Honest caveat (documented):** this detects *corruption, not a malicious
 /// build*. `artifact == build(sha)` verification requires the source and stays
@@ -1074,31 +1143,50 @@ pub fn cmd_verify_checksum_only(root: &Path) -> Result<String, String> {
     match Manifest::load(root) {
         Ok(manifest) => {
             let mut out = String::new();
-            let mut checked = 0usize;
+            let (mut verified, mut unrecorded) = (0usize, 0usize);
             for m in &manifest.members {
                 let label = format!("member `{}`", m.name);
-                let (state, checksum) = verify_store_checksum(&root.join(&m.path), &label)?;
-                out.push_str(&format!(
-                    "  {:<16} {}@{}  ({})\n",
-                    m.name,
-                    state.repo_id,
-                    state.sha,
-                    &checksum[..12]
-                ));
-                checked += 1;
+                match verify_store_checksum(&root.join(&m.path), &label)? {
+                    ChecksumVerify::Ok(state, checksum) => {
+                        out.push_str(&format!(
+                            "  {:<16} {}@{}  ({})\n",
+                            m.name,
+                            state.repo_id,
+                            state.sha,
+                            &checksum[..12]
+                        ));
+                        verified += 1;
+                    }
+                    ChecksumVerify::NoRecord(_) => {
+                        out.push_str(&format!("  {:<16} {NO_RECORD_NOTICE}\n", m.name));
+                        unrecorded += 1;
+                    }
+                }
             }
-            Ok(format!(
-                "verify OK (checksum-only): {checked} member{}\n{out}",
-                if checked == 1 { "" } else { "s" }
-            ))
+            let header = if unrecorded == 0 {
+                format!(
+                    "verify OK (checksum-only): {verified} member{}",
+                    if verified == 1 { "" } else { "s" }
+                )
+            } else {
+                format!(
+                    "verify OK (checksum-only): {verified} member{} verified · {unrecorded} \
+                     without a recorded install checksum (re-pull to enable)",
+                    if verified == 1 { "" } else { "s" }
+                )
+            };
+            Ok(format!("{header}\n{out}"))
         }
-        Err(_) => {
-            let (state, checksum) = verify_store_checksum(root, "this store")?;
-            Ok(format!(
+        Err(_) => match verify_store_checksum(root, "this store")? {
+            ChecksumVerify::Ok(state, checksum) => Ok(format!(
                 "verify OK (checksum-only): {}@{}\n  checksum : {checksum}\n",
                 state.repo_id, state.sha
-            ))
-        }
+            )),
+            ChecksumVerify::NoRecord(state) => Ok(format!(
+                "verify (checksum-only): {}@{}: {NO_RECORD_NOTICE}\n",
+                state.repo_id, state.sha
+            )),
+        },
     }
 }
 
@@ -2331,6 +2419,102 @@ total         : 2 repos, 4 artifacts, 125504 bytes
         idx.save(&store).unwrap();
         let err = cmd_verify_checksum_only(into.path()).unwrap_err();
         assert!(err.contains("verify FAILED (checksum-only) for member `beta`"), "got: {err}");
+        std::env::remove_var("CCE_HOME");
+    }
+
+    /// #55, the cross-version shape (live-review finding): a `.cce/synced.json`
+    /// written by an OLDER cce has no `installed_sha256`. That is a clear,
+    /// actionable NOTICE with exit-0 semantics (`Ok`), never a false failure —
+    /// the earlier export-based design false-failed intact pulls of artifacts
+    /// pushed by older versions.
+    #[test]
+    fn verify_checksum_only_old_marker_is_a_notice_not_a_false_failure() {
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let src = source_repo();
+        init_cfg(src.path(), &url);
+        cmd_push(src.path(), None, false).unwrap();
+
+        let consumer = tempfile::tempdir().unwrap();
+        init_cfg(consumer.path(), &url);
+        cmd_pull(consumer.path(), PullTarget::Latest, false, false).unwrap();
+        // Rewrite the marker to the pre-#55 shape (no installed_sha256).
+        let mut state = SyncState::load(consumer.path()).unwrap();
+        assert!(state.installed_sha256.is_some(), "a fresh pull records the hash");
+        state.installed_sha256 = None;
+        state.save(consumer.path()).unwrap();
+
+        let out = cmd_verify_checksum_only(consumer.path()).unwrap();
+        assert!(
+            out.contains("no install checksum recorded (pulled by an older cce)"),
+            "got: {out}"
+        );
+        assert!(out.contains("re-pull"), "the notice must be actionable: {out}");
+
+        // Workspace-mixed: one member verified, one on the notice path (a
+        // fresh cache so only the two workspace members are pulled).
+        let (_bare_ws, url_ws) = bare_remote();
+        let src_ws = workspace_repo();
+        SyncConfig {
+            remote: Some(url_ws.clone()),
+            lfs: false,
+            repo_id: Some("example.com__acme__mono".to_string()),
+            auto_pull: false,
+            retention: crate::sync::config::Retention::All,
+        }
+        .save(src_ws.path())
+        .unwrap();
+        cmd_push(src_ws.path(), None, true).unwrap();
+        let into = tempfile::tempdir().unwrap();
+        cmd_pull_all(into.path(), Some(url_ws)).unwrap();
+        let beta = into.path().join("beta");
+        let mut state = SyncState::load(&beta).unwrap();
+        state.installed_sha256 = None;
+        state.save(&beta).unwrap();
+        let out = cmd_verify_checksum_only(into.path()).unwrap();
+        assert!(
+            out.contains(
+                "verify OK (checksum-only): 1 member verified · 1 without a recorded install \
+                 checksum (re-pull to enable)"
+            ),
+            "got: {out}"
+        );
+        assert!(out.contains("beta"), "the notice names the member: {out}");
+        std::env::remove_var("CCE_HOME");
+    }
+
+    /// Live-review finding: a member directory whose `.cce` (config + marker)
+    /// was deleted must be RE-ADOPTED by the next `pull --all` — matched by its
+    /// short name — not duplicated as `<name>-2` beside the orphan.
+    #[test]
+    fn pull_all_re_adopts_an_orphaned_member_dir_instead_of_duplicating() {
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let src = source_repo();
+        init_cfg(src.path(), &url);
+        cmd_push(src.path(), None, false).unwrap();
+
+        let into = tempfile::tempdir().unwrap();
+        cmd_pull_all(into.path(), Some(url)).unwrap();
+        assert!(into.path().join("demo/.cce/index.json").exists());
+        // Kill the member's whole .cce dir: config, marker, and store gone.
+        std::fs::remove_dir_all(into.path().join("demo/.cce")).unwrap();
+
+        let out = cmd_pull_all(into.path(), None).unwrap();
+        assert!(
+            out.contains("note: re-adopting existing member `demo` for example.com__acme__demo"),
+            "got: {out}"
+        );
+        assert!(out.contains("summary       : 1 pulled · 0 up-to-date · 0 skipped"), "got: {out}");
+        assert!(into.path().join("demo/.cce/index.json").exists(), "re-pulled into the same dir");
+        assert_eq!(
+            SyncConfig::load(&into.path().join("demo")).repo_id.as_deref(),
+            Some("example.com__acme__demo"),
+            "the config is rewritten"
+        );
+        assert!(!into.path().join("demo-2").exists(), "no duplicate member dir");
+        let manifest = Manifest::load(into.path()).unwrap();
+        assert_eq!(manifest.members.len(), 1, "no duplicate manifest entry");
         std::env::remove_var("CCE_HOME");
     }
 

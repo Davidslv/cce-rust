@@ -330,9 +330,10 @@ enum SyncCmd {
         /// The commit to verify (default: the pulled cache's sha, else HEAD).
         #[arg(long)]
         commit: Option<String>,
-        /// Re-hash the pulled store against the checksum recorded at pull time —
-        /// no source checkout, no rebuild, no remote (#55). Detects corruption,
-        /// not a malicious build (that needs full `verify` on a source checkout).
+        /// Re-hash the pulled store against the checksum recorded from the
+        /// installed bytes at pull time — version-independent; no source
+        /// checkout, no rebuild, no remote (#55). Detects corruption, not a
+        /// malicious build (that needs full `verify` on a source checkout).
         #[arg(long, conflicts_with = "commit")]
         checksum_only: bool,
         /// Project/workspace root (default: current directory).

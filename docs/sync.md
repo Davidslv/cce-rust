@@ -193,10 +193,11 @@ Rules:
 - `pull --all --into <dir>` is **consumer mode** (§7): enumerate the cache, pull
   every repo_id's latest artifact, and synthesize a ready-to-search workspace —
   no source checkout anywhere.
-- `verify --checksum-only` re-hashes the **pulled** store against the checksum
-  recorded at pull time — no source checkout, no rebuild, no remote (§7, the
-  consumer integrity check). Full `verify` (rebuild-and-compare) remains the
-  source-holders' check.
+- `verify --checksum-only` re-hashes the **pulled** store against the SHA-256
+  **recorded from the installed bytes at pull time** — no source checkout, no
+  rebuild, no remote, and no version coupling (§7, the consumer integrity
+  check). Full `verify` (rebuild-and-compare) remains the source-holders'
+  check.
 - Offline / no remote / auth failure → a clear message; local indexing and search
   continue to work.
 - **Workspace-aware:** `--workspace` iterates the manifest's members, each keyed by
@@ -262,6 +263,9 @@ Behaviour:
   `-2`/`-3` suffix in repo_id order. The full repo_id lives in the member's
   `.cce/config` (`sync.repo_id`), so a per-member `cce sync pull --latest
   --dir ctx/billing` keeps working, and refresh runs never re-derive names.
+  A member directory whose config went missing (e.g. its `.cce/` was deleted
+  by hand) is **re-adopted by name** on the next run — noted in the report,
+  its config rewritten — rather than duplicated with a `-2` suffix.
 - **Synthesized manifest.** Members are written with `type: store-only` — the
   neutral `MemberType` for a member with no source to classify. Detection never
   emits it; hand-written manifests are untouched and stay byte-compatible.
@@ -311,9 +315,14 @@ consumer does not have:
 
 **Consumer integrity: `cce sync verify --checksum-only`.** Full `cce sync
 verify` rebuilds the index from the working tree, which inherently needs the
-source. Repo-less consumers instead re-hash the **pulled** store against the
-checksum recorded at pull time (the artifact-manifest checksum in
-`.cce/synced.json`) — zero source checkout, zero rebuild, zero network:
+source. Repo-less consumers instead re-hash the **pulled** store's on-disk
+bytes against the SHA-256 **recorded from the installed bytes at pull time**
+(the `installed_sha256` field `pull` writes into `.cce/synced.json`, hashed
+from the exact `index.json` file it just installed) — zero source checkout,
+zero rebuild, zero network. Because the baseline is the installed file itself,
+never a re-export through the current code, the check is
+**version-independent**: artifacts pushed by any older cce verify exactly like
+current ones ("has this file changed since pull"):
 
 ```console
 $ cce sync verify --checksum-only --dir ctx
@@ -323,12 +332,22 @@ verify OK (checksum-only): 2 members
 ```
 
 A corrupted or truncated store fails loudly, naming the member; exit codes
-mirror full `verify`. **The honest caveat:** checksum-only detects
-*corruption, not a malicious build*. True `artifact == build(sha)`
-verification requires the source and stays where the source lives (CI /
-source-holders, via full `verify`). The trust posture for repo-less consumers
-is **CI as the canonical pusher + the git host's access control** (a
-signed-manifest scheme would be a future spec).
+mirror full `verify` (non-zero only on a real mismatch or an unreadable
+store). A store whose marker was written by an **older cce** (no
+`installed_sha256` recorded) is reported as an explicit notice with **exit
+0** — it is not known-bad, it is unverifiable until a re-pull records the
+hash:
+
+```
+  legacy           no install checksum recorded (pulled by an older cce) — re-pull with `cce sync pull --force` to enable checksum verification
+```
+
+**The honest caveat:** checksum-only detects *corruption, not a malicious
+build*. True `artifact == build(sha)` verification requires the source and
+stays where the source lives (CI / source-holders, via full `verify`). The
+trust posture for repo-less consumers is **CI as the canonical pusher + the
+git host's access control** (a signed-manifest scheme would be a future
+spec).
 
 ---
 

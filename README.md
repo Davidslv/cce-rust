@@ -551,9 +551,10 @@ members whose latest pointer moved. The cache is **self-describing**: `cce sync
 push --workspace` also publishes the workspace manifest and its cross-member
 dependency graph, so repo-less consumers keep the real member metadata and the
 cross-member graph expansion, and `cce sync verify --checksum-only` gives them a
-real integrity check (re-hash the pulled store against the recorded checksum —
-detects corruption, not a malicious build; no source needed). See the
-consumer-mode section of [`docs/sync.md`](docs/sync.md).
+real integrity check (re-hash the pulled store against the checksum recorded
+from the installed bytes at pull time — version-independent; detects
+corruption, not a malicious build; no source needed). See the consumer-mode
+section of [`docs/sync.md`](docs/sync.md).
 
 **CI (GitHub Actions):** index `main` and push on every merge with the ready-to-copy
 [`docs/ci/cce-sync.yml`](docs/ci/cce-sync.yml). The token it uses needs **write**
@@ -736,7 +737,7 @@ real offline cold-start run in [`docs/VERIFIED.md`](docs/VERIFIED.md):
 | `cce feedback` / `cce conformance` / `cce packs` / `cce bench` | ✅ fully offline | pure local operations |
 | `cce sync list` | ❌ needs the cache remote | read-only enumeration of what a cache holds (repo_ids, latest shas, artifact counts/bytes); works from a bare directory with just `--remote <url>` |
 | `cce sync pull --all` | ❌ needs the cache remote | consumer mode: pulls every repo_id's latest artifact into `--into <dir>` and synthesizes the workspace (enriched from the published workspace metadata when the cache carries it) — the resulting search/MCP over it is then fully offline |
-| `cce sync verify --checksum-only` | ✅ fully offline | re-hashes the pulled store against the checksum recorded at pull time; no source checkout, no rebuild, no remote |
+| `cce sync verify --checksum-only` | ✅ fully offline | re-hashes the pulled store against the checksum recorded from the installed bytes at pull time; version-independent — no source checkout, no rebuild, no remote |
 
 The **only** things that ever touch the network are, explicitly:
 
