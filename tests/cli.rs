@@ -498,3 +498,56 @@ fn knowledge_index_missing_file_exits_nonzero() {
     assert!(!out.status.success());
     assert!(String::from_utf8_lossy(&out.stderr).contains("error"));
 }
+
+#[test]
+fn index_writes_a_fingerprint_and_doctor_reports_health_end_to_end() {
+    // Issue #62, process level: `cce index` stamps `fingerprint.json` beside
+    // the store; `cce doctor` exits 0 on a healthy store, flags a recorded
+    // config drift (edited fingerprint field) with a non-zero exit, and treats
+    // a fingerprint-less (pre-v2.8) store as a notice with exit 0.
+    let tmp = tempfile::tempdir().unwrap();
+    let root = tmp.path();
+    // Copy the fixture so `.cce/` lives in a scratch root, not the repo.
+    for entry in std::fs::read_dir(fixture()).unwrap() {
+        let entry = entry.unwrap();
+        if entry.file_type().unwrap().is_file() {
+            std::fs::copy(entry.path(), root.join(entry.file_name())).unwrap();
+        }
+    }
+
+    let out = Command::new(bin()).args(["index"]).arg(root).output().unwrap();
+    assert!(out.status.success(), "index failed: {}", String::from_utf8_lossy(&out.stderr));
+    let fingerprint = root.join(".cce").join("fingerprint.json");
+    assert!(fingerprint.exists(), "index must write the fingerprint beside the store");
+
+    // Healthy: exit 0 and an explicit fingerprint-match line.
+    let out = Command::new(bin()).args(["doctor", "--dir"]).arg(root).output().unwrap();
+    assert!(out.status.success(), "doctor failed: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("fingerprint matches this binary"), "{stdout}");
+    assert!(stdout.contains("0 failures"), "{stdout}");
+
+    // Drift: rewrite the recorded pack set through the public fingerprint API
+    // (re-sealing the self-checksum, so the CHUNKER mismatch is what fires,
+    // not the integrity check) — the "edit the recorded field in a fixture"
+    // acceptance case.
+    let store = root.join(".cce").join("index.json");
+    let mut fp = cce::fingerprint::Fingerprint::load_beside_store(&store).unwrap().unwrap();
+    assert_eq!(fp.pack_set, "c,javascript,python,ruby,rust,typescript");
+    fp.pack_set = "python,ruby".to_string();
+    fp.seal();
+    fp.save_beside_store(&store).unwrap();
+
+    let out = Command::new(bin()).args(["doctor", "--dir"]).arg(root).output().unwrap();
+    assert!(!out.status.success(), "doctor must exit non-zero on chunker drift");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("chunker changed"), "{stdout}");
+    assert!(stdout.contains("chunk_ids may not be reproducible"), "{stdout}");
+
+    // Pre-fingerprint store: delete the fingerprint — a notice, exit 0.
+    std::fs::remove_file(&fingerprint).unwrap();
+    let out = Command::new(bin()).args(["doctor", "--dir"]).arg(root).output().unwrap();
+    assert!(out.status.success(), "a fingerprint-less store must not fail doctor");
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("no fingerprint recorded"), "{stdout}");
+}
