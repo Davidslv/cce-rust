@@ -47,7 +47,7 @@ responsibilities header.
 | `src/sync/config.rs` | The `sync.*` config (opt-in; absent ⇒ pure local) (SPEC-SYNC §8) | `SyncConfig`, `Retention`, `load`, `save` |
 | `src/sync/git.rs` | Thin `git` CLI wrappers: HEAD sha, branch, dirty, commit date, origin (SPEC-SYNC §4) | `head_sha`, `current_branch`, `is_dirty`, `commit_date`, `origin_url` |
 | `src/sync/remote.rs` | The `SyncRemote` trait + git backend (working clone, put/get, LFS, race-retry) (SPEC-SYNC §4) | `SyncRemote`, `GitRemote` |
-| `src/sync/commands.rs` | `cce sync init/push/pull/status/verify` orchestration + `--workspace` fan-out; MCP freshness (SPEC-SYNC §5, SPEC-MCP) | `cmd_init`, `cmd_push`, `cmd_pull`, `cmd_status`, `cmd_verify`, `freshness` |
+| `src/sync/commands.rs` | `cce sync init/push/pull/list/status/verify` orchestration + `--workspace` fan-out + consumer mode (`list`, `pull --all`, `verify --checksum-only`); MCP freshness (SPEC-SYNC §3/§5, SPEC-MCP) | `cmd_init`, `cmd_push`, `cmd_pull`, `cmd_list`, `cmd_pull_all`, `cmd_status`, `cmd_verify`, `cmd_verify_checksum_only`, `freshness` |
 | `src/mcp/protocol.rs` | JSON-RPC 2.0 framing for the MCP stdio transport (SPEC-MCP) | `parse_request`, `success`, `error`, `Request` |
 | `src/mcp/server.rs` | The `cce mcp` stdio dispatch loop + store/metrics resolution + sync-warm + per-session ledger & output level (SPEC-MCP, SPEC-V2.5) | `McpServer`, `run`, `serve`, `handle_line`, `warm_via_sync`, `session_digest` |
 | `src/mcp/tools.rs` | The **nine** MCP tools with their exact cross-language schemas (SPEC-MCP, SPEC-V2.5 §6) | `tool_definitions`, `context_search`, `expand_chunk`, `related_context`, `set_output_compression`, `record_decision`, `session_recall`, `summarize_context`, … |

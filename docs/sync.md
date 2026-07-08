@@ -19,6 +19,11 @@ breaks local indexing or search.
   base with one command.
 - You want supply-chain safety: `cce sync verify` re-indexes locally and confirms
   the pulled cache's checksum, so you never have to *trust* the pusher.
+- You want searchable, agent-ready context for a whole ecosystem **without
+  checking out any source** — a review machine, a docs box, an agent sandbox.
+  That is **consumer mode** (§7): `cce sync list` to see what a cache holds,
+  `cce sync pull --all` to turn it into a ready-to-search workspace, and
+  `cce sync verify --checksum-only` to integrity-check it, all repo-less.
 
 Only the deterministic **hash embedder** produces shareable caches. Ollama/semantic
 indexes are non-reproducible and are **local-only** — `cce sync push` refuses them.
@@ -417,6 +422,8 @@ access to the cache repo to `pull`; members with write access may also push
 | `cache miss: …<sha>.cce not found` | nobody pushed this sha (or `cce_version` window differs) | push it, `--latest`, or just `cce index` locally |
 | `could not clone remote …` | wrong URL / no auth / offline | check the URL and your git credentials; local commands are unaffected |
 | `verify FAILED` | working tree differs from the sha, or the cache is untrustworthy | check out the exact sha and re-run, or rebuild locally |
+| `verify FAILED (checksum-only): <member>` | the pulled store's on-disk bytes changed since pull (corruption, truncation, manual edit) | `cce sync pull --force` (or `pull --all` for a consumer workspace) to reinstall it |
+| `no install checksum recorded (pulled by an older cce)` | the `.cce/synced.json` marker predates `installed_sha256` | not a failure (exit 0) — re-pull with `cce sync pull --force` to record the hash |
 | LFS: `git-lfs` filter errors on `get` | `.gitattributes` routes `*.cce` through LFS but `git-lfs` is not installed | `git lfs install`, or `cce sync init --no-lfs` for a plain-git cache |
 | `local cache is at … but you are pulling …` | pulling a different sha over an existing cache | `cce sync pull --force` (only if you intend to overwrite) |
 

@@ -634,3 +634,40 @@ sees a secret and chunk ids/token counts derive from redacted text.
 `SHA-256(path:start:end:prefix)` function, with the record `id` as the synthetic
 document path — so ids are stable across snapshots as long as a record's rendered,
 redacted content is unchanged.
+
+## Consumer mode (#53–#55) — a repo-less client over the cache, not a server
+
+**Consumer mode is a smarter client, not a context server.** The obvious way to
+serve indexed context to machines that hold no source is a server: a daemon that
+owns the indexes and answers queries over the network. That was rejected. The
+determinism + content-addressing decisions already made the cache itself the
+service: an artifact for `repo@sha` is byte-identical whoever built it, addressed
+by a pure function of its identity, and complete (chunks, embeddings, whole-file
+reconstruction, import graph — everything search needs). So a consumer needs no
+protocol beyond `get` from a git remote — `cce sync list` enumerates the cache,
+`pull --all` materializes it into a synthesized workspace, and search/MCP run
+**fully offline** on the result. A server would have inverted every posture the
+project holds: online-at-query-time instead of offline-first, a new auth/RBAC
+surface instead of delegating permissions to git, an availability dependency
+instead of a file cache, and a second query path to keep conformant across two
+engines. Consumer mode adds zero infrastructure: the same cache, read by a
+smarter client.
+
+**Integrity without source is a recorded-at-install checksum, deliberately
+version-independent.** Full `verify` (rebuild-and-compare) needs the source, so
+repo-less consumers get `verify --checksum-only`: `pull` records the SHA-256 of
+the exact bytes it installs, and verify re-hashes the on-disk file against that
+record. The baseline is the installed file, never a re-export through the current
+code — so artifacts pushed by any older cce verify identically ("has this file
+changed since pull"). The caveat is stated wherever the flag is documented:
+this detects corruption, not a malicious build; `artifact == build(sha)` stays
+with source-holders/CI. The honest trust posture for consumers is CI as the
+canonical pusher plus the git host's access control.
+
+**The cache self-describes through additive well-known keys.** Publishing the
+workspace manifest and cross-member graph under the base repo_id (SPEC-SYNC §3)
+was chosen over embedding workspace metadata in the artifact (a format change —
+`SYNC_FORMAT_VERSION` would move and every existing cache would miss) and over
+requiring consumers to hold a manifest (defeats repo-less). Keys that are neither
+artifacts nor ref pointers are normatively additive: old clients ignore them,
+old caches simply lack them, and their absence is never an error.

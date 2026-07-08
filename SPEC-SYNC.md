@@ -138,6 +138,8 @@ interface keeps them possible without CLI changes.
 cce sync init  --remote <git-url> [--lfs] [--repo-id <id>]   # configure + set up local clone
 cce sync push  [--commit <sha>]        # ensure local hash-index for HEAD/sha, export artifact, put to remote
 cce sync pull  [--commit <sha> | --latest]  # fetch cache for sha (default HEAD; else latest main) → install into .cce/
+cce sync pull  --all --into <dir> [--remote <url>]  # consumer mode: pull every repo_id's latest, synthesize a workspace (no source)
+cce sync list  [--remote <url>] [--json]    # enumerate the cache: one row per repo_id (latest sha, artifact count, bytes); read-only, repo-less
 cce sync status                        # remote, local cache sha vs remote latest, working-tree match
 cce sync verify [--commit <sha>]       # re-index locally and confirm the pulled artifact's checksum
 cce sync verify --checksum-only        # consumer integrity: re-hash the pulled store against the recorded checksum (no source)
@@ -153,7 +155,16 @@ Rules:
   continue to work.
 - **Workspace-aware:** `cce sync push/pull --workspace` iterates members, each
   keyed by its own `repo_id@sha` (a member is just a repo). This composes with
-  SPEC-V2.2.
+  SPEC-V2.2. `push --workspace` additionally publishes the workspace metadata at
+  the §3 well-known keys, making the cache self-describing for repo-less
+  consumers.
+- **Consumer mode is repo-less by construction.** `list` and `pull --all` need
+  no local store, config, or source checkout — a bare directory plus
+  `--remote <url>` suffices. `pull --all` synthesizes the workspace manifest
+  (members typed `store-only`) and is an idempotent refresh; `verify
+  --checksum-only` re-hashes the installed bytes against the checksum recorded
+  at pull time (version-independent — corruption detection, not
+  `artifact == build(sha)`, which stays with source-holders via full `verify`).
 
 ---
 

@@ -420,6 +420,15 @@ The two compose, as a **soft dependency**:
 on the local index, offline. A failed or absent Sync never degrades MCP below "use
 the local index."
 
+**Repo-less agent context (consumer mode).** The agent's corpus does not have to be
+a checkout at all: `cce sync pull --all --into ctx --remote <cache-url>` turns a
+bare directory into a synthesized, federated workspace of every repo in the cache,
+and `cce mcp --workspace --dir ctx` serves it — full `context_search`,
+`expand_chunk` (whole-file reconstruction from the pulled index), and cross-member
+graph expansion, with **zero source checkouts**. Re-run the pull to refresh;
+`cce sync verify --checksum-only --dir ctx` integrity-checks the stores offline.
+See [`sync.md`](sync.md) §7.
+
 Config lives in `.cce/config` (see [`docs/sync.md`](sync.md)); the relevant key is
 `sync.auto_pull` (bool, default off).
 

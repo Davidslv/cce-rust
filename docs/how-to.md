@@ -146,6 +146,51 @@ cce savings --dir ./my-project --json   # the same shape as /api/metrics.savings
   zero; the compact chunks (and that bucket) come from the agent-facing
   `context_search` MCP tool. See [`mcp.md`](mcp.md).
 
+## Pull the team's CI-built index (CCE Sync)
+
+```bash
+cce sync init --remote git@github.com:acme/cce-cache.git   # one-time, per project
+cce sync pull --latest                                     # main@sha index, instantly
+cce sync status                                            # remote, local sha, tree match
+```
+
+- The remote is a **content-addressed git cache**: because the hash-embedder index
+  is deterministic, a cache for `repo@sha` is byte-identical no matter who built
+  it. Let CI push on every merge ([`ci/cce-sync.yml`](ci/cce-sync.yml)); you only
+  pull. Offline or no remote is never fatal — local commands are unaffected.
+- `cce sync verify` re-indexes locally and confirms the pulled checksum when you
+  want proof. Full model, permissions, and troubleshooting: [`sync.md`](sync.md).
+
+## Consume a team cache — no source checkout (consumer mode)
+
+Turn a whole team cache into a searchable, agent-ready workspace on a machine
+with **zero source checkouts** — only the `cce` binary and git read access:
+
+```bash
+# What does the cache hold? (repo-less: a bare directory + --remote is enough)
+cce sync list --remote git@github.com:acme/cce-cache.git
+
+# Pull EVERY repo's latest index and synthesize a ready-to-search workspace
+cce sync pull --all --into ctx --remote git@github.com:acme/cce-cache.git
+
+# Search / serve it immediately — federated, member-tagged
+cce search "charge invoice" ctx --workspace
+cce mcp --workspace --dir ctx
+
+# Integrity-check the pulled stores (no source, no rebuild, no network)
+cce sync verify --checksum-only --dir ctx
+```
+
+- Re-running `pull --all` is an **idempotent refresh**: only members whose latest
+  pointer moved are re-pulled; new repos join, vanished ones are warned about,
+  never deleted.
+- If the source side pushes with `cce sync push --workspace`, the cache is
+  **self-describing** — consumers also get the real member types/packages and the
+  cross-member dependency graph, so graph expansion works exactly as at the source.
+- `verify --checksum-only` detects corruption, not a malicious build — the full
+  rebuild-and-compare `cce sync verify` stays with whoever has the source (CI).
+- The whole flow, naming/refresh rules, and output examples: [`sync.md`](sync.md) §7.
+
 ## Ingest a knowledge feed (issues, epics, policy docs)
 
 ```bash
