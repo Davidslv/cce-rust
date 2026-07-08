@@ -24,7 +24,8 @@ use crate::sync::artifact::{Artifact, ManifestMeta};
 use crate::sync::config::SyncConfig;
 use crate::sync::remote::{GitRemote, SyncRemote};
 use crate::sync::{
-    content_address, git, normalize_repo_id, pointer_address, HASH_EMBEDDER, SYNC_FORMAT_VERSION,
+    content_address, git, normalize_repo_id, pointer_address, workspace_graph_address,
+    workspace_manifest_address, HASH_EMBEDDER, SYNC_FORMAT_VERSION,
 };
 use crate::workspace::{Manifest, Member, MemberType};
 use serde::{Deserialize, Serialize};
@@ -224,7 +225,16 @@ pub fn cmd_push(root: &Path, commit: Option<String>, workspace: bool) -> Result<
     Ok(format!("Pushed {repo_id}@{sha}\n  key      : {key}\n  checksum : {checksum}\n"))
 }
 
-/// Push every workspace member, each keyed by its own `repo_id@sha`.
+/// Push every workspace member, each keyed by its own `repo_id@sha`, then
+/// publish the workspace metadata under the **base** repo_id (#55, the
+/// self-describing cache): the canonical `workspace.yml` bytes and a freshly
+/// derived `workspace-graph.json` at the well-known
+/// `workspace_manifest_address`/`workspace_graph_address` keys. Publishing is
+/// **additive** — neither key is a `<sha>.cce` artifact nor a `refs/<ref>`
+/// pointer, so existing artifact keys, ref pointers, and old-client pulls are
+/// untouched. The graph is re-derived from the source manifests on disk (the
+/// same `build_graph` `cce index --workspace` uses) rather than re-uploading a
+/// possibly stale `.cce/workspace-graph.json`.
 fn push_workspace(
     root: &Path,
     cfg: &SyncConfig,
@@ -240,6 +250,17 @@ fn push_workspace(
         let (key, checksum) = push_one(&member_dir, remote, &repo_id, &sha)?;
         out.push_str(&format!("  {:<16} {key}  ({})\n", m.name, &checksum[..12]));
     }
+    let ver = SYNC_FORMAT_VERSION.to_string();
+    let graph = crate::workspace::build_graph(root, &manifest);
+    remote.put_many(&[
+        (workspace_manifest_address(HASH_EMBEDDER, &ver, &base), manifest.to_yaml().into_bytes()),
+        (workspace_graph_address(HASH_EMBEDDER, &ver, &base), graph.to_json().into_bytes()),
+    ])?;
+    out.push_str(&format!(
+        "  metadata         workspace.yml + workspace-graph.json under {base} ({} edge{})\n",
+        graph.edges.len(),
+        if graph.edges.len() == 1 { "" } else { "s" }
+    ));
     Ok(out)
 }
 
@@ -1117,6 +1138,7 @@ mod tests {
     }
 
     /// A git workspace with two detectable JS members, committed on `main`.
+    /// `alpha` declares a dependency on `beta` (one cross-member edge, #55).
     fn workspace_repo() -> tempfile::TempDir {
         let tmp = tempfile::tempdir().unwrap();
         let d = tmp.path();
@@ -1124,7 +1146,12 @@ mod tests {
         for name in ["alpha", "beta"] {
             let m = d.join(name);
             std::fs::create_dir_all(m.join("src")).unwrap();
-            std::fs::write(m.join("package.json"), format!("{{\"name\":\"{name}\"}}")).unwrap();
+            let pkg = if name == "alpha" {
+                format!("{{\"name\":\"{name}\",\"dependencies\":{{\"beta\":\"1.0.0\"}}}}")
+            } else {
+                format!("{{\"name\":\"{name}\"}}")
+            };
+            std::fs::write(m.join("package.json"), pkg).unwrap();
             std::fs::write(m.join("src/index.js"), format!("function {name}() {{ return 1; }}\n"))
                 .unwrap();
         }
@@ -1173,6 +1200,59 @@ mod tests {
         // Each member now has its own store.
         assert!(dst.path().join("alpha/.cce/index.json").exists());
         assert!(dst.path().join("beta/.cce/index.json").exists());
+        std::env::remove_var("CCE_HOME");
+    }
+
+    /// #55 Part 1: `push --workspace` additionally publishes the canonical
+    /// workspace manifest + a freshly derived cross-member graph at the
+    /// well-known keys under the **base** repo_id — additively (the member
+    /// artifact keys and ref pointers are exactly the pre-#55 ones).
+    #[test]
+    fn workspace_push_publishes_manifest_and_graph_under_the_base_repo_id() {
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let src = workspace_repo();
+        let base = "example.com__acme__mono";
+        SyncConfig {
+            remote: Some(url.clone()),
+            lfs: false,
+            repo_id: Some(base.to_string()),
+            auto_pull: false,
+            retention: crate::sync::config::Retention::All,
+        }
+        .save(src.path())
+        .unwrap();
+
+        let report = cmd_push(src.path(), None, true).unwrap();
+        assert!(report.contains("metadata"), "got: {report}");
+
+        let ver = SYNC_FORMAT_VERSION.to_string();
+        let remote = GitRemote::open(&url, false).unwrap();
+        // The published manifest is the canonical serialization of the root
+        // manifest, byte-for-byte.
+        let yaml = remote.get(&workspace_manifest_address(HASH_EMBEDDER, &ver, base)).unwrap();
+        let manifest = Manifest::load(src.path()).unwrap();
+        assert_eq!(String::from_utf8(yaml).unwrap(), manifest.to_yaml());
+        // The published graph carries the alpha -> beta edge.
+        let json = remote.get(&workspace_graph_address(HASH_EMBEDDER, &ver, base)).unwrap();
+        let graph =
+            crate::workspace::WorkspaceGraph::from_json(&String::from_utf8(json).unwrap()).unwrap();
+        assert_eq!(graph.members, vec!["alpha", "beta"]);
+        assert_eq!(graph.edges.len(), 1);
+        assert_eq!(graph.edges[0].from, "alpha");
+        assert_eq!(graph.edges[0].to, "beta");
+        // Additive: the member keys and pointers are exactly the pre-#55 shape.
+        let sha = git::head_sha(src.path()).unwrap();
+        for m in ["alpha", "beta"] {
+            let repo_id = format!("{base}__{m}");
+            assert!(remote.has(&content_address(HASH_EMBEDDER, &ver, &repo_id, &sha)).unwrap());
+            assert_eq!(
+                remote
+                    .read_blob_text(&pointer_address(HASH_EMBEDDER, &ver, &repo_id, "main"))
+                    .unwrap(),
+                sha
+            );
+        }
         std::env::remove_var("CCE_HOME");
     }
 
