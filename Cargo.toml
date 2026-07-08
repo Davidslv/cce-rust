@@ -37,7 +37,14 @@ ignore = "=0.4.23"
 clap = { version = "=4.6.1", features = ["derive"] }
 ureq = { version = "=3.3.0", features = ["json"] }
 serde = { version = "=1.0.228", features = ["derive"] }
-serde_json = "=1.0.150"
+# `float_roundtrip`: parse floats with full precision so a persisted f64 (an
+# embedding) parses back to the EXACT double that was written. Load-bearing for
+# knowledge-corpus sync (SPEC-SYNC-KNOWLEDGE §2): `knowledge push` exports the
+# LOADED store (there is no feed at push time to rebuild from), so without exact
+# parsing the `.cck` would drift a ULP from a local ingest and break the
+# pulled-store byte-identity bar. Writing was always shortest-roundtrip; this
+# makes reading match it.
+serde_json = { version = "=1.0.150", features = ["float_roundtrip"] }
 # High-confidence secret redaction patterns (SPEC-V2.1 §1, Layer 2), pinned.
 regex = "=1.12.4"
 # YAML parsing for the workspace manifest (SPEC-V2.2 §2), pinned. Reading only —

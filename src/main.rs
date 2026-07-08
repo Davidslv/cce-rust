@@ -342,15 +342,58 @@ enum SyncCmd {
     },
 }
 
-/// Subcommands of `cce knowledge` (SPEC-V2.6 §4).
+/// Subcommands of `cce knowledge` (SPEC-V2.6 §4; sync per SPEC-SYNC-KNOWLEDGE §5).
 #[derive(Subcommand)]
 enum KnowledgeCmd {
     /// Index a `cce.knowledge/v1` NDJSON feed into `<dir>/.cce/knowledge/`.
+    ///
+    /// The v2.1 redactor runs at index time, before chunking — unconditionally
+    /// (there is no redaction-bypass flag, by design: SPEC-SYNC-KNOWLEDGE §4.6).
     Index {
         /// The `cce.knowledge/v1` file to ingest (NDJSON, one record per line).
         file: PathBuf,
         /// Project root whose `.cce/knowledge/` store receives the snapshot
         /// (default: current directory).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// Export the current local knowledge store as a canonical `.cck` and put it
+    /// on the cache remote: artifact + `current` pointer + `corpus.json` in one
+    /// commit, then retention (SPEC-SYNC-KNOWLEDGE §5). The raw feed never
+    /// travels — only the built, redacted store.
+    Push {
+        /// The corpus identity (else `knowledge.sync.corpus_id` from .cce/config).
+        #[arg(long)]
+        corpus: Option<String>,
+        /// Push to this cache URL (else `knowledge.sync.remote`, else `sync.remote`).
+        #[arg(long)]
+        remote: Option<String>,
+        /// Project root holding the knowledge store (default: current directory).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+    },
+    /// Fetch a corpus from the cache remote, verify its checksum, and install it
+    /// into `<dir>/.cce/knowledge/` exactly as a local ingest would
+    /// (SPEC-SYNC-KNOWLEDGE §5/§7).
+    Pull {
+        /// The corpus identity (else `knowledge.sync.corpus_id` from .cce/config).
+        #[arg(long)]
+        corpus: Option<String>,
+        /// Resolve the corpus's `current` pointer (the explicit spelling of the
+        /// default).
+        #[arg(long, conflicts_with = "snapshot")]
+        latest: bool,
+        /// Pin a specific snapshot id instead of the `current` pointer.
+        #[arg(long)]
+        snapshot: Option<String>,
+        /// Replace a locally-installed DIFFERENT corpus (one active corpus per
+        /// root; a newer snapshot of the same corpus supersedes without this).
+        #[arg(long)]
+        force: bool,
+        /// Pull from this cache URL (else `knowledge.sync.remote`, else `sync.remote`).
+        #[arg(long)]
+        remote: Option<String>,
+        /// Project root receiving the store (default: current directory).
         #[arg(long)]
         dir: Option<PathBuf>,
     },
@@ -437,6 +480,18 @@ fn main() -> ExitCode {
         Command::Savings { dir, store, metrics, json } => cmd_savings(dir, store, metrics, json),
         Command::Knowledge { cmd } => match cmd {
             KnowledgeCmd::Index { file, dir } => cmd_knowledge_index(&file, dir),
+            KnowledgeCmd::Push { corpus, remote, dir } => {
+                let root = dir.unwrap_or_else(|| PathBuf::from("."));
+                cce::sync::knowledge_commands::cmd_knowledge_push(&root, corpus, remote)
+                    .map(|report| print!("{report}"))
+            }
+            KnowledgeCmd::Pull { corpus, latest: _, snapshot, force, remote, dir } => {
+                let root = dir.unwrap_or_else(|| PathBuf::from("."));
+                cce::sync::knowledge_commands::cmd_knowledge_pull(
+                    &root, corpus, snapshot, force, remote,
+                )
+                .map(|report| print!("{report}"))
+            }
         },
         Command::Eval { runs, questions, json } => cmd_eval(&runs, &questions, json),
     };
