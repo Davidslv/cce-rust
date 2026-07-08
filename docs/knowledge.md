@@ -154,6 +154,27 @@ knowledge:
   default_source: both      # code | knowledge | both — used when a search omits `source`
 ```
 
+## Syncing a corpus (M5.1/M5.2) — `cce knowledge push` / `pull`
+
+A built corpus travels through the **same content-addressed cache** as code
+indexes, as a canonical `.cck` artifact under its own additive
+`knowledge/<contract_version>/<corpus_id>/` key space — the built, redacted
+store, **never the raw feed**. The normative reference is
+[SPEC-SYNC-KNOWLEDGE.md](../SPEC-SYNC-KNOWLEDGE.md) (the six decisions, the
+byte-exact container, guards, retention); this section is a stub until the M5.4
+documentation pass.
+
+```sh
+cce knowledge push [--corpus <id>] [--remote <url>]   # export + publish the current store
+cce knowledge pull [--corpus <id>] [--latest | --snapshot <id>] [--force] [--remote <url>]
+```
+
+Configured via `knowledge.sync.corpus_id` / `knowledge.sync.remote` /
+`knowledge.sync.retention` in `.cce/config` (SPEC-SYNC-KNOWLEDGE §8). A pulled
+corpus is **byte-identical to a local ingest**, so retrieval needs zero changes.
+The consumer surfaces (`cce sync list` knowledge section, `pull --all`,
+`verify --checksum-only`) land with M5.3.
+
 ## The plugin / adapter strategy
 
 CCE ships the chunker + the `cce.knowledge/v1` contract + the ingest. **Real

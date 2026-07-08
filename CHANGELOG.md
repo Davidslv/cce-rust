@@ -7,6 +7,37 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **Knowledge-corpus sync M5.1+M5.2 — the `.cck` artifact and `cce knowledge push` / `pull`
+  (#56, per SPEC-SYNC-KNOWLEDGE).** A built knowledge store now travels through the same
+  content-addressed cache as code indexes. `sync::knowledge_artifact` owns the canonical,
+  byte-exact `.cck` container (manifest + one line per chunk in store order, sorted-keys
+  compact JSON, the `.cce` base64 f64-LE embedding codec, zero provenance fields, checksum
+  computed with `checksum:""`) — a pure function of `(feed, corpus_id)`, with a committed
+  golden checksum for the shared fixture feed and a refusal of embedding-less Phase-A
+  stores. `cce knowledge push [--corpus <id>] [--remote <url>]` exports the current local
+  store and lands artifact + `current` pointer + published `corpus.json`
+  (`cce.knowledgemeta/v1`, carrying `pushed_at` — deliberately outside the reproducible
+  artifact; the deterministic `data_as_of` lives inside it) in one commit, then applies
+  per-corpus `knowledge.sync.retention` (`keep-last-<n>` prunes oldest by the cache repo's
+  commit order; the `current` snapshot is never pruned; prune failures warn, never fail the
+  push). `cce knowledge pull [--corpus <id>] [--latest | --snapshot <id>] [--force]
+  [--remote <url>]` verifies the manifest checksum (a mismatch is a hard failure naming the
+  key) and installs into `.cce/knowledge/` **byte-identical to a local ingest**, recording
+  the knowledge sync marker (`synced.json` with `installed_sha256`, the #55 mechanism —
+  the `verify --checksum-only` surface wires up in M5.3). Guards per the spec: corpus_id is
+  never derived (explicit `--corpus` or `knowledge.sync.corpus_id`, validated
+  sanitize-stable); pulling a different corpus refuses without `--force`; the raw feed
+  never travels and a planted secret arrives redacted in the artifact (`knowledge index`
+  has no bypass flag — asserted). Config: `knowledge.sync.corpus_id` / `remote` (per-corpus
+  §4.3 override; default `sync.remote`) / `retention`. `serde_json` gains the
+  `float_roundtrip` feature so a loaded store's embeddings parse back to the exact doubles
+  that were written (push exports the loaded store; without it the `.cck` drifted a ULP
+  from a local ingest). Additive throughout: `SYNC_FORMAT_VERSION`, `conformance.json`,
+  code artifacts, and every existing golden are untouched (asserted, not assumed — a
+  knowledge corpus beside code artifacts leaves `sync list --json` byte-identical). M5.3
+  (consumer surfaces) and M5.4 (docs + ingestion reference) remain.
+
 ### Documentation
 - **SPEC-SYNC-KNOWLEDGE.md — the normative build spec for M5, knowledge-corpus sync (#56).**
   The SPEC-SYNC pattern reapplied to the v2.6 knowledge system: a canonical, provenance-free
