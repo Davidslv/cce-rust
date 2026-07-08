@@ -23,6 +23,7 @@ pub mod artifact;
 pub mod commands;
 pub mod config;
 pub mod git;
+pub mod knowledge_artifact;
 pub mod remote;
 
 use sha2::{Digest, Sha256};
@@ -153,6 +154,44 @@ pub fn workspace_graph_address(embedder: &str, cce_ver: &str, base_repo_id: &str
     format!("{embedder}/{cce_ver}/{base_repo_id}/workspace-graph.json")
 }
 
+/// The version segment of the pinned knowledge contract id (SPEC-SYNC-KNOWLEDGE
+/// §3): `v1` from `cce.knowledge/v1`. The knowledge key space versions on this —
+/// its OWN contract — never on `SYNC_FORMAT_VERSION`: only a change to the `.cck`
+/// bytes' shape moves it.
+pub fn knowledge_contract_version() -> &'static str {
+    crate::knowledge::KNOWLEDGE_SCHEMA_ID.rsplit('/').next().unwrap_or("v1")
+}
+
+/// The content address for a knowledge corpus artifact (SPEC-SYNC-KNOWLEDGE §3):
+/// `knowledge/<contract_version>/<corpus_id>/<snapshot>.cck`. The `knowledge/`
+/// prefix is disjoint from every `<embedder_id>/…` prefix, so introducing it is
+/// additive — no existing key or old-client read path can collide with it.
+pub fn knowledge_content_address(contract_ver: &str, corpus_id: &str, snapshot: &str) -> String {
+    format!("knowledge/{contract_ver}/{corpus_id}/{snapshot}.cck")
+}
+
+/// The corpus `current` pointer address (SPEC-SYNC-KNOWLEDGE §3): a one-line file
+/// naming the corpus's active snapshot — the exact analogue of the code cache's
+/// `refs/<ref>` pointers (and of the local store's `.cce/knowledge/current`).
+pub fn knowledge_pointer_address(contract_ver: &str, corpus_id: &str) -> String {
+    format!("knowledge/{contract_ver}/{corpus_id}/current")
+}
+
+/// The published corpus-metadata address (SPEC-SYNC-KNOWLEDGE §4.4): the tiny,
+/// non-LFS `corpus.json` blob carrying `pushed_at` (deliberately OUTSIDE the
+/// reproducible artifact) — the #55 well-known-key pattern.
+pub fn knowledge_corpus_meta_address(contract_ver: &str, corpus_id: &str) -> String {
+    format!("knowledge/{contract_ver}/{corpus_id}/corpus.json")
+}
+
+/// Validate a `corpus_id` (SPEC-SYNC-KNOWLEDGE §4.1): non-empty, charset
+/// `[A-Za-z0-9._-]`, and **sanitize-stable** — push refuses an id `sanitize_id`
+/// would alter rather than silently rewriting it (the repo_id discipline, with
+/// derivation dropped: knowledge has no git origin to normalize).
+pub fn valid_corpus_id(id: &str) -> bool {
+    !id.is_empty() && sanitize_id(id) == id
+}
+
 /// The base directory that holds every remote's local working clone. It is
 /// `$CCE_HOME/sync` when `CCE_HOME` is set (used by hermetic tests), else
 /// `~/.cce/sync` (SPEC-SYNC §4). Falls back to `./.cce/sync` if no home is known.
@@ -246,6 +285,35 @@ mod tests {
             pointer_address("hash", "2.3", "github.com__acme__billing", "main"),
             "hash/2.3/github.com__acme__billing/refs/main"
         );
+    }
+
+    #[test]
+    fn knowledge_addresses_live_under_their_own_prefix() {
+        assert_eq!(knowledge_contract_version(), "v1");
+        assert_eq!(
+            knowledge_content_address("v1", "internal-tickets", "9f1c2a3b4c5d6e7f"),
+            "knowledge/v1/internal-tickets/9f1c2a3b4c5d6e7f.cck"
+        );
+        assert_eq!(
+            knowledge_pointer_address("v1", "internal-tickets"),
+            "knowledge/v1/internal-tickets/current"
+        );
+        assert_eq!(
+            knowledge_corpus_meta_address("v1", "internal-tickets"),
+            "knowledge/v1/internal-tickets/corpus.json"
+        );
+        // Disjoint from every embedder prefix (SPEC-SYNC-KNOWLEDGE §3 additivity).
+        assert!(!knowledge_content_address("v1", "x", "y").starts_with(HASH_EMBEDDER));
+    }
+
+    #[test]
+    fn corpus_id_validation_is_sanitize_stable() {
+        assert!(valid_corpus_id("internal-tickets"));
+        assert!(valid_corpus_id("runbooks_v2.1"));
+        assert!(!valid_corpus_id(""));
+        assert!(!valid_corpus_id("has space"));
+        assert!(!valid_corpus_id("has/slash"));
+        assert!(!valid_corpus_id("emoji✨"));
     }
 
     #[test]
