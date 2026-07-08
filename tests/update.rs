@@ -130,13 +130,27 @@ fn handle(mut stream: TcpStream, root: &Path) {
 }
 
 /// Run `bin` with the update env overrides pointing at `base`.
+///
+/// Retries on `ETXTBSY` (#78): a sibling test's fork can momentarily inherit
+/// the write fd from `stage_binary`'s copy, so the first exec of a freshly
+/// staged binary is racy under a parallel run. The inherited fd closes as soon
+/// as that child execs, so a short retry always clears it.
 fn run_update(bin: &Path, base: &str, args: &[&str]) -> Output {
-    Command::new(bin)
-        .args(args)
-        .env("CCE_UPDATE_BASE_URL", base)
-        .env("CCE_UPDATE_TARGET", TEST_TRIPLE)
-        .output()
-        .expect("run cce")
+    let mut attempts = 0;
+    loop {
+        let result = Command::new(bin)
+            .args(args)
+            .env("CCE_UPDATE_BASE_URL", base)
+            .env("CCE_UPDATE_TARGET", TEST_TRIPLE)
+            .output();
+        match result {
+            Err(e) if e.kind() == std::io::ErrorKind::ExecutableFileBusy && attempts < 10 => {
+                attempts += 1;
+                thread::sleep(std::time::Duration::from_millis(50));
+            }
+            other => return other.expect("run cce"),
+        }
+    }
 }
 
 fn stdout(out: &Output) -> String {
