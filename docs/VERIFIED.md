@@ -4,7 +4,7 @@ This file records the **mandatory cold-start passes**: the documented install +
 walkthroughs followed from scratch, confirming **every documented command runs
 verbatim** and its output matches the docs. A doc example that does not run is a bug.
 
-Three passes are recorded, all real captured runs:
+Four passes are recorded, all real captured runs:
 
 - **Offline cold start (THE guarantee)** — with **no network and no sync remote
   configured**, `index` · `search` · `stats` · `dashboard` · `workspace` · `cce mcp`
@@ -15,6 +15,11 @@ Three passes are recorded, all real captured runs:
 - **v2.5 Savings Layers cold start** — a fresh `cce index` → a nine-tool `cce mcp`
   session (compact `context_search` → `expand_chunk` → `record_decision` /
   `session_recall` → `summarize_context`) → `cce savings`, all offline (Part 3).
+- **Knowledge-corpus sync cold start (M5)** — feed → `cce knowledge index` →
+  `cce knowledge push` to a local bare cache → a bare-directory consumer:
+  `sync list` (knowledge section), `pull --all` (corpus installed), `verify
+  --checksum-only` (knowledge row), MCP `index_status` + `context_search
+  source: both` (Part 4).
 
 - **Engine:** `cce 2.5.5` (release build). Parts 1–2 are re-confirmed at 2.5.5: v2.5
   is **additive**, so the offline core and Sync behave exactly as before (only the
@@ -581,6 +586,145 @@ CCE eval — real end-to-end A/B (cost-primary, correctness-gated, paired)
   paired cost: off $2.45 · on $0.67 · saved $1.78  (72.7%)
 ```
 
+---
+
+# Part 4 — Knowledge-corpus sync cold start (M5)
+
+The SPEC-SYNC-KNOWLEDGE §10.5-style verification gate for M5.4: the documented
+knowledge walkthrough ([knowledge.md](knowledge.md) "Syncing a corpus",
+[sync.md](sync.md) consumer mode) followed from scratch against a **local bare
+git remote** (`file://`), no network, LFS off. Engine: `cce 2.6.9` (dev build at
+the M5.3+M5.4 change). Absolute paths appear as `$WORK`; the snapshot ids and
+checksums are the real, deterministic values for this fixture feed.
+
+## 1. Producer — index (redacts) and push the corpus
+
+A producer root with `sync.remote` + `knowledge.sync.*` configured, and a
+two-record `cce.knowledge/v1` feed (`corpus.jsonl`). One code repo
+(`github.com__acme__billing`) was pushed to the same cache first, the
+documented Part-2 way.
+
+```console
+$ cce knowledge index producer/corpus.jsonl --dir producer
+Indexed knowledge from producer/corpus.jsonl
+  schema    : cce.knowledge/v1
+  records   : 2
+  chunks    : 2
+  snapshot  : cd0ebbdf8dcc0972
+  store     : producer/.cce/knowledge/cd0ebbdf8dcc0972.json
+
+$ cce knowledge push --dir producer
+Pushed corpus internal-tickets@cd0ebbdf8dcc0972
+  key        : knowledge/v1/internal-tickets/cd0ebbdf8dcc0972.cck
+  checksum   : c6bda840f22cc142388e04fae361cf90c5a53b1c554b00dbb5969ca7f3cb8457
+  records    : 2 · chunks : 2
+  data as-of : 2026-07-01T09:00:00Z
+  pushed at  : 2026-07-08T16:27:59Z
+```
+
+`data as-of` (deterministic, inside the artifact) and `pushed at` (outside, in
+the published `corpus.json`) are the two §4.4 freshness signals.
+
+## 2. Discovery — `cce sync list` grows the knowledge section
+
+```console
+$ cce sync list --remote file://$WORK/cache.git
+remote        : file://$WORK/cache.git
+
+repo_id                    latest                                    artifacts  bytes
+github.com__acme__billing  416acb0718d9f68aa3c3dd39fc07d3e94496913b          1   3349
+
+total         : 1 repo, 1 artifact, 3349 bytes
+
+knowledge:
+corpus_id         current           snapshots  bytes  data as-of
+internal-tickets  cd0ebbdf8dcc0972          1   6723  2026-07-01T09:00:00Z
+```
+
+`--json` stays `cce.synclist/v1` and gains the optional `knowledge` array
+(emitted only because a corpus exists — a knowledge-free cache's listing is
+byte-identical to Part 2's):
+
+```json
+  "knowledge": [
+    {
+      "bytes": 6723,
+      "corpus_id": "internal-tickets",
+      "current": "cd0ebbdf8dcc0972",
+      "data_as_of": "2026-07-01T09:00:00Z",
+      "pushed_at": "2026-07-08T16:27:59Z",
+      "snapshots": 1
+    }
+  ],
+```
+
+## 3. Consumer — a bare directory gets code AND knowledge in one command
+
+```console
+$ cce sync pull --all --into ctx --remote file://$WORK/cache.git
+remote        : file://$WORK/cache.git
+
+  billing          pulled      github.com__acme__billing@416acb0718d9f68aa3c3dd39fc07d3e94496913b  chunks 1  (c4b5ad7ad0db)
+  knowledge        pulled      internal-tickets@cd0ebbdf8dcc0972  → .cce/knowledge/
+
+workspace     : ctx/.cce/workspace.yml (1 member)
+summary       : 1 pulled · 0 up-to-date · 0 skipped
+
+$ cce sync verify --checksum-only --dir ctx
+verify OK (checksum-only): 1 member
+  billing          github.com__acme__billing@416acb0718d9f68aa3c3dd39fc07d3e94496913b  (d02501b4a5f6)
+  knowledge        internal-tickets@cd0ebbdf8dcc0972  (027ad6e20f95)
+```
+
+The installed `ctx/.cce/knowledge/cd0ebbdf8dcc0972.json` is **byte-identical**
+to the producer's (the §7 bar — asserted continuously by
+`tests/knowledge_sync.rs`). A second run is idempotent — nothing re-fetched:
+
+```console
+$ cce sync pull --all --into ctx --remote file://$WORK/cache.git
+  billing          up-to-date  github.com__acme__billing@416acb0718d9f68aa3c3dd39fc07d3e94496913b
+  knowledge        up-to-date  internal-tickets@cd0ebbdf8dcc0972
+  …
+summary       : 0 pulled · 1 up-to-date · 0 skipped
+```
+
+## 4. MCP over the consumer — freshness + the blended search
+
+`cce mcp --workspace --dir ctx`, driven over stdio:
+
+```console
+# index_status → the §4.4 knowledge block
+Workspace status: ctx
+  billing (package billing) — files 1, chunks 1
+  totals  : files 1, chunks 1
+  edges (0):
+  source  : local (built by cce index)
+  remote  : (no sync remote configured — pure local)
+  knowledge :
+    corpus         : internal-tickets
+    snapshot       : cd0ebbdf8dcc0972
+    records/chunks : 2 / 2
+    data as-of     : 2026-07-01T09:00:00Z
+    remote current : cd0ebbdf8dcc0972
+    behind remote  : no
+
+# context_search {"query": "password hashing policy", "source": "both"}
+ 1. [0.988523] [knowledge] Password hashing policy — closed · 2026-07-01T09:00:00Z · https://tickets.example/41 #268f67628c20b2b9
+# Password hashing policy
+
+## Rule
+
+Store each password only as a salted slow hash; never keep the plaintext password.
+
+ 2. [0.876031] billing · billing.py:1-2 (function/function_definition) #33459f1fa15c580c
+def hash_password(password):
+return slow_salted_hash(password)
+```
+
+The *why* (the policy record, with full provenance) ranks beside the *what*
+(the pulled code chunk) — on a machine that never ran an adapter and never had
+a source checkout. **Result: knowledge cold-start PASSED.**
+
 ## Automated gates (re-run to reproduce)
 
 ```console
@@ -602,5 +746,5 @@ suite (`tests/sync.rs`) covers init → push → pull → search → verify plus
 and the offline guarantee. The dashboard suites (`src/dashboard.rs`, `tests/dashboard.rs`)
 assert the refreshed `/api/metrics` panels over a real loopback socket.
 
-**Result: cold-start PASSED (offline + online + v2.5 Savings Layers).** Every
+**Result: cold-start PASSED (offline + online + v2.5 Savings Layers + M5 knowledge sync).** Every
 documented command ran verbatim and its output matched the docs.

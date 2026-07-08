@@ -225,6 +225,28 @@ store path, and the sync **freshness**: the index source (local vs pulled), its 
 and whether it is behind the remote. In a workspace it reports per-member counts and
 the cross-member dependency edges.
 
+When a **knowledge store** exists at the served root ([knowledge.md](knowledge.md)),
+the report additionally gains a knowledge block (SPEC-SYNC-KNOWLEDGE §4.4):
+
+```
+  knowledge :
+    corpus         : internal-tickets
+    snapshot       : 9f1c2a3b4c5d6e7f
+    records/chunks : 412 / 1873
+    data as-of     : 2026-07-01T09:00:00Z
+    remote current : 9f1c2a3b4c5d6e7f
+    behind remote  : no
+```
+
+`corpus` is the pulled corpus id, or `(local ingest)` when the current snapshot
+did not come from a pull; `data as-of` is the corpus's max `updated_at` (`-` when
+no record carries one). `remote current` / `behind remote` follow the same
+offline-safe rules as the code freshness lines: consulted only when a sync remote
+is configured, best-effort, any failure degrades to `-` / `no` (`behind remote`
+becomes the actionable ``yes — run `cce knowledge pull` `` only when both
+snapshots are known and differ) — `index_status` always answers. With no
+knowledge store the report is byte-identical to before.
+
 ### 3. `record_feedback`
 
 > Record whether a prior `context_search` result was helpful, to improve the quality

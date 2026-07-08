@@ -35,8 +35,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   that were written (push exports the loaded store; without it the `.cck` drifted a ULP
   from a local ingest). Additive throughout: `SYNC_FORMAT_VERSION`, `conformance.json`,
   code artifacts, and every existing golden are untouched (asserted, not assumed — a
-  knowledge corpus beside code artifacts leaves `sync list --json` byte-identical). M5.3
-  (consumer surfaces) and M5.4 (docs + ingestion reference) remain.
+  knowledge corpus beside code artifacts leaves `sync list --json` byte-identical).
+- **Knowledge-corpus sync M5.3+M5.4 — the consumer surface and the ingestion reference
+  (#56, completing SPEC-SYNC-KNOWLEDGE).** Corpora are now first-class on every consumer
+  surface. `cce sync list` grows the §6 knowledge section: a human block after the repos
+  table (corpus / current / snapshots / LFS-aware bytes / data as-of) and an OPTIONAL
+  `knowledge` array on the unchanged `cce.synclist/v1` JSON — emitted only when the cache
+  carries a corpus, so knowledge-free listings stay byte-identical (nullable fields stay
+  present as `null`). `cce sync pull --all [--corpus <id>]` installs the cache's corpus
+  into the consumer workspace root `.cce/knowledge/` via the `knowledge pull` machinery
+  verbatim (store, `current`, and marker byte-identical to a direct pull): an explicit
+  `--corpus` wins, a single-corpus cache auto-installs, several corpora warn-and-skip
+  naming the ids (one active corpus per root; member pulls never fail because of
+  knowledge), and refresh is marker-idempotent — an unmoved remote `current` reports
+  `up-to-date` with no fetch, a moved one refreshes exactly the corpus. `cce sync verify
+  --checksum-only` gains the knowledge row: re-hash of the installed snapshot against the
+  marker's `installed_sha256`, with member semantics (pass row; a mismatch fails loudly
+  naming the corpus — plus the honest sharpening that knowledge has NO rebuild-verify
+  escalation path at all; a marker without the hash is an explicit notice at exit 0), and
+  a knowledge-only root verifies too. MCP `index_status` gains the §4.4 knowledge block
+  (corpus or `(local ingest)`, snapshot, records/chunks, data as-of, best-effort
+  offline-safe `remote current` / `behind remote` mirroring the code freshness rules);
+  reports without a knowledge store are byte-identical. M5.4 ships the reference
+  scheduled-adapter workflow `docs/ci/cce-knowledge-sync.yml` (fetch → emit
+  `cce.knowledge/v1` → `cce knowledge index` (redacts) → `cce knowledge push`; a builder
+  job, never a serving process; the feed is ephemeral and never committed; disjoint
+  source-READ vs cache-WRITE secrets) and the documentation pass: docs/knowledge.md M5
+  un-deferred with the full sync/consumer/freshness/trust story, docs/sync.md consumer
+  mode covers corpora in `list`/`pull --all`/`verify`, docs/mcp.md documents the
+  `index_status` knowledge block, README and llms.txt updated. One pinned surface moved
+  by design: the #69 additivity test now asserts the M5.3 shape (every pre-existing
+  listing field byte-stable beside a corpus; the corpus visible only as the new optional
+  key).
 
 ### Documentation
 - **SPEC-SYNC-KNOWLEDGE.md — the normative build spec for M5, knowledge-corpus sync (#56).**
