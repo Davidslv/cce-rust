@@ -434,6 +434,61 @@ fn knowledge_index_ingests_a_feed_in_a_fresh_process() {
     assert!(kdir.join(format!("{}.json", ptr.trim())).exists());
 }
 
+/// Run `cce <args> --store <store>` and assert the corrupt-store contract
+/// (issue #37): non-zero exit, the friendly `could not load store` message
+/// naming the path, and no panic leaking to stderr.
+fn assert_corrupt_store_error(args: &[&str], store: &std::path::Path) {
+    let out = Command::new(bin()).args(args).arg("--store").arg(store).output().unwrap();
+    assert!(!out.status.success(), "{args:?} on a corrupt store must exit non-zero");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(
+        stderr.contains("error: could not load store"),
+        "{args:?} must print the friendly load error, got: {stderr}"
+    );
+    assert!(
+        stderr.contains("index.json"),
+        "{args:?} must name the offending store path, got: {stderr}"
+    );
+    assert!(!stderr.contains("panicked"), "{args:?} must not panic, got: {stderr}");
+}
+
+#[test]
+fn search_and_stats_on_truncated_store_exit_nonzero() {
+    // Issue #37: a store cut off mid-write (crash, full disk, partial copy) is
+    // truncated JSON. Both read commands must fail cleanly, never panic.
+    let tmp = tempfile::tempdir().unwrap();
+    write_tiny_repo(tmp.path());
+    let store = tmp.path().join("index.json");
+    let out = Command::new(bin())
+        .args(["index"])
+        .arg(tmp.path())
+        .arg("--store")
+        .arg(&store)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "index failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    let bytes = std::fs::read(&store).unwrap();
+    assert!(bytes.len() > 2, "fixture store unexpectedly small");
+    std::fs::write(&store, &bytes[..bytes.len() / 2]).unwrap();
+
+    assert_corrupt_store_error(&["search", "hash password"], &store);
+    assert_corrupt_store_error(&["stats"], &store);
+}
+
+#[test]
+fn search_and_stats_on_binary_junk_store_exit_nonzero() {
+    // Issue #37: a store overwritten with non-JSON binary junk (not even UTF-8)
+    // must be a clear non-zero error at the binary level, never a panic.
+    let tmp = tempfile::tempdir().unwrap();
+    let store = tmp.path().join("index.json");
+    let junk: Vec<u8> = [0x00u8, 0xff, 0xfe, 0x01, 0x80, 0x7f].repeat(64);
+    std::fs::write(&store, junk).unwrap();
+
+    assert_corrupt_store_error(&["search", "hash password"], &store);
+    assert_corrupt_store_error(&["stats"], &store);
+}
+
 #[test]
 fn knowledge_index_missing_file_exits_nonzero() {
     let out = Command::new(bin())
