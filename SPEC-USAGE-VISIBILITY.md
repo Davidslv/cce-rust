@@ -258,6 +258,7 @@ cce: 5 results from 38,628 chunks · served ~1,204 tok vs ~9,880 baseline · sav
 - **Docs:** `docs/mcp.md` (footer toggle + "off by default for context hygiene" + `cce usage` as a
   confirm-usage signal), `docs/dashboard.md` (cross-link `cce usage`; the §2.5 additive fields),
   `docs/how-to.md` (the "who used CCE" recipe), and the command table in `README.md`.
+  `SPEC-MCP.md` gains the footer note (output formatting only; contract unchanged).
 
 ## 5. Conformance & tests
 
