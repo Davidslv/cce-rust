@@ -891,3 +891,365 @@ fn pull_all_name_collision_gets_the_dash2_suffix() {
         "got: {report}"
     );
 }
+
+// --- #55: the self-describing cache — published workspace metadata + checksum-only verify ---
+
+/// A committed JS workspace where member `alpha` DEPENDS ON member `beta`
+/// (`package.json` dependency → one cross-member edge). Beta's content shares
+/// no vocabulary with the alpha query, so only the graph edge can pull it in.
+fn dep_workspace() -> tempfile::TempDir {
+    let tmp = tempfile::tempdir().unwrap();
+    let d = tmp.path();
+    git(d, &["init", "-q", "-b", "main"]);
+    std::fs::create_dir_all(d.join("alpha/src")).unwrap();
+    std::fs::write(
+        d.join("alpha/package.json"),
+        "{\"name\":\"alpha\",\"dependencies\":{\"beta\":\"1.0.0\"}}",
+    )
+    .unwrap();
+    // Three query-relevant functions: with `--top-k 3` the base ranking is all
+    // alpha, so a beta row can ONLY come from cross-member graph expansion.
+    std::fs::write(
+        d.join("alpha/src/launch.js"),
+        "function alphaRocketLaunchThrust(thrust) {\n  return thrust * 2;\n}\n\n\
+         function alphaRocketLaunchWindow(thrust) {\n  return thrust + 1;\n}\n\n\
+         function alphaRocketLaunchAbort(thrust) {\n  return thrust - 1;\n}\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(d.join("beta/src")).unwrap();
+    std::fs::write(d.join("beta/package.json"), "{\"name\":\"beta\"}").unwrap();
+    std::fs::write(
+        d.join("beta/src/dive.js"),
+        "function betaSubmarineDive(depth) {\n  return depth + 1;\n}\n",
+    )
+    .unwrap();
+    git(d, &["add", "-A"]);
+    git(d, &["commit", "-q", "-m", "init"]);
+    tmp
+}
+
+const BASE_ID: &str = "example.com__acme__mono";
+
+/// `cce workspace init` + `cce sync init` + `cce sync push --workspace`,
+/// asserting the metadata publication line.
+fn init_and_push_workspace(home: &Path, url: &str, dir: &Path) {
+    let out = cce(home, &["workspace", "init", dir.to_str().unwrap()]);
+    assert!(out.status.success(), "workspace init: {}", String::from_utf8_lossy(&out.stderr));
+    let out = cce(
+        home,
+        &[
+            "sync",
+            "init",
+            "--remote",
+            url,
+            "--no-lfs",
+            "--repo-id",
+            BASE_ID,
+            "--dir",
+            dir.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success(), "sync init: {}", String::from_utf8_lossy(&out.stderr));
+    let out = cce(home, &["sync", "push", "--workspace", "--dir", dir.to_str().unwrap()]);
+    assert!(out.status.success(), "push --workspace: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("workspace.yml + workspace-graph.json"), "got: {stdout}");
+}
+
+/// Run a federated `--json` search (`--top-k 3`) and return the parsed
+/// `results` array.
+fn fed_results(home: &Path, dir: &Path, query: &str, graph: bool) -> serde_json::Value {
+    let mut args =
+        vec!["search", query, dir.to_str().unwrap(), "--workspace", "--json", "--top-k", "3"];
+    if !graph {
+        args.push("--no-graph");
+    }
+    let out = cce(home, &args);
+    assert!(out.status.success(), "search failed: {}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    v["results"].clone()
+}
+
+/// The decisive #55 test: A depends on B → `push --workspace` publishes the
+/// metadata → a REPO-LESS `pull --workspace` and a repo-less `pull --all` both
+/// regain cross-member graph expansion — a federated search hitting alpha pulls
+/// beta context, byte-identical to the same search on the source-side workspace.
+#[test]
+fn published_metadata_gives_repo_less_consumers_cross_member_expansion_byte_identical() {
+    let home = tempfile::tempdir().unwrap();
+    let (_bare, url) = bare_remote();
+    let src = dep_workspace();
+    init_and_push_workspace(home.path(), &url, src.path());
+
+    // Source-side truth: index the workspace (member stores + derived graph),
+    // then search WITH graph expansion.
+    let out = cce(home.path(), &["index", src.path().to_str().unwrap(), "--workspace"]);
+    assert!(out.status.success(), "index --workspace: {}", String::from_utf8_lossy(&out.stderr));
+    let query = "alpha rocket launch thrust";
+    let source_results = fed_results(home.path(), src.path(), query, true);
+    let members_of = |results: &serde_json::Value| -> Vec<String> {
+        results
+            .as_array()
+            .unwrap()
+            .iter()
+            .map(|r| r["package"].as_str().unwrap().to_string())
+            .collect()
+    };
+    // The source-side search proves the expansion premise: beta appears only
+    // because of the alpha -> beta edge (absent under --no-graph).
+    assert!(members_of(&source_results).contains(&"beta".to_string()));
+    assert!(!members_of(&fed_results(home.path(), src.path(), query, false))
+        .contains(&"beta".to_string()));
+
+    // Consumer 1: repo-less `pull --workspace --latest` (bare dir + config only).
+    let c1 = tempfile::tempdir().unwrap();
+    let ctx1 = c1.path().join("ctx");
+    std::fs::create_dir_all(&ctx1).unwrap();
+    let out = cce(
+        home.path(),
+        &[
+            "sync",
+            "init",
+            "--remote",
+            &url,
+            "--no-lfs",
+            "--repo-id",
+            BASE_ID,
+            "--dir",
+            ctx1.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success());
+    let out = cce(
+        home.path(),
+        &["sync", "pull", "--workspace", "--latest", "--dir", ctx1.to_str().unwrap()],
+    );
+    assert!(out.status.success(), "pull --workspace: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains("manifest         installed from the published metadata"),
+        "got: {stdout}"
+    );
+    assert!(
+        stdout.contains("workspace-graph.json installed (1 cross-member edge)"),
+        "got: {stdout}"
+    );
+    let r1 = fed_results(home.path(), &ctx1, query, true);
+    assert_eq!(r1, source_results, "pull --workspace consumer must match the source search");
+    assert_eq!(r1.to_string(), source_results.to_string(), "byte-identical results JSON");
+
+    // Consumer 2: repo-less `pull --all`.
+    let c2 = tempfile::tempdir().unwrap();
+    let ctx2 = c2.path().join("ctx");
+    let out = cce(
+        home.path(),
+        &["sync", "pull", "--all", "--into", ctx2.to_str().unwrap(), "--remote", &url],
+    );
+    assert!(out.status.success(), "pull --all: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        stdout.contains(
+            "metadata      : 1 published workspace manifest applied · 1 cross-member edge installed"
+        ),
+        "got: {stdout}"
+    );
+    let r2 = fed_results(home.path(), &ctx2, query, true);
+    assert_eq!(r2, source_results, "pull --all consumer must match the source search");
+    assert_eq!(r2.to_string(), source_results.to_string(), "byte-identical results JSON");
+}
+
+/// #55 stability: `pull --all` against a cache with NO published manifest is
+/// exactly the #54 behaviour — synthesized store-only members, no metadata
+/// line, and no workspace-graph.json is written.
+#[test]
+fn pull_all_without_published_metadata_keeps_the_54_shape() {
+    let home = tempfile::tempdir().unwrap();
+    let (_bare, url) = bare_remote();
+    let alpha = tiny_repo("a.py", "def alpha_one():\n    return 1\n");
+    init_and_push(home.path(), &url, alpha.path(), "example.com__team__alpha");
+
+    let consumer = tempfile::tempdir().unwrap();
+    let ctx = consumer.path().join("ctx");
+    let out = cce(
+        home.path(),
+        &["sync", "pull", "--all", "--into", ctx.to_str().unwrap(), "--remote", &url],
+    );
+    assert!(out.status.success());
+    let report = String::from_utf8_lossy(&out.stdout);
+    assert!(!report.contains("metadata      :"), "got: {report}");
+    assert!(!ctx.join(".cce/workspace-graph.json").exists(), "no graph without a manifest");
+    let yaml = std::fs::read_to_string(ctx.join(".cce/workspace.yml")).unwrap();
+    assert!(yaml.contains("    type: store-only\n"), "got: {yaml}");
+}
+
+/// #55, the documented multi-workspace rule at the CLI level: two published
+/// workspaces whose member names collide → the first (repo_id order) keeps the
+/// bare name, the later one stays at its `-2` name — warned — and each manifest
+/// enriches only its OWN member.
+#[test]
+fn two_published_workspaces_with_a_member_name_collision_first_wins_and_warns() {
+    let home = tempfile::tempdir().unwrap();
+    let (_bare, url) = bare_remote();
+    for (base, package) in
+        [("example.com__acme__mono", "demo_acme"), ("example.com__zeta__mono", "demo_zeta")]
+    {
+        let src = tempfile::tempdir().unwrap();
+        let d = src.path();
+        git(d, &["init", "-q", "-b", "main"]);
+        std::fs::create_dir_all(d.join("demo/src")).unwrap();
+        std::fs::write(d.join("demo/package.json"), format!("{{\"name\":\"{package}\"}}")).unwrap();
+        std::fs::write(
+            d.join("demo/src/index.js"),
+            format!("function {package}() {{ return 1; }}\n"),
+        )
+        .unwrap();
+        git(d, &["add", "-A"]);
+        git(d, &["commit", "-q", "-m", "init"]);
+        let out = cce(home.path(), &["workspace", "init", d.to_str().unwrap()]);
+        assert!(out.status.success());
+        let out = cce(
+            home.path(),
+            &[
+                "sync",
+                "init",
+                "--remote",
+                &url,
+                "--no-lfs",
+                "--repo-id",
+                base,
+                "--dir",
+                d.to_str().unwrap(),
+            ],
+        );
+        assert!(out.status.success());
+        let out = cce(home.path(), &["sync", "push", "--workspace", "--dir", d.to_str().unwrap()]);
+        assert!(out.status.success(), "push: {}", String::from_utf8_lossy(&out.stderr));
+    }
+
+    let consumer = tempfile::tempdir().unwrap();
+    let ctx = consumer.path().join("ctx");
+    let out = cce(
+        home.path(),
+        &["sync", "pull", "--all", "--into", ctx.to_str().unwrap(), "--remote", &url],
+    );
+    assert!(out.status.success(), "pull --all: {}", String::from_utf8_lossy(&out.stderr));
+    let report = String::from_utf8_lossy(&out.stdout);
+    assert!(
+        report.contains(
+            "warning: workspace example.com__zeta__mono: member name `demo` was taken by an \
+             earlier repo — kept as `demo-2` (first in repo_id order wins)"
+        ),
+        "got: {report}"
+    );
+    let yaml = std::fs::read_to_string(ctx.join(".cce/workspace.yml")).unwrap();
+    assert!(
+        yaml.contains(
+            "  - name: demo\n    path: demo\n    type: javascript\n    package: demo_acme\n"
+        ),
+        "got: {yaml}"
+    );
+    assert!(
+        yaml.contains(
+            "  - name: demo-2\n    path: demo-2\n    type: javascript\n    package: demo_zeta\n"
+        ),
+        "got: {yaml}"
+    );
+}
+
+/// #55: `verify --checksum-only` at the CLI level — passes on an intact
+/// repo-less consumer workspace, fails loudly NAMING the member after one byte
+/// flips in a pulled store, with no source checkout anywhere.
+#[test]
+fn verify_checksum_only_passes_intact_and_names_the_corrupted_member() {
+    let home = tempfile::tempdir().unwrap();
+    let (_bare, url) = bare_remote();
+    let src = dep_workspace();
+    init_and_push_workspace(home.path(), &url, src.path());
+
+    let consumer = tempfile::tempdir().unwrap();
+    let ctx = consumer.path().join("ctx");
+    let out = cce(
+        home.path(),
+        &["sync", "pull", "--all", "--into", ctx.to_str().unwrap(), "--remote", &url],
+    );
+    assert!(out.status.success());
+
+    let out =
+        cce(home.path(), &["sync", "verify", "--checksum-only", "--dir", ctx.to_str().unwrap()]);
+    assert!(out.status.success(), "intact verify: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("verify OK (checksum-only): 2 members"), "got: {stdout}");
+
+    // Flip one byte in beta's pulled store.
+    let store = ctx.join("beta/.cce/index.json");
+    let mut bytes = std::fs::read(&store).unwrap();
+    let idx = bytes.iter().position(|&b| b == b'u').unwrap();
+    bytes[idx] = b'v';
+    std::fs::write(&store, bytes).unwrap();
+
+    let out =
+        cce(home.path(), &["sync", "verify", "--checksum-only", "--dir", ctx.to_str().unwrap()]);
+    assert!(!out.status.success(), "corrupted store must fail verify");
+    let stderr = String::from_utf8_lossy(&out.stderr);
+    assert!(stderr.contains("verify FAILED (checksum-only) for member `beta`"), "got: {stderr}");
+}
+
+/// #55 additivity, the old-client shape: a plain single-member `pull --latest`
+/// against a METADATA-CARRYING cache is byte-for-byte the pre-#55 experience —
+/// the published workspace keys are invisible to it.
+#[test]
+fn plain_single_member_pull_latest_is_unchanged_on_a_metadata_carrying_cache() {
+    let home = tempfile::tempdir().unwrap();
+    let (_bare, url) = bare_remote();
+    let src = dep_workspace();
+    init_and_push_workspace(home.path(), &url, src.path());
+
+    // A repo-less single-member consumer of just alpha.
+    let consumer = tempfile::tempdir().unwrap();
+    let dir = consumer.path().join("alpha");
+    std::fs::create_dir_all(&dir).unwrap();
+    let repo_id = format!("{BASE_ID}__alpha");
+    let out = cce(
+        home.path(),
+        &[
+            "sync",
+            "init",
+            "--remote",
+            &url,
+            "--no-lfs",
+            "--repo-id",
+            &repo_id,
+            "--dir",
+            dir.to_str().unwrap(),
+        ],
+    );
+    assert!(out.status.success());
+    let out = cce(home.path(), &["sync", "pull", "--latest", "--dir", dir.to_str().unwrap()]);
+    assert!(out.status.success(), "pull --latest: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(&format!("Pulled {repo_id}@")), "got: {stdout}");
+    assert!(
+        stdout.contains("(no source checkout — consumer mode; the pulled index is the corpus)"),
+        "got: {stdout}"
+    );
+    // The pull touched only the member's own store — no workspace metadata
+    // appears for a plain pull.
+    assert!(dir.join(".cce/index.json").exists());
+    assert!(!dir.join(".cce/workspace.yml").exists());
+    assert!(!dir.join(".cce/workspace-graph.json").exists());
+    // And a plain search over it works exactly as before.
+    let out = cce(
+        home.path(),
+        &[
+            "search",
+            "rocket launch thrust",
+            "--dir",
+            dir.to_str().unwrap(),
+            "--json",
+            "--no-metrics",
+        ],
+    );
+    assert!(out.status.success());
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert!(!v["results"].as_array().unwrap().is_empty());
+}
