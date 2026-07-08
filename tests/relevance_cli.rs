@@ -49,7 +49,13 @@ fn code_starter_set_runs_green() {
     for m in ["P@k", "recall", "MRR", "F1"] {
         assert!(s.contains(m), "missing metric {m} in:\n{s}");
     }
-    assert!(s.contains("queries : 6"), "{s}");
+    assert!(s.contains("queries : 7"), "{s}");
+    // The starter set carries one ranged case (issue #85), so the token-level
+    // section renders.
+    assert!(s.contains("token-level span metrics (1 of 7 queries carry ranged anchors)"), "{s}");
+    for m in ["tok-P", "tok-recall", "tok-IoU"] {
+        assert!(s.contains(m), "missing token metric {m} in:\n{s}");
+    }
 }
 
 #[test]
@@ -59,6 +65,9 @@ fn docs_starter_set_runs_green() {
     let s = String::from_utf8_lossy(&out.stdout);
     assert!(s.contains("queries : 4"), "{s}");
     assert!(s.contains("docs-corpus"), "{s}");
+    // No ranged anchors in the docs set → no token-level section (the exact
+    // pre-#85 rendering).
+    assert!(!s.contains("token-level"), "{s}");
 }
 
 #[test]
@@ -102,11 +111,65 @@ fn compare_mode_prints_per_query_deltas() {
         "code-loader-class",
         "code-sum-node",
         "code-interface-kind",
+        "code-read-config-span",
     ] {
         assert!(s.contains(id), "missing per-query row {id} in:\n{s}");
     }
     assert!(s.contains("mean"), "{s}");
     assert!(s.contains("+0.000000") || s.contains("-0."), "{s}");
+    // The paired significance block (issue #84): header, columns, and the
+    // undefined-t marker for a zero-variance metric.
+    assert!(s.contains("paired t-test on the per-query deltas (two-sided, n=7, df=6)"), "{s}");
+    for col in ["mean-delta", "95% CI"] {
+        assert!(s.contains(col), "missing stats column {col} in:\n{s}");
+    }
+    assert!(s.contains("n/a"), "{s}");
+}
+
+#[test]
+fn compare_json_carries_the_paired_significance_block() {
+    let out = run(&["eval/relevance/code.jsonl", "--compare", "bm25,hybrid", "--json"]);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert_eq!(v["schema"], "cce.relevance.report/v2");
+    let c = &v["compare"];
+    assert_eq!(c["a"], "bm25");
+    assert_eq!(c["b"], "hybrid");
+    // Every metric reports n and a mean delta; defined stats are 6-decimal
+    // strings, undefined ones are null.
+    for key in ["precision_at_k", "recall", "mrr", "f1"] {
+        let m = &c["metrics"][key];
+        assert_eq!(m["n"], 7, "metric {key}");
+        assert!(m["mean_delta"].as_str().unwrap().starts_with(['+', '-']), "metric {key}");
+        assert!(m["p"].is_string(), "metric {key}: {m}");
+        assert!(m["ci95_low"].is_string() && m["ci95_high"].is_string(), "metric {key}");
+    }
+    // Without --compare there is no compare block.
+    let out = run(&["eval/relevance/code.jsonl", "--json"]);
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    assert!(v.get("compare").is_none());
+}
+
+#[test]
+fn ranged_case_reports_token_metrics_in_json() {
+    let out = run(&["eval/relevance/code.jsonl", "--json"]);
+    assert!(out.status.success(), "stderr: {}", String::from_utf8_lossy(&out.stderr));
+    let v: serde_json::Value = serde_json::from_str(&String::from_utf8_lossy(&out.stdout)).unwrap();
+    for backend in v["backends"].as_array().unwrap() {
+        // Backend-level aggregate over the one ranged case.
+        assert_eq!(backend["tokens"]["queries"], 1, "backend {}", backend["backend"]);
+        assert!(backend["tokens"]["iou"].is_string());
+        // Per-query: only the ranged case carries a tokens object.
+        for q in backend["per_query"].as_array().unwrap() {
+            if q["id"] == "code-read-config-span" {
+                for m in ["precision", "recall", "iou"] {
+                    assert!(q["tokens"][m].is_string(), "missing tokens.{m}: {q}");
+                }
+            } else {
+                assert!(q.get("tokens").is_none(), "unranged case grew tokens: {q}");
+            }
+        }
+    }
 }
 
 #[test]
@@ -117,7 +180,7 @@ fn backend_flag_scopes_the_report() {
     let backends = v["backends"].as_array().unwrap();
     assert_eq!(backends.len(), 1);
     assert_eq!(backends[0]["backend"], "bm25");
-    assert_eq!(v["schema"], "cce.relevance.report/v1");
+    assert_eq!(v["schema"], "cce.relevance.report/v2");
 }
 
 #[test]

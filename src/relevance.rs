@@ -12,9 +12,13 @@
 //! pipeline at a named backend configuration (`bm25` = the issue-#30 degraded
 //! mode, `vector` = pure cosine ranking, `hybrid` = the full SPEC §6 pipeline
 //! that `cce search` serves), and scores precision@k, recall, MRR, and F1 per
-//! query plus macro-averaged per backend. A comparison mode diffs two backends
-//! per query. Deterministic for deterministic backends: with the hash embedder
-//! the JSON report is byte-pinnable, conformance-style.
+//! query plus macro-averaged per backend. Cases with line-ranged anchors are
+//! additionally scored at token resolution — token-level recall / precision /
+//! IoU weighted with the ONE `cce.tokens/v1` estimator (issue #85). A
+//! comparison mode diffs two backends per query and reports the paired
+//! significance of each mean delta — t, two-sided p, 95% CI, n (issue #84).
+//! Deterministic for deterministic backends: with the hash embedder the JSON
+//! report (`cce.relevance.report/v2`) is byte-pinnable, conformance-style.
 //!
 //! **Responsibilities:**
 //! - Own the `cce.relevance/v1` fixture contract and its parsing.
@@ -36,8 +40,10 @@ use std::collections::{BTreeMap, BTreeSet};
 /// The pinned schema id for the fixture contract. A bump is a compatibility event.
 pub const RELEVANCE_SCHEMA_ID: &str = "cce.relevance/v1";
 
-/// The pinned schema id of the `--json` report shape.
-pub const RELEVANCE_REPORT_SCHEMA_ID: &str = "cce.relevance.report/v1";
+/// The pinned schema id of the `--json` report shape. v2 (issues #84/#85)
+/// added the `compare` paired-significance block and the token-level fields;
+/// every v1 field is carried unchanged.
+pub const RELEVANCE_REPORT_SCHEMA_ID: &str = "cce.relevance.report/v2";
 
 // --- Fixture contract (cce.relevance/v1) ---
 
@@ -597,6 +603,57 @@ pub fn evaluate_backend(
     }
 }
 
+// --- Paired significance testing for --compare (issue #84) ---
+
+/// One metric's paired t-test over the per-query deltas of a comparison.
+#[derive(Debug, Clone)]
+pub struct MetricStats {
+    /// Human table label (`P@k`, `recall`, `MRR`, `F1`).
+    pub metric: &'static str,
+    /// JSON report key (`precision_at_k`, `recall`, `mrr`, `f1`).
+    pub key: &'static str,
+    pub stats: crate::stats::PairedStats,
+}
+
+/// The paired-significance block of a two-backend comparison: per metric, the
+/// t-statistic, two-sided p-value, 95% CI on the mean delta, and n — so a
+/// compare table states how much evidence there is that a delta is real, not
+/// just how big it looks (issue #84).
+#[derive(Debug, Clone)]
+pub struct CompareStats {
+    pub a: Backend,
+    pub b: Backend,
+    /// Fixed metric order: P@k, recall, MRR, F1 — the summary-table order.
+    pub metrics: Vec<MetricStats>,
+}
+
+/// Run the paired t-test per metric over the per-query deltas (`b − a`,
+/// paired by case order — both reports score the same fixture cases).
+pub fn compare_stats(a: &BackendReport, b: &BackendReport) -> CompareStats {
+    let deltas = |f: fn(&QueryScore) -> f64| -> Vec<f64> {
+        a.queries.iter().zip(b.queries.iter()).map(|(qa, qb)| f(qb) - f(qa)).collect()
+    };
+    let metrics = vec![
+        MetricStats {
+            metric: "P@k",
+            key: "precision_at_k",
+            stats: crate::stats::paired_t(&deltas(|q| q.precision)),
+        },
+        MetricStats {
+            metric: "recall",
+            key: "recall",
+            stats: crate::stats::paired_t(&deltas(|q| q.recall)),
+        },
+        MetricStats {
+            metric: "MRR",
+            key: "mrr",
+            stats: crate::stats::paired_t(&deltas(|q| q.mrr)),
+        },
+        MetricStats { metric: "F1", key: "f1", stats: crate::stats::paired_t(&deltas(|q| q.f1)) },
+    ];
+    CompareStats { a: a.backend, b: b.backend, metrics }
+}
+
 // --- Rendering (deterministic; format6 fixed 6-decimal strings) ---
 
 /// The human summary table: one row per backend.
@@ -621,12 +678,36 @@ pub fn render_human(corpus: &str, embedder_name: &str, reports: &[BackendReport]
             format6(r.f1)
         ));
     }
+    // Token-level table, only when the fixture set carries ranged anchors
+    // (issue #85) — an unranged set renders exactly the v1 block above.
+    if let Some(agg) = reports.iter().find_map(|r| r.tokens) {
+        out.push_str(&format!(
+            "\n  token-level span metrics ({} of {n} queries carry ranged anchors)\n",
+            agg.queries
+        ));
+        out.push_str(&format!(
+            "  {:<10}{:>12}{:>12}{:>12}\n",
+            "backend", "tok-P", "tok-recall", "tok-IoU"
+        ));
+        for r in reports {
+            if let Some(t) = r.tokens {
+                out.push_str(&format!(
+                    "  {:<10}{:>12}{:>12}{:>12}\n",
+                    r.backend.name(),
+                    format6(t.precision),
+                    format6(t.recall),
+                    format6(t.iou)
+                ));
+            }
+        }
+    }
     out
 }
 
-/// The per-query comparison table between exactly two backends (`--compare`).
-/// A positive delta means `b` beats `a` on that query.
-pub fn render_compare_human(a: &BackendReport, b: &BackendReport) -> String {
+/// The per-query comparison table between exactly two backends (`--compare`),
+/// followed by the paired-significance block (issue #84). A positive delta
+/// means `b` beats `a` on that query.
+pub fn render_compare_human(a: &BackendReport, b: &BackendReport, stats: &CompareStats) -> String {
     let mut out = String::new();
     out.push_str(&format!(
         "\n  per-query deltas ({} → {}; positive = {} wins)\n",
@@ -656,6 +737,33 @@ pub fn render_compare_human(a: &BackendReport, b: &BackendReport) -> String {
         format6_signed(b.mrr - a.mrr),
         format6_signed(b.f1 - a.f1)
     ));
+    // The significance block (issue #84): is the mean delta evidence, or noise?
+    let n = stats.metrics.first().map(|m| m.stats.n).unwrap_or(0);
+    out.push_str(&format!(
+        "\n  paired t-test on the per-query deltas (two-sided, n={n}, df={})\n",
+        n.saturating_sub(1)
+    ));
+    out.push_str(&format!(
+        "  {:<10}{:>14}{:>12}{:>12}{:>26}\n",
+        "metric", "mean-delta", "t", "p", "95% CI"
+    ));
+    for m in &stats.metrics {
+        let s = &m.stats;
+        let t = s.t.map(format6_signed).unwrap_or_else(|| "n/a".to_string());
+        let p = s.p.map(format6).unwrap_or_else(|| "n/a".to_string());
+        let ci = s
+            .ci95
+            .map(|(lo, hi)| format!("[{}, {}]", format6_signed(lo), format6_signed(hi)))
+            .unwrap_or_else(|| "n/a".to_string());
+        out.push_str(&format!(
+            "  {:<10}{:>14}{:>12}{:>12}{:>26}\n",
+            m.metric,
+            format6_signed(s.mean_delta),
+            t,
+            p,
+            ci
+        ));
+    }
     out
 }
 
@@ -672,10 +780,34 @@ pub fn format6_signed(v: f64) -> String {
     format!("+{s}")
 }
 
+/// One `PairedStats` as report JSON: 6-decimal strings (signed for deltas and
+/// bounds), `null` where a statistic is undefined at this input.
+fn stats_json(s: &crate::stats::PairedStats) -> serde_json::Value {
+    serde_json::json!({
+        "n": s.n,
+        "mean_delta": format6_signed(s.mean_delta),
+        "t": s.t.map(format6_signed),
+        "p": s.p.map(format6),
+        "ci95_low": s.ci95.map(|(lo, _)| format6_signed(lo)),
+        "ci95_high": s.ci95.map(|(_, hi)| format6_signed(hi)),
+    })
+}
+
 /// The `--json` report (byte-pinnable for deterministic backends): pretty-printed,
 /// serde_json's alphabetical key order, scores as fixed 6-decimal strings, and a
 /// single trailing newline — the same grammar discipline as `cce search --json`.
-pub fn render_json(corpus: &str, embedder_name: &str, reports: &[BackendReport]) -> String {
+///
+/// Schema `cce.relevance.report/v2`: every v1 field unchanged, plus
+/// - per-query `tokens` and per-backend `tokens` aggregates, present only for
+///   cases/sets with ranged anchors (issue #85);
+/// - a top-level `compare` block with the per-metric paired t-test, present
+///   only in `--compare` mode (issue #84).
+pub fn render_json(
+    corpus: &str,
+    embedder_name: &str,
+    reports: &[BackendReport],
+    compare: Option<&CompareStats>,
+) -> String {
     let backends: Vec<serde_json::Value> = reports
         .iter()
         .map(|r| {
@@ -683,7 +815,7 @@ pub fn render_json(corpus: &str, embedder_name: &str, reports: &[BackendReport])
                 .queries
                 .iter()
                 .map(|q| {
-                    serde_json::json!({
+                    let mut obj = serde_json::json!({
                         "id": q.id,
                         "k": q.k,
                         "precision_at_k": format6(q.precision),
@@ -691,27 +823,55 @@ pub fn render_json(corpus: &str, embedder_name: &str, reports: &[BackendReport])
                         "mrr": format6(q.mrr),
                         "f1": format6(q.f1),
                         "first_relevant_rank": q.first_relevant_rank,
-                    })
+                    });
+                    if let Some(t) = q.tokens {
+                        obj["tokens"] = serde_json::json!({
+                            "precision": format6(t.precision),
+                            "recall": format6(t.recall),
+                            "iou": format6(t.iou),
+                        });
+                    }
+                    obj
                 })
                 .collect();
-            serde_json::json!({
+            let mut obj = serde_json::json!({
                 "backend": r.backend.name(),
                 "precision_at_k": format6(r.precision),
                 "recall": format6(r.recall),
                 "mrr": format6(r.mrr),
                 "f1": format6(r.f1),
                 "per_query": per_query,
-            })
+            });
+            if let Some(t) = r.tokens {
+                obj["tokens"] = serde_json::json!({
+                    "queries": t.queries,
+                    "precision": format6(t.precision),
+                    "recall": format6(t.recall),
+                    "iou": format6(t.iou),
+                });
+            }
+            obj
         })
         .collect();
     let n = reports.first().map(|r| r.queries.len()).unwrap_or(0);
-    let body = serde_json::json!({
+    let mut body = serde_json::json!({
         "schema": RELEVANCE_REPORT_SCHEMA_ID,
         "corpus": corpus,
         "embedder": embedder_name,
         "queries": n,
         "backends": backends,
     });
+    if let Some(cs) = compare {
+        let mut metrics = serde_json::Map::new();
+        for m in &cs.metrics {
+            metrics.insert(m.key.to_string(), stats_json(&m.stats));
+        }
+        body["compare"] = serde_json::json!({
+            "a": cs.a.name(),
+            "b": cs.b.name(),
+            "metrics": metrics,
+        });
+    }
     serde_json::to_string_pretty(&body).unwrap_or_else(|_| "{}".to_string()) + "\n"
 }
 
@@ -1264,17 +1424,128 @@ mod tests {
         }];
         let reports: Vec<BackendReport> =
             Backend::all().iter().map(|b| evaluate_backend(&idx, &e, *b, &cases)).collect();
-        let a = render_json("corpus", "hash", &reports);
-        let b = render_json("corpus", "hash", &reports);
+        let a = render_json("corpus", "hash", &reports, None);
+        let b = render_json("corpus", "hash", &reports, None);
         assert_eq!(a, b);
         let v: serde_json::Value = serde_json::from_str(&a).unwrap();
         assert_eq!(v["schema"], RELEVANCE_REPORT_SCHEMA_ID);
+        assert_eq!(v["schema"], "cce.relevance.report/v2");
         assert_eq!(v["queries"], 1);
         let backends = v["backends"].as_array().unwrap();
         assert_eq!(backends.len(), 3);
         assert_eq!(backends[0]["backend"], "bm25");
         // Scores are fixed 6-decimal strings, like `cce search --json`.
         assert!(backends[0]["precision_at_k"].as_str().unwrap().contains('.'));
+        // No ranged case, no compare → the v1 shape carried over: no token or
+        // compare keys anywhere.
+        assert!(backends[0].get("tokens").is_none());
+        assert!(backends[0]["per_query"][0].get("tokens").is_none());
+        assert!(v.get("compare").is_none());
         assert!(a.ends_with("}\n"));
+    }
+
+    #[test]
+    fn compare_stats_hand_computed_and_rendered() {
+        // Two synthetic reports over the same 6 cases, engineered so the MRR
+        // deltas are exactly [0.2, 0.1, 0.0, 0.3, −0.1, 0.1] — the stats.rs
+        // hand-worked example (t = √3, CI = [−0.048413, 0.248413]) — while
+        // precision deltas are all zero (p = 1, t undefined).
+        let mk = |backend, mrrs: &[f64]| BackendReport {
+            backend,
+            precision: 0.5,
+            recall: 1.0,
+            mrr: mrrs.iter().sum::<f64>() / mrrs.len() as f64,
+            f1: 0.6,
+            tokens: None,
+            queries: mrrs
+                .iter()
+                .enumerate()
+                .map(|(i, m)| QueryScore {
+                    id: format!("q{i}"),
+                    k: 5,
+                    precision: 0.5,
+                    recall: 1.0,
+                    mrr: *m,
+                    f1: 0.6,
+                    first_relevant_rank: Some(1),
+                    tokens: None,
+                })
+                .collect(),
+        };
+        let a = mk(Backend::Bm25, &[0.5, 0.5, 0.5, 0.5, 0.5, 0.5]);
+        let b = mk(Backend::Hybrid, &[0.7, 0.6, 0.5, 0.8, 0.4, 0.6]);
+        let cs = compare_stats(&a, &b);
+        assert_eq!(cs.metrics.len(), 4);
+        let mrr = &cs.metrics[2];
+        assert_eq!(mrr.key, "mrr");
+        assert_eq!(mrr.stats.n, 6);
+        assert!((mrr.stats.t.unwrap() - 3.0_f64.sqrt()).abs() < 1e-9);
+        let p = &cs.metrics[0];
+        assert_eq!(p.key, "precision_at_k");
+        assert_eq!(p.stats.t, None);
+        assert_eq!(p.stats.p, Some(1.0));
+
+        // Human block: table header, the undefined-t marker, and the CI pair.
+        let human = render_compare_human(&a, &b, &cs);
+        assert!(human.contains("paired t-test on the per-query deltas (two-sided, n=6, df=5)"));
+        assert!(human.contains("mean-delta"));
+        assert!(human.contains("95% CI"));
+        assert!(human.contains("n/a"), "{human}");
+        assert!(human.contains("[-0.048413, +0.248413]"), "{human}");
+        assert!(human.contains("+1.732051"), "{human}");
+
+        // JSON block: alphabetical keys, strings for defined stats, null for
+        // the undefined t.
+        let json = render_json("corpus", "hash", &[a, b], Some(&cs));
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["compare"]["a"], "bm25");
+        assert_eq!(v["compare"]["b"], "hybrid");
+        let m = &v["compare"]["metrics"];
+        assert_eq!(m["mrr"]["n"], 6);
+        assert_eq!(m["mrr"]["t"], "+1.732051");
+        assert_eq!(m["mrr"]["mean_delta"], "+0.100000");
+        assert_eq!(m["mrr"]["ci95_low"], "-0.048413");
+        assert_eq!(m["mrr"]["ci95_high"], "+0.248413");
+        assert_eq!(m["precision_at_k"]["t"], serde_json::Value::Null);
+        assert_eq!(m["precision_at_k"]["p"], "1.000000");
+        assert_eq!(m["recall"]["n"], 6);
+        assert_eq!(m["f1"]["n"], 6);
+    }
+
+    #[test]
+    fn render_json_carries_token_fields_for_ranged_cases() {
+        // A synthetic single-backend report with one ranged case: the tokens
+        // objects must appear at both per-query and backend level, as fixed
+        // 6-decimal strings.
+        let report = BackendReport {
+            backend: Backend::Bm25,
+            precision: 0.2,
+            recall: 1.0,
+            mrr: 1.0,
+            f1: 1.0 / 3.0,
+            tokens: Some(TokenAggregate { queries: 1, precision: 0.5, recall: 1.0, iou: 0.5 }),
+            queries: vec![QueryScore {
+                id: "ranged".into(),
+                k: 5,
+                precision: 0.2,
+                recall: 1.0,
+                mrr: 1.0,
+                f1: 1.0 / 3.0,
+                first_relevant_rank: Some(1),
+                tokens: Some(TokenScore { precision: 0.5, recall: 1.0, iou: 0.5 }),
+            }],
+        };
+        let json = render_json("corpus", "hash", std::slice::from_ref(&report), None);
+        let v: serde_json::Value = serde_json::from_str(&json).unwrap();
+        assert_eq!(v["backends"][0]["tokens"]["queries"], 1);
+        assert_eq!(v["backends"][0]["tokens"]["precision"], "0.500000");
+        assert_eq!(v["backends"][0]["per_query"][0]["tokens"]["recall"], "1.000000");
+        assert_eq!(v["backends"][0]["per_query"][0]["tokens"]["iou"], "0.500000");
+
+        // And the human table grows the token-level section.
+        let human = render_human("corpus", "hash", &[report]);
+        assert!(human.contains("token-level span metrics (1 of 1 queries carry ranged anchors)"));
+        assert!(human.contains("tok-P"));
+        assert!(human.contains("tok-IoU"));
     }
 }
