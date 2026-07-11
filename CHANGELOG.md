@@ -45,6 +45,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test/fixture/samples` verified byte-identical.
 
 ### Fixed
+- **Walker path normalisation no longer conflates distinct Unix filenames
+  (#105).** The relative `file_path` was built with `replace('\\', "/")`, which
+  rewrites the literal backslash — a legal filename byte on macOS/Linux — so a
+  root file named `a\b.py` collapsed onto the same path as a nested `a/b.py`,
+  giving two files identical, order-nondeterministic provenance. The walker
+  (and the workspace member-path builder, the same defect) now normalise ONLY
+  the platform separator (`std::path::MAIN_SEPARATOR`): a no-op on Unix that
+  preserves backslashes, still `\`→`/` on Windows where `\` is never a filename
+  byte.
 - **Memory append is a single write with a newline guard, so a torn or
   interleaved append can no longer silently lose entries (#102).** `append`
   in `src/memory.rs` wrote the JSON line and its trailing `\n` as two separate

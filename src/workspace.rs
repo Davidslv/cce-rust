@@ -266,11 +266,16 @@ fn detect_subtree(root: &Path, dir: &Path, out: &mut Vec<Detected>) {
 }
 
 /// The `/`-separated path of `dir` relative to `root` (root itself => ".").
+///
+/// Normalises ONLY the platform path separator (`MAIN_SEPARATOR`): '/' on Unix (a
+/// no-op) and '\' on Windows. A blanket `replace('\\', "/")` would rewrite the
+/// legal backslash byte in a Unix directory name and conflate distinct members —
+/// the same defect fixed in the walker for issue #105.
 fn rel_path(root: &Path, dir: &Path) -> String {
     match dir.strip_prefix(root) {
         Ok(p) if p.as_os_str().is_empty() => ".".to_string(),
-        Ok(p) => p.to_string_lossy().replace('\\', "/"),
-        Err(_) => dir.to_string_lossy().replace('\\', "/"),
+        Ok(p) => p.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"),
+        Err(_) => dir.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/"),
     }
 }
 

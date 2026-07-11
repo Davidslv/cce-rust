@@ -160,7 +160,12 @@ pub fn walk(root: &Path, protect_secrets: bool) -> WalkResult {
             Ok(p) => p,
             Err(_) => path,
         };
-        let rel_str = rel.to_string_lossy().replace('\\', "/");
+        // Normalise ONLY the platform path separator to '/'. A literal backslash
+        // is a legal filename byte on Unix, so a blanket `replace('\\', "/")` would
+        // rewrite a file named `a\b.py` to `a/b.py` and collide it with the nested
+        // `a/b.py` (issue #105). `MAIN_SEPARATOR` is '/' on Unix (a no-op that keeps
+        // backslashes) and '\' on Windows (where '\' is never a filename byte).
+        let rel_str = rel.to_string_lossy().replace(std::path::MAIN_SEPARATOR, "/");
         files.push((rel_str, content));
     }
 
@@ -344,6 +349,31 @@ mod tests {
 
         let paths = walked_paths(root);
         assert_eq!(paths, vec!["app.ts".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn backslash_in_unix_filename_is_not_conflated_with_a_slash_path() {
+        // Issue #105: a literal backslash is a legal filename byte on Unix. A root
+        // file named `a\b.py` and a nested file `a/b.py` are TWO distinct real
+        // files and must map to TWO distinct root-relative `file_path`s — the
+        // separator normalisation must not rewrite the backslash and collapse them
+        // onto the same path (which gives colliding, nondeterministic provenance).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::create_dir(root.join("a")).unwrap();
+        fs::write(root.join("a").join("b.py"), "nested = 1\n").unwrap();
+        // A DISTINCT root file whose name literally contains a backslash.
+        fs::write(root.join("a\\b.py"), "backslash = 2\n").unwrap();
+
+        let res = walk(root, true);
+        let paths: Vec<&str> = res.files.iter().map(|(p, _)| p.as_str()).collect();
+        assert_eq!(res.files.len(), 2, "two distinct files; got {paths:?}");
+        assert!(paths.contains(&"a/b.py"), "nested slash path preserved; got {paths:?}");
+        assert!(
+            paths.contains(&"a\\b.py"),
+            "literal-backslash filename must NOT be rewritten to a slash; got {paths:?}"
+        );
     }
 
     #[test]
