@@ -185,12 +185,23 @@ pub fn paired_t(deltas: &[f64]) -> PairedStats {
     if n < 2 {
         return PairedStats { n, mean_delta: mean, t: None, p: None, ci95: None };
     }
-    // Exact constancy check, not `sd == 0.0`: summing equal f64s and dividing
-    // leaves rounding residue in the variance (e.g. [0.1, 0.1, 0.1]), which
-    // would otherwise masquerade as an astronomically large t.
+    // Constancy check tolerant of rounding residue, not bit-identity. Per-query
+    // deltas that are mathematically equal but computed from different bases
+    // (0.6−0.4 = 0.199…996 vs 0.2−0.0 = 0.2) differ in the last bit(s); a raw
+    // `all(== first)` misses them and their ~1e-17 variance then yields an
+    // astronomical t (~1e16) that saturates the report's t column (#108). Treat
+    // the deltas as constant when their spread is within a few ULPs of their
+    // magnitude — the interval below which no honest per-query effect lives.
     let first = deltas[0];
-    if deltas.iter().all(|d| *d == first) {
-        let p = if first == 0.0 { 1.0 } else { 0.0 };
+    let (mut lo, mut hi) = (first, first);
+    for &d in deltas {
+        lo = lo.min(d);
+        hi = hi.max(d);
+    }
+    let scale = lo.abs().max(hi.abs());
+    let constancy_tol = 16.0 * f64::EPSILON * scale;
+    if hi - lo <= constancy_tol {
+        let p = if mean == 0.0 { 1.0 } else { 0.0 };
         return PairedStats {
             n,
             mean_delta: first,
@@ -338,6 +349,27 @@ mod tests {
         assert_eq!(s.p, Some(0.0));
         assert_eq!(s.ci95, Some((0.1, 0.1)));
         assert!((s.mean_delta - 0.1).abs() < 1e-12);
+    }
+
+    #[test]
+    fn paired_t_mathematically_equal_deltas_from_different_bases_are_constant() {
+        // #108: per-query deltas that are mathematically the same value but
+        // computed from DIFFERENT bases differ in the last bit(s). The constancy
+        // guard must treat them as constant (t = None, p = 0, CI = [mean, mean]),
+        // not let ~1e-17 rounding residue produce a saturating t.
+        let d = [0.6 - 0.4, 0.3 - 0.1, 0.5 - 0.3, 0.7 - 0.5];
+        // Precondition: these really are bit-distinct, so a bit-identity guard
+        // (the old code) would miss them — otherwise this test proves nothing.
+        assert!(
+            !(d[0] == d[1] && d[1] == d[2] && d[2] == d[3]),
+            "inputs must be bit-distinct to exercise #108"
+        );
+        let s = paired_t(&d);
+        assert_eq!(s.t, None, "rounding residue must not masquerade as a huge t");
+        assert_eq!(s.p, Some(0.0));
+        let (lo, hi) = s.ci95.unwrap();
+        assert_eq!(lo, hi, "CI collapses to the constant delta, not a saturated bound");
+        assert!((s.mean_delta - 0.2).abs() < 1e-9);
     }
 
     #[test]

@@ -151,6 +151,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   zeroing the correctness-gated A/B paired set. Punt phrases now match only on
   non-alphanumeric word boundaries, so `N/A` as a real non-answer still fires
   while a path segment never does.
+- **Paired-t constancy guard tolerates rounding residue, so mathematically-equal
+  deltas from different bases no longer emit a saturating t (#108).** `paired_t`
+  in `src/stats.rs` used an exact bit-identity check, so per-query deltas that
+  are the same value computed from different bases (`0.6−0.4` vs `0.2−0.0`)
+  slipped through and their ~1e-17 variance produced t ≈ 1e16, rendered as the
+  i64-saturated `+9223372036854.775807` in the byte-pinnable
+  `cce.relevance.report/v2`. The guard now treats deltas whose spread is within
+  a few ULPs of their magnitude as constant (t = `n/a`, p = 0, CI = [mean, mean]).
 - **Memory append is a single write with a newline guard, so a torn or
   interleaved append can no longer silently lose entries (#102).** `append`
   in `src/memory.rs` wrote the JSON line and its trailing `\n` as two separate
