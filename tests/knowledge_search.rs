@@ -409,3 +409,184 @@ fn acceptance_heading_chunking_surfaces_the_buried_section() {
         "after: the surfaced section must be topic-focused, not the mixed blob"
     );
 }
+
+// --- issue #132: a code-index LOAD FAILURE must be visible in the blend ---
+
+/// A `context_search` call with NO `source` argument — the true default path, which
+/// resolves to the blend once a knowledge store exists (SPEC-V2.6 §5).
+fn default_search_call(id: i64, query: &str) -> String {
+    format!(
+        "{{\"jsonrpc\":\"2.0\",\"id\":{id},\"method\":\"tools/call\",\"params\":{{\"name\":\"context_search\",\"arguments\":{{\"query\":\"{query}\"}}}}}}\n"
+    )
+}
+
+/// Whether the tool result with `id` carries the MCP `isError` flag.
+fn tool_is_error(stdout: &str, id: i64) -> bool {
+    for line in stdout.lines().filter(|l| !l.trim().is_empty()) {
+        let v: serde_json::Value = serde_json::from_str(line).unwrap();
+        if v["id"] == id {
+            return v["result"]["isError"].as_bool().unwrap();
+        }
+    }
+    panic!("no response with id {id} in:\n{stdout}");
+}
+
+#[test]
+fn blended_default_surfaces_a_corrupt_code_index_instead_of_swallowing_it() {
+    // Issue #132: the code store EXISTS on disk but cannot be loaded. The blended
+    // default must NOT silently downgrade that to zero code rows and serve a
+    // knowledge-only answer as if it were complete.
+    let tmp = tempfile::tempdir().unwrap();
+    write_tiny_repo(tmp.path());
+    index_dir(tmp.path());
+    index_knowledge(tmp.path(), &feed());
+    // Corrupt the built store in place: present, unparseable.
+    std::fs::write(tmp.path().join(".cce").join("index.json"), "{ not an index").unwrap();
+    let dir = tmp.path().to_string_lossy().to_string();
+
+    let input = format!(
+        "{}{}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+        default_search_call(2, "hash password"),
+    );
+    let out = drive(&["mcp", "--dir", &dir], &input);
+    let text = tool_text(&out, 2);
+
+    // The degradation is VISIBLE (the issue #30 notice-channel precedent) …
+    assert!(
+        text.contains("NOTICE: the code index exists but could not be loaded"),
+        "corrupt code index was swallowed silently:\n{text}"
+    );
+    // … the knowledge hits are still served (degraded, not withheld) …
+    assert!(
+        text.contains("[knowledge] Password hashing policy"),
+        "knowledge hits must still be served under a code-store failure:\n{text}"
+    );
+    // … and it is a degraded RESULT, not a tool error (`isError` stays reserved
+    // for malformed calls, per the ToolOutput contract).
+    assert!(!tool_is_error(&out, 2), "degraded blend must not set isError:\n{out}");
+}
+
+#[test]
+fn knowledge_only_project_blends_silently_without_a_code_notice() {
+    // CONTROL (issue #132): a code store that has never been built is NOT a failure —
+    // knowledge-only is then the correct, complete answer, with no notice.
+    let tmp = tempfile::tempdir().unwrap();
+    index_knowledge(tmp.path(), &feed()); // no code index at all
+    let dir = tmp.path().to_string_lossy().to_string();
+
+    let input = format!(
+        "{}{}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+        default_search_call(2, "hash password"),
+    );
+    let out = drive(&["mcp", "--dir", &dir], &input);
+    let text = tool_text(&out, 2);
+
+    assert!(
+        text.contains("[knowledge] Password hashing policy"),
+        "knowledge-only project must return its knowledge hits:\n{text}"
+    );
+    assert!(!text.contains("NOTICE:"), "a truly absent code index must stay silent:\n{text}");
+    assert!(!tool_is_error(&out, 2), "a knowledge-only project is not an error:\n{out}");
+}
+
+#[test]
+fn healthy_blend_serves_both_pools_with_no_notice() {
+    // CONTROL (issue #132): both stores healthy — code + knowledge rows, no
+    // degradation marker anywhere in the output.
+    let tmp = tempfile::tempdir().unwrap();
+    write_tiny_repo(tmp.path());
+    index_dir(tmp.path());
+    index_knowledge(tmp.path(), &feed());
+    let dir = tmp.path().to_string_lossy().to_string();
+
+    let input = format!(
+        "{}{}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+        default_search_call(2, "hash password"),
+    );
+    let out = drive(&["mcp", "--dir", &dir], &input);
+    let text = tool_text(&out, 2);
+
+    assert!(text.contains("auth.py"), "healthy blend missing code:\n{text}");
+    assert!(
+        text.contains("[knowledge] Password hashing policy"),
+        "healthy blend missing knowledge:\n{text}"
+    );
+    assert!(!text.contains("NOTICE:"), "healthy blend must carry no notice:\n{text}");
+}
+
+/// A one-member workspace (a tiny JS member) with a knowledge store at its root.
+fn write_tiny_workspace(root: &Path) {
+    let app = root.join("app");
+    std::fs::create_dir_all(&app).unwrap();
+    std::fs::write(
+        app.join("auth.js"),
+        "function hashPassword(pw) {\n  return pw + \"salt\";\n}\n",
+    )
+    .unwrap();
+    std::fs::create_dir_all(root.join(".cce")).unwrap();
+    std::fs::write(
+        root.join(".cce").join("workspace.yml"),
+        "version: 1\nname: ws\nmembers:\n  - name: app\n    path: app\n    type: javascript\n    package: app\n",
+    )
+    .unwrap();
+}
+
+#[test]
+fn workspace_blend_surfaces_a_corrupt_member_store() {
+    // The workspace variant of issue #132: an indexed member whose store is then
+    // corrupted in place must surface the same visible notice.
+    let tmp = tempfile::tempdir().unwrap();
+    write_tiny_workspace(tmp.path());
+    let out = Command::new(bin()).args(["index", "--workspace"]).arg(tmp.path()).output().unwrap();
+    assert!(out.status.success(), "index failed: {}", String::from_utf8_lossy(&out.stderr));
+    index_knowledge(tmp.path(), &feed());
+    std::fs::write(tmp.path().join("app").join(".cce").join("index.json"), "{ nope").unwrap();
+    let dir = tmp.path().to_string_lossy().to_string();
+
+    let input = format!(
+        "{}{}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+        default_search_call(2, "hash password"),
+    );
+    let out = drive(&["mcp", "--dir", &dir, "--workspace"], &input);
+    let text = tool_text(&out, 2);
+
+    assert!(
+        text.contains("NOTICE: the code index exists but could not be loaded"),
+        "corrupt member store was swallowed silently:\n{text}"
+    );
+    assert!(
+        text.contains("[knowledge] Password hashing policy"),
+        "knowledge hits must still be served under a member-store failure:\n{text}"
+    );
+    assert!(!tool_is_error(&out, 2), "degraded workspace blend must not set isError:\n{out}");
+}
+
+#[test]
+fn workspace_blend_stays_silent_when_no_member_was_ever_indexed() {
+    // CONTROL (issue #132, workspace variant): a workspace whose members were never
+    // indexed has NO member store on disk — true absence, so the blend serves the
+    // knowledge hits silently, exactly like the single-repo knowledge-only project.
+    let tmp = tempfile::tempdir().unwrap();
+    write_tiny_workspace(tmp.path());
+    index_knowledge(tmp.path(), &feed()); // knowledge only; `index --workspace` never ran
+    let dir = tmp.path().to_string_lossy().to_string();
+
+    let input = format!(
+        "{}{}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+        default_search_call(2, "hash password"),
+    );
+    let out = drive(&["mcp", "--dir", &dir, "--workspace"], &input);
+    let text = tool_text(&out, 2);
+
+    assert!(
+        text.contains("[knowledge] Password hashing policy"),
+        "never-indexed workspace must still return knowledge hits:\n{text}"
+    );
+    assert!(!text.contains("NOTICE:"), "a truly absent member store must stay silent:\n{text}");
+    assert!(!tool_is_error(&out, 2), "a never-indexed workspace is not an error:\n{out}");
+}

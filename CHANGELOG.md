@@ -74,6 +74,21 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `knowledge/<ver>/<corpus_id>/` (segment-exact) and errors on any key outside
   it — this holds in shipped binaries and checks the key set itself, so it
   refuses the cross-corpus delete even if a traversal id ever reached it.
+- **Blended `context_search` no longer silently swallows a code-index load
+  failure (#132).** The blend — the DEFAULT path once a knowledge store
+  exists — mapped every `load_index()` error to zero code rows, so a corrupt
+  or unreadable `.cce/index.json` produced a confident knowledge-only answer
+  with `isError:false` and no hint that code results were missing, while
+  `source:"code"` on the same server correctly surfaced guidance. The fix
+  splits absent from failed: a store that was NEVER built (a knowledge-only
+  project) still blends silently — knowledge-only is then the correct,
+  complete answer — but a store that EXISTS and fails to load now prepends
+  the pinned `CODE_INDEX_LOAD_ERROR_NOTICE` through the same visible-
+  degradation notice channel as issue #30's Ollama-down notice (knowledge
+  hits still served, `isError` still reserved for malformed calls). The
+  workspace variant gets the same split: a corrupt member store or an
+  unparseable manifest surfaces the notice; a workspace whose members were
+  never indexed stays silent. Healthy-path output is byte-unchanged.
 - **A sync push that loses a ref race can no longer report success while
   publishing nothing (#92).** The push retry rebased the working clone onto
   the advanced remote with the result discarded, under the assumption that
