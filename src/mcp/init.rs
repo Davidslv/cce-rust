@@ -290,6 +290,12 @@ const GITIGNORE_BLOCK: &str =
 /// migrating it is not required, just don't double-add). This is the team-wide,
 /// committed fix so no one commits their local cache and pollutes a content-
 /// addressed sync artifact (issue #24).
+///
+/// Fail-safe (#99): the file is handled as raw BYTES, so a `.gitignore` that is
+/// not valid UTF-8 (e.g. a latin-1 accented path written by older tooling) is
+/// preserved verbatim and safely appended to — `.gitignore` is line-based, so
+/// appending whole lines never corrupts existing ones. Any other read failure
+/// aborts the update with an error; the existing file is never replaced.
 fn ensure_cce_gitignored(dir: &Path) -> Result<Option<PathBuf>, String> {
     // Only meaningful inside a git repository — the walker honors committed
     // `.gitignore`, and a non-repo has no sha to be builder-independent against.
@@ -298,8 +304,20 @@ fn ensure_cce_gitignored(dir: &Path) -> Result<Option<PathBuf>, String> {
         return Ok(None);
     }
     let path = dir.join(".gitignore");
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    let already = existing
+    let existing: Vec<u8> = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            return Err(format!(
+                "cannot read {}: {e} — refusing to modify it so its rules are not lost; \
+                 fix the file and re-run `cce init`",
+                path.display()
+            ))
+        }
+    };
+    // The `.cce` rules are pure ASCII, so a lossy view is exact for the check
+    // while the original bytes stay untouched for the append.
+    let already = String::from_utf8_lossy(&existing)
         .lines()
         .any(|l| matches!(l.trim(), ".cce/*" | ".cce" | ".cce/" | "/.cce" | "/.cce/"));
     if already {
@@ -307,13 +325,13 @@ fn ensure_cce_gitignored(dir: &Path) -> Result<Option<PathBuf>, String> {
     }
     let mut next = existing;
     if next.is_empty() {
-        next.push_str(GITIGNORE_BLOCK);
+        next.extend_from_slice(GITIGNORE_BLOCK.as_bytes());
     } else {
-        if !next.ends_with('\n') {
-            next.push('\n');
+        if !next.ends_with(b"\n") {
+            next.push(b'\n');
         }
-        next.push('\n');
-        next.push_str(GITIGNORE_BLOCK);
+        next.push(b'\n');
+        next.extend_from_slice(GITIGNORE_BLOCK.as_bytes());
     }
     std::fs::write(&path, next).map_err(|e| e.to_string())?;
     Ok(Some(path))
@@ -352,7 +370,8 @@ fn write_claude_md(dir: &Path, level: OutputLevel) -> Result<PathBuf, String> {
                     s.push_str(&text[end_idx..]);
                     s
                 }
-                _ => return Err(format!(
+                _ => {
+                    return Err(format!(
                     "{} has unpaired, misordered, or duplicated CCE markers ({} `{CLAUDE_BEGIN}`, \
                          {} `{CLAUDE_END}`) — refusing to modify it so your content is not lost; \
                          repair the file to exactly one BEGIN followed by one END (or remove both \
@@ -360,7 +379,8 @@ fn write_claude_md(dir: &Path, level: OutputLevel) -> Result<PathBuf, String> {
                     path.display(),
                     begins.len(),
                     ends.len()
-                )),
+                ))
+                }
             }
         }
         Err(_) => format!("# CLAUDE.md\n\n{block}"),
@@ -751,6 +771,77 @@ mod tests {
         assert!(gi.contains("node_modules/"), "existing rules preserved");
         // A blanket `.cce` was already present → no `.cce/*` block appended.
         assert!(!gi.contains(".cce/*"), "must not add a new block when `.cce` already present");
+    }
+
+    #[test]
+    fn init_preserves_a_non_utf8_gitignore_byte_for_byte_and_appends_the_block() {
+        // #99: a single non-UTF-8 byte (e.g. a latin-1 accented path) used to
+        // make read_to_string fail, the error was swallowed with
+        // unwrap_or_default(), and the whole .gitignore was replaced with just
+        // the 3-line CCE block — previously-ignored secrets became committable.
+        // The original bytes must be preserved verbatim, with the CCE block
+        // appended after them.
+        let tmp = tempfile::tempdir().unwrap();
+        write_tiny_repo(tmp.path());
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        let original: &[u8] = b"node_modules/\n*.log\nsecret.env\ncaf\xe9/\n";
+        std::fs::write(tmp.path().join(".gitignore"), original).unwrap();
+
+        run(&opts(tmp.path())).unwrap();
+        let after = std::fs::read(tmp.path().join(".gitignore")).unwrap();
+        assert!(
+            after.starts_with(original),
+            "original .gitignore bytes must be preserved verbatim; got: {}",
+            String::from_utf8_lossy(&after)
+        );
+        let tail = String::from_utf8_lossy(&after[original.len()..]);
+        assert!(tail.contains(".cce/*"), "CCE block must still be appended; got tail: {tail}");
+        assert!(tail.contains("!.cce/workspace.yml"), "got tail: {tail}");
+
+        // Idempotent: a second run changes nothing.
+        run(&opts(tmp.path())).unwrap();
+        let again = std::fs::read(tmp.path().join(".gitignore")).unwrap();
+        assert_eq!(after, again, ".gitignore must be idempotent across runs");
+    }
+
+    #[test]
+    fn init_skips_gitignore_when_a_blanket_cce_rule_exists_even_with_non_utf8_bytes() {
+        // The "already handled" detection must survive non-UTF-8 content too.
+        let tmp = tempfile::tempdir().unwrap();
+        write_tiny_repo(tmp.path());
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        let original: &[u8] = b"caf\xe9/\n.cce/\n";
+        std::fs::write(tmp.path().join(".gitignore"), original).unwrap();
+
+        run(&opts(tmp.path())).unwrap();
+        let after = std::fs::read(tmp.path().join(".gitignore")).unwrap();
+        assert_eq!(after, original, "an already-covered .gitignore must be left byte-untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_refuses_an_unreadable_gitignore_instead_of_replacing_it() {
+        // #99: a transient read failure (not NotFound) must abort the
+        // .gitignore update, not be treated as "file empty" and clobbered.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        write_tiny_repo(tmp.path());
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        let gi = tmp.path().join(".gitignore");
+        std::fs::write(&gi, "node_modules/\n").unwrap();
+        std::fs::set_permissions(&gi, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Running as root would make the file readable anyway — skip there.
+        if std::fs::read(&gi).is_ok() {
+            std::fs::set_permissions(&gi, std::fs::Permissions::from_mode(0o644)).unwrap();
+            return;
+        }
+
+        let result = run(&opts(tmp.path()));
+        std::fs::set_permissions(&gi, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = result.unwrap_err();
+        assert!(err.contains(".gitignore"), "error must name the file: {err}");
+        let after = std::fs::read_to_string(&gi).unwrap();
+        assert_eq!(after, "node_modules/\n", ".gitignore must be left byte-untouched");
     }
 
     #[test]
