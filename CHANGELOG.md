@@ -177,6 +177,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   project config that exists but does not parse is now surfaced with a clear
   warning and the load stays all-local, so the misconfiguration cannot be masked
   by an unrelated global remote.
+- **`parse_iso` applies an explicit timezone offset and rejects impossible
+  calendar dates (#130).** The ISO parser validated only the first 19 bytes and
+  ignored the timezone suffix, so `--since 2026-07-01T09:45:00+09:00` was read as
+  `09:45Z` (should be `00:45Z`), silently excluding in-window events, and
+  `2026-02-31` was accepted and normalized to March 3. It now parses and applies
+  `Z` / `±HH` / `±HHMM` / `±HH:MM` offsets, rejects any other trailing text, and
+  rejects a day that fails the civil-date round-trip. Self-written timestamps
+  (always `…Z`) are unaffected.
 - **`cce usage --since` rejects an overflowing relative duration with a clear
   error instead of panicking or wrapping (#129).** `parse_since` in
   `src/usage.rs` multiplied the parsed count by the unit seconds with unchecked
