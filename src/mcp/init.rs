@@ -84,6 +84,17 @@ pub struct InitOptions {
     pub force: bool,
 }
 
+/// Append a partial-init note to a later-writer refusal (#99): the file named in
+/// `e` was left untouched, but earlier files in the same `cce init` run may already
+/// have been updated. Every writer is idempotent, so re-running after the fix is
+/// safe and completes the remaining files.
+fn partial_init_note(e: String) -> String {
+    format!(
+        "{e}\nnote: `cce init` had already updated earlier files (e.g. .mcp.json) before this — \
+         fix the file above and re-run `cce init`; it is idempotent and will finish the rest."
+    )
+}
+
 /// Run `cce init` and return a human-readable report (SPEC-MCP §"cce init").
 pub fn run(opts: &InitOptions) -> Result<String, String> {
     if opts.agent != "claude" {
@@ -99,16 +110,20 @@ pub fn run(opts: &InitOptions) -> Result<String, String> {
     let is_workspace = manifest_path(dir).exists();
 
     let index_line = ensure_index(opts, is_workspace)?;
+    // `cce init` wires files in order (.mcp.json, then CLAUDE.md, then
+    // .gitignore). A fail-safe refusal of a LATER file (#99) leaves the
+    // EARLIER ones already updated, so a refusal past the first writer carries
+    // a note that a re-run after the fix is safe (each writer is idempotent).
     let mcp_path = write_mcp_json(dir, is_workspace)?;
     // The CLAUDE.md block honours the configured L4 output level (SPEC-V2.5 §5).
     let output_level = OutputConfig::load(dir).level;
-    let claude_path = write_claude_md(dir, output_level)?;
+    let claude_path = write_claude_md(dir, output_level).map_err(partial_init_note)?;
     // Team-wide fix for issue #24: keep cce's own cache out of the tree so nobody
     // commits their local artifacts (which would then be honored via `.gitignore`
     // on other machines only if committed — but more importantly, they must never
     // pollute the index). Committing `.cce/` to `.gitignore` is the canonical,
     // machine-independent way to ensure that.
-    let gitignore_path = ensure_cce_gitignored(dir)?;
+    let gitignore_path = ensure_cce_gitignored(dir).map_err(partial_init_note)?;
 
     let mode = if is_workspace { " (workspace)" } else { "" };
     let mut out = String::new();
@@ -198,6 +213,11 @@ fn build_workspace_index(dir: &Path) -> Result<(usize, usize), String> {
 /// Write/merge `<dir>/.mcp.json` with a `cce` MCP server entry (idempotent). Any
 /// existing servers are preserved; the `cce` entry is (re)written to the canonical
 /// value, so a re-run produces byte-identical output.
+///
+/// Fail-safe (#99): `.mcp.json` is user-owned and may hold other servers' config
+/// (commands, env, tokens). A read/parse failure — or a root/`mcpServers` that is
+/// not a JSON object — must NEVER cause a rebuild from scratch; init refuses with
+/// an actionable error and leaves the existing file byte-untouched.
 fn write_mcp_json(dir: &Path, is_workspace: bool) -> Result<PathBuf, String> {
     let path = dir.join(".mcp.json");
     let args: Vec<Value> = if is_workspace {
@@ -208,21 +228,35 @@ fn write_mcp_json(dir: &Path, is_workspace: bool) -> Result<PathBuf, String> {
     let entry = json!({ "command": "cce", "args": args });
 
     let mut root: Value = if path.exists() {
-        let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        serde_json::from_str(&text).unwrap_or_else(|_| json!({}))
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read {}: {e} — fix the file and re-run `cce init`; refusing to overwrite it", path.display()))?;
+        serde_json::from_str(&text).map_err(|e| {
+            format!(
+                "{} is not valid JSON ({e}) — refusing to rewrite it because that would drop \
+                 your existing MCP servers; fix the syntax and re-run `cce init`",
+                path.display()
+            )
+        })?
     } else {
         json!({})
     };
-    if !root.is_object() {
-        root = json!({});
-    }
     {
-        let obj = root.as_object_mut().expect("root is an object");
+        let obj = root.as_object_mut().ok_or_else(|| {
+            format!(
+                "{} does not contain a JSON object at the top level — refusing to rewrite it; \
+                 fix the file and re-run `cce init`",
+                path.display()
+            )
+        })?;
         let servers = obj.entry("mcpServers").or_insert_with(|| json!({}));
-        if !servers.is_object() {
-            *servers = json!({});
-        }
-        servers.as_object_mut().expect("servers is an object").insert("cce".to_string(), entry);
+        let servers = servers.as_object_mut().ok_or_else(|| {
+            format!(
+                "\"mcpServers\" in {} is not a JSON object — refusing to rewrite it; \
+                 fix the file and re-run `cce init`",
+                path.display()
+            )
+        })?;
+        servers.insert("cce".to_string(), entry);
     }
     let text = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())? + "\n";
     std::fs::write(&path, text).map_err(|e| e.to_string())?;
@@ -271,6 +305,12 @@ const GITIGNORE_BLOCK: &str =
 /// migrating it is not required, just don't double-add). This is the team-wide,
 /// committed fix so no one commits their local cache and pollutes a content-
 /// addressed sync artifact (issue #24).
+///
+/// Fail-safe (#99): the file is handled as raw BYTES, so a `.gitignore` that is
+/// not valid UTF-8 (e.g. a latin-1 accented path written by older tooling) is
+/// preserved verbatim and safely appended to — `.gitignore` is line-based, so
+/// appending whole lines never corrupts existing ones. Any other read failure
+/// aborts the update with an error; the existing file is never replaced.
 fn ensure_cce_gitignored(dir: &Path) -> Result<Option<PathBuf>, String> {
     // Only meaningful inside a git repository — the walker honors committed
     // `.gitignore`, and a non-repo has no sha to be builder-independent against.
@@ -279,8 +319,20 @@ fn ensure_cce_gitignored(dir: &Path) -> Result<Option<PathBuf>, String> {
         return Ok(None);
     }
     let path = dir.join(".gitignore");
-    let existing = std::fs::read_to_string(&path).unwrap_or_default();
-    let already = existing
+    let existing: Vec<u8> = match std::fs::read(&path) {
+        Ok(bytes) => bytes,
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => Vec::new(),
+        Err(e) => {
+            return Err(format!(
+                "cannot read {}: {e} — refusing to modify it so its rules are not lost; \
+                 fix the file and re-run `cce init`",
+                path.display()
+            ))
+        }
+    };
+    // The `.cce` rules are pure ASCII, so a lossy view is exact for the check
+    // while the original bytes stay untouched for the append.
+    let already = String::from_utf8_lossy(&existing)
         .lines()
         .any(|l| matches!(l.trim(), ".cce/*" | ".cce" | ".cce/" | "/.cce" | "/.cce/"));
     if already {
@@ -288,44 +340,112 @@ fn ensure_cce_gitignored(dir: &Path) -> Result<Option<PathBuf>, String> {
     }
     let mut next = existing;
     if next.is_empty() {
-        next.push_str(GITIGNORE_BLOCK);
+        next.extend_from_slice(GITIGNORE_BLOCK.as_bytes());
     } else {
-        if !next.ends_with('\n') {
-            next.push('\n');
+        if !next.ends_with(b"\n") {
+            next.push(b'\n');
         }
-        next.push('\n');
-        next.push_str(GITIGNORE_BLOCK);
+        next.push(b'\n');
+        next.extend_from_slice(GITIGNORE_BLOCK.as_bytes());
     }
     std::fs::write(&path, next).map_err(|e| e.to_string())?;
     Ok(Some(path))
 }
 
+/// Byte offsets of the `CLAUDE_BEGIN` / `CLAUDE_END` markers that are ALONE on
+/// their own line (`line.trim() == marker`) — the only shape `claude_block` ever
+/// writes, so the only shape treated as a real delimiter (#99). Markers quoted
+/// inline in a user's prose are ignored. Each offset points at the marker
+/// substring within its line, so splicing preserves any surrounding bytes.
+///
+/// Line-anchoring is the required defence. A marker sitting alone on its own line
+/// INSIDE a fenced code block would still be counted (a much rarer shape); a
+/// second heading-confirmation check was considered and deliberately skipped to
+/// keep this simple. Even in that residual case the "exactly one BEGIN before one
+/// END, else refuse" rule downstream still prevents silent data loss — an odd
+/// arrangement is refused, never mangled.
+fn marker_line_offsets(text: &str) -> (Vec<usize>, Vec<usize>) {
+    let mut begins = Vec::new();
+    let mut ends = Vec::new();
+    let mut offset = 0usize;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed == CLAUDE_BEGIN {
+            begins.push(offset + line.find(CLAUDE_BEGIN).expect("line trims to the marker"));
+        } else if trimmed == CLAUDE_END {
+            ends.push(offset + line.find(CLAUDE_END).expect("line trims to the marker"));
+        }
+        offset += line.len();
+    }
+    (begins, ends)
+}
+
 /// Write/merge the bounded CCE block into `<dir>/CLAUDE.md` (idempotent). If the
 /// markers already exist their region is replaced; otherwise the block is appended
 /// (or the file is created). A re-run produces byte-identical output.
+///
+/// Fail-safe (#99): only `NotFound` means "no file yet — create one". Any other
+/// read failure of an EXISTING CLAUDE.md (non-UTF-8 content, a permission error)
+/// aborts with an actionable error and leaves the file byte-untouched; it is
+/// user-authored and non-regenerable, so it must never be replaced wholesale.
 fn write_claude_md(dir: &Path, level: OutputLevel) -> Result<PathBuf, String> {
     let path = dir.join("CLAUDE.md");
     let block = claude_block(level);
     let new_content = match std::fs::read_to_string(&path) {
         Ok(text) => {
-            if let (Some(b), Some(e)) = (text.find(CLAUDE_BEGIN), text.find(CLAUDE_END)) {
-                let end_idx = e + CLAUDE_END.len();
-                let mut s = String::new();
-                s.push_str(&text[..b]);
-                s.push_str(block.trim_end());
-                s.push_str(&text[end_idx..]);
-                s
-            } else {
-                let mut s = text;
-                if !s.is_empty() && !s.ends_with('\n') {
+            // Defensive marker handling (#99): only two shapes are touchable —
+            // no markers at all (append) or exactly one BEGIN before exactly
+            // one END (replace that bounded region). Anything else (an orphan
+            // marker, END before BEGIN, duplicate pairs) used to mangle user
+            // content or grow the file unboundedly; it is refused instead.
+            //
+            // A marker counts as a real delimiter ONLY when it is ALONE ON ITS
+            // OWN LINE, which is exactly how `claude_block` writes it. A raw
+            // substring scan (the pre-review code) also matched the marker
+            // STRINGS quoted in a user's prose, so the region between two prose
+            // mentions was spliced out — the same #99 data-loss class. We
+            // line-anchor instead: iterate lines, match `line.trim() == marker`,
+            // and record the byte offset of the marker within that line.
+            let (begins, ends) = marker_line_offsets(&text);
+            match (begins.as_slice(), ends.as_slice()) {
+                ([], []) => {
+                    let mut s = text;
+                    if !s.is_empty() && !s.ends_with('\n') {
+                        s.push('\n');
+                    }
                     s.push('\n');
+                    s.push_str(&block);
+                    s
                 }
-                s.push('\n');
-                s.push_str(&block);
-                s
+                ([b], [e]) if b < e => {
+                    let end_idx = e + CLAUDE_END.len();
+                    let mut s = String::new();
+                    s.push_str(&text[..*b]);
+                    s.push_str(block.trim_end());
+                    s.push_str(&text[end_idx..]);
+                    s
+                }
+                _ => {
+                    return Err(format!(
+                    "{} has unpaired, misordered, or duplicated CCE markers ({} `{CLAUDE_BEGIN}`, \
+                         {} `{CLAUDE_END}`) — refusing to modify it so your content is not lost; \
+                         repair the file to exactly one BEGIN followed by one END (or remove both \
+                         markers) and re-run `cce init`",
+                    path.display(),
+                    begins.len(),
+                    ends.len()
+                ))
+                }
             }
         }
-        Err(_) => format!("# CLAUDE.md\n\n{block}"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => format!("# CLAUDE.md\n\n{block}"),
+        Err(e) => {
+            return Err(format!(
+                "cannot read {}: {e} — refusing to overwrite it so your instructions are not \
+                 lost; fix the file (it must be readable UTF-8) and re-run `cce init`",
+                path.display()
+            ))
+        }
     };
     std::fs::write(&path, new_content).map_err(|e| e.to_string())?;
     Ok(path)
@@ -411,6 +531,42 @@ mod tests {
     }
 
     #[test]
+    fn init_refuses_to_rewrite_malformed_mcp_json_preserving_user_servers() {
+        // #99: a user-authored .mcp.json with a real server entry plus one
+        // trailing comma (a JSONC-ism serde rejects). init used to rebuild the
+        // file from `{}`, silently wiping every user server. It must instead
+        // refuse with an error naming the parse problem and leave the file
+        // byte-untouched.
+        let tmp = tempfile::tempdir().unwrap();
+        write_tiny_repo(tmp.path());
+        let malformed =
+            "{\n  \"mcpServers\": {\n    \"github\": {\"command\": \"gh-mcp\"},\n  }\n}\n";
+        std::fs::write(tmp.path().join(".mcp.json"), malformed).unwrap();
+
+        let err = run(&opts(tmp.path())).unwrap_err();
+        assert!(err.contains(".mcp.json"), "error must name the file: {err}");
+        let after = std::fs::read_to_string(tmp.path().join(".mcp.json")).unwrap();
+        assert_eq!(after, malformed, ".mcp.json must be left byte-untouched on a parse failure");
+    }
+
+    #[test]
+    fn init_refuses_mcp_json_whose_root_or_servers_is_not_an_object() {
+        // #99: a non-object root (or a non-object `mcpServers`) used to be
+        // silently replaced with `{}`, causing the same wholesale loss as a
+        // parse failure. Both must be refused, file untouched.
+        for content in ["[1, 2, 3]\n", "{\n  \"mcpServers\": \"oops\"\n}\n"] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_tiny_repo(tmp.path());
+            std::fs::write(tmp.path().join(".mcp.json"), content).unwrap();
+
+            let err = run(&opts(tmp.path())).unwrap_err();
+            assert!(err.contains(".mcp.json"), "error must name the file: {err}");
+            let after = std::fs::read_to_string(tmp.path().join(".mcp.json")).unwrap();
+            assert_eq!(after, content, "input {content:?} must be left byte-untouched");
+        }
+    }
+
+    #[test]
     fn init_appends_block_to_existing_claude_md() {
         let tmp = tempfile::tempdir().unwrap();
         write_tiny_repo(tmp.path());
@@ -425,6 +581,212 @@ mod tests {
         let claude2 = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
         assert_eq!(claude2.matches(CLAUDE_BEGIN).count(), 1);
         assert!(claude2.starts_with("# My Project"));
+    }
+
+    #[test]
+    fn init_refuses_claude_md_with_an_orphan_begin_marker() {
+        // #99 case A: a BEGIN whose END was lost (e.g. in a merge-conflict
+        // resolution). Run 1 used to append a second block; run 2 then spliced
+        // from the orphan BEGIN to the appended END, silently deleting the
+        // user's own sections in between. init must refuse and leave the file
+        // byte-untouched, on every run.
+        let tmp = tempfile::tempdir().unwrap();
+        write_tiny_repo(tmp.path());
+        let content = format!(
+            "# Proj\n\n{CLAUDE_BEGIN}\n\n## Important team conventions\n\n- never touch prod db\n"
+        );
+        std::fs::write(tmp.path().join("CLAUDE.md"), &content).unwrap();
+
+        for run_n in 1..=2 {
+            let err = run(&opts(tmp.path())).unwrap_err();
+            assert!(err.contains("CLAUDE.md"), "run {run_n}: error must name the file: {err}");
+            let after = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
+            assert_eq!(after, content, "run {run_n}: CLAUDE.md must be left byte-untouched");
+        }
+    }
+
+    #[test]
+    fn init_refuses_claude_md_with_an_orphan_end_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_tiny_repo(tmp.path());
+        let content = format!("# Proj\n\n{CLAUDE_END}\n\n## My stuff\n");
+        std::fs::write(tmp.path().join("CLAUDE.md"), &content).unwrap();
+
+        let err = run(&opts(tmp.path())).unwrap_err();
+        assert!(err.contains("CLAUDE.md"), "error must name the file: {err}");
+        let after = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
+        assert_eq!(after, content, "CLAUDE.md must be left byte-untouched");
+    }
+
+    #[test]
+    fn init_refuses_claude_md_with_misordered_markers_and_does_not_grow_it() {
+        // #99 case B: END before BEGIN. Every run used to duplicate the region
+        // between them, growing the file unboundedly. init must refuse, leave
+        // the file byte-untouched, and stay refused (idempotent) on re-runs.
+        let tmp = tempfile::tempdir().unwrap();
+        write_tiny_repo(tmp.path());
+        let content = format!("{CLAUDE_END}\n\n## My stuff\n\n{CLAUDE_BEGIN}\n");
+        std::fs::write(tmp.path().join("CLAUDE.md"), &content).unwrap();
+
+        for run_n in 1..=3 {
+            let err = run(&opts(tmp.path())).unwrap_err();
+            assert!(err.contains("CLAUDE.md"), "run {run_n}: error must name the file: {err}");
+            let after = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
+            assert_eq!(after, content, "run {run_n}: CLAUDE.md must not grow or change");
+        }
+    }
+
+    #[test]
+    fn init_refuses_claude_md_with_duplicate_marker_pairs() {
+        // Two BEGIN/END pairs: which block is "the" CCE block is ambiguous, so
+        // init must refuse rather than guess and mangle.
+        let tmp = tempfile::tempdir().unwrap();
+        write_tiny_repo(tmp.path());
+        let content = format!(
+            "{CLAUDE_BEGIN}\nold\n{CLAUDE_END}\n\n## Mine\n\n{CLAUDE_BEGIN}\nold2\n{CLAUDE_END}\n"
+        );
+        std::fs::write(tmp.path().join("CLAUDE.md"), &content).unwrap();
+
+        let err = run(&opts(tmp.path())).unwrap_err();
+        assert!(err.contains("CLAUDE.md"), "error must name the file: {err}");
+        let after = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
+        assert_eq!(after, content, "CLAUDE.md must be left byte-untouched");
+    }
+
+    #[test]
+    fn init_ignores_marker_strings_that_appear_inline_in_user_prose() {
+        // #99 (review): the marker STRINGS can legitimately appear inside a
+        // user's own prose (docs that quote them, backtick-wrapped, mid
+        // sentence). A substring match treats those mentions as the CCE block
+        // delimiters and splices out everything between them — the exact
+        // #99 data-loss class. Only a marker ALONE ON ITS OWN LINE (as
+        // claude_block writes it) is a real delimiter; inline mentions must be
+        // ignored, and with no real block the CCE block is appended.
+        let tmp = tempfile::tempdir().unwrap();
+        write_tiny_repo(tmp.path());
+        let content = format!(
+            "# Team CLAUDE.md\n\n\
+             The CCE block starts with `{CLAUDE_BEGIN}` and is managed by tooling.\n\n\
+             ## CRITICAL SECURITY RULES\n\n\
+             - Never commit secrets. Never disable auth in tests.\n\n\
+             It ends with `{CLAUDE_END}` — do not edit between the markers by hand.\n"
+        );
+        std::fs::write(tmp.path().join("CLAUDE.md"), &content).unwrap();
+
+        run(&opts(tmp.path())).unwrap();
+        let after = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
+        // The user's security section — sitting BETWEEN the two inline mentions —
+        // must survive; the inline mentions were not delimiters.
+        assert!(after.contains("## CRITICAL SECURITY RULES"), "user section spliced out:\n{after}");
+        assert!(after.contains("Never commit secrets"), "user content lost:\n{after}");
+        // The whole original prose is preserved verbatim as a prefix.
+        assert!(after.starts_with(&content), "original prose not preserved verbatim:\n{after}");
+        // With no REAL (own-line) block present, the CCE block is appended once:
+        // one inline BEGIN mention + one appended own-line BEGIN = 2.
+        assert_eq!(after.matches(CLAUDE_BEGIN).count(), 2, "1 inline + 1 appended BEGIN expected");
+        assert_eq!(after.matches(CLAUDE_END).count(), 2, "1 inline + 1 appended END expected");
+        assert!(after.contains("## Code Context Engine (CCE)"), "CCE block not appended:\n{after}");
+
+        // Idempotent: the appended own-line block is now the sole real delimiter
+        // pair, so a re-run updates it in place and changes nothing.
+        run(&opts(tmp.path())).unwrap();
+        let again = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
+        assert_eq!(after, again, "re-run must be byte-idempotent");
+    }
+
+    #[test]
+    fn init_updates_a_real_own_line_block_and_preserves_the_rest() {
+        // Control: a legitimate own-its-own-line BEGIN/END block round-trips —
+        // only the bounded region is replaced, the user's surrounding content
+        // (including prose that MENTIONS the markers inline) is preserved.
+        let tmp = tempfile::tempdir().unwrap();
+        write_tiny_repo(tmp.path());
+        let content = format!(
+            "# Proj\n\nSee `{CLAUDE_BEGIN}` for the managed block.\n\n\
+             {CLAUDE_BEGIN}\nstale cce content\n{CLAUDE_END}\n\n## My notes\n\nkeep me\n"
+        );
+        std::fs::write(tmp.path().join("CLAUDE.md"), &content).unwrap();
+
+        run(&opts(tmp.path())).unwrap();
+        let after = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
+        assert!(after.starts_with("# Proj\n\nSee `<!-- BEGIN CCE MCP -->` for the managed block."));
+        assert!(!after.contains("stale cce content"), "stale block not replaced:\n{after}");
+        assert!(after.contains("## Code Context Engine (CCE)"), "real block not written:\n{after}");
+        assert!(after.contains("## My notes"), "trailing user content lost:\n{after}");
+        assert!(after.contains("keep me"));
+        // Exactly one own-line block; the inline prose mention still stands.
+        run(&opts(tmp.path())).unwrap();
+        let again = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
+        assert_eq!(after, again, "re-run must be byte-idempotent");
+    }
+
+    #[test]
+    fn init_notes_earlier_files_were_written_when_a_later_file_refuses() {
+        // MINOR (#99 review): .mcp.json is written before CLAUDE.md, so a
+        // CLAUDE.md refusal leaves .mcp.json already updated. The error must
+        // say so and point at a safe re-run; .mcp.json indeed carries the cce
+        // entry, while the offending CLAUDE.md is left byte-untouched.
+        let tmp = tempfile::tempdir().unwrap();
+        write_tiny_repo(tmp.path());
+        let bad_claude = format!("{CLAUDE_END}\n\n## Mine\n\n{CLAUDE_BEGIN}\n"); // misordered
+        std::fs::write(tmp.path().join("CLAUDE.md"), &bad_claude).unwrap();
+
+        let err = run(&opts(tmp.path())).unwrap_err();
+        assert!(err.contains("CLAUDE.md"), "error must name the offending file: {err}");
+        assert!(err.contains("re-run `cce init`"), "must point at a safe re-run: {err}");
+        assert!(err.contains("earlier files"), "must note earlier files were written: {err}");
+        // .mcp.json was written before the refusal.
+        let mcp: Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.path().join(".mcp.json")).unwrap())
+                .unwrap();
+        assert_eq!(mcp["mcpServers"]["cce"]["command"], "cce");
+        // The offending CLAUDE.md is untouched.
+        let after = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
+        assert_eq!(after, bad_claude, "CLAUDE.md must be left byte-untouched");
+    }
+
+    #[test]
+    fn init_refuses_a_non_utf8_claude_md_instead_of_overwriting_it() {
+        // #99: a single non-UTF-8 byte (e.g. a Windows-1252 curly quote pasted
+        // from a doc) made read_to_string fail, the Err(_) arm fabricated a
+        // fresh "# CLAUDE.md" + block, and the user's entire instruction file
+        // was silently replaced. Only NotFound may mean "create a new file";
+        // any other read error must abort, leaving the file byte-untouched.
+        let tmp = tempfile::tempdir().unwrap();
+        write_tiny_repo(tmp.path());
+        let original: &[u8] = b"# Proj Caf\xe9\n\n- never touch prod db\n";
+        std::fs::write(tmp.path().join("CLAUDE.md"), original).unwrap();
+
+        let err = run(&opts(tmp.path())).unwrap_err();
+        assert!(err.contains("CLAUDE.md"), "error must name the file: {err}");
+        let after = std::fs::read(tmp.path().join("CLAUDE.md")).unwrap();
+        assert_eq!(after, original, "CLAUDE.md must be left byte-untouched on a read failure");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_refuses_an_unreadable_claude_md_instead_of_overwriting_it() {
+        // #99: a transient read failure (e.g. permissions) must not be treated
+        // as "file absent" — the whole file used to be overwritten with just
+        // the CCE block while the subsequent write succeeded.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        write_tiny_repo(tmp.path());
+        let path = tmp.path().join("CLAUDE.md");
+        std::fs::write(&path, "# Proj\n\n- never touch prod db\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Running as root would make the file readable anyway — skip there.
+        if std::fs::read(&path).is_ok() {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            return;
+        }
+
+        let result = run(&opts(tmp.path()));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = result.unwrap_err();
+        assert!(err.contains("CLAUDE.md"), "error must name the file: {err}");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, "# Proj\n\n- never touch prod db\n", "must be left byte-untouched");
     }
 
     /// Write a `.cce/config` selecting an L4 output level.
@@ -607,6 +969,77 @@ mod tests {
         assert!(gi.contains("node_modules/"), "existing rules preserved");
         // A blanket `.cce` was already present → no `.cce/*` block appended.
         assert!(!gi.contains(".cce/*"), "must not add a new block when `.cce` already present");
+    }
+
+    #[test]
+    fn init_preserves_a_non_utf8_gitignore_byte_for_byte_and_appends_the_block() {
+        // #99: a single non-UTF-8 byte (e.g. a latin-1 accented path) used to
+        // make read_to_string fail, the error was swallowed with
+        // unwrap_or_default(), and the whole .gitignore was replaced with just
+        // the 3-line CCE block — previously-ignored secrets became committable.
+        // The original bytes must be preserved verbatim, with the CCE block
+        // appended after them.
+        let tmp = tempfile::tempdir().unwrap();
+        write_tiny_repo(tmp.path());
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        let original: &[u8] = b"node_modules/\n*.log\nsecret.env\ncaf\xe9/\n";
+        std::fs::write(tmp.path().join(".gitignore"), original).unwrap();
+
+        run(&opts(tmp.path())).unwrap();
+        let after = std::fs::read(tmp.path().join(".gitignore")).unwrap();
+        assert!(
+            after.starts_with(original),
+            "original .gitignore bytes must be preserved verbatim; got: {}",
+            String::from_utf8_lossy(&after)
+        );
+        let tail = String::from_utf8_lossy(&after[original.len()..]);
+        assert!(tail.contains(".cce/*"), "CCE block must still be appended; got tail: {tail}");
+        assert!(tail.contains("!.cce/workspace.yml"), "got tail: {tail}");
+
+        // Idempotent: a second run changes nothing.
+        run(&opts(tmp.path())).unwrap();
+        let again = std::fs::read(tmp.path().join(".gitignore")).unwrap();
+        assert_eq!(after, again, ".gitignore must be idempotent across runs");
+    }
+
+    #[test]
+    fn init_skips_gitignore_when_a_blanket_cce_rule_exists_even_with_non_utf8_bytes() {
+        // The "already handled" detection must survive non-UTF-8 content too.
+        let tmp = tempfile::tempdir().unwrap();
+        write_tiny_repo(tmp.path());
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        let original: &[u8] = b"caf\xe9/\n.cce/\n";
+        std::fs::write(tmp.path().join(".gitignore"), original).unwrap();
+
+        run(&opts(tmp.path())).unwrap();
+        let after = std::fs::read(tmp.path().join(".gitignore")).unwrap();
+        assert_eq!(after, original, "an already-covered .gitignore must be left byte-untouched");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_refuses_an_unreadable_gitignore_instead_of_replacing_it() {
+        // #99: a transient read failure (not NotFound) must abort the
+        // .gitignore update, not be treated as "file empty" and clobbered.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        write_tiny_repo(tmp.path());
+        std::fs::create_dir_all(tmp.path().join(".git")).unwrap();
+        let gi = tmp.path().join(".gitignore");
+        std::fs::write(&gi, "node_modules/\n").unwrap();
+        std::fs::set_permissions(&gi, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Running as root would make the file readable anyway — skip there.
+        if std::fs::read(&gi).is_ok() {
+            std::fs::set_permissions(&gi, std::fs::Permissions::from_mode(0o644)).unwrap();
+            return;
+        }
+
+        let result = run(&opts(tmp.path()));
+        std::fs::set_permissions(&gi, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = result.unwrap_err();
+        assert!(err.contains(".gitignore"), "error must name the file: {err}");
+        let after = std::fs::read_to_string(&gi).unwrap();
+        assert_eq!(after, "node_modules/\n", ".gitignore must be left byte-untouched");
     }
 
     #[test]

@@ -45,6 +45,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test/fixture/samples` verified byte-identical.
 
 ### Fixed
+- **`cce init` can no longer destroy user-owned files on a read/parse failure
+  (#99).** One root cause, five sub-bugs: a failed read or parse of an
+  existing `.mcp.json`, `CLAUDE.md`, or `.gitignore` was silently treated as
+  "file empty/absent" and the file rebuilt from scratch under a success
+  message. Concretely: a `.mcp.json` with one trailing comma (or a non-object
+  root/`mcpServers`) was rebuilt from `{}`, wiping every other MCP server the
+  user had configured; a `CLAUDE.md` with an orphaned/misordered/duplicated
+  CCE marker had user sections spliced away or was grown unboundedly on every
+  run; a `.gitignore` containing one non-UTF-8 byte was replaced with just
+  the 3-line CCE block, making previously-ignored secrets committable; and a
+  `CLAUDE.md` that could not be read (non-UTF-8 content, a permission error)
+  was overwritten wholesale with just the CCE block. `cce init` now fails
+  safe at every seam: a read/parse failure of an existing file aborts that
+  file's update with an actionable error naming the problem and leaves the
+  file byte-untouched; CLAUDE.md markers are recognised only when ALONE ON
+  THEIR OWN LINE and touched only as exactly one BEGIN followed by exactly one
+  END (anything else is refused with the marker counts and a repair hint) — so
+  the marker strings quoted in a user's prose are no longer mistaken for the
+  block delimiters and the content between two prose mentions is never spliced
+  out; `.gitignore` is handled as raw bytes, so non-UTF-8 content is preserved
+  verbatim with the CCE block appended after it; and only `NotFound` may create
+  a fresh file. A fail-safe refusal of a later file notes that earlier files may
+  already have been updated and that re-running (idempotent) is safe. The
+  successful-path output is byte-identical to before. Scope: this guarantee
+  covers read/parse failures; a crash MID-WRITE can still truncate a file (the
+  writers use non-atomic `std::fs::write` truncate-then-write) — atomic
+  temp-file + rename is a separate change, tracked with the store-atomicity work.
 - **Generic-assignment redaction no longer leaks a secret containing a quote
   or apostrophe (#104).** The row-10 value class `[^\s"']+` stopped at the
   first `'`/`"`, so `password = don't-…` matched only `don` — under the
