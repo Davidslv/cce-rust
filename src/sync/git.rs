@@ -105,8 +105,15 @@ pub fn current_branch(dir: &Path) -> Option<String> {
 /// only `.cce/` changes counts as clean, so `cce index` before `cce sync push`
 /// does not spuriously block the push.
 pub fn is_dirty(dir: &Path) -> bool {
-    match run(dir, &["status", "--porcelain"]) {
-        Ok(text) => text.lines().filter(|l| !l.trim().is_empty()).any(|l| !status_line_is_cce(l)),
+    // Read RAW stdout: `run()` trims the whole output, which strips the leading
+    // space off the FIRST porcelain line (` M path` -> `M path`), misaligning
+    // `status_line_is_cce`'s fixed `get(3..)` path slice and breaking the `.cce/`
+    // exemption in both directions (#117). Porcelain lines keep their columns here.
+    match run_bytes(dir, &["status", "--porcelain"]) {
+        Ok(bytes) => {
+            let text = String::from_utf8_lossy(&bytes);
+            text.lines().filter(|l| !l.trim().is_empty()).any(|l| !status_line_is_cce(l))
+        }
         // If git cannot report status, treat as clean is unsafe; treat as dirty so
         // we refuse rather than push a possibly-uncommitted tree.
         Err(_) => true,
@@ -172,6 +179,43 @@ mod tests {
         // A real source change does.
         std::fs::write(d.join("a.txt"), "changed\n").unwrap();
         assert!(is_dirty(d), "a modified tracked file marks the tree dirty");
+    }
+
+    #[test]
+    fn tracked_cce_only_modification_stays_clean_despite_porcelain_leading_space() {
+        // #117 false-block: a TRACKED `.cce/` file modified in the worktree yields
+        // porcelain " M .cce/index.json" — a leading-space first line. `run()`
+        // trims stdout, stripping that leading space, so `status_line_is_cce`'s
+        // fixed `get(3..)` slice read "cce/index.json" (no dot) and classified the
+        // documented .cce churn as real dirt, wrongly blocking `cce sync push`.
+        let tmp = repo_with_commit();
+        let d = tmp.path();
+        std::fs::create_dir_all(d.join(".cce")).unwrap();
+        std::fs::write(d.join(".cce/index.json"), "{}").unwrap();
+        // Force-add: `.cce/` may be globally gitignored, but a tracked store file
+        // is the real workflow the exemption exists for.
+        run_commit(d, &["add", "-f", ".cce/index.json"]).unwrap();
+        run_commit(d, &["commit", "-q", "-m", "add cce store"]).unwrap();
+        // The only change is the tracked .cce store file.
+        std::fs::write(d.join(".cce/index.json"), "{\"x\":1}").unwrap();
+        assert!(!is_dirty(d), "a tracked .cce-only change must still count as clean");
+    }
+
+    #[test]
+    fn dirty_first_line_non_cce_change_is_detected_despite_porcelain_leading_space() {
+        // #117 false-clean (other direction): a tracked file under a "..cce/"
+        // directory (sorts to the FIRST porcelain line) modified in the worktree
+        // yields " M ..cce/logic.py". After `run()`'s trim, the misaligned
+        // `get(3..)` read ".cce/logic.py", so a real source change was mistaken for
+        // .cce churn and a dirty tree was reported clean.
+        let tmp = repo_with_commit();
+        let d = tmp.path();
+        std::fs::create_dir_all(d.join("..cce")).unwrap();
+        std::fs::write(d.join("..cce/logic.py"), "x = 1\n").unwrap();
+        run_commit(d, &["add", "..cce/logic.py"]).unwrap();
+        run_commit(d, &["commit", "-q", "-m", "add dotdot file"]).unwrap();
+        std::fs::write(d.join("..cce/logic.py"), "x = 2\n").unwrap();
+        assert!(is_dirty(d), "a real non-.cce change on the first line must be detected");
     }
 
     #[test]

@@ -71,6 +71,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   manifest `checksum` blanked), so a byte-identical push always round-trips while
   genuine corruption is still caught. Canonical pushed bytes and the cross-engine
   golden are unchanged.
+- **`is_dirty` no longer misparses the first `git status --porcelain` line,
+  keeping the `.cce/` churn exemption correct both ways (#117).** `run()` trims
+  stdout, which strips the leading status column off the first porcelain line
+  (` M .cce/index.json` → `M .cce/index.json`), so the fixed 3-char path offset
+  read the wrong substring: a tracked-modified `.cce/` file was misclassified as
+  real dirt (wrongly blocking `cce sync push`), and a change under a `..cce/`
+  path was misclassified as ignorable churn (wrongly publishing from a dirty
+  tree). `is_dirty` now reads raw, untrimmed porcelain output so every line keeps
+  its status columns.
 - **Workspace member-name suffixing is now collision-free against real
   sibling directories (#131).** `detect_members` minted `basename-N` suffixes
   by a per-basename counter without checking the result against other members'
