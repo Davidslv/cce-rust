@@ -45,6 +45,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test/fixture/samples` verified byte-identical.
 
 ### Fixed
+- **Knowledge redaction residuals: served `record_id` is now redacted for display,
+  and `cce doctor` scans persisted facets for un-redacted secrets (#144).** A
+  secret placed in a knowledge record id could not be scrubbed at rest (chunk ids
+  and the synthetic document path derive from it) yet was served verbatim through
+  the `expand_chunk` and `related_context` headers, and via the `summarize_context`
+  session digest (the id was recorded raw into the session ledger's `files`
+  section) — a leak the #111/#112 facet redaction did not cover. Those served
+  surfaces now render a **redacted display form** of the id (`crate::redactor::redact`
+  over the id, display-only; the raw id still addresses; on the knowledge search
+  path the id is redacted before it enters the session ledger). Redaction is the identity on a clean id, so served output for
+  the common case is byte-identical and no served-output golden moves; only an id
+  that contains a secret changes. Separately, a store indexed **before** #111 (or
+  one that was tampered with) keeps raw facets on disk — and a local re-index does
+  not scrub a copy already `push`ed to a shared remote — so `cce doctor` gains an
+  advisory scrub scan: it runs the redactor over every persisted facet and the
+  record id, flags any that still carry a secret-shaped value (naming the facet,
+  never printing the raw value), and calls out a secret-bearing id separately as
+  needing a source-adapter fix rather than a re-index. Advisory, exit 0.
 - **`cce sync pull` no longer overwrites the local index at a different sha when
   the code marker is corrupt, and never activates a pulled store before its
   marker is durable (#163) — the code-side twins of the knowledge-side #123/#122.**

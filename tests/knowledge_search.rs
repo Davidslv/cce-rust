@@ -264,6 +264,154 @@ fn expand_and_related_work_on_knowledge_chunks() {
     );
 }
 
+// Secret-shaped test inputs are assembled from split fragments via `concat!` so no
+// committed source file carries a contiguous secret literal (GitHub push protection);
+// the redactor still sees the full value at runtime.
+const SECRET_ID_AWS_KEY: &str = concat!("AKIA", "IOSFODNN7EXAMPLE");
+
+/// A multi-section handbook whose RECORD ID carries a secret. The id cannot be
+/// redacted at rest (chunk ids/document path derive from it), so it reaches disk
+/// raw — the residual #144 targets. The title is clean, so only the served id
+/// headers can leak it.
+fn secret_id_feed() -> String {
+    // A long overview forces the markdown chunker to split, so the document has
+    // several sections and the searched section HAS same-document neighbours (so
+    // related_context exercises the non-empty `related to <id>` header, not the
+    // empty-neighbours fallback).
+    let overview: String = std::iter::repeat_n(
+        "This handbook collects the operating rules for the service across many areas. ",
+        40,
+    )
+    .collect();
+    let body = format!(
+        "{overview}\n\n\
+         ## Rate limiting\n\nReject more than one hundred requests per minute.\n\n\
+         ## Refund windows\n\nApprove a refund only within fourteen days of the charge.\n\n\
+         ## Data retention\n\nPurge inactive account records after ninety days.\n"
+    );
+    let rec = serde_json::json!({
+        "id": format!("gh:{SECRET_ID_AWS_KEY}"),
+        "title": "Service operations handbook",
+        "body": body,
+        "source": "handbook",
+        "state": "open",
+        "updated_at": "2026-03-01T00:00:00Z",
+    });
+    format!("{}\n", serde_json::to_string(&rec).unwrap())
+}
+
+#[test]
+fn secret_in_record_id_is_redacted_in_served_expand_and_related() {
+    // #144 Part A (RED on pre-fix code, which served the id verbatim): a secret in a
+    // knowledge record id must not exfiltrate through the expand_chunk /
+    // related_context headers — they render a REDACTED display form of the id.
+    let tmp = tempfile::tempdir().unwrap();
+    index_knowledge(tmp.path(), &secret_id_feed());
+    let dir = tmp.path().to_string_lossy().to_string();
+
+    // Find a knowledge chunk_id via search (context_search shows only the hashed
+    // chunk_id, never the record id — the search hit itself carries no secret).
+    let find = format!(
+        "{}{}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+        search_call(2, "refund window fourteen days", "knowledge"),
+    );
+    let out = drive(&["mcp", "--dir", &dir], &find);
+    let hit = tool_text(&out, 2);
+    assert!(!hit.contains(SECRET_ID_AWS_KEY), "context_search leaked the raw id secret:\n{hit}");
+    let id = knowledge_chunk_id(&hit);
+
+    let call = |rpc_id: i64, name: &str, extra: &str| {
+        format!(
+            "{{\"jsonrpc\":\"2.0\",\"id\":{rpc_id},\"method\":\"tools/call\",\"params\":{{\"name\":\"{name}\",\"arguments\":{{\"chunk_id\":\"{id}\"{extra}}}}}}}\n"
+        )
+    };
+    let input = format!(
+        "{}{}{}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+        call(3, "expand_chunk", ",\"scope\":\"file\""),
+        call(4, "related_context", ""),
+    );
+    let out = drive(&["mcp", "--dir", &dir], &input);
+
+    // expand_chunk(scope=file): the `document <id> — N section(s)` header + the
+    // per-section `<id>:...` headers must show the REDACTED id, never the secret.
+    let file = tool_text(&out, 3);
+    assert!(!file.contains(SECRET_ID_AWS_KEY), "raw secret id leaked in expand file:\n{file}");
+    assert!(
+        file.contains("document gh:[REDACTED:AWS_ACCESS_KEY]"),
+        "expand file header must show the redacted id:\n{file}"
+    );
+
+    // related_context: the `related to <id> in the same document` header must be
+    // redacted too.
+    let related = tool_text(&out, 4);
+    assert!(!related.contains(SECRET_ID_AWS_KEY), "raw secret id leaked in related:\n{related}");
+    assert!(
+        related.contains("related to gh:[REDACTED:AWS_ACCESS_KEY]"),
+        "related header must show the redacted id:\n{related}"
+    );
+
+    // The whole served transcript must be free of the raw secret.
+    assert!(!out.contains(SECRET_ID_AWS_KEY), "raw secret id leaked in served output:\n{out}");
+}
+
+#[test]
+fn secret_in_record_id_is_redacted_in_summarize_context_digest() {
+    // #144 (round-2 leak): context_search(source:"knowledge") records the returned
+    // record ids into the session ledger's `files` section, which summarize_context
+    // (Layer 6) serves VERBATIM — so a secret-bearing id would exfiltrate into agent
+    // context on a normal-use path (search → summarize). The recording site now
+    // stores the redacted DISPLAY form, symmetric with the served headers. RED
+    // before the fix: the digest's files section showed the raw AWS key.
+    let tmp = tempfile::tempdir().unwrap();
+    index_knowledge(tmp.path(), &secret_id_feed());
+    let dir = tmp.path().to_string_lossy().to_string();
+
+    let input = format!(
+        "{}{}{}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+        search_call(2, "refund window fourteen days", "knowledge"),
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"summarize_context\",\"arguments\":{}}}\n",
+    );
+    let out = drive(&["mcp", "--dir", &dir], &input);
+    let digest = tool_text(&out, 3);
+
+    assert!(digest.contains("files ("), "digest missing files section:\n{digest}");
+    assert!(
+        digest.contains("gh:[REDACTED:AWS_ACCESS_KEY]"),
+        "digest files section must show the redacted id:\n{digest}"
+    );
+    assert!(!digest.contains(SECRET_ID_AWS_KEY), "raw secret id leaked in digest:\n{digest}");
+    // The whole served transcript (search + summarize) is free of the raw key.
+    assert!(!out.contains(SECRET_ID_AWS_KEY), "raw secret id leaked in served output:\n{out}");
+}
+
+#[test]
+fn clean_record_id_is_byte_identical_in_summarize_context_digest() {
+    // Control (#144): a clean id (`kn:1`) is the identity under the redactor, so it
+    // appears VERBATIM in the digest's files section and carries no redaction marker
+    // — the summarize_context digest does not move for secret-free stores.
+    let tmp = tempfile::tempdir().unwrap();
+    index_knowledge(tmp.path(), &feed());
+    let dir = tmp.path().to_string_lossy().to_string();
+
+    let input = format!(
+        "{}{}{}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+        search_call(2, "hash password", "knowledge"),
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"summarize_context\",\"arguments\":{}}}\n",
+    );
+    let out = drive(&["mcp", "--dir", &dir], &input);
+    let digest = tool_text(&out, 3);
+
+    assert!(digest.contains("- kn:1"), "clean id must appear verbatim in digest:\n{digest}");
+    assert!(
+        !digest.contains("[REDACTED"),
+        "a clean-id digest must carry no redaction marker:\n{digest}"
+    );
+}
+
 #[test]
 fn code_result_bytes_are_unchanged_between_code_and_both() {
     let tmp = tempfile::tempdir().unwrap();

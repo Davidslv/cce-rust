@@ -417,6 +417,7 @@ fn check_knowledge(root: &Path, r: &mut Report) {
                     crate::knowledge::contract::KNOWLEDGE_SCHEMA_ID
                 ));
             }
+            check_knowledge_scrub(&store, r);
         }
     }
     match verify_knowledge_checksum(root) {
@@ -429,6 +430,85 @@ fn check_knowledge(root: &Path, r: &mut Report) {
         )),
         Some(Ok(KnowledgeChecksumVerify::NoRecord(_))) => r.advisory(KNOWLEDGE_NO_RECORD_NOTICE),
         Some(Err(e)) => r.fail(&e),
+    }
+}
+
+/// #144: scan every PERSISTED free-text facet (and the record id) of the loaded
+/// knowledge store through the Layer-2 redactor. `redact` is the identity on clean
+/// text, so `redact(value) != value` means the value is STILL secret-shaped: the
+/// store predates the #111/#112 facet-redaction fix (a local re-index will scrub
+/// it), or it was tampered with. If it was `push`ed, the `.cck` on the shared
+/// remote is NOT scrubbed by a local re-index — the fix must also re-push.
+///
+/// Advisory, not a failure (exit stays 0): a pre-#111 store is legitimately old,
+/// not corrupt, and doctor reserves the non-zero exit for definite
+/// corruption/mismatch. The finding names the affected facet(s) — never their raw
+/// value — so the advisory itself never prints a secret.
+///
+/// The `record_id` is reported SEPARATELY: it is an addressing key that CANNOT be
+/// redacted at rest (chunk ids and the document path derive from it), so a secret
+/// there needs the SOURCE ADAPTER to fix the id — a re-index will not scrub it. It
+/// is shown in its REDACTED display form, so this advisory does not leak it either.
+fn check_knowledge_scrub(store: &crate::knowledge::store::KnowledgeStore, r: &mut Report) {
+    use std::collections::BTreeSet;
+    let dirty = |v: &str| crate::redactor::redact(v) != v;
+    let mut dirty_facets: BTreeSet<&'static str> = BTreeSet::new();
+    let mut dirty_ids: BTreeSet<String> = BTreeSet::new();
+
+    for c in &store.chunks {
+        // The record id is scanned but reported separately (it cannot be scrubbed
+        // by re-index). Key the set by its REDACTED form so the advisory below can
+        // never print the raw secret.
+        if dirty(&c.record_id) {
+            dirty_ids.insert(crate::redactor::redact(&c.record_id));
+        }
+        // Every OTHER persisted free-text facet SHOULD already be redacted (#111).
+        let mut facets: Vec<(&'static str, &str)> = vec![
+            ("content", c.content.as_str()),
+            ("kind", c.kind.as_str()),
+            ("name", c.name.as_str()),
+            ("source", c.source.as_str()),
+            ("title", c.title.as_str()),
+        ];
+        for (name, opt) in [
+            ("url", &c.url),
+            ("state", &c.state),
+            ("state_reason", &c.state_reason),
+            ("updated_at", &c.updated_at),
+            ("group", &c.group),
+        ] {
+            if let Some(v) = opt.as_deref() {
+                facets.push((name, v));
+            }
+        }
+        for (name, value) in facets {
+            if dirty(value) {
+                dirty_facets.insert(name);
+            }
+        }
+        if c.labels.iter().any(|l| dirty(l)) {
+            dirty_facets.insert("labels");
+        }
+        if c.links.iter().any(|l| dirty(l)) {
+            dirty_facets.insert("links");
+        }
+    }
+
+    if !dirty_facets.is_empty() {
+        let names: Vec<&str> = dirty_facets.iter().copied().collect();
+        r.advisory(&format!(
+            "knowledge store carries un-redacted content in facet(s): {} — it predates the \
+             redaction fix (or was tampered with); re-index the feed, and if it was pushed, \
+             re-push (a local re-index does NOT scrub the remote .cck)",
+            names.join(", ")
+        ));
+    }
+    for id in &dirty_ids {
+        r.advisory(&format!(
+            "knowledge record id `{id}` contains secret-shaped content; record ids are addressing \
+             keys and cannot be redacted by re-index — fix the source adapter to remove the secret \
+             from the id"
+        ));
     }
 }
 
@@ -809,6 +889,108 @@ mod tests {
         let out = run(tmp.path());
         assert!(!out.healthy());
         assert!(out.report.contains("knowledge contract mismatch"), "{}", out.report);
+    }
+
+    // Secret-shaped inputs are assembled from split fragments via `concat!` so no
+    // committed source file carries a contiguous secret literal (GitHub push
+    // protection); the redactor still sees the full value at runtime.
+    const SCRUB_AWS_KEY: &str = concat!("AKIA", "IOSFODNN7EXAMPLE");
+
+    /// Ingest a one-record clean feed into `root`'s knowledge store, then apply
+    /// `mutate` to the in-memory store BEFORE it is persisted — so a facet can be
+    /// dirtied AFTER the ingest-time redaction, simulating a pre-#111 (or tampered)
+    /// store that carries raw secrets on disk.
+    fn save_dirty_knowledge_store(
+        root: &Path,
+        mutate: impl FnOnce(&mut crate::knowledge::store::KnowledgeStore),
+    ) {
+        let feed = "{\"id\":\"kn:1\",\"title\":\"Login policy\",\"body\":\"## Rule\\n\\nStore only a salted hash.\",\"source\":\"handbook\"}\n";
+        let recs = crate::knowledge::contract::parse_ndjson(feed).unwrap();
+        let mut store = crate::knowledge::store::ingest(&recs, feed.as_bytes(), 400);
+        mutate(&mut store);
+        store.save(root).unwrap();
+    }
+
+    #[test]
+    fn doctor_flags_a_knowledge_store_with_an_unredacted_facet() {
+        // #144 Part B (RED on pre-fix code, which never scanned facets): a store
+        // whose persisted `title` facet still carries a raw secret (a pre-#111 or
+        // tampered store) is flagged — advisory (exit 0), naming the facet, never
+        // printing the raw value.
+        let tmp = tempfile::tempdir().unwrap();
+        save_dirty_knowledge_store(tmp.path(), |store| {
+            for c in &mut store.chunks {
+                c.title = format!("Rotate leaked key {SCRUB_AWS_KEY} now");
+            }
+        });
+        let out = run(tmp.path());
+        assert!(out.healthy(), "scrub scan must stay advisory (exit 0):\n{}", out.report);
+        assert!(
+            out.report.contains("un-redacted content in facet(s): title"),
+            "advisory must name the dirty facet:\n{}",
+            out.report
+        );
+        assert!(out.report.contains("re-push"), "advisory must mention re-push:\n{}", out.report);
+        assert!(
+            !out.report.contains(SCRUB_AWS_KEY),
+            "the advisory must NOT print the raw secret:\n{}",
+            out.report
+        );
+    }
+
+    #[test]
+    fn doctor_flags_a_secret_bearing_record_id_separately() {
+        // #144 Part B: a record id carrying a secret is flagged on its OWN advisory
+        // — ids are addressing keys, unscrubbable by re-index — and is shown only in
+        // its redacted display form, so the advisory never leaks the raw secret.
+        let tmp = tempfile::tempdir().unwrap();
+        save_dirty_knowledge_store(tmp.path(), |store| {
+            for c in &mut store.chunks {
+                c.record_id = format!("gh:{SCRUB_AWS_KEY}");
+            }
+        });
+        let out = run(tmp.path());
+        assert!(out.healthy(), "id scan must stay advisory (exit 0):\n{}", out.report);
+        assert!(
+            out.report.contains("record id `gh:[REDACTED:AWS_ACCESS_KEY]` contains secret-shaped"),
+            "advisory must name the redacted id:\n{}",
+            out.report
+        );
+        assert!(
+            out.report.contains("fix the source adapter"),
+            "advisory must point at the source adapter:\n{}",
+            out.report
+        );
+        assert!(
+            !out.report.contains(SCRUB_AWS_KEY),
+            "the advisory must NOT print the raw secret id:\n{}",
+            out.report
+        );
+    }
+
+    #[test]
+    fn doctor_is_silent_on_the_scrub_scan_for_a_clean_store() {
+        // #144 Part B control: a secret-free store trips NO scrub finding (redaction
+        // is the identity on clean text).
+        let tmp = tempfile::tempdir().unwrap();
+        save_dirty_knowledge_store(tmp.path(), |_| {});
+        let out = run(tmp.path());
+        assert!(out.healthy(), "report:\n{}", out.report);
+        assert!(
+            !out.report.contains("un-redacted content"),
+            "clean store must not trip the facet scan:\n{}",
+            out.report
+        );
+        assert!(
+            !out.report.contains("secret-shaped"),
+            "clean store must not trip the id scan:\n{}",
+            out.report
+        );
+        assert_eq!(
+            out.advisories, 0,
+            "clean locally-indexed store has no advisories:\n{}",
+            out.report
+        );
     }
 
     #[test]
