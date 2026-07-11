@@ -84,14 +84,25 @@ pub fn provenance_line(
     line
 }
 
-/// Neutralize any control character (newline, carriage return, tab, …) in a
-/// free-text provenance field to a single space, so feed-controlled data can
-/// never break the single-line `«rank». [«score»] [knowledge] …` grammar or
-/// inject a spoofed ranked-result/heading line (#112). A field with no control
-/// character is returned byte-identical, so every clean provenance line — and
-/// its byte-pinned golden — is unchanged.
+/// Neutralize any line-breaking character in a free-text provenance field to a
+/// single space, so feed-controlled data can never break the single-line
+/// `«rank». [«score»] [knowledge] …` grammar or inject a spoofed
+/// ranked-result/heading line (#112). This covers every C0/C1 control
+/// (newline, carriage return, tab, …) plus the Unicode line/paragraph
+/// separators U+2028/U+2029, which are `char::is_control() == false` yet act as
+/// line terminators for non-terminal consumers. A field with no such character
+/// is returned byte-identical, so every clean provenance line — and its
+/// byte-pinned golden — is unchanged.
 fn sanitize_provenance_field(s: &str) -> String {
-    s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
+    s.chars()
+        .map(|c| {
+            if c.is_control() || c == '\u{2028}' || c == '\u{2029}' {
+                ' '
+            } else {
+                c
+            }
+        })
+        .collect()
 }
 
 /// True if a `state_reason` drops the record from knowledge results (SPEC-V2.6 §5):
@@ -379,6 +390,12 @@ mod tests {
         let f = provenance_line("Bare", Some("open\nspoof"), None, None);
         assert!(!f.contains('\n'), "{f:?}");
         assert_eq!(f, "[knowledge] Bare — open spoof");
+        // #112: the Unicode line/paragraph separators U+2028/U+2029 are line
+        // terminators for non-terminal consumers but are NOT `is_control()`, so
+        // they must be neutralized too or a title can still break the line.
+        let u = provenance_line("First\u{2028}## Injected\u{2029}second", Some("open"), None, None);
+        assert!(!u.contains('\u{2028}') && !u.contains('\u{2029}'), "{u:?}");
+        assert_eq!(u, "[knowledge] First ## Injected second — open");
         // A CLEAN title/facets stay byte-identical (golden unchanged).
         assert_eq!(
             provenance_line("Login policy", Some("closed"), None, None),

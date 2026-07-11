@@ -165,8 +165,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   so a feed-controlled title containing `\n` produced a multi-line MCP
   `context_search` header, letting attacker-controlled data spoof extra
   ranked-result/heading lines. Free-text provenance fields now neutralize any
-  control character to a space; a clean title stays byte-identical, so every
-  pinned provenance golden is unchanged.
+  control character — plus the Unicode line/paragraph separators U+2028/U+2029,
+  which are line terminators for non-terminal consumers yet not `is_control()` —
+  to a space; a clean title stays byte-identical, so every pinned provenance
+  golden is unchanged.
 - **`SyncConfig::load` surfaces a malformed project config instead of silently
   using the global remote (#119).** `load` in `src/sync/config.rs` mapped a
   failed parse of an existing `.cce/config` to `None` via `.ok()`, treating a
