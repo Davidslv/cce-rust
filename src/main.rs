@@ -371,8 +371,11 @@ enum SyncCmd {
     },
     /// Ensure a hash-index for HEAD/sha, export the artifact, and put it on the remote.
     Push {
-        /// The commit to push (default: HEAD). The working tree must be clean.
-        #[arg(long)]
+        /// Sanity-assert the commit being published equals HEAD (default: HEAD).
+        /// Push always builds from the working tree, so a non-HEAD value is
+        /// rejected. Not a backfill selector; ignored by --workspace, so the two
+        /// conflict.
+        #[arg(long, conflicts_with = "workspace")]
         commit: Option<String>,
         /// Push every workspace member, each keyed by its own repo_id@sha.
         #[arg(long)]

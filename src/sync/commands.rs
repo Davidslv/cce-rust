@@ -2381,6 +2381,19 @@ mod tests {
         std::env::remove_var("CCE_HOME");
     }
 
+    /// #116 hardening: a leading-dash `--commit` value (e.g. `--output=x`) must be
+    /// rejected as an invalid commit, never resolved or smuggled into git as a flag.
+    #[test]
+    fn push_rejects_dash_leading_commit() {
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let src = source_repo();
+        init_cfg(src.path(), &url);
+        let err = cmd_push(src.path(), Some("--output=x".to_string()), false).unwrap_err();
+        assert!(err.contains("not a valid commit"), "got: {err}");
+        std::env::remove_var("CCE_HOME");
+    }
+
     #[test]
     fn init_rejects_non_directory() {
         let _home = set_home();
