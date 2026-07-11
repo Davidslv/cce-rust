@@ -45,6 +45,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test/fixture/samples` verified byte-identical.
 
 ### Fixed
+- **A valid-JSON request with an id but no string `method` now echoes the id as
+  a `-32600` Invalid Request instead of a null-id parse error (#125).**
+  `parse_request` flattened "invalid JSON" and "valid JSON, wrong shape" into one
+  error, so `handle_line` answered a request like `{"jsonrpc":"2.0","id":7,"method":5}`
+  with `-32700` and `id:null` — a conforming client correlates responses by id,
+  cannot match `id:null` to request 7, and leaves the call pending until timeout.
+  `parse_request` now returns a `ParseError` that distinguishes the two: non-JSON
+  stays `-32700` with a null id, while valid JSON that is not a well-formed
+  request is `-32600` "invalid request" with the recoverable id echoed, so the
+  client can correlate and fail the call cleanly.
 - **One invalid-UTF-8 byte on stdin no longer kills the whole MCP session
   (#124).** The `cce mcp` read loop read each line into a `String` with
   `read_line`, which propagates an `InvalidData` ("stream did not contain valid

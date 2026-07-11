@@ -459,8 +459,15 @@ impl McpServer {
     pub fn handle_line(&self, line: &str) -> Option<String> {
         let req = match protocol::parse_request(line) {
             Ok(r) => r,
-            Err(_) => {
+            // Non-JSON: id is undeterminable ⇒ -32700 with a null id.
+            Err(protocol::ParseError::Parse) => {
                 return Some(protocol::error(Value::Null, protocol::PARSE_ERROR, "parse error"))
+            }
+            // Valid JSON but not a well-formed request: echo the recoverable id and
+            // return -32600 so the client can correlate the error with its pending
+            // call instead of being orphaned on a null id (#125).
+            Err(protocol::ParseError::InvalidRequest { id }) => {
+                return Some(protocol::error(id, protocol::INVALID_REQUEST, "invalid request"))
             }
         };
         if req.is_notification() {
@@ -968,6 +975,32 @@ mod tests {
         let v: Value = serde_json::from_str(&resp).unwrap();
         assert_eq!(v["error"]["code"], protocol::PARSE_ERROR);
         assert!(v["id"].is_null());
+    }
+
+    #[test]
+    fn methodless_request_echoes_its_id_as_invalid_request_not_a_null_id_parse_error() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = server_for(tmp.path());
+
+        // Valid JSON, has an id, but `method` is not a string: the id is recoverable,
+        // so the client must get -32600 with id 7 echoed — not -32700 with id null,
+        // which would orphan its pending request (#125).
+        let resp = s.handle_line(r#"{"jsonrpc":"2.0","id":7,"method":5}"#).unwrap();
+        let v: Value = serde_json::from_str(&resp).unwrap();
+        assert_eq!(v["error"]["code"], protocol::INVALID_REQUEST);
+        assert_eq!(v["id"], 7);
+
+        // Method entirely absent but id present ⇒ same treatment, string id echoed.
+        let resp2 = s.handle_line(r#"{"id":"abc"}"#).unwrap();
+        let v2: Value = serde_json::from_str(&resp2).unwrap();
+        assert_eq!(v2["error"]["code"], protocol::INVALID_REQUEST);
+        assert_eq!(v2["id"], "abc");
+
+        // Truly non-JSON remains a -32700 parse error with a null id (unchanged).
+        let resp3 = s.handle_line("not json at all").unwrap();
+        let v3: Value = serde_json::from_str(&resp3).unwrap();
+        assert_eq!(v3["error"]["code"], protocol::PARSE_ERROR);
+        assert!(v3["id"].is_null());
     }
 
     #[test]
