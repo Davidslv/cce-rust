@@ -335,8 +335,15 @@ pub fn recall(
     let index =
         Index::from_parts(chunks, BTreeMap::new(), BTreeMap::new(), embedder.name().to_string());
 
-    // Rank generously (top_k candidates), then precision-filter down.
-    let results = search(&index, &embedder, query, top_k, false);
+    // Rank generously (the WHOLE corpus, not just `top_k`) so the precision
+    // filter sees every candidate before we truncate to `top_k`. Passing `top_k`
+    // to `search` here truncated BEFORE the filter (#103): it both shrank the
+    // candidate pool and cut the list to `top_k`, so coincidental no-token
+    // matches inside the window consumed slots and valid, lexically overlapping
+    // entries ranked just below were silently dropped — contradicting the
+    // filter-then-truncate contract documented above.
+    let generous = entries.len().max(top_k);
+    let results = search(&index, &embedder, query, generous, false);
     let mut hits: Vec<RecallHit> = Vec::new();
     for r in results {
         if r.score < min_score {
@@ -440,6 +447,74 @@ mod tests {
         let raw = std::fs::read_to_string(&path).unwrap();
         assert!(raw.contains("[REDACTED:AWS_ACCESS_KEY]"));
         assert!(!raw.contains(AWS_KEY));
+    }
+
+    fn mementry(text: &str, tags: &[&str]) -> MemoryEntry {
+        MemoryEntry {
+            id: memory_id(text),
+            text: text.to_string(),
+            tags: tags.iter().map(|s| s.to_string()).collect(),
+            area: None,
+            ts: "2026-07-05T00:00:00Z".to_string(),
+        }
+    }
+
+    #[test]
+    fn recall_filters_before_truncating_so_valid_entries_are_not_starved() {
+        // #103: recall must rank GENEROUSLY, then precision-filter, then truncate
+        // to top_k (the documented filter-then-truncate contract) — NOT truncate
+        // to top_k first. Passing top_k into `search` did the latter: it both
+        // shrank the candidate pool AND truncated before the shares-token filter,
+        // so coincidental no-token matches consumed top_k slots and qualifying
+        // entries ranked just below were silently dropped.
+        //
+        // Scenario (all deterministic on the hash embedder):
+        //  - Two DISTRACTORS whose FNV-collision tokens give cosine 1.0 to the
+        //    query but share NO query token — top of the vector arm, filtered out.
+        //  - Many VALID entries that share the exact token "plan" (score ≥ the
+        //    floor, a real lexical overlap), enough that the truncate-first pool
+        //    cannot see them all.
+        // With top_k=5 the contract must return 5 valid hits; the buggy
+        // truncate-then-filter returns only 3 (two slots eaten by distractors).
+        let q = "database migration rollback plan";
+        let mut entries = vec![
+            // cosine 1.0 to the query, share NO token → filtered out.
+            mementry("apbj accs acnf aabi", &[]),
+            mementry("apbj accs acnf aabi indeed", &[]),
+            // valid but low-cosine (anti-token) entries: share exact "plan".
+            mementry("plan aact aact aact aaoa aaoa aaoa aama aama aama alpha", &[]),
+            mementry("plan aact aact aact aaoa aaoa aaoa aama aama aama bravo", &[]),
+            mementry("plan aact aact aact aaoa aaoa aaoa aama aama aama delta", &[]),
+        ];
+        // Unrelated filler (no shared token) that shapes the score field, plus a
+        // pool of valid "plan …" entries larger than the truncate-first window.
+        for i in 0..12 {
+            entries.push(mementry(
+                &format!("unrelated note number {i} about gardening tomatoes"),
+                &[],
+            ));
+        }
+        for i in 0..25 {
+            entries.push(mementry(
+                &format!("plan revision {i} concerning aact aaoa aama logistics detail note"),
+                &[],
+            ));
+        }
+
+        let top_k = 5;
+        let hits = recall(&entries, q, top_k, MEMORY_RECALL_MIN_SCORE);
+
+        // Every returned hit is genuinely qualifying (shares a token, over the floor)…
+        for h in &hits {
+            assert!(h.score >= MEMORY_RECALL_MIN_SCORE, "under floor: {h:?}");
+            let e = entries.iter().find(|e| e.id == h.id).unwrap();
+            assert!(shares_token(q, e), "recalled a no-token distractor: {h:?}");
+            assert!(!h.text.starts_with("apbj"), "distractor leaked into hits: {h:?}");
+        }
+        // …and the filter runs BEFORE the truncate, so the full top_k is delivered
+        // rather than being starved by the two coincidental distractors that the
+        // truncate-first bug lets consume slots (buggy recall returns only 3 here).
+        assert_eq!(hits.len(), top_k, "filter-then-truncate must fill top_k with valid hits");
     }
 
     #[test]

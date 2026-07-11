@@ -136,6 +136,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `<file-name>.fingerprint.json`, so colocated stores keep independent
   fingerprints. (The non-atomic write half of the report was already closed by
   #101, which routes the fingerprint write through `crate::atomic::atomic_write`.)
+- **`recall()` filters before it truncates, so valid memories are no longer
+  starved by coincidental non-matches (#103).** `src/memory.rs` passed `top_k`
+  into `search`, which truncated the candidate list to `top_k` BEFORE the
+  precision filter (score floor AND shared-token) ran — contradicting the
+  documented rank-generously-then-filter-then-truncate contract. A no-token
+  vector coincidence inside the `top_k` window could consume a slot and drop a
+  qualifying entry ranked just below it. Recall now ranks the whole corpus,
+  filters, then truncates to `top_k`.
 - **Memory append is a single write with a newline guard, so a torn or
   interleaved append can no longer silently lose entries (#102).** `append`
   in `src/memory.rs` wrote the JSON line and its trailing `\n` as two separate
