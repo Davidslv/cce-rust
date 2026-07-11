@@ -117,14 +117,42 @@ const PUNT_PHRASES: [&str; 12] = [
 ];
 
 /// True if `answer` reads as a cheap non-answer (SPEC-V2.5 §7 punt-detection).
-/// Deterministic: case-insensitive substring match plus a minimum-length floor.
+/// Deterministic: case-insensitive **whole-token** phrase match plus a
+/// minimum-length floor. Matching is bounded (not a raw substring scan) so a
+/// phrase embedded inside a larger word never triggers — critically, the short
+/// phrase `n/a` no longer fires on a legitimate multi-segment path like
+/// `common/auth.py` (`…commo·n/a·uth…`), which would silently misgrade a fully
+/// correct, path-citing answer as a punt (#106).
 pub fn is_punt(answer: &str) -> bool {
     let trimmed = answer.trim();
     if trimmed.chars().filter(|c| !c.is_whitespace()).count() < 3 {
         return true;
     }
     let lower = trimmed.to_lowercase();
-    PUNT_PHRASES.iter().any(|p| lower.contains(p))
+    PUNT_PHRASES.iter().any(|p| contains_bounded_phrase(&lower, p))
+}
+
+/// True if `phrase` occurs in `haystack` bounded by a non-alphanumeric edge on
+/// both sides (start/end of string counts). Both are already lowercased. This
+/// keeps a punt phrase from matching when it is glued inside a longer token
+/// (e.g. `n/a` inside `common/auth.py`) while still catching it as a real word
+/// (`N/A`, `it is n/a here`). Every pinned phrase starts and ends with an
+/// alphanumeric char, so alphanumeric neighbours are the correct boundary test.
+fn contains_bounded_phrase(haystack: &str, phrase: &str) -> bool {
+    let bytes = haystack.as_bytes();
+    let plen = phrase.len();
+    let mut from = 0;
+    while let Some(rel) = haystack[from..].find(phrase) {
+        let start = from + rel;
+        let end = start + plen;
+        let before_ok = start == 0 || !bytes[start - 1].is_ascii_alphanumeric();
+        let after_ok = end >= bytes.len() || !bytes[end].is_ascii_alphanumeric();
+        if before_ok && after_ok {
+            return true;
+        }
+        from = start + 1;
+    }
+    false
 }
 
 /// Grade one run against its question. Punt-detection first (a punt is never
@@ -351,7 +379,27 @@ mod tests {
         assert!(is_punt("no"));
         assert!(is_punt("I couldn't find the function anywhere."));
         assert!(is_punt("N/A"));
+        assert!(is_punt("The answer is n/a for this repo."));
         assert!(!is_punt("It is defined in auth.py at hash_password."));
+    }
+
+    #[test]
+    fn punt_phrase_na_does_not_match_inside_a_file_path() {
+        // #106: a correct answer that cites a multi-segment path must not be
+        // graded a punt just because the path contains the bytes "n/a"
+        // (common/auth.py, gen/api, main/app, session/auth).
+        assert!(!is_punt("hash_password is defined in common/auth.py at line 1."));
+        assert!(!is_punt("See gen/api and main/app for the handler."));
+        // The grade path must therefore score such an answer Correct, not Punt.
+        let question = q("q1", &["auth.py", "hash_password"]);
+        let r = run(
+            "q1",
+            Condition::On,
+            "hash_password is defined in common/auth.py at line 1.",
+            0.1,
+            0.0,
+        );
+        assert_eq!(grade(&question, &r), Grade::Correct);
     }
 
     #[test]

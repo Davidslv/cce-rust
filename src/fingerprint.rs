@@ -161,12 +161,25 @@ impl Fingerprint {
     }
 }
 
-/// The fingerprint path for a store file: `FINGERPRINT_FILE` in the store's
-/// directory (mirrors how the metrics log resolves beside the store).
+/// The fingerprint filename for a store file. The canonical store `index.json`
+/// keeps the historical `fingerprint.json` (so fingerprints beside every
+/// pre-existing `<root>/.cce/index.json` still resolve), but a NAMED store
+/// (`--store d/a.json`) gets a per-store `<file-name>.fingerprint.json`, so two
+/// stores in one directory never clobber each other's fingerprint (#100).
+fn fingerprint_file_name(store_path: &Path) -> String {
+    match store_path.file_name().and_then(|n| n.to_str()) {
+        Some("index.json") | None => FINGERPRINT_FILE.to_string(),
+        Some(name) => format!("{name}.{FINGERPRINT_FILE}"),
+    }
+}
+
+/// The fingerprint path for a store file: [`fingerprint_file_name`] in the
+/// store's directory (mirrors how the metrics log resolves beside the store).
 pub fn beside_store(store_path: &Path) -> PathBuf {
+    let name = fingerprint_file_name(store_path);
     match store_path.parent() {
-        Some(p) if !p.as_os_str().is_empty() => p.join(FINGERPRINT_FILE),
-        _ => PathBuf::from(FINGERPRINT_FILE),
+        Some(p) if !p.as_os_str().is_empty() => p.join(name),
+        _ => PathBuf::from(name),
     }
 }
 
@@ -253,6 +266,39 @@ mod tests {
         assert_eq!(Fingerprint::load_beside_store(&store).unwrap(), None);
         std::fs::write(tmp.path().join(FINGERPRINT_FILE), "not json").unwrap();
         assert!(Fingerprint::load_beside_store(&store).is_err());
+    }
+
+    #[test]
+    fn two_named_stores_in_one_dir_keep_separate_fingerprints() {
+        // #100: two `--store` files in one directory must not clobber each
+        // other's fingerprint — otherwise `doctor` reports a permanent false
+        // corruption on whichever store was fingerprinted first.
+        let tmp = tempfile::tempdir().unwrap();
+        let (idx, _) = Index::build_from_dir(&fixture(), &HashEmbedder).unwrap();
+        // A second, DIFFERENT store (fewer chunks ⇒ different bytes/sha).
+        let mut chunks2 = idx.chunks.clone();
+        chunks2.truncate(1);
+        let idx2 = Index::from_parts(
+            chunks2,
+            idx.file_imports.clone(),
+            idx.file_tokens.clone(),
+            idx.embedder_name.clone(),
+        );
+        let store_a = tmp.path().join("a.json");
+        let store_b = tmp.path().join("b.json");
+        idx.save(&store_a).unwrap();
+        idx2.save(&store_b).unwrap();
+
+        let fp_a = write_for_store(&store_a, &idx, true).unwrap();
+        let fp_b = write_for_store(&store_b, &idx2, true).unwrap();
+        assert_ne!(fp_a, fp_b, "each named store needs its own fingerprint file");
+
+        // Each fingerprint must still bind to ITS OWN store's bytes (no clobber).
+        let a = Fingerprint::load_beside_store(&store_a).unwrap().expect("a fingerprint");
+        let b = Fingerprint::load_beside_store(&store_b).unwrap().expect("b fingerprint");
+        assert_eq!(a.store_sha256, hex_lower(&Sha256::digest(std::fs::read(&store_a).unwrap())));
+        assert_eq!(b.store_sha256, hex_lower(&Sha256::digest(std::fs::read(&store_b).unwrap())));
+        assert_ne!(a.store_sha256, b.store_sha256, "fingerprints must not be clobbered");
     }
 
     #[test]

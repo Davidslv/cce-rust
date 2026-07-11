@@ -124,6 +124,59 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "vector recall disabled". `rank_core` now gathers no vector candidates when the
   query vector is empty, leaving BM25 as the sole recall source (a zero-overlap
   query returns empty, matching `bm25_only_search`).
+- **Per-store fingerprint filename so two named stores in one directory no
+  longer clobber each other's fingerprint (#100).** `beside_store` in
+  `src/fingerprint.rs` resolved every store in a directory to the same constant
+  `fingerprint.json`, so `cce index dirB --store D/b.json` overwrote the
+  fingerprint written for `D/a.json` and `cce doctor --store D/a.json` then
+  reported a permanent false "store bytes do not match the fingerprint"
+  corruption that re-indexing could never clear. The canonical `index.json`
+  store keeps the historical `fingerprint.json` (existing stores resolve
+  unchanged), but a named store now derives a per-store
+  `<file-name>.fingerprint.json`, so colocated stores keep independent
+  fingerprints. (The non-atomic write half of the report was already closed by
+  #101, which routes the fingerprint write through `crate::atomic::atomic_write`.)
+- **`recall()` filters before it truncates, so valid memories are no longer
+  starved by coincidental non-matches (#103).** `src/memory.rs` passed `top_k`
+  into `search`, which truncated the candidate list to `top_k` BEFORE the
+  precision filter (score floor AND shared-token) ran — contradicting the
+  documented rank-generously-then-filter-then-truncate contract. A no-token
+  vector coincidence inside the `top_k` window could consume a slot and drop a
+  qualifying entry ranked just below it. Recall now ranks the whole corpus,
+  filters, then truncates to `top_k`.
+- **Punt phrase `n/a` no longer substring-matches file paths, so correct
+  answers are not silently misgraded as punts (#106).** `is_punt` in
+  `src/eval.rs` did a raw case-insensitive substring scan, so an answer citing a
+  multi-segment path like `common/auth.py` (`…commo·n/a·uth…`) graded `Punt`,
+  zeroing the correctness-gated A/B paired set. Punt phrases now match only on
+  non-alphanumeric word boundaries, so `N/A` as a real non-answer still fires
+  while a path segment never does.
+- **Paired-t constancy guard tolerates rounding residue, so mathematically-equal
+  deltas from different bases no longer emit a saturating t (#108).** `paired_t`
+  in `src/stats.rs` used an exact bit-identity check, so per-query deltas that
+  are the same value computed from different bases (`0.6−0.4` vs `0.2−0.0`)
+  slipped through and their ~1e-17 variance produced t ≈ 1e16, rendered as the
+  i64-saturated `+9223372036854.775807` in the byte-pinnable
+  `cce.relevance.report/v2`. The guard now treats deltas whose spread is within
+  a few ULPs of their magnitude as constant (t = `n/a`, p = 0, CI = [mean, mean]).
+- **Newline in a knowledge record title can no longer break the single-line
+  provenance grammar or inject a fake result line (#112).** `provenance_line` in
+  `src/knowledge/retrieval.rs` interpolated the title (and facets) unsanitized,
+  so a feed-controlled title containing `\n` produced a multi-line MCP
+  `context_search` header, letting attacker-controlled data spoof extra
+  ranked-result/heading lines. Free-text provenance fields now neutralize any
+  control character — plus the Unicode line/paragraph separators U+2028/U+2029,
+  which are line terminators for non-terminal consumers yet not `is_control()` —
+  to a space; a clean title stays byte-identical, so every pinned provenance
+  golden is unchanged.
+- **`SyncConfig::load` surfaces a malformed project config instead of silently
+  using the global remote (#119).** `load` in `src/sync/config.rs` mapped a
+  failed parse of an existing `.cce/config` to `None` via `.ok()`, treating a
+  typo'd config exactly like an absent one and falling back to the global
+  remote — so `sync push`/`pull` could target the wrong cache with no warning. A
+  project config that exists but does not parse is now surfaced with a clear
+  warning and the load stays all-local, so the misconfiguration cannot be masked
+  by an unrelated global remote.
 - **Memory append is a single write with a newline guard, so a torn or
   interleaved append can no longer silently lose entries (#102).** `append`
   in `src/memory.rs` wrote the JSON line and its trailing `\n` as two separate
