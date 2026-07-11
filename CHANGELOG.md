@@ -177,6 +177,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   project config that exists but does not parse is now surfaced with a clear
   warning and the load stays all-local, so the misconfiguration cannot be masked
   by an unrelated global remote.
+- **`cce usage --since` rejects an overflowing relative duration with a clear
+  error instead of panicking or wrapping (#129).** `parse_since` in
+  `src/usage.rs` multiplied the parsed count by the unit seconds with unchecked
+  i64 arithmetic, so a count like `999999999999999d` panicked in debug and
+  wrapped to a garbage cutoff in release. It now uses `checked_mul` (surfacing
+  the standard `invalid --since` guidance on overflow) and a saturating
+  subtraction for the cutoff. Verified in a release build: the overflow is an
+  error, not a wrapped cutoff.
 - **Aggregate roll-ups sum `tokens_saved` (and `sensitive_skipped`) with
   saturating u64 arithmetic, so a corrupt or forged log value can no longer
   overflow-panic `cce usage` / kill the dashboard process in debug, nor wrap to

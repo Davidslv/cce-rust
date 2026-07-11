@@ -82,13 +82,20 @@ pub fn parse_since(spec: &str, now_secs: i64) -> Result<SinceCut, String> {
             if n == 0 {
                 return Err(err());
             }
-            let secs = match unit {
-                'm' => n * 60,
-                'h' => n * 3600,
-                'd' => n * 86_400,
-                _ => n * 7 * 86_400,
+            // Checked multiply so an absurd count (e.g. 999999999999999d) is a clear
+            // error, not an i64 overflow-panic (debug) or a wrapped garbage cutoff
+            // (release) — see #129. The subtraction is saturating for the same reason.
+            let unit_secs: i64 = match unit {
+                'm' => 60,
+                'h' => 3600,
+                'd' => 86_400,
+                _ => 7 * 86_400,
             };
-            return Ok(SinceCut { cutoff_secs: now_secs - secs, relative: Some(lower) });
+            let secs = n.checked_mul(unit_secs).ok_or_else(err)?;
+            return Ok(SinceCut {
+                cutoff_secs: now_secs.saturating_sub(secs),
+                relative: Some(lower),
+            });
         }
     }
     // ISO instant (second precision) or bare date (midnight UTC).
@@ -492,6 +499,19 @@ mod tests {
         // A bare date is midnight UTC.
         let d = parse_since("2026-07-01", n).unwrap();
         assert_eq!(d.cutoff_secs, parse_iso("2026-07-01T00:00:00Z").unwrap());
+    }
+
+    #[test]
+    fn parse_since_rejects_overflowing_relative_durations() {
+        // #129: a count so large that count * unit-seconds overflows i64 must be a
+        // clean error listing the accepted forms — not an overflow panic (debug) or
+        // a wrapped garbage cutoff (release). Asserting the ERROR pins the graceful
+        // result in BOTH profiles.
+        for bad in ["999999999999999d", "99999999999999999999w", "9223372036854775807h"] {
+            let err = parse_since(bad, now()).unwrap_err();
+            assert!(err.contains("invalid --since"), "{bad}: {err}");
+            assert!(err.contains("90m, 24h, 7d, 4w"), "{bad}: {err}");
+        }
     }
 
     #[test]
