@@ -1,0 +1,26 @@
+import unittest
+from retriever import rank_core
+
+class TestRetriever(unittest.TestCase):
+    def test_rank_core_top_k_zero(self):
+        query = "hash password"
+        index = [
+            {"id": 1, "score": 0.9},
+            {"id": 2, "score": 0.8},
+            {"id": 3, "score": 0.7},
+        ]
+        top_k = 0
+        self.assertEqual(rank_core(query, index, top_k), [])
+
+    def test_rank_core_top_k_positive(self):
+        query = "hash password"
+        index = [
+            {"id": 1, "score": 0.9},
+            {"id": 2, "score": 0.8},
+            {"id": 3, "score": 0.7},
+        ]
+        top_k = 2
+        self.assertEqual(rank_core(query, index, top_k), [{"id": 1, "score": 0.9}, {"id": 2, "score": 0.8}])
+
+if __name__ == "__main__":
+    unittest.main()
