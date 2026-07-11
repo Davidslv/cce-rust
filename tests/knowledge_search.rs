@@ -357,6 +357,62 @@ fn secret_in_record_id_is_redacted_in_served_expand_and_related() {
 }
 
 #[test]
+fn secret_in_record_id_is_redacted_in_summarize_context_digest() {
+    // #144 (round-2 leak): context_search(source:"knowledge") records the returned
+    // record ids into the session ledger's `files` section, which summarize_context
+    // (Layer 6) serves VERBATIM — so a secret-bearing id would exfiltrate into agent
+    // context on a normal-use path (search → summarize). The recording site now
+    // stores the redacted DISPLAY form, symmetric with the served headers. RED
+    // before the fix: the digest's files section showed the raw AWS key.
+    let tmp = tempfile::tempdir().unwrap();
+    index_knowledge(tmp.path(), &secret_id_feed());
+    let dir = tmp.path().to_string_lossy().to_string();
+
+    let input = format!(
+        "{}{}{}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+        search_call(2, "refund window fourteen days", "knowledge"),
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"summarize_context\",\"arguments\":{}}}\n",
+    );
+    let out = drive(&["mcp", "--dir", &dir], &input);
+    let digest = tool_text(&out, 3);
+
+    assert!(digest.contains("files ("), "digest missing files section:\n{digest}");
+    assert!(
+        digest.contains("gh:[REDACTED:AWS_ACCESS_KEY]"),
+        "digest files section must show the redacted id:\n{digest}"
+    );
+    assert!(!digest.contains(SECRET_ID_AWS_KEY), "raw secret id leaked in digest:\n{digest}");
+    // The whole served transcript (search + summarize) is free of the raw key.
+    assert!(!out.contains(SECRET_ID_AWS_KEY), "raw secret id leaked in served output:\n{out}");
+}
+
+#[test]
+fn clean_record_id_is_byte_identical_in_summarize_context_digest() {
+    // Control (#144): a clean id (`kn:1`) is the identity under the redactor, so it
+    // appears VERBATIM in the digest's files section and carries no redaction marker
+    // — the summarize_context digest does not move for secret-free stores.
+    let tmp = tempfile::tempdir().unwrap();
+    index_knowledge(tmp.path(), &feed());
+    let dir = tmp.path().to_string_lossy().to_string();
+
+    let input = format!(
+        "{}{}{}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+        search_call(2, "hash password", "knowledge"),
+        "{\"jsonrpc\":\"2.0\",\"id\":3,\"method\":\"tools/call\",\"params\":{\"name\":\"summarize_context\",\"arguments\":{}}}\n",
+    );
+    let out = drive(&["mcp", "--dir", &dir], &input);
+    let digest = tool_text(&out, 3);
+
+    assert!(digest.contains("- kn:1"), "clean id must appear verbatim in digest:\n{digest}");
+    assert!(
+        !digest.contains("[REDACTED"),
+        "a clean-id digest must carry no redaction marker:\n{digest}"
+    );
+}
+
+#[test]
 fn code_result_bytes_are_unchanged_between_code_and_both() {
     let tmp = tempfile::tempdir().unwrap();
     write_tiny_repo(tmp.path());

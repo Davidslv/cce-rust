@@ -793,8 +793,13 @@ fn context_search_knowledge(server: &McpServer, args: &Value, query: &str) -> To
     let p = parse_params(server, args);
     let (hits, knotice) = load_knowledge_hits(server, query, p.top_k);
     // Record the knowledge search in the session ledger (its query + returned ids/docs).
+    // The record ids land in the ledger's `files` section, which `summarize_context`
+    // serves verbatim — so they get the SAME redacted DISPLAY form as the
+    // expand_chunk/related_context headers (#144). Clean ids are the identity under
+    // the redactor, so the digest stays byte-identical; only a secret-bearing id
+    // changes, closing the summarize_context exfiltration channel.
     let chunk_ids: Vec<String> = hits.iter().map(|h| h.chunk_id.clone()).collect();
-    let record_ids: Vec<String> = hits.iter().map(|h| h.record_id.clone()).collect();
+    let record_ids: Vec<String> = hits.iter().map(|h| display_record_id(&h.record_id)).collect();
     server.record_search(query, &chunk_ids, &record_ids);
     let items: Vec<BlendItem> = hits.into_iter().map(BlendItem::Knowledge).collect();
     // A present-but-corrupt store must not masquerade as "0 chunk(s)" even on the
