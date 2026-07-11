@@ -159,6 +159,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   i64-saturated `+9223372036854.775807` in the byte-pinnable
   `cce.relevance.report/v2`. The guard now treats deltas whose spread is within
   a few ULPs of their magnitude as constant (t = `n/a`, p = 0, CI = [mean, mean]).
+- **Newline in a knowledge record title can no longer break the single-line
+  provenance grammar or inject a fake result line (#112).** `provenance_line` in
+  `src/knowledge/retrieval.rs` interpolated the title (and facets) unsanitized,
+  so a feed-controlled title containing `\n` produced a multi-line MCP
+  `context_search` header, letting attacker-controlled data spoof extra
+  ranked-result/heading lines. Free-text provenance fields now neutralize any
+  control character to a space; a clean title stays byte-identical, so every
+  pinned provenance golden is unchanged.
 - **Memory append is a single write with a newline guard, so a torn or
   interleaved append can no longer silently lose entries (#102).** `append`
   in `src/memory.rs` wrote the JSON line and its trailing `\n` as two separate

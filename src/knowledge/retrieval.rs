@@ -69,10 +69,11 @@ pub fn provenance_line(
     updated_at: Option<&str>,
     url: Option<&str>,
 ) -> String {
-    let mut facets: Vec<&str> = Vec::new();
+    let title = sanitize_provenance_field(title);
+    let mut facets: Vec<String> = Vec::new();
     for v in [state, updated_at, url].into_iter().flatten() {
         if !v.is_empty() {
-            facets.push(v);
+            facets.push(sanitize_provenance_field(v));
         }
     }
     let mut line = format!("[knowledge] {title}");
@@ -81,6 +82,16 @@ pub fn provenance_line(
         line.push_str(&facets.join(" · "));
     }
     line
+}
+
+/// Neutralize any control character (newline, carriage return, tab, …) in a
+/// free-text provenance field to a single space, so feed-controlled data can
+/// never break the single-line `«rank». [«score»] [knowledge] …` grammar or
+/// inject a spoofed ranked-result/heading line (#112). A field with no control
+/// character is returned byte-identical, so every clean provenance line — and
+/// its byte-pinned golden — is unchanged.
+fn sanitize_provenance_field(s: &str) -> String {
+    s.chars().map(|c| if c.is_control() { ' ' } else { c }).collect()
 }
 
 /// True if a `state_reason` drops the record from knowledge results (SPEC-V2.6 §5):
@@ -354,6 +365,25 @@ mod tests {
         assert_eq!(provenance_line("Bare", None, None, None), "[knowledge] Bare");
         // Empty strings are treated as missing.
         assert_eq!(provenance_line("Bare", Some(""), None, None), "[knowledge] Bare");
+    }
+
+    #[test]
+    fn provenance_line_stays_single_line_when_a_title_carries_a_newline() {
+        // #112: a feed-controlled newline in a title must not break the pinned
+        // single-line provenance grammar or inject a fake heading/result line.
+        let line =
+            provenance_line("Line1\n## Injected heading", Some("open"), None, Some("https://x/1"));
+        assert!(!line.contains('\n'), "provenance must stay single-line: {line:?}");
+        assert_eq!(line, "[knowledge] Line1 ## Injected heading — open · https://x/1");
+        // A control char in a facet is neutralized too (any free-text field).
+        let f = provenance_line("Bare", Some("open\nspoof"), None, None);
+        assert!(!f.contains('\n'), "{f:?}");
+        assert_eq!(f, "[knowledge] Bare — open spoof");
+        // A CLEAN title/facets stay byte-identical (golden unchanged).
+        assert_eq!(
+            provenance_line("Login policy", Some("closed"), None, None),
+            "[knowledge] Login policy — closed"
+        );
     }
 
     #[test]
