@@ -340,6 +340,11 @@ fn ensure_cce_gitignored(dir: &Path) -> Result<Option<PathBuf>, String> {
 /// Write/merge the bounded CCE block into `<dir>/CLAUDE.md` (idempotent). If the
 /// markers already exist their region is replaced; otherwise the block is appended
 /// (or the file is created). A re-run produces byte-identical output.
+///
+/// Fail-safe (#99): only `NotFound` means "no file yet — create one". Any other
+/// read failure of an EXISTING CLAUDE.md (non-UTF-8 content, a permission error)
+/// aborts with an actionable error and leaves the file byte-untouched; it is
+/// user-authored and non-regenerable, so it must never be replaced wholesale.
 fn write_claude_md(dir: &Path, level: OutputLevel) -> Result<PathBuf, String> {
     let path = dir.join("CLAUDE.md");
     let block = claude_block(level);
@@ -383,7 +388,14 @@ fn write_claude_md(dir: &Path, level: OutputLevel) -> Result<PathBuf, String> {
                 }
             }
         }
-        Err(_) => format!("# CLAUDE.md\n\n{block}"),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => format!("# CLAUDE.md\n\n{block}"),
+        Err(e) => {
+            return Err(format!(
+                "cannot read {}: {e} — refusing to overwrite it so your instructions are not \
+                 lost; fix the file (it must be readable UTF-8) and re-run `cce init`",
+                path.display()
+            ))
+        }
     };
     std::fs::write(&path, new_content).map_err(|e| e.to_string())?;
     Ok(path)
@@ -589,6 +601,50 @@ mod tests {
         assert!(err.contains("CLAUDE.md"), "error must name the file: {err}");
         let after = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
         assert_eq!(after, content, "CLAUDE.md must be left byte-untouched");
+    }
+
+    #[test]
+    fn init_refuses_a_non_utf8_claude_md_instead_of_overwriting_it() {
+        // #99: a single non-UTF-8 byte (e.g. a Windows-1252 curly quote pasted
+        // from a doc) made read_to_string fail, the Err(_) arm fabricated a
+        // fresh "# CLAUDE.md" + block, and the user's entire instruction file
+        // was silently replaced. Only NotFound may mean "create a new file";
+        // any other read error must abort, leaving the file byte-untouched.
+        let tmp = tempfile::tempdir().unwrap();
+        write_tiny_repo(tmp.path());
+        let original: &[u8] = b"# Proj Caf\xe9\n\n- never touch prod db\n";
+        std::fs::write(tmp.path().join("CLAUDE.md"), original).unwrap();
+
+        let err = run(&opts(tmp.path())).unwrap_err();
+        assert!(err.contains("CLAUDE.md"), "error must name the file: {err}");
+        let after = std::fs::read(tmp.path().join("CLAUDE.md")).unwrap();
+        assert_eq!(after, original, "CLAUDE.md must be left byte-untouched on a read failure");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn init_refuses_an_unreadable_claude_md_instead_of_overwriting_it() {
+        // #99: a transient read failure (e.g. permissions) must not be treated
+        // as "file absent" — the whole file used to be overwritten with just
+        // the CCE block while the subsequent write succeeded.
+        use std::os::unix::fs::PermissionsExt;
+        let tmp = tempfile::tempdir().unwrap();
+        write_tiny_repo(tmp.path());
+        let path = tmp.path().join("CLAUDE.md");
+        std::fs::write(&path, "# Proj\n\n- never touch prod db\n").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // Running as root would make the file readable anyway — skip there.
+        if std::fs::read(&path).is_ok() {
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+            return;
+        }
+
+        let result = run(&opts(tmp.path()));
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        let err = result.unwrap_err();
+        assert!(err.contains("CLAUDE.md"), "error must name the file: {err}");
+        let after = std::fs::read_to_string(&path).unwrap();
+        assert_eq!(after, "# Proj\n\n- never touch prod db\n", "must be left byte-untouched");
     }
 
     /// Write a `.cce/config` selecting an L4 output level.
