@@ -75,6 +75,15 @@ pub fn head_sha(dir: &Path) -> Option<String> {
     run(dir, &["rev-parse", "HEAD"]).ok().filter(|s| !s.is_empty())
 }
 
+/// Resolve a commit-ish (`<sha>`, short sha, tag, `HEAD~1`, …) to its canonical
+/// 40-char commit sha, or `None` if it is not a valid commit in `dir`. Uses
+/// `rev-parse --verify <rev>^{commit}` so a tree/blob/tag-to-non-commit and a
+/// nonexistent/garbage ref both resolve to `None` rather than a bogus sha.
+pub fn resolve_commit(dir: &Path, rev: &str) -> Option<String> {
+    let spec = format!("{rev}^{{commit}}");
+    run(dir, &["rev-parse", "--verify", "--quiet", &spec]).ok().filter(|s| !s.is_empty())
+}
+
 /// The current branch name (`main`/`master`/…), resolving even an unborn HEAD.
 pub fn current_branch(dir: &Path) -> Option<String> {
     // `symbolic-ref --short HEAD` works before the first commit too.
@@ -152,6 +161,20 @@ mod tests {
         // A real source change does.
         std::fs::write(d.join("a.txt"), "changed\n").unwrap();
         assert!(is_dirty(d), "a modified tracked file marks the tree dirty");
+    }
+
+    #[test]
+    fn resolve_commit_normalizes_and_rejects_garbage() {
+        let tmp = repo_with_commit();
+        let d = tmp.path();
+        let head = head_sha(d).unwrap();
+        // Full sha, "HEAD", and a short sha all resolve to the canonical 40-char sha.
+        assert_eq!(resolve_commit(d, &head).unwrap(), head);
+        assert_eq!(resolve_commit(d, "HEAD").unwrap(), head);
+        assert_eq!(resolve_commit(d, &head[..8]).unwrap(), head);
+        // Nonexistent and garbage revs resolve to None (never a bogus sha).
+        assert!(resolve_commit(d, &"0".repeat(40)).is_none());
+        assert!(resolve_commit(d, "not-a-sha").is_none());
     }
 
     #[test]

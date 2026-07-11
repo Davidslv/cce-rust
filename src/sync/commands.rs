@@ -184,6 +184,14 @@ pub fn cmd_init(
 }
 
 /// Resolve the sha to push: `--commit` or HEAD; refuse a dirty tree (SPEC-SYNC §5).
+///
+/// **`--commit` is a sanity assertion, not a backfill selector (#116).** Push always
+/// rebuilds the artifact from the *working tree* (`ensure_hash_index`), so the only
+/// sha it can honestly publish is HEAD — `artifact == build(HEAD)`. An explicit
+/// `--commit <sha>` that resolves to something other than HEAD would launder
+/// build(HEAD) into that sha's content-address key *and* rewind `refs/<branch>` to
+/// it, poisoning the shared cache. We therefore reject any `--commit` that is not a
+/// valid commit, or that does not resolve to the current HEAD.
 fn resolve_push_sha(root: &Path, commit: Option<String>) -> Result<String, String> {
     if git::is_dirty(root) {
         return Err(
@@ -192,11 +200,24 @@ fn resolve_push_sha(root: &Path, commit: Option<String>) -> Result<String, Strin
                 .to_string(),
         );
     }
+    let head = git::head_sha(root).ok_or_else(|| {
+        "cannot determine HEAD sha — is this a git repository with a commit?".to_string()
+    })?;
     match commit {
-        Some(sha) => Ok(sha),
-        None => git::head_sha(root).ok_or_else(|| {
-            "cannot determine HEAD sha — is this a git repository with a commit?".to_string()
-        }),
+        None => Ok(head),
+        Some(sha) => {
+            let resolved = git::resolve_commit(root, &sha).ok_or_else(|| {
+                format!("--commit {sha} is not a valid commit in this repository")
+            })?;
+            if resolved != head {
+                return Err(format!(
+                    "--commit {sha} does not match HEAD {head}; push builds the artifact from the \
+                     working tree, so it can only publish HEAD. (To publish an old commit you must \
+                     check it out first.)"
+                ));
+            }
+            Ok(head)
+        }
     }
 }
 
@@ -2301,6 +2322,62 @@ mod tests {
         let sha = git::head_sha(src.path()).unwrap();
         let report = cmd_push(src.path(), Some(sha.clone()), false).unwrap();
         assert!(report.contains(&sha), "got: {report}");
+        std::env::remove_var("CCE_HOME");
+    }
+
+    /// Advance `src` by one commit and return its new (v2) HEAD sha.
+    fn commit_v2(src: &tempfile::TempDir) -> String {
+        std::fs::write(src.path().join("extra.py"), "GREETING = 'hi'\n").unwrap();
+        git::run_commit(src.path(), &["add", "-A"]).unwrap();
+        git::run_commit(src.path(), &["commit", "-q", "-m", "v2"]).unwrap();
+        git::head_sha(src.path()).unwrap()
+    }
+
+    /// #116: `push --commit <sha>` with `sha != HEAD` must be REJECTED. Push builds
+    /// the artifact from the working tree (build(HEAD)); publishing it under a
+    /// different sha's key would launder build(HEAD) into the v1 slot AND rewind the
+    /// ref pointer, poisoning the shared cache. Assert it publishes NOTHING and does
+    /// NOT move the ref.
+    #[test]
+    fn push_rejects_commit_that_is_not_head() {
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let src = source_repo();
+        init_cfg(src.path(), &url);
+        let v1 = git::head_sha(src.path()).unwrap();
+        let v2 = commit_v2(&src);
+        assert_ne!(v1, v2, "HEAD must have advanced to v2");
+
+        // Clean tree at HEAD=v2, but ask to push the old v1 sha.
+        let err = cmd_push(src.path(), Some(v1.clone()), false).unwrap_err();
+        assert!(err.contains("does not match HEAD"), "got: {err}");
+        assert!(err.contains(&v1) && err.contains(&v2), "error should name both shas: {err}");
+
+        // Nothing was published under the v1 key and no ref pointer was created/moved.
+        let ver = SYNC_FORMAT_VERSION.to_string();
+        let repo_id = "example.com__acme__demo";
+        let remote = GitRemote::open(&url, false).unwrap();
+        let key = content_address(HASH_EMBEDDER, &ver, repo_id, &v1);
+        assert!(remote.get(&key).is_err(), "must publish NOTHING under the v1 key");
+        let pointer = pointer_address(HASH_EMBEDDER, &ver, repo_id, "main");
+        assert!(remote.get(&pointer).is_err(), "must NOT create or move the ref pointer");
+        std::env::remove_var("CCE_HOME");
+    }
+
+    /// #116: a `--commit` value that is not a real commit in the repo (garbage /
+    /// nonexistent sha) must be rejected before any build/put.
+    #[test]
+    fn push_rejects_nonexistent_commit() {
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let src = source_repo();
+        init_cfg(src.path(), &url);
+
+        let err = cmd_push(src.path(), Some("0".repeat(40)), false).unwrap_err();
+        assert!(err.contains("not a valid commit"), "got: {err}");
+
+        let err2 = cmd_push(src.path(), Some("not-a-sha".to_string()), false).unwrap_err();
+        assert!(err2.contains("not a valid commit"), "got: {err2}");
         std::env::remove_var("CCE_HOME");
     }
 
