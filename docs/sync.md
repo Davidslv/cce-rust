@@ -137,9 +137,12 @@ A cache is addressed by a path in the git remote built from its identity:
 - `sha` = the commit the index was built from.
 
 Distinct shas are distinct files, so concurrent pushes for different shas never
-conflict in content — only git-ref advancement can race, handled with
-fetch-rebase-retry. A small pointer file `…/<repo_id>/refs/<branch>` records the
-latest sha pushed for a branch; that is what `cce sync pull --latest` reads.
+conflict in content. A small pointer file `…/<repo_id>/refs/<branch>` records the
+latest sha pushed for a branch; that is what `cce sync pull --latest` reads. The
+pointer is a fixed path rewritten by every push, so two racing pushes genuinely
+conflict there: every key is whole-file last-writer-wins, and a lost push race
+is retried by re-applying the write on the freshly fetched remote state. A push
+that cannot land fails loudly — it never reports success without publishing.
 
 ---
 
@@ -147,8 +150,13 @@ latest sha pushed for a branch; that is what `cce sync pull --latest` reads.
 
 The remote is a **git repository** (`sync.remote`). A local working clone lives
 under `~/.cce/sync/<remote-id>/` (override the base with `CCE_HOME`). `put` writes
-the artifact at its content path, commits, and `git push` (fetch-rebase-retry on a
-ref race). `get` fetches and reads the file back.
+the artifact at its content path, commits, and `git push` (a lost ref race
+fetches, re-applies the write on the new remote state, and retries). `get`
+fetches and reads the file back. A working clone found with a rebase in progress
+(a state older versions could leave behind after a lost race) is recovered
+automatically the next time any sync operation opens it. The clone directory is
+program-owned and disposable — operations hard-reset it to the remote state, so
+never keep work of your own under `~/.cce/sync/`.
 
 Artifacts are large, so `*.cce` blobs use **git-LFS** by default (`sync.lfs: true`).
 `cce sync init --lfs` writes the `.gitattributes` and runs `git lfs install`.
@@ -473,6 +481,8 @@ access to the cache repo to `pull`; members with write access may also push
 | `no install checksum recorded (pulled by an older cce)` | the `.cce/synced.json` marker predates `installed_sha256` | not a failure (exit 0) — re-pull with `cce sync pull --force` to record the hash |
 | LFS: `git-lfs` filter errors on `get` | `.gitattributes` routes `*.cce` through LFS but `git-lfs` is not installed | `git lfs install`, or `cce sync init --no-lfs` for a plain-git cache |
 | `local cache is at … but you are pulling …` | pulling a different sha over an existing cache | `cce sync pull --force` (only if you intend to overwrite) |
+| `push failed after 5 attempts …` | the push kept losing the ref race, or the remote kept refusing (auth, hooks) | nothing was published and local stores are unaffected; check remote access and re-run the push |
+| `push verification failed …` | the push was reported accepted but the just-written keys could not be confirmed on the remote branch (e.g. a server-side hook moved the ref) | fetch and inspect `origin/<branch>`; local stores are unaffected; re-run the push to retry |
 
 Offline is never fatal: with no remote, or an unreachable one, `cce index`,
 `cce search`, and `cce sync status` all still work — `status` simply reports the
