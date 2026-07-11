@@ -174,8 +174,9 @@ fn resolve_corpus_id(
     })?;
     if !valid_corpus_id(&id) {
         return Err(format!(
-            "invalid corpus_id `{id}`: must be non-empty, charset [A-Za-z0-9._-] \
-             (sanitize-stable — it is a path segment on the cache)"
+            "invalid corpus_id `{id}`: must be non-empty, charset [A-Za-z0-9._-], and a \
+             single path segment — `.` and `..` are rejected (it is a path segment on \
+             the cache, so a traversal token would escape the corpus namespace)"
         ));
     }
     Ok(id)
@@ -230,8 +231,37 @@ fn apply_retention(
     let current_key = knowledge_content_address(ver, corpus_id, current_snapshot);
     let prune: Vec<String> =
         ordered[..keep_from].iter().map(|(_, k)| k.clone()).filter(|k| *k != current_key).collect();
+    confine_to_corpus(&prune, ver, corpus_id)?;
     remote.remove_many(&prune, &format!("cce knowledge sync: retention prune ({corpus_id})"))?;
     Ok(prune)
+}
+
+/// Release-present confinement guard for the retention delete site (#121). This
+/// is the destructive seam: every key about to be pruned MUST be a direct child
+/// of `knowledge/<ver>/<corpus_id>/` — i.e. its 3rd path segment equals the
+/// resolved `corpus_id`. Unlike a `debug_assert!` (compiled out of release
+/// binaries) this holds in shipped builds, and it checks the actual key SET
+/// rather than the id string, so it catches a broadened enumeration even if a
+/// traversal id slipped past `valid_corpus_id`: under the original `..` bug the
+/// enumerated keys were `knowledge/v1/prod/…` whose 3rd segment (`prod`) ≠ the
+/// resolved id `..`, so this refuses the cross-corpus delete on its own. A key
+/// outside the prefix is a should-never-happen invariant breach — hard error,
+/// never a silent skip.
+fn confine_to_corpus(keys: &[String], ver: &str, corpus_id: &str) -> Result<(), String> {
+    for key in keys {
+        let mut segs = key.split('/');
+        let confined = segs.next() == Some("knowledge")
+            && segs.next() == Some(ver)
+            && segs.next() == Some(corpus_id);
+        if !confined {
+            return Err(format!(
+                "retention refused: key `{key}` is not confined to \
+                 `knowledge/{ver}/{corpus_id}/` — refusing to prune outside the corpus \
+                 namespace (should-never-happen invariant breach; see #121)"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Fetch the `.cck` at `corpus_id@snapshot` and verify the manifest checksum
@@ -664,6 +694,57 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let err = push(tmp.path(), Some("c1".into()), Some("file:///x".into())).unwrap_err();
         assert!(err.contains("no local knowledge store"), "got: {err}");
+    }
+
+    #[test]
+    fn push_and_pull_reject_traversal_corpus_ids_before_any_remote_operation() {
+        let _home = with_home();
+        let root = root_with_store(&feed("a"));
+        // #121: `--corpus ..` used to pass validation and become the path
+        // segment `knowledge/v1/..` on the cache — escaping the corpus
+        // namespace and letting retention prune delete OTHER corpora's
+        // artifacts. The rejection must fire BEFORE any filesystem or remote
+        // operation: the remote URL below points nowhere, so reaching it
+        // (clone attempt) would surface a different error than the one asserted.
+        for id in ["..", "."] {
+            let err =
+                push(root.path(), Some(id.into()), Some("file:///nonexistent".into())).unwrap_err();
+            assert!(err.contains("invalid corpus_id"), "push `{id}` got: {err}");
+            let err = cmd_knowledge_pull(
+                root.path(),
+                Some(id.into()),
+                None,
+                false,
+                Some("file:///nonexistent".into()),
+            )
+            .unwrap_err();
+            assert!(err.contains("invalid corpus_id"), "pull `{id}` got: {err}");
+        }
+    }
+
+    #[test]
+    fn retention_refuses_to_prune_a_foreign_corpus_key() {
+        // #121 release-present delete-site guard: even if a traversal id somehow
+        // reached retention, the enumerated key set carries the real corpus's
+        // path segment (`prod`), which does not equal the resolved id (`..`), so
+        // the confinement check refuses the cross-corpus delete. This test pins
+        // the guard in RELEASE (a debug_assert would not run here).
+        let foreign = vec![
+            "knowledge/v1/prod/aaaa.cck".to_string(),
+            "knowledge/v1/prod/bbbb.cck".to_string(),
+        ];
+        let err = confine_to_corpus(&foreign, "v1", "..").unwrap_err();
+        assert!(err.contains("not confined"), "got: {err}");
+        assert!(err.contains("knowledge/v1/prod/aaaa.cck"), "names the offending key: {err}");
+        // A key whose 3rd segment is a mere PREFIX of the id is also foreign
+        // (segment-exact, not starts_with): `production` ≠ `prod`.
+        let sibling = vec!["knowledge/v1/production/cccc.cck".to_string()];
+        assert!(confine_to_corpus(&sibling, "v1", "prod").is_err());
+        // The honest, in-namespace key set passes unchanged.
+        let own = vec!["knowledge/v1/prod/dddd.cck".to_string()];
+        assert!(confine_to_corpus(&own, "v1", "prod").is_ok());
+        // Empty prune set is trivially confined.
+        assert!(confine_to_corpus(&[], "v1", "prod").is_ok());
     }
 
     #[test]

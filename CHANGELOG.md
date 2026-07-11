@@ -72,6 +72,78 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   covers read/parse failures; a crash MID-WRITE can still truncate a file (the
   writers use non-atomic `std::fs::write` truncate-then-write) — atomic
   temp-file + rename is a separate change, tracked with the store-atomicity work.
+- **Generic-assignment redaction no longer leaks a secret containing a quote
+  or apostrophe (#104).** The row-10 value class `[^\s"']+` stopped at the
+  first `'`/`"`, so `password = don't-…` matched only `don` — under the
+  8-char guard, leaving the whole secret unredacted in the store — and
+  `password = "abcdefghij'tail…"` redacted only the prefix, persisting the
+  tail. The value is now matched by quoting style: a double-quoted value runs
+  to its matching `"` (inner `'` and spaces allowed), a single-quoted value
+  to its matching `'` (inner `"` and spaces allowed), an unquoted value to
+  whitespace/line end — never across a line, never past the first closing
+  quote into a neighbouring assignment, and the closing quote still survives
+  outside the redaction. Placeholder-guard and short-value semantics are
+  unchanged; output stays deterministic and idempotent.
+- **A corpus_id of `..` or `.` can no longer escape the corpus namespace and
+  destroy other corpora's snapshots (#121).** `valid_corpus_id` accepted any
+  non-empty sanitize-stable id, and `.`/`..` are sanitize-stable in the
+  `[A-Za-z0-9._-]` charset — yet the id is used verbatim as a path segment on
+  the cache, so `knowledge/v1/..` normalizes to `knowledge/` and a
+  keep-last-N retention prune under `--corpus ..` enumerated and deleted
+  EVERY corpus's `.cck` snapshots (cross-corpus data loss, dangling `current`
+  pointers). The validation rule now additionally requires the id to resolve
+  to exactly one `Normal` path component (`Path::new(id).components()`), so
+  `.` and `..` are rejected at the single `resolve_corpus_id` chokepoint —
+  before any filesystem or remote operation — while legitimate dotted ids
+  (`my.corpus.v1`, `.hidden`, `v1.`) remain valid. Push, pull, and retention
+  all inherit the guard. As release-present defense in depth, the retention
+  delete site now confines every key it is about to prune to
+  `knowledge/<ver>/<corpus_id>/` (segment-exact) and errors on any key outside
+  it — this holds in shipped binaries and checks the key set itself, so it
+  refuses the cross-corpus delete even if a traversal id ever reached it.
+- **Blended `context_search` no longer silently swallows a code-index load
+  failure (#132).** The blend — the DEFAULT path once a knowledge store
+  exists — mapped every `load_index()` error to zero code rows, so a corrupt
+  or unreadable `.cce/index.json` produced a confident knowledge-only answer
+  with `isError:false` and no hint that code results were missing, while
+  `source:"code"` on the same server correctly surfaced guidance. The fix
+  splits absent from failed: a store that was NEVER built (a knowledge-only
+  project) still blends silently — knowledge-only is then the correct,
+  complete answer — but a store that EXISTS and fails to load now prepends
+  the pinned `CODE_INDEX_LOAD_ERROR_NOTICE` through the same visible-
+  degradation notice channel as issue #30's Ollama-down notice (knowledge
+  hits still served, `isError` still reserved for malformed calls). The
+  workspace variant gets the same split, through its own
+  `WORKSPACE_CODE_INDEX_LOAD_ERROR_NOTICE`: because the federated path can
+  only tell that a member store is missing or unloadable (not corrupt vs
+  never-indexed), its wording reports code results as INCOMPLETE and covers
+  corrupt, unreadable, OR not-yet-indexed members — so a normal
+  partially-indexed workspace gets an accurate message, never a false
+  corruption claim. A workspace whose members were all never indexed stays
+  silent. Healthy-path output is byte-unchanged.
+- **A secret in a knowledge record's title (or any other facet) can no longer
+  reach the store, the provenance line, or a pushed corpus (#111).** `ingest()`
+  redacted the rendered document before chunking but then attached the RAW
+  `rec.title` — and raw `url`, `labels`, `group`, `state`, `state_reason`,
+  `updated_at`, `source`, and `links` — as per-chunk facets, so a record titled
+  e.g. `Rotate api_key: … in prod` persisted the secret verbatim in
+  `.cce/knowledge/<snapshot>.json`, served it in every `[knowledge] <title> — …`
+  provenance header (which also renders `state` and `updated_at`), and exported
+  it in the `.cck` on `knowledge push`, while the body was redacted — violating
+  the module's "the store never sees a secret" invariant. The `cce.knowledge/v1`
+  schema validates none of these facets (`state`/`updated_at`/`source` are plain
+  `Option<String>`/`String`, not an enum or ISO-checked format), so EVERY facet
+  except the record id now passes through the SAME v2.1 redactor at the ingest
+  seam, once per record, before attachment; the breadcrumb `name`/`kind` were
+  already safe (derived from the redacted document). The record `id` is an
+  **accepted, documented residual**: it is the addressing key (chunk ids and the
+  synthetic document path derive from it), so it stays verbatim, the contract
+  now requires ids to be secret-free (`docs/knowledge.md`), and the
+  redacted-display mitigation for `expand_chunk`/`related_context` is tracked as
+  #144. Redaction is the identity on clean text, so secret-free stores are
+  byte-unchanged (the pinned ingest checksum and `conformance.json` goldens
+  hold); stores indexed from a secret-bearing feed before this fix should be
+  re-indexed to scrub the persisted facets.
 - **A sync push that loses a ref race can no longer report success while
   publishing nothing (#92).** The push retry rebased the working clone onto
   the advanced remote with the result discarded, under the assumption that

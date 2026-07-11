@@ -91,7 +91,16 @@ For each record it:
    code index's Layer 2).
 3. **Heading-chunks** it with M1 (honouring `markdown.max_section_tokens`).
 4. **Attaches facets** to every chunk: `source`, `url`, `state`, `state_reason`,
-   `updated_at`, `group`, `labels`, and the record `id`.
+   `updated_at`, `group`, `labels`, `title`, `links`, and the record `id`. Every
+   facet **except the record `id`** is run through the **same v2.1 redactor** before
+   it is attached (#111), because the schema validates none of them and `title` /
+   `state` / `updated_at` / `url` are served in the provenance line — so a secret in
+   any of them is scrubbed on disk and in every served header. The record **`id` is
+   deliberately not redacted** — it is the addressing key (chunk ids and the
+   synthetic document path derive from it), so the `cce.knowledge/v1` contract
+   **requires record ids to be secret-free**; a secret placed in an id can still
+   surface via `expand_chunk`/`related_context` (a redacted-display mitigation is
+   tracked as #144).
 
 The result is written to a **separate, snapshot-keyed knowledge store** under
 `<root>/.cce/knowledge/` — never the code cache:
@@ -180,9 +189,11 @@ cce sync pull --all --into <dir> [--corpus <id>]   # code members AND the corpus
 cce sync verify --checksum-only     # covers the pulled knowledge store too
 ```
 
-- **Identity.** `corpus_id` is an adapter-chosen stable slug (validated like a
-  `repo_id`), resolved from `--corpus` or `knowledge.sync.corpus_id` — never
-  derived: knowledge has no git origin to normalize.
+- **Identity.** `corpus_id` is an adapter-chosen stable slug — non-empty, charset
+  `[A-Za-z0-9._-]`, sanitize-stable, and a single path segment (the traversal
+  tokens `.` and `..` are rejected so the id cannot escape its cache namespace) —
+  resolved from `--corpus` or `knowledge.sync.corpus_id`, never derived: knowledge
+  has no git origin to normalize.
 - **Push** refuses a missing store, an unresolved/invalid corpus_id, and an
   embedding-less (pre-v2.6.1) store; it never blocks local work. Retention
   (`knowledge.sync.retention: keep-last-<n>`) prunes the oldest snapshots after
