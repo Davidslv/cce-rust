@@ -339,8 +339,11 @@ LFS blobs a year); `KeepLast` is the same answer sync already gives, per corpus.
 ## 5. CLI
 
 ```
-cce knowledge push [--corpus <id>] [--dir <root>]
-    # export the CURRENT local knowledge store as a .cck, put it at its
+cce knowledge push [--corpus <id>] [--dir <root>] [--force] [--dry-run]
+    # export the CURRENT local knowledge store as a .cck, diff its record ids
+    # against the remote current snapshot (the shrink guard below — a push
+    # that would DROP remote-live records refuses without --force; --dry-run
+    # prints the diff and publishes nothing), put the artifact at its
     # content-addressed key, advance the corpus `current` pointer, publish
     # corpus.json — one commit/push (put_many). Applies retention (§4.5).
 
@@ -358,8 +361,35 @@ Rules (normative):
 
 - **push** refuses: no local knowledge store (`current` missing); an unresolved
   `corpus_id` (§4.1); an invalid `corpus_id`; a store without persisted
-  embeddings (§2); a (future) redaction-bypassed store (§4.6). It is best-effort
-  and never blocks local work. The remote resolves per §4.3.
+  embeddings (§2); a (future) redaction-bypassed store (§4.6); and a
+  **shrinking publish** without `--force` (the shrink guard, next bullet). It
+  is best-effort and never blocks local work — every push refusal aborts only
+  the REMOTE publish; local indexing, retrieval, and serving are untouched
+  (§10 protects the local/offline paths, and push is not one). The remote
+  resolves per §4.3.
+- **Shrink guard (#90):** push replaces the corpus's `current` snapshot
+  wholesale, so before publishing it diffs the outgoing snapshot's DISTINCT
+  record-id set against the remote current snapshot, fetched and
+  **checksum-verified exactly as a pull**: `added` = ids only in the outgoing
+  store; `removed` = ids only in the remote current; `changed` = ids on both
+  sides whose rendered content (title + body) differs. When `removed` is
+  non-empty, push prints the diff report — record counts plus the three id
+  lists, lexicographically sorted (deterministic output) — and **refuses**
+  without `--force`. When the pointer exists but its artifact cannot be
+  fetched or fails checksum verification, push likewise refuses without
+  `--force` — it never silently replaces what it cannot verify. Adds-only,
+  changed-only, and unchanged publishes proceed with no new output. A missing
+  (or empty) remote pointer is the **first publish** — nothing to diff,
+  proceed silently; a pointer equal to the outgoing snapshot is an idempotent
+  re-publish — proceed. `--force` skips the fetch/diff entirely. The guard
+  runs before any remote mutation. It is **client-side** — enforced by this
+  engine's push path, so engine parity (§13) requires other engines to
+  implement the same rule — and a read-then-publish guard, not a transaction:
+  two concurrent pushers can each pass it against the same remote state.
+- **`--dry-run`:** compute and print the same diff report, then exit 0 having
+  published **nothing** — no artifact, no pointer move, no `corpus.json`, no
+  retention. Against a corpus with no remote pointer it reports that the push
+  would be the first publish.
 - **pull** verifies the manifest checksum before installing; a mismatch is a hard
   failure naming the key. Install = write `<root>/.cce/knowledge/<snapshot>.json`
   (native-store bytes, §2 byte-identity) + point `current` at it + write the

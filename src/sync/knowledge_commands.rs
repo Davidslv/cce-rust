@@ -41,7 +41,7 @@ use crate::sync::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
 
 /// The published corpus-metadata schema id (SPEC-SYNC-KNOWLEDGE §4.4).
@@ -251,32 +251,40 @@ fn fetch_verified_artifact(
 /// The record-level diff between the outgoing store and the remote current
 /// snapshot (§5 push guard, #90), over DISTINCT `record_id` sets: `added` = ids
 /// only in the outgoing store; `removed` = ids only on the remote; `changed` =
-/// ids on both sides whose SET of chunk_ids differs (chunk ids are
-/// content-addressed, so any content edit re-keys). Every list is
-/// lexicographically sorted — the report is deterministic.
+/// ids on both sides whose rendered content (title + body, per `record_digests`)
+/// differs — facet-only edits (state/labels/url/updated_at) do not render into
+/// chunk content and do not register. Every list is lexicographically sorted —
+/// the report is deterministic.
 struct RecordDiff {
     added: Vec<String>,
     removed: Vec<String>,
     changed: Vec<String>,
 }
 
-/// `record_id` → its set of chunk_ids (BTree ⇒ sorted iteration for free).
-fn record_chunk_sets(chunks: &[KnowledgeChunk]) -> BTreeMap<&str, BTreeSet<&str>> {
-    let mut map: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+/// `record_id` → SHA-256 over the record's chunks' FULL `content`, in store
+/// (chunk) order, each chunk length-prefixed so chunk boundaries are
+/// unambiguous. Deliberately not the chunk_id set: a chunk_id hashes only a
+/// content PREFIX (`chunker::chunk_id`), so an edit past that prefix within an
+/// unchanged line span would not re-key — the digest sees every byte. (BTree ⇒
+/// sorted iteration for free.)
+fn record_digests(chunks: &[KnowledgeChunk]) -> BTreeMap<&str, [u8; 32]> {
+    let mut hashers: BTreeMap<&str, Sha256> = BTreeMap::new();
     for c in chunks {
-        map.entry(c.record_id.as_str()).or_default().insert(c.chunk_id.as_str());
+        let h = hashers.entry(c.record_id.as_str()).or_default();
+        h.update((c.content.len() as u64).to_le_bytes());
+        h.update(c.content.as_bytes());
     }
-    map
+    hashers.into_iter().map(|(id, h)| (id, h.finalize().into())).collect()
 }
 
 fn diff_records(local: &[KnowledgeChunk], remote: &[KnowledgeChunk]) -> RecordDiff {
-    let l = record_chunk_sets(local);
-    let r = record_chunk_sets(remote);
+    let l = record_digests(local);
+    let r = record_digests(remote);
     let mut diff = RecordDiff { added: Vec::new(), removed: Vec::new(), changed: Vec::new() };
-    for (id, chunk_ids) in &l {
+    for (id, digest) in &l {
         match r.get(id) {
             None => diff.added.push((*id).to_string()),
-            Some(remote_ids) if remote_ids != chunk_ids => diff.changed.push((*id).to_string()),
+            Some(remote_digest) if remote_digest != digest => diff.changed.push((*id).to_string()),
             Some(_) => {}
         }
     }
@@ -336,8 +344,10 @@ fn diff_report(
 /// Push already requires a reachable remote, so a failed pointer READ is a hard
 /// failure (consistent with `put_many`); so is a remote current that exists but
 /// cannot be fetched or verified — `--force` (checked at the call site) is the
-/// only bypass. Returns `Ok(Some(report))` when `dry_run` (the caller prints it
-/// and pushes nothing), `Ok(None)` when the push may proceed.
+/// only bypass. An empty or whitespace-only pointer blob is deliberately
+/// treated as absent (first publish), mirroring `knowledge_freshness`'s
+/// empty-pointer filter. Returns `Ok(Some(report))` when `dry_run` (the caller
+/// prints it and pushes nothing), `Ok(None)` when the push may proceed.
 fn push_guard(
     remote: &GitRemote,
     corpus_id: &str,
@@ -374,10 +384,19 @@ fn push_guard(
         }));
     }
     let current = fetch_verified_artifact(remote, corpus_id, &remote_snapshot).map_err(|e| {
+        // Flag-aware bypass hint: under --dry-run the user may ALREADY have
+        // passed --force (dry-run still diffs), so "pass --force" would name a
+        // flag they gave — point at a real push instead.
+        let hint = if dry_run {
+            "there is no diff to report (--dry-run). A real `--force` push (without --dry-run) \
+             would bypass the guard."
+        } else {
+            "Refusing to replace a corpus the guard cannot read. Pass --force to push without \
+             the guard."
+        };
         format!(
             "push guard: could not verify the remote's current snapshot \
-             ({corpus_id}@{remote_snapshot}) — {e}\nRefusing to replace a corpus the guard \
-             cannot read. Pass --force to push without the guard."
+             ({corpus_id}@{remote_snapshot}) — {e}\n{hint}"
         )
     })?;
     let diff = diff_records(&store.chunks, &current.chunks);
@@ -1055,6 +1074,143 @@ mod tests {
         assert!(s.ends_with("… and 5 more"), "got: {s}");
         assert_eq!(format_id_list(&[]), "0");
         assert_eq!(format_id_list(&["kn:1".to_string()]), "1 — kn:1");
+    }
+
+    /// The chunk_id blind spot (the reason `changed` uses a full-content
+    /// digest): chunk ids hash only a content PREFIX, so an edit past it
+    /// within an unchanged line span leaves every chunk_id identical — the
+    /// digest must still see the record as changed.
+    #[test]
+    fn changed_detects_a_content_edit_past_the_chunk_id_prefix() {
+        let long = "A".repeat(150);
+        let f1 = feed_of(&[("kn:1", &format!("{long} tail-one."))]);
+        let f2 = feed_of(&[("kn:1", &format!("{long} tail-two."))]);
+        let s1 = {
+            let recs = parse_ndjson(&f1).unwrap();
+            ingest_default(&recs, f1.as_bytes())
+        };
+        let s2 = {
+            let recs = parse_ndjson(&f2).unwrap();
+            ingest_default(&recs, f2.as_bytes())
+        };
+        // Same line span, same 100-byte prefix ⇒ the chunk_ids are identical…
+        let ids =
+            |s: &KnowledgeStore| s.chunks.iter().map(|c| c.chunk_id.clone()).collect::<Vec<_>>();
+        assert_eq!(ids(&s1), ids(&s2), "the test must exercise the prefix blind spot");
+        assert_ne!(s1.chunks[0].content, s2.chunks[0].content);
+        // …but the guard still reports the record as changed.
+        let diff = diff_records(&s2.chunks, &s1.chunks);
+        assert!(diff.added.is_empty() && diff.removed.is_empty());
+        assert_eq!(diff.changed, vec!["kn:1".to_string()]);
+    }
+
+    #[test]
+    fn dry_run_with_force_still_diffs_and_pushes_nothing() {
+        let _home = with_home();
+        let (_bare, url) = bare_remote();
+        let root = root_with_store(&feed_of(&[("kn:1", "One."), ("kn:2", "Two.")]));
+        push(root.path(), Some("c1".into()), Some(url.clone())).unwrap();
+        let published = KnowledgeStore::load_current(root.path()).unwrap().snapshot;
+
+        // Both flags: dry-run wins — the diff prints, nothing is written.
+        let local = reindex(root.path(), &feed_of(&[("kn:1", "One.")]));
+        let out = cmd_knowledge_push(root.path(), Some("c1".into()), Some(url.clone()), true, true)
+            .unwrap();
+        assert!(out.contains("removed : 1 — kn:2"), "got: {out}");
+        assert!(out.contains("Nothing pushed (--dry-run)."), "got: {out}");
+        let remote = GitRemote::open(&url, false).unwrap();
+        assert_eq!(
+            remote.read_blob_text(&knowledge_pointer_address("v1", "c1")).unwrap(),
+            published
+        );
+        assert!(!remote.has(&knowledge_content_address("v1", "c1", &local)).unwrap());
+    }
+
+    #[test]
+    fn dry_run_on_an_unverifiable_remote_names_the_real_push_bypass() {
+        let _home = with_home();
+        let (_bare, url) = bare_remote();
+        let root = root_with_store(&feed_of(&[("kn:1", "One.")]));
+        push(root.path(), Some("c1".into()), Some(url.clone())).unwrap();
+        let published = KnowledgeStore::load_current(root.path()).unwrap().snapshot;
+
+        // Tamper with the remote current, then ask for a dry-run diff.
+        let remote = GitRemote::open(&url, false).unwrap();
+        let key = knowledge_content_address("v1", "c1", &published);
+        let text = String::from_utf8(remote.get(&key).unwrap()).unwrap();
+        remote.put(&key, text.replace("One", "Two").as_bytes()).unwrap();
+        reindex(root.path(), &feed_of(&[("kn:1", "One."), ("kn:2", "Two.")]));
+
+        // Under --dry-run the bypass hint must NOT say "pass --force" — the
+        // user may already have passed it (dry-run still diffs with --force).
+        for force in [false, true] {
+            let err =
+                cmd_knowledge_push(root.path(), Some("c1".into()), Some(url.clone()), force, true)
+                    .unwrap_err();
+            assert!(err.contains("could not verify the remote's current snapshot"), "got: {err}");
+            assert!(err.contains("no diff to report (--dry-run)"), "got: {err}");
+            assert!(err.contains("without --dry-run"), "got: {err}");
+            assert!(!err.contains("Pass --force to push without the guard"), "got: {err}");
+        }
+    }
+
+    #[test]
+    fn empty_or_whitespace_remote_pointer_is_treated_as_first_publish() {
+        let _home = with_home();
+        let (_bare, url) = bare_remote();
+        let root = root_with_store(&feed_of(&[("kn:1", "One.")]));
+        push(root.path(), Some("c1".into()), Some(url.clone())).unwrap();
+        let snapshot = KnowledgeStore::load_current(root.path()).unwrap().snapshot;
+
+        // Blank the pointer in place (whitespace-only blob).
+        let remote = GitRemote::open(&url, false).unwrap();
+        let pointer_key = knowledge_pointer_address("v1", "c1");
+        remote.put(&pointer_key, b"  \n").unwrap();
+
+        // Deliberate: an empty pointer is ABSENT to the guard (mirroring
+        // knowledge_freshness) — a dry-run reports a first publish…
+        let out =
+            cmd_knowledge_push(root.path(), Some("c1".into()), Some(url.clone()), false, true)
+                .unwrap();
+        assert!(out.contains("first publish"), "got: {out}");
+        // …and a real push proceeds silently, restoring the pointer.
+        let out = push(root.path(), Some("c1".into()), Some(url)).unwrap();
+        assert!(out.starts_with("Pushed corpus c1@"), "got: {out}");
+        assert!(!out.contains("removed"), "guard leaked: {out}");
+        assert_eq!(remote.read_blob_text(&pointer_key).unwrap(), snapshot);
+    }
+
+    #[test]
+    fn empty_local_store_push_over_a_nonempty_remote_is_refused() {
+        let _home = with_home();
+        let (_bare, url) = bare_remote();
+        let root = root_with_store(&feed_of(&[("kn:1", "One.")]));
+        push(root.path(), Some("c1".into()), Some(url.clone())).unwrap();
+
+        // A zero-record local store (empty feed) would erase the corpus.
+        reindex(root.path(), "");
+        let err = push(root.path(), Some("c1".into()), Some(url)).unwrap_err();
+        assert!(err.contains("records : 0 local · 1 remote"), "got: {err}");
+        assert!(err.contains("removed : 1 — kn:1"), "got: {err}");
+        assert!(err.contains("--force"), "got: {err}");
+    }
+
+    #[test]
+    fn dangling_pointer_is_refused_naming_the_missing_artifact_key() {
+        let _home = with_home();
+        let (_bare, url) = bare_remote();
+        let root = root_with_store(&feed_of(&[("kn:1", "One.")]));
+        push(root.path(), Some("c1".into()), Some(url.clone())).unwrap();
+
+        // Point `current` at a snapshot whose .cck does not exist.
+        let remote = GitRemote::open(&url, false).unwrap();
+        remote.put(&knowledge_pointer_address("v1", "c1"), b"aaaaaaaaaaaaaaaa\n").unwrap();
+
+        let err = push(root.path(), Some("c1".into()), Some(url)).unwrap_err();
+        let missing = knowledge_content_address("v1", "c1", "aaaaaaaaaaaaaaaa");
+        assert!(err.contains("could not verify the remote's current snapshot"), "got: {err}");
+        assert!(err.contains(&missing), "the failure names the missing key, got: {err}");
+        assert!(err.contains("--force"), "got: {err}");
     }
 
     #[test]

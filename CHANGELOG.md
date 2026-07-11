@@ -53,9 +53,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   remote's current snapshot (fetched and checksum-verified with the exact pull
   machinery) and **refuses a push whose `removed` set is non-empty**, printing
   a deterministic diff report — record counts plus lexicographically sorted
-  `added` / `removed` / `changed` id lists (`changed` = a record whose
-  content-addressed chunk set differs; lists elide past 20 ids) — and naming
-  `--force`, the only override (it skips the diff entirely). The new
+  `added` / `removed` / `changed` id lists (`changed` = a record whose rendered
+  content — title + body — differs byte-for-byte, via a full-content per-record
+  digest; facet-only edits do not register; lists elide past 20 ids) — and
+  naming `--force`, the only override (it skips the diff entirely). The new
   `--dry-run` prints the same report and exits 0 without touching the remote —
   no artifact, no pointer move, no retention — and reports "first publish"
   when no remote pointer exists. Guard rules: a first publish and an
@@ -66,8 +67,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   guard runs before any remote mutation (the LFS attribute write included).
   Proposals 3 (`--merge`) and 4 (`index --into`) from #90 are deferred — a
   merged store is not derived from any single feed, so it needs a new snapshot
-  derivation. Docs: `docs/knowledge.md`, `docs/sync.md`, and a subset-builder
-  note in `docs/ci/cce-knowledge-sync.yml`.
+  derivation. `SPEC-SYNC-KNOWLEDGE.md` §5 is amended to define the guard
+  normatively (client-side, enforced by this engine's push path; §13 parity
+  requires other engines to implement the same rule; a read-then-publish guard,
+  not a transaction). Docs: `docs/knowledge.md`, `docs/sync.md`, and a
+  subset-builder note in `docs/ci/cce-knowledge-sync.yml`.
 
 ## [2.8.0] - 2026-07-08
 

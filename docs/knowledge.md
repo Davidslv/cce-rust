@@ -194,13 +194,17 @@ cce sync verify --checksum-only     # covers the pulled knowledge store too
   machinery). A push that would **drop** record ids live on the remote — e.g. a
   local store rebuilt from only one of a corpus's feed sources (feedA of
   feedA+feedB) — prints the diff (record counts plus sorted `added` / `removed`
-  / `changed` id lists; `changed` = a record whose chunk set differs) and
-  refuses without `--force`. Adds-only, changed-only, and unchanged pushes
+  / `changed` id lists) and refuses without `--force`. `changed` reflects a
+  record's **rendered content** (title + body, compared byte-for-byte);
+  facet-only edits (state/labels/url/updated_at) do not render into chunk
+  content and do not register. Adds-only, changed-only, and unchanged pushes
   proceed exactly as quietly as before; a first publish (no remote `current`
   pointer) has nothing to diff and proceeds silently. If the pointer exists but
   its snapshot cannot be fetched or verified, the push refuses rather than
   silently replacing what it cannot read — `--force` is the only bypass (it
-  skips the diff entirely).
+  skips the diff entirely). The guard reads remote state before publishing, so
+  two simultaneous builders can both pass it — it is a guard, not a
+  transaction. It is also client-side: older cce versions push without it.
 - **`--dry-run`** computes and prints the same diff, then exits 0 **without
   pushing anything** (no artifact, no pointer move, no retention) — the
   blast-radius preview. Against a corpus with no remote pointer it reports that
