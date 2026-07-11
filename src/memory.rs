@@ -201,9 +201,29 @@ fn append(path: &Path, entry: &MemoryEntry) -> io::Result<()> {
         std::fs::create_dir_all(parent)?;
     }
     let line = serde_json::to_string(entry).map_err(io::Error::other)?;
+
+    // Leading-newline guard: if the store already exists and does NOT end with a
+    // '\n' (a previously torn or O_APPEND-interleaved append left a broken final
+    // line), prepend one so this entry starts a fresh line and self-heals the
+    // boundary — never concatenating onto the broken line (#102). A well-formed
+    // file (ends in '\n', or is empty/absent) is left byte-identical.
+    let needs_leading_nl = match std::fs::read(path) {
+        Ok(bytes) => bytes.last().is_some_and(|&b| b != b'\n'),
+        Err(_) => false,
+    };
+
+    // Single write: build the whole record — optional healing newline, the JSON
+    // line, and its terminating '\n' — as ONE buffer and issue ONE write_all. On
+    // an O_APPEND handle this is the atomic-append unit POSIX guarantees for a
+    // normal-size record, so a concurrent writer can no longer interleave between
+    // the line and its newline, and a kill/ENOSPC can no longer tear the pair.
+    let record = if needs_leading_nl {
+        format!("\n{line}\n")
+    } else {
+        format!("{line}\n")
+    };
     let mut f = std::fs::OpenOptions::new().create(true).append(true).open(path)?;
-    f.write_all(line.as_bytes())?;
-    f.write_all(b"\n")?;
+    f.write_all(record.as_bytes())?;
     Ok(())
 }
 
@@ -215,16 +235,30 @@ pub fn load_entries(paths: &[PathBuf]) -> Vec<MemoryEntry> {
     let mut seen: HashSet<String> = HashSet::new();
     for p in paths {
         let Ok(text) = std::fs::read_to_string(p) else { continue };
+        let mut skipped = 0usize;
         for line in text.lines() {
             let line = line.trim();
             if line.is_empty() {
                 continue;
             }
-            if let Ok(e) = serde_json::from_str::<MemoryEntry>(line) {
-                if seen.insert(e.id.clone()) {
-                    out.push(e);
+            match serde_json::from_str::<MemoryEntry>(line) {
+                Ok(e) => {
+                    if seen.insert(e.id.clone()) {
+                        out.push(e);
+                    }
                 }
+                // A non-blank line that will not parse is a corrupted record — most
+                // likely a torn or interleaved append (#102). We still skip it (a
+                // legacy broken file must not crash recall), but we surface the loss
+                // rather than swallowing it, so it stops being silent.
+                Err(_) => skipped += 1,
             }
+        }
+        if skipped > 0 {
+            eprintln!(
+                "warning: skipped {skipped} malformed memory line(s) in {} — possible torn/interleaved append; those decisions are not recalled",
+                p.display()
+            );
         }
     }
     out
@@ -484,6 +518,69 @@ mod tests {
         let entries = load_entries(std::slice::from_ref(&path));
         assert_eq!(entries.len(), 1);
         assert_eq!(entries[0].text, "ok");
+    }
+
+    #[test]
+    fn append_after_missing_trailing_newline_does_not_merge_entries() {
+        // Repro of #102 (headline): a torn or O_APPEND-interleaved prior append
+        // left memory.jsonl WITHOUT a trailing newline. A subsequent append must
+        // NOT concatenate onto the last line — BOTH the prior entry and the new
+        // one must load back, rather than merging into one malformed, skipped line.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = memory_path(tmp.path());
+        let clock = FixedClock("2026-07-05T00:00:00Z");
+
+        let first = record(&path, "prior validated decision one", &[], None, &clock).unwrap();
+        assert!(first.is_new);
+
+        // Simulate the torn/interleaved state: strip the trailing newline.
+        let torn = std::fs::read_to_string(&path).unwrap();
+        let torn = torn.strip_suffix('\n').unwrap_or(&torn).to_string();
+        std::fs::write(&path, &torn).unwrap();
+        assert!(!torn.ends_with('\n'), "precondition: file must lack a trailing newline");
+
+        let second = record(&path, "new validated decision two", &[], None, &clock).unwrap();
+        assert!(second.is_new, "record_decision still reports success (is_new)");
+
+        // Neither decision is silently lost: the boundary self-heals, not merges.
+        let entries = load_entries(std::slice::from_ref(&path));
+        assert_eq!(entries.len(), 2, "torn boundary must self-heal, not merge: {entries:?}");
+        assert!(entries.iter().any(|e| e.text.contains("decision one")));
+        assert!(entries.iter().any(|e| e.text.contains("decision two")));
+    }
+
+    #[test]
+    fn append_normal_path_round_trips_both_entries() {
+        // Control: the ordinary append path (file always ends in a newline) keeps
+        // every entry loadable.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = memory_path(tmp.path());
+        let clock = FixedClock("2026-07-05T00:00:00Z");
+        record(&path, "decision alpha", &[], None, &clock).unwrap();
+        record(&path, "decision beta", &[], None, &clock).unwrap();
+        let entries = load_entries(std::slice::from_ref(&path));
+        assert_eq!(entries.len(), 2);
+    }
+
+    #[test]
+    fn append_writes_exactly_one_line_per_entry_with_single_trailing_newline() {
+        // Single-write invariant: each entry is exactly one line terminated by
+        // exactly one '\n' — no missing terminator, no doubled blank line.
+        let tmp = tempfile::tempdir().unwrap();
+        let path = memory_path(tmp.path());
+        let clock = FixedClock("2026-07-05T00:00:00Z");
+        record(&path, "decision one", &[], None, &clock).unwrap();
+        record(&path, "decision two", &[], None, &clock).unwrap();
+        record(&path, "decision three", &[], None, &clock).unwrap();
+
+        let raw = std::fs::read_to_string(&path).unwrap();
+        assert!(raw.ends_with('\n'), "must end with a trailing newline");
+        assert!(!raw.ends_with("\n\n"), "must not double the terminator");
+        let newlines = raw.bytes().filter(|&b| b == b'\n').count();
+        assert_eq!(newlines, 3, "exactly one newline per entry");
+        let entries = load_entries(std::slice::from_ref(&path));
+        assert_eq!(entries.len(), 3);
+        assert_eq!(raw.lines().count(), entries.len(), "line count == entry count");
     }
 
     #[test]
