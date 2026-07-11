@@ -45,6 +45,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test/fixture/samples` verified byte-identical.
 
 ### Fixed
+- **`cce init` can no longer destroy user-owned files on a read/parse failure
+  (#99).** One root cause, five sub-bugs: a failed read or parse of an
+  existing `.mcp.json`, `CLAUDE.md`, or `.gitignore` was silently treated as
+  "file empty/absent" and the file rebuilt from scratch under a success
+  message. Concretely: a `.mcp.json` with one trailing comma (or a non-object
+  root/`mcpServers`) was rebuilt from `{}`, wiping every other MCP server the
+  user had configured; a `CLAUDE.md` with an orphaned/misordered/duplicated
+  CCE marker had user sections spliced away or was grown unboundedly on every
+  run; a `.gitignore` containing one non-UTF-8 byte was replaced with just
+  the 3-line CCE block, making previously-ignored secrets committable; and a
+  `CLAUDE.md` that could not be read (non-UTF-8 content, a permission error)
+  was overwritten wholesale with just the CCE block. `cce init` now fails
+  safe at every seam: a read/parse failure of an existing file aborts that
+  file's update with an actionable error naming the problem and leaves the
+  file byte-untouched; CLAUDE.md markers are touched only as exactly one
+  BEGIN followed by exactly one END (anything else is refused with the
+  marker counts and a repair hint); `.gitignore` is handled as raw bytes, so
+  non-UTF-8 content is preserved verbatim with the CCE block appended after
+  it; and only `NotFound` may create a fresh file. The successful-path
+  output is byte-identical to before.
 - **A sync push that loses a ref race can no longer report success while
   publishing nothing (#92).** The push retry rebased the working clone onto
   the advanced remote with the result discarded, under the assumption that
