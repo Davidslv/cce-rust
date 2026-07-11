@@ -478,7 +478,9 @@ enum KnowledgeCmd {
     /// Export the current local knowledge store as a canonical `.cck` and put it
     /// on the cache remote: artifact + `current` pointer + `corpus.json` in one
     /// commit, then retention (SPEC-SYNC-KNOWLEDGE §5). The raw feed never
-    /// travels — only the built, redacted store.
+    /// travels — only the built, redacted store. A push that would DROP record
+    /// ids live on the remote's current snapshot prints the diff and refuses
+    /// without `--force` (the §5 shrink guard, #90).
     Push {
         /// The corpus identity (else `knowledge.sync.corpus_id` from .cce/config).
         #[arg(long)]
@@ -489,6 +491,15 @@ enum KnowledgeCmd {
         /// Project root holding the knowledge store (default: current directory).
         #[arg(long)]
         dir: Option<PathBuf>,
+        /// Push even when records live on the remote's current snapshot would be
+        /// dropped (skips the shrink-guard diff entirely).
+        #[arg(long)]
+        force: bool,
+        /// Print the record-level diff vs the remote's current snapshot (record
+        /// counts plus added / removed / changed record ids) and exit without
+        /// pushing anything.
+        #[arg(long)]
+        dry_run: bool,
     },
     /// Fetch a corpus from the cache remote, verify its checksum, and install it
     /// into `<dir>/.cce/knowledge/` exactly as a local ingest would
@@ -615,10 +626,12 @@ fn main() -> ExitCode {
         },
         Command::Knowledge { cmd } => match cmd {
             KnowledgeCmd::Index { file, dir } => cmd_knowledge_index(&file, dir),
-            KnowledgeCmd::Push { corpus, remote, dir } => {
+            KnowledgeCmd::Push { corpus, remote, dir, force, dry_run } => {
                 let root = dir.unwrap_or_else(|| PathBuf::from("."));
-                cce::sync::knowledge_commands::cmd_knowledge_push(&root, corpus, remote)
-                    .map(|report| print!("{report}"))
+                cce::sync::knowledge_commands::cmd_knowledge_push(
+                    &root, corpus, remote, force, dry_run,
+                )
+                .map(|report| print!("{report}"))
             }
             KnowledgeCmd::Pull { corpus, latest: _, snapshot, force, remote, dir } => {
                 let root = dir.unwrap_or_else(|| PathBuf::from("."));

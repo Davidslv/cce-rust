@@ -10,24 +10,28 @@
 //! `sync::commands`, on the knowledge key space.
 //!
 //! **What it is / does:** `cmd_knowledge_push` exports the CURRENT local store as
-//! a canonical `.cck`, puts it at its content-addressed key, advances the corpus
-//! `current` pointer, and publishes `corpus.json` — one commit/push (`put_many`) —
-//! then applies retention (§4.5, best-effort). `cmd_knowledge_pull` fetches the
-//! corpus's current (or a pinned) snapshot, verifies the manifest checksum,
-//! installs it into `<root>/.cce/knowledge/` **exactly as a local ingest would**
-//! (§7 byte-identity), and records the knowledge sync marker with
-//! `installed_sha256` (the #55 mechanism verbatim).
+//! a canonical `.cck`, runs the §5 push guard — diff the outgoing record-id set
+//! against the remote's current snapshot and refuse a push that would DROP
+//! records without `--force` (`--dry-run` prints the diff and pushes nothing;
+//! #90) — then puts the artifact at its content-addressed key, advances the
+//! corpus `current` pointer, and publishes `corpus.json` — one commit/push
+//! (`put_many`) — then applies retention (§4.5, best-effort).
+//! `cmd_knowledge_pull` fetches the corpus's current (or a pinned) snapshot,
+//! verifies the manifest checksum, installs it into `<root>/.cce/knowledge/`
+//! **exactly as a local ingest would** (§7 byte-identity), and records the
+//! knowledge sync marker with `installed_sha256` (the #55 mechanism verbatim).
 //!
 //! **Responsibilities:**
 //! - Own the §4.1 corpus_id resolution/validation and the §4.3 remote resolution
 //!   (`--remote` > `knowledge.sync.remote` > `sync.remote`).
-//! - Own the `.cce/knowledge/synced.json` marker and the §5 overwrite guard.
+//! - Own the `.cce/knowledge/synced.json` marker, the §5 pull overwrite guard,
+//!   and the §5 push shrink guard (#90).
 //! - Offline-first (§10): every failure here is a clean message; local ingest and
 //!   search are never touched by a failed sync.
 //! - It does NOT define the `.cck` bytes (that is `knowledge_artifact`) nor parse
 //!   CLI args (main.rs).
 
-use crate::knowledge::store::KnowledgeStore;
+use crate::knowledge::store::{KnowledgeChunk, KnowledgeStore};
 use crate::sync::config::{KnowledgeSyncConfig, Retention, SyncConfig};
 use crate::sync::knowledge_artifact::KnowledgeArtifact;
 use crate::sync::remote::{GitRemote, SyncRemote};
@@ -37,6 +41,7 @@ use crate::sync::{
 };
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
+use std::collections::{BTreeMap, BTreeSet};
 use std::path::{Path, PathBuf};
 
 /// The published corpus-metadata schema id (SPEC-SYNC-KNOWLEDGE §4.4).
@@ -229,6 +234,176 @@ fn apply_retention(
     Ok(prune)
 }
 
+/// Fetch the `.cck` at `corpus_id@snapshot` and verify the manifest checksum
+/// (SPEC-SYNC-KNOWLEDGE §5) — the shared fetch machinery of `pull` and the
+/// push guard. Checksum verification happens inside `from_bytes`; any failure
+/// names the key.
+fn fetch_verified_artifact(
+    remote: &GitRemote,
+    corpus_id: &str,
+    snapshot: &str,
+) -> Result<KnowledgeArtifact, String> {
+    let key = knowledge_content_address(knowledge_contract_version(), corpus_id, snapshot);
+    let bytes = remote.get(&key)?;
+    KnowledgeArtifact::from_bytes(&bytes).map_err(|e| format!("{key}: {e}"))
+}
+
+/// The record-level diff between the outgoing store and the remote current
+/// snapshot (§5 push guard, #90), over DISTINCT `record_id` sets: `added` = ids
+/// only in the outgoing store; `removed` = ids only on the remote; `changed` =
+/// ids on both sides whose SET of chunk_ids differs (chunk ids are
+/// content-addressed, so any content edit re-keys). Every list is
+/// lexicographically sorted — the report is deterministic.
+struct RecordDiff {
+    added: Vec<String>,
+    removed: Vec<String>,
+    changed: Vec<String>,
+}
+
+/// `record_id` → its set of chunk_ids (BTree ⇒ sorted iteration for free).
+fn record_chunk_sets(chunks: &[KnowledgeChunk]) -> BTreeMap<&str, BTreeSet<&str>> {
+    let mut map: BTreeMap<&str, BTreeSet<&str>> = BTreeMap::new();
+    for c in chunks {
+        map.entry(c.record_id.as_str()).or_default().insert(c.chunk_id.as_str());
+    }
+    map
+}
+
+fn diff_records(local: &[KnowledgeChunk], remote: &[KnowledgeChunk]) -> RecordDiff {
+    let l = record_chunk_sets(local);
+    let r = record_chunk_sets(remote);
+    let mut diff = RecordDiff { added: Vec::new(), removed: Vec::new(), changed: Vec::new() };
+    for (id, chunk_ids) in &l {
+        match r.get(id) {
+            None => diff.added.push((*id).to_string()),
+            Some(remote_ids) if remote_ids != chunk_ids => diff.changed.push((*id).to_string()),
+            Some(_) => {}
+        }
+    }
+    for id in r.keys() {
+        if !l.contains_key(id) {
+            diff.removed.push((*id).to_string());
+        }
+    }
+    diff
+}
+
+/// Ids listed per diff line before eliding with "… and N more".
+const DIFF_IDS_LISTED: usize = 20;
+
+/// `"0"`, or `"<n> — id1, id2"` (elided past `DIFF_IDS_LISTED`).
+fn format_id_list(ids: &[String]) -> String {
+    if ids.is_empty() {
+        return "0".to_string();
+    }
+    let shown = ids.iter().take(DIFF_IDS_LISTED).map(String::as_str).collect::<Vec<_>>().join(", ");
+    if ids.len() > DIFF_IDS_LISTED {
+        format!("{} — {shown} … and {} more", ids.len(), ids.len() - DIFF_IDS_LISTED)
+    } else {
+        format!("{} — {shown}", ids.len())
+    }
+}
+
+/// The human diff report (the house aligned `key : value` grammar), shared by
+/// `--dry-run` and the shrink refusal.
+fn diff_report(
+    corpus_id: &str,
+    local_snapshot: &str,
+    local_records: usize,
+    remote_snapshot: &str,
+    remote_records: usize,
+    diff: &RecordDiff,
+) -> String {
+    format!(
+        "Corpus {corpus_id} — outgoing {local_snapshot} vs remote current {remote_snapshot}\n  \
+         records : {local_records} local · {remote_records} remote\n  \
+         added   : {}\n  removed : {}\n  changed : {}\n",
+        format_id_list(&diff.added),
+        format_id_list(&diff.removed),
+        format_id_list(&diff.changed),
+    )
+}
+
+/// The §5 push guard (#90). Reads the remote `current` pointer and decides
+/// whether the push may proceed:
+/// - pointer absent ⇒ first publish, nothing to diff — proceed silently;
+/// - pointer == the outgoing snapshot ⇒ idempotent re-publish — proceed;
+/// - pointer differs ⇒ fetch + checksum-verify the remote current (the pull
+///   machinery) and diff record ids: a non-empty `removed` set refuses with the
+///   diff (a push must never silently drop published records); adds/changes
+///   never block and produce no new output.
+///
+/// Push already requires a reachable remote, so a failed pointer READ is a hard
+/// failure (consistent with `put_many`); so is a remote current that exists but
+/// cannot be fetched or verified — `--force` (checked at the call site) is the
+/// only bypass. Returns `Ok(Some(report))` when `dry_run` (the caller prints it
+/// and pushes nothing), `Ok(None)` when the push may proceed.
+fn push_guard(
+    remote: &GitRemote,
+    corpus_id: &str,
+    store: &KnowledgeStore,
+    dry_run: bool,
+) -> Result<Option<String>, String> {
+    let pointer_key = knowledge_pointer_address(knowledge_contract_version(), corpus_id);
+    let remote_snapshot = if remote.has(&pointer_key)? {
+        Some(remote.read_blob_text(&pointer_key)?).filter(|s| !s.is_empty())
+    } else {
+        None
+    };
+    let Some(remote_snapshot) = remote_snapshot else {
+        // First publish: nothing to diff, push proceeds exactly as before #90.
+        return Ok(dry_run.then(|| {
+            format!(
+                "Dry-run: corpus {corpus_id}@{} — no remote `current` pointer; this would be \
+                 the first publish ({} records · {} chunks).\nNothing pushed (--dry-run).\n",
+                store.snapshot,
+                store.records,
+                store.chunks.len()
+            )
+        }));
+    };
+    if remote_snapshot == store.snapshot {
+        // The remote current already names this snapshot: re-publish is
+        // idempotent — nothing changes, nothing to diff.
+        return Ok(dry_run.then(|| {
+            format!(
+                "Dry-run: corpus {corpus_id}@{} — the remote `current` already names this \
+                 snapshot; a push would re-publish it unchanged.\nNothing pushed (--dry-run).\n",
+                store.snapshot
+            )
+        }));
+    }
+    let current = fetch_verified_artifact(remote, corpus_id, &remote_snapshot).map_err(|e| {
+        format!(
+            "push guard: could not verify the remote's current snapshot \
+             ({corpus_id}@{remote_snapshot}) — {e}\nRefusing to replace a corpus the guard \
+             cannot read. Pass --force to push without the guard."
+        )
+    })?;
+    let diff = diff_records(&store.chunks, &current.chunks);
+    let report = diff_report(
+        corpus_id,
+        &store.snapshot,
+        store.records,
+        &remote_snapshot,
+        current.manifest.records,
+        &diff,
+    );
+    if dry_run {
+        return Ok(Some(format!("{report}Nothing pushed (--dry-run).\n")));
+    }
+    if !diff.removed.is_empty() {
+        return Err(format!(
+            "{report}refusing to push: {} record{} live on the remote would be dropped (the \
+             `removed` list above). Pass --force to shrink corpus {corpus_id}, or --dry-run to \
+             inspect without pushing.",
+            diff.removed.len(),
+            if diff.removed.len() == 1 { "" } else { "s" },
+        ));
+    }
+    Ok(None)
+}
+
 /// The published `corpus.json` bytes (SPEC-SYNC-KNOWLEDGE §4.4): sorted-keys,
 /// pretty-printed, trailing newline — the house `--json` grammar. `pushed_at` is
 /// deliberately OUTSIDE the artifact (it would break reproducibility).
@@ -246,15 +421,20 @@ fn corpus_meta_json(a: &KnowledgeArtifact, pushed_at: &str) -> String {
 }
 
 /// `cce knowledge push` (SPEC-SYNC-KNOWLEDGE §5): export the CURRENT local
-/// knowledge store as a canonical `.cck`, put it at its content-addressed key,
-/// advance the corpus `current` pointer, publish `corpus.json` — one commit/push
-/// — then apply retention (best-effort: a prune failure warns, never fails the
-/// push). Refuses: no local store; unresolved/invalid corpus_id; a store without
-/// persisted embeddings. Best-effort and never blocks local work (§10).
+/// knowledge store as a canonical `.cck`, run the §5 push guard (#90; see
+/// `push_guard` — `force` skips it entirely, `dry_run` prints the diff and
+/// pushes nothing), put the artifact at its content-addressed key, advance the
+/// corpus `current` pointer, publish `corpus.json` — one commit/push — then
+/// apply retention (best-effort: a prune failure warns, never fails the push).
+/// Refuses: no local store; unresolved/invalid corpus_id; a store without
+/// persisted embeddings; a push that would drop remote-live records (without
+/// `--force`). Best-effort and never blocks local work (§10).
 pub fn cmd_knowledge_push(
     root: &Path,
     corpus_override: Option<String>,
     remote_override: Option<String>,
+    force: bool,
+    dry_run: bool,
 ) -> Result<String, String> {
     let store = KnowledgeStore::load_current(root).map_err(|_| {
         format!(
@@ -270,6 +450,16 @@ pub fn cmd_knowledge_push(
     let bytes = artifact.to_bytes();
 
     let (remote, lfs) = open_knowledge_remote(root, remote_override)?;
+
+    // §5 push guard (#90) — BEFORE any remote mutation (the LFS attribute write
+    // included), so `--dry-run` provably touches nothing. `--force` skips the
+    // diff entirely and pushes as before the guard existed.
+    if dry_run || !force {
+        if let Some(report) = push_guard(&remote, &corpus_id, &store, dry_run)? {
+            return Ok(report);
+        }
+    }
+
     if lfs {
         // §3: `*.cck` joins `*.cce` in the cache's `.gitattributes` (additive;
         // best-effort exactly like the code path's LFS setup).
@@ -359,10 +549,7 @@ pub fn cmd_knowledge_pull(
         }
     }
 
-    let key = knowledge_content_address(ver, &corpus_id, &snapshot);
-    let bytes = remote.get(&key)?;
-    // Checksum verification happens inside from_bytes; name the key on failure.
-    let artifact = KnowledgeArtifact::from_bytes(&bytes).map_err(|e| format!("{key}: {e}"))?;
+    let artifact = fetch_verified_artifact(&remote, &corpus_id, &snapshot)?;
     let checksum = artifact.manifest.checksum.clone();
     let (records, chunk_count) = (artifact.manifest.records, artifact.manifest.chunk_count);
 
@@ -399,6 +586,12 @@ mod tests {
     use crate::knowledge::{ingest_default, parse_ndjson};
     use crate::sync::git;
     use crate::sync::remote::SyncRemote;
+
+    /// `cmd_knowledge_push` with the pre-#90 default flags (no force, no
+    /// dry-run) — the shape every pre-guard test exercises.
+    fn push(root: &Path, corpus: Option<String>, remote: Option<String>) -> Result<String, String> {
+        cmd_knowledge_push(root, corpus, remote, false, false)
+    }
 
     /// A bare git repo acting as the remote; returns (tempdir, file:// URL).
     fn bare_remote() -> (tempfile::TempDir, String) {
@@ -450,8 +643,7 @@ mod tests {
     fn push_refuses_without_a_local_store() {
         let _home = with_home();
         let tmp = tempfile::tempdir().unwrap();
-        let err = cmd_knowledge_push(tmp.path(), Some("c1".into()), Some("file:///x".into()))
-            .unwrap_err();
+        let err = push(tmp.path(), Some("c1".into()), Some("file:///x".into())).unwrap_err();
         assert!(err.contains("no local knowledge store"), "got: {err}");
     }
 
@@ -459,9 +651,9 @@ mod tests {
     fn push_refuses_missing_and_invalid_corpus_ids() {
         let _home = with_home();
         let root = root_with_store(&feed("a"));
-        let err = cmd_knowledge_push(root.path(), None, None).unwrap_err();
+        let err = push(root.path(), None, None).unwrap_err();
         assert!(err.contains("cannot determine corpus_id"), "got: {err}");
-        let err = cmd_knowledge_push(root.path(), Some("has space".into()), None).unwrap_err();
+        let err = push(root.path(), Some("has space".into()), None).unwrap_err();
         assert!(err.contains("invalid corpus_id"), "got: {err}");
         // Validation happens before any remote is touched — no remote needed.
     }
@@ -477,7 +669,7 @@ mod tests {
             c.embedding = Vec::new();
         }
         store.save(root.path()).unwrap();
-        let err = cmd_knowledge_push(root.path(), Some("c1".into()), None).unwrap_err();
+        let err = push(root.path(), Some("c1".into()), None).unwrap_err();
         assert!(err.contains("Re-ingest"), "got: {err}");
     }
 
@@ -485,7 +677,7 @@ mod tests {
     fn push_without_a_remote_fails_cleanly_and_leaves_local_state() {
         let _home = with_home();
         let root = root_with_store(&feed("a"));
-        let err = cmd_knowledge_push(root.path(), Some("c1".into()), None).unwrap_err();
+        let err = push(root.path(), Some("c1".into()), None).unwrap_err();
         assert!(err.contains("no sync remote configured"), "got: {err}");
         // Local store untouched (§10 offline-first).
         assert!(KnowledgeStore::load_current(root.path()).is_ok());
@@ -496,7 +688,7 @@ mod tests {
         let _home = with_home();
         let (_bare, url) = bare_remote();
         let root = root_with_store(&feed("a"));
-        let out = cmd_knowledge_push(root.path(), Some("c1".into()), Some(url.clone())).unwrap();
+        let out = push(root.path(), Some("c1".into()), Some(url.clone())).unwrap();
         assert!(out.contains("Pushed corpus c1@"), "got: {out}");
 
         let store = KnowledgeStore::load_current(root.path()).unwrap();
@@ -523,7 +715,7 @@ mod tests {
         let _home = with_home();
         let (_bare, url) = bare_remote();
         let producer = root_with_store(&feed("a"));
-        cmd_knowledge_push(producer.path(), Some("c1".into()), Some(url.clone())).unwrap();
+        push(producer.path(), Some("c1".into()), Some(url.clone())).unwrap();
         let store = KnowledgeStore::load_current(producer.path()).unwrap();
         let producer_bytes =
             std::fs::read(KnowledgeStore::snapshot_path(producer.path(), &store.snapshot)).unwrap();
@@ -550,9 +742,9 @@ mod tests {
         let _home = with_home();
         let (_bare, url) = bare_remote();
         let p1 = root_with_store(&feed("a"));
-        cmd_knowledge_push(p1.path(), Some("c1".into()), Some(url.clone())).unwrap();
+        push(p1.path(), Some("c1".into()), Some(url.clone())).unwrap();
         let p2 = root_with_store(&feed("bb"));
-        cmd_knowledge_push(p2.path(), Some("c2".into()), Some(url.clone())).unwrap();
+        push(p2.path(), Some("c2".into()), Some(url.clone())).unwrap();
 
         let consumer = tempfile::tempdir().unwrap();
         cmd_knowledge_pull(consumer.path(), Some("c1".into()), None, false, Some(url.clone()))
@@ -566,7 +758,7 @@ mod tests {
         let newer = feed("ccc");
         let recs = parse_ndjson(&newer).unwrap();
         ingest_default(&recs, newer.as_bytes()).save(p1.path()).unwrap();
-        cmd_knowledge_push(p1.path(), Some("c1".into()), Some(url.clone())).unwrap();
+        push(p1.path(), Some("c1".into()), Some(url.clone())).unwrap();
         cmd_knowledge_pull(consumer.path(), Some("c1".into()), None, false, Some(url.clone()))
             .unwrap();
         // --force replaces the corpus.
@@ -579,12 +771,12 @@ mod tests {
         let _home = with_home();
         let (_bare, url) = bare_remote();
         let producer = root_with_store(&feed("a"));
-        cmd_knowledge_push(producer.path(), Some("c1".into()), Some(url.clone())).unwrap();
+        push(producer.path(), Some("c1".into()), Some(url.clone())).unwrap();
         let first = KnowledgeStore::load_current(producer.path()).unwrap().snapshot;
         let newer = feed("bb");
         let recs = parse_ndjson(&newer).unwrap();
         ingest_default(&recs, newer.as_bytes()).save(producer.path()).unwrap();
-        cmd_knowledge_push(producer.path(), Some("c1".into()), Some(url.clone())).unwrap();
+        push(producer.path(), Some("c1".into()), Some(url.clone())).unwrap();
 
         let consumer = tempfile::tempdir().unwrap();
         cmd_knowledge_pull(
@@ -608,7 +800,7 @@ mod tests {
         let _home = with_home();
         let (_bare, url) = bare_remote();
         let producer = root_with_store(&feed("a"));
-        cmd_knowledge_push(producer.path(), Some("c1".into()), Some(url.clone())).unwrap();
+        push(producer.path(), Some("c1".into()), Some(url.clone())).unwrap();
         let snapshot = KnowledgeStore::load_current(producer.path()).unwrap().snapshot;
 
         // Tamper with the artifact in place (flip a content byte, keep the shape).
@@ -648,7 +840,7 @@ mod tests {
             let store = ingest_default(&recs, text.as_bytes());
             store.save(root.path()).unwrap();
             snapshots.push(store.snapshot.clone());
-            cmd_knowledge_push(root.path(), None, Some(url.clone())).unwrap();
+            push(root.path(), None, Some(url.clone())).unwrap();
         }
 
         let remote = GitRemote::open(&url, false).unwrap();
@@ -689,6 +881,180 @@ mod tests {
         let mut sorted = keys.clone();
         sorted.sort_unstable();
         assert_eq!(keys, sorted, "corpus.json keys are sorted");
+    }
+
+    /// A multi-record feed: one NDJSON line per `(id, body)`, fixed timestamp
+    /// (deterministic `data_as_of`), for the #90 push-guard diff tests.
+    fn feed_of(records: &[(&str, &str)]) -> String {
+        records
+            .iter()
+            .map(|(id, body)| {
+                format!(
+                    "{{\"id\":\"{id}\",\"title\":\"Note {id}\",\"body\":\"{body}\",\
+                     \"source\":\"handbook\",\"updated_at\":\"2026-01-01T00:00:00Z\"}}\n"
+                )
+            })
+            .collect()
+    }
+
+    /// Re-ingest `feed_text` into an existing root (supersedes the current
+    /// store, exactly like `cce knowledge index`); returns the new snapshot id.
+    fn reindex(root: &Path, feed_text: &str) -> String {
+        let recs = parse_ndjson(feed_text).unwrap();
+        let store = ingest_default(&recs, feed_text.as_bytes());
+        store.save(root).unwrap();
+        store.snapshot
+    }
+
+    #[test]
+    fn first_publish_and_adds_only_and_changed_pushes_stay_quiet() {
+        let _home = with_home();
+        let (_bare, url) = bare_remote();
+        let root = root_with_store(&feed_of(&[("kn:1", "Body one.")]));
+        // First publish: no remote pointer, nothing to diff, no guard output.
+        let out = push(root.path(), Some("c1".into()), Some(url.clone())).unwrap();
+        assert!(out.starts_with("Pushed corpus c1@"), "got: {out}");
+        assert!(!out.contains("added") && !out.contains("removed"), "guard leaked: {out}");
+        // Adds + a changed record never block and stay exactly as quiet.
+        reindex(root.path(), &feed_of(&[("kn:1", "Body one edited."), ("kn:2", "Body two.")]));
+        let out = push(root.path(), Some("c1".into()), Some(url)).unwrap();
+        assert!(out.starts_with("Pushed corpus c1@"), "got: {out}");
+        assert!(!out.contains("added") && !out.contains("removed"), "guard leaked: {out}");
+    }
+
+    #[test]
+    fn republishing_the_already_current_snapshot_proceeds_idempotently() {
+        let _home = with_home();
+        let (_bare, url) = bare_remote();
+        let root = root_with_store(&feed_of(&[("kn:1", "Body one.")]));
+        push(root.path(), Some("c1".into()), Some(url.clone())).unwrap();
+        // The remote `current` already names this snapshot: push as today.
+        let out = push(root.path(), Some("c1".into()), Some(url)).unwrap();
+        assert!(out.starts_with("Pushed corpus c1@"), "got: {out}");
+    }
+
+    #[test]
+    fn shrinking_push_is_refused_naming_the_removed_ids_and_force_overrides() {
+        let _home = with_home();
+        let (_bare, url) = bare_remote();
+        let root =
+            root_with_store(&feed_of(&[("kn:1", "One."), ("kn:2", "Two."), ("kn:3", "Three.")]));
+        push(root.path(), Some("c1".into()), Some(url.clone())).unwrap();
+        let published = KnowledgeStore::load_current(root.path()).unwrap().snapshot;
+
+        // A partial rebuild (one record of three) must not silently clobber.
+        let shrunk = reindex(root.path(), &feed_of(&[("kn:2", "Two.")]));
+        let err = push(root.path(), Some("c1".into()), Some(url.clone())).unwrap_err();
+        assert!(err.contains("removed : 2 — kn:1, kn:3"), "sorted removed ids named: {err}");
+        assert!(err.contains("2 records live on the remote would be dropped"), "got: {err}");
+        assert!(err.contains("--force"), "got: {err}");
+        // Nothing moved on the remote: pointer intact, no new artifact key.
+        let remote = GitRemote::open(&url, false).unwrap();
+        assert_eq!(
+            remote.read_blob_text(&knowledge_pointer_address("v1", "c1")).unwrap(),
+            published
+        );
+        assert!(!remote.has(&knowledge_content_address("v1", "c1", &shrunk)).unwrap());
+
+        // --force pushes the shrink.
+        let out =
+            cmd_knowledge_push(root.path(), Some("c1".into()), Some(url.clone()), true, false)
+                .unwrap();
+        assert!(out.contains(&format!("Pushed corpus c1@{shrunk}")), "got: {out}");
+        assert_eq!(remote.read_blob_text(&knowledge_pointer_address("v1", "c1")).unwrap(), shrunk);
+    }
+
+    #[test]
+    fn dry_run_reports_the_full_diff_and_pushes_nothing() {
+        let _home = with_home();
+        let (_bare, url) = bare_remote();
+        let root = root_with_store(&feed_of(&[("kn:1", "Body A."), ("kn:2", "Two.")]));
+        push(root.path(), Some("c1".into()), Some(url.clone())).unwrap();
+        let published = KnowledgeStore::load_current(root.path()).unwrap().snapshot;
+
+        // Local: kn:1 changed, kn:2 dropped, kn:3 added.
+        let local = reindex(root.path(), &feed_of(&[("kn:1", "Body B."), ("kn:3", "Three.")]));
+        let out =
+            cmd_knowledge_push(root.path(), Some("c1".into()), Some(url.clone()), false, true)
+                .unwrap();
+        assert!(out.contains(&format!("outgoing {local} vs remote current {published}")), "{out}");
+        assert!(out.contains("records : 2 local · 2 remote"), "got: {out}");
+        assert!(out.contains("added   : 1 — kn:3"), "got: {out}");
+        assert!(out.contains("removed : 1 — kn:2"), "got: {out}");
+        assert!(out.contains("changed : 1 — kn:1"), "got: {out}");
+        assert!(out.contains("Nothing pushed (--dry-run)."), "got: {out}");
+        // The remote is untouched: pointer unmoved, no new artifact key.
+        let remote = GitRemote::open(&url, false).unwrap();
+        assert_eq!(
+            remote.read_blob_text(&knowledge_pointer_address("v1", "c1")).unwrap(),
+            published
+        );
+        assert!(!remote.has(&knowledge_content_address("v1", "c1", &local)).unwrap());
+    }
+
+    #[test]
+    fn dry_run_against_an_absent_remote_reports_first_publish_and_pushes_nothing() {
+        let _home = with_home();
+        let (_bare, url) = bare_remote();
+        let root = root_with_store(&feed_of(&[("kn:1", "One."), ("kn:2", "Two.")]));
+        let out =
+            cmd_knowledge_push(root.path(), Some("c1".into()), Some(url.clone()), false, true)
+                .unwrap();
+        assert!(out.contains("first publish"), "got: {out}");
+        assert!(out.contains("2 records"), "got: {out}");
+        assert!(out.contains("Nothing pushed (--dry-run)."), "got: {out}");
+        let remote = GitRemote::open(&url, false).unwrap();
+        assert!(!remote.has(&knowledge_pointer_address("v1", "c1")).unwrap(), "pointer appeared");
+    }
+
+    #[test]
+    fn dry_run_on_the_already_current_snapshot_reports_unchanged() {
+        let _home = with_home();
+        let (_bare, url) = bare_remote();
+        let root = root_with_store(&feed_of(&[("kn:1", "One.")]));
+        push(root.path(), Some("c1".into()), Some(url.clone())).unwrap();
+        let out =
+            cmd_knowledge_push(root.path(), Some("c1".into()), Some(url), false, true).unwrap();
+        assert!(out.contains("already names this snapshot"), "got: {out}");
+        assert!(out.contains("Nothing pushed (--dry-run)."), "got: {out}");
+    }
+
+    #[test]
+    fn guard_refuses_an_unverifiable_remote_current_and_force_bypasses() {
+        let _home = with_home();
+        let (_bare, url) = bare_remote();
+        let root = root_with_store(&feed_of(&[("kn:1", "One.")]));
+        push(root.path(), Some("c1".into()), Some(url.clone())).unwrap();
+        let published = KnowledgeStore::load_current(root.path()).unwrap().snapshot;
+
+        // Tamper with the remote current in place (flip a content byte).
+        let remote = GitRemote::open(&url, false).unwrap();
+        let key = knowledge_content_address("v1", "c1", &published);
+        let text = String::from_utf8(remote.get(&key).unwrap()).unwrap();
+        remote.put(&key, text.replace("One", "Two").as_bytes()).unwrap();
+
+        // A guarded push cannot verify what it would replace: refuse, not proceed.
+        reindex(root.path(), &feed_of(&[("kn:1", "One."), ("kn:2", "Two.")]));
+        let err = push(root.path(), Some("c1".into()), Some(url.clone())).unwrap_err();
+        assert!(err.contains("could not verify the remote's current snapshot"), "got: {err}");
+        assert!(err.contains(&key), "the failure names the key, got: {err}");
+        assert!(err.contains("--force"), "got: {err}");
+
+        // --force skips the guard entirely and pushes as today.
+        let out =
+            cmd_knowledge_push(root.path(), Some("c1".into()), Some(url), true, false).unwrap();
+        assert!(out.starts_with("Pushed corpus c1@"), "got: {out}");
+    }
+
+    #[test]
+    fn diff_id_lists_elide_past_twenty_ids() {
+        let ids: Vec<String> = (0..25).map(|i| format!("kn:{i:02}")).collect();
+        let s = format_id_list(&ids);
+        assert!(s.starts_with("25 — kn:00, kn:01"), "got: {s}");
+        assert!(s.contains("kn:19") && !s.contains("kn:20"), "got: {s}");
+        assert!(s.ends_with("… and 5 more"), "got: {s}");
+        assert_eq!(format_id_list(&[]), "0");
+        assert_eq!(format_id_list(&["kn:1".to_string()]), "1 — kn:1");
     }
 
     #[test]
