@@ -66,9 +66,11 @@ pub struct WalkResult {
     /// Number of traversal errors the `ignore` walk reported (e.g. a
     /// permission-denied or unreadable directory). Tallied separately from
     /// `skipped` — these are directory-level failures, not per-file skips, so the
-    /// files beneath them were never enumerated. Surfacing the count keeps the walk
-    /// from silently depending on machine-local permissions (issue #133); dropping
-    /// them via `flatten()` made files under an unreadable dir vanish unrecorded.
+    /// files beneath them were never enumerated. The count is threaded through
+    /// `BuildStats` and surfaced by the CLI (an index-summary line plus a stderr
+    /// warning when nonzero), so the loss of files under an unreadable dir is
+    /// visible rather than silently machine-dependent (issue #133); the old
+    /// `flatten()` dropped these errors and made those files vanish unrecorded.
     pub walk_errors: usize,
 }
 

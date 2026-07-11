@@ -62,8 +62,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   different permissions (the same builder-independence violation class as #24).
   The loop now matches the `Err` arm and tallies it in a new
   `WalkResult::walk_errors` counter (separate from `skipped`, since these are
-  directory-level failures, not per-file skips), so the loss is surfaced rather
-  than dropped.
+  directory-level failures, not per-file skips). The count is threaded through
+  `BuildStats` and surfaced to the operator: `cce index` prints a `walk errors`
+  summary line and emits a stderr warning ("N directory(ies) could not be
+  read; files under them were NOT indexed…") whenever it is nonzero, and the
+  workspace index warns per member — so the loss and the cross-machine
+  divergence are visible, not silent. When there are no traversal errors the
+  summary is byte-identical to before.
 - **Walker path normalisation no longer conflates distinct Unix filenames
   (#105).** The relative `file_path` was built with `replace('\\', "/")`, which
   rewrites the literal backslash — a legal filename byte on macOS/Linux — so a

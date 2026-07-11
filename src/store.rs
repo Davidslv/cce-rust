@@ -61,6 +61,10 @@ pub struct BuildStats {
     pub files_skipped: usize,
     /// Files skipped by the Layer-1 sensitive-file policy (SPEC-V2.1 §2).
     pub sensitive_skipped: usize,
+    /// Directories the walk could not read (permission-denied / IO). Nonzero means
+    /// files beneath them were NOT indexed, so the index is incomplete and may
+    /// differ across machines — the caller surfaces this to the operator (#133).
+    pub walk_errors: usize,
     pub total_chunks: usize,
 }
 
@@ -176,6 +180,7 @@ impl Index {
         let walked = crate::walker::walk(root, protect_secrets);
         let files_skipped = walked.skipped;
         let sensitive_skipped = walked.sensitive_skipped;
+        let walk_errors = walked.walk_errors;
         let kept_files: Vec<&(String, String)> =
             walked.files.iter().filter(|(p, _)| keep(p)).collect();
         let files_indexed = kept_files.len();
@@ -246,7 +251,16 @@ impl Index {
 
         let total_chunks = chunks.len();
         let index = Index::assemble(chunks, file_imports, file_tokens, embedder.name().to_string());
-        Ok((index, BuildStats { files_indexed, files_skipped, sensitive_skipped, total_chunks }))
+        Ok((
+            index,
+            BuildStats {
+                files_indexed,
+                files_skipped,
+                sensitive_skipped,
+                walk_errors,
+                total_chunks,
+            },
+        ))
     }
 
     /// Persist the index to `path` (JSON). Creates parent directories.
@@ -352,6 +366,34 @@ mod tests {
         assert_eq!(idx.chunks.len(), 7);
         // payments.py -> auth edge present
         assert_eq!(idx.file_imports.get("payments.py"), Some(&vec!["auth".to_string()]));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn build_stats_carry_walk_errors_for_an_unreadable_dir() {
+        // Issue #133: the traversal-error count must travel from WalkResult all the
+        // way to BuildStats (and thence the operator summary + warning), or the
+        // silent loss of files under an unreadable directory stays invisible.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        std::fs::write(root.join("top.py"), "top = 1\n").unwrap();
+        let sub = root.join("locked");
+        std::fs::create_dir(&sub).unwrap();
+        std::fs::write(sub.join("inner.py"), "inner = 2\n").unwrap();
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o000)).unwrap();
+        // If we can still read it (e.g. running as root), the scenario can't be
+        // exercised — restore and bail rather than assert a false negative.
+        let privileged = std::fs::read_dir(&sub).is_ok();
+
+        let e = HashEmbedder;
+        let (_idx, stats) = Index::build_from_dir(root, &e).unwrap();
+
+        std::fs::set_permissions(&sub, std::fs::Permissions::from_mode(0o755)).unwrap();
+        if privileged {
+            return;
+        }
+        assert!(stats.walk_errors >= 1, "an unreadable dir must reach BuildStats.walk_errors");
     }
 
     #[test]
