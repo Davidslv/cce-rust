@@ -63,6 +63,13 @@ pub struct WalkResult {
     /// Number of files skipped by the Layer-1 sensitive-file policy (SPEC-V2.1
     /// §2) — tallied separately from `skipped` and never read.
     pub sensitive_skipped: usize,
+    /// Number of traversal errors the `ignore` walk reported (e.g. a
+    /// permission-denied or unreadable directory). Tallied separately from
+    /// `skipped` — these are directory-level failures, not per-file skips, so the
+    /// files beneath them were never enumerated. Surfacing the count keeps the walk
+    /// from silently depending on machine-local permissions (issue #133); dropping
+    /// them via `flatten()` made files under an unreadable dir vanish unrecorded.
+    pub walk_errors: usize,
 }
 
 /// `filter_entry` predicate: keep this entry (and, for a directory, descend into
@@ -93,6 +100,7 @@ pub fn walk(root: &Path, protect_secrets: bool) -> WalkResult {
     let mut files = Vec::new();
     let mut skipped = 0usize;
     let mut sensitive_skipped = 0usize;
+    let mut walk_errors = 0usize;
 
     // Honor ONLY committed `.gitignore` files at/below the walk root; ignore every
     // machine-local source so `artifact == build(sha)` holds across machines. See
@@ -108,7 +116,18 @@ pub fn walk(root: &Path, protect_secrets: bool) -> WalkResult {
         .filter_entry(keep_entry)
         .build();
 
-    for entry in walker.flatten() {
+    for result in walker {
+        // Do NOT `flatten()` away the `Err` arm: an unreadable/permission-denied
+        // directory surfaces here, and dropping it would make every file beneath it
+        // vanish from the index with nothing recording the loss (issue #133). Count
+        // it so the walk never silently depends on machine-local permissions.
+        let entry = match result {
+            Ok(entry) => entry,
+            Err(_) => {
+                walk_errors += 1;
+                continue;
+            }
+        };
         // Directories were pruned/handled by `filter_entry`; only files are indexed.
         if !entry.file_type().map(|ft| ft.is_file()).unwrap_or(false) {
             continue;
@@ -171,7 +190,7 @@ pub fn walk(root: &Path, protect_secrets: bool) -> WalkResult {
 
     // Deterministic order regardless of filesystem traversal order.
     files.sort_by(|a, b| a.0.cmp(&b.0));
-    WalkResult { files, skipped, sensitive_skipped }
+    WalkResult { files, skipped, sensitive_skipped, walk_errors }
 }
 
 #[cfg(test)]
@@ -349,6 +368,46 @@ mod tests {
 
         let paths = walked_paths(root);
         assert_eq!(paths, vec!["app.ts".to_string()]);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn traversal_errors_are_counted_not_silently_dropped() {
+        // Issue #133: files under an unreadable directory must not vanish from the
+        // walk with NOTHING recording it. The old `walker.flatten()` discarded the
+        // ignore-crate `Err` for a permission-denied directory, so `inner.py`
+        // disappeared and neither `skipped` nor any counter reflected it — the walk
+        // output silently depended on machine-local permissions.
+        use std::os::unix::fs::PermissionsExt;
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        fs::write(root.join("top.py"), "top = 1\n").unwrap();
+        let sub = root.join("locked");
+        fs::create_dir(&sub).unwrap();
+        fs::write(sub.join("inner.py"), "inner = 2\n").unwrap();
+        // Make the subdirectory untraversable (no read/execute).
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o000)).unwrap();
+        // If we can still read it (e.g. running as root), the scenario cannot be
+        // exercised — restore and bail rather than assert a false negative.
+        let privileged = fs::read_dir(&sub).is_ok();
+
+        let res = walk(root, true);
+
+        // Always restore so tempdir cleanup can recurse in.
+        fs::set_permissions(&sub, fs::Permissions::from_mode(0o755)).unwrap();
+        if privileged {
+            return;
+        }
+
+        // The unreadable subtree's file is not indexed...
+        assert!(
+            !res.files.iter().any(|(p, _)| p.contains("inner.py")),
+            "unreadable file cannot be indexed"
+        );
+        // ...but the traversal error is surfaced as a count, not silently dropped.
+        assert!(res.walk_errors >= 1, "an unreadable directory must be counted as a walk error");
+        // The reachable sibling is still indexed.
+        assert!(res.files.iter().any(|(p, _)| p == "top.py"));
     }
 
     #[cfg(unix)]

@@ -45,6 +45,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test/fixture/samples` verified byte-identical.
 
 ### Fixed
+- **Walker no longer silently drops traversal errors (#133).** The walk loop
+  used `walker.flatten()`, which discards the `ignore` crate's `Err` entries —
+  so a permission-denied or otherwise unreadable directory made every file
+  beneath it vanish from the index with nothing recorded: `skipped` stayed 0,
+  exit was clean, and the artifact silently diverged across machines with
+  different permissions (the same builder-independence violation class as #24).
+  The loop now matches the `Err` arm and tallies it in a new
+  `WalkResult::walk_errors` counter (separate from `skipped`, since these are
+  directory-level failures, not per-file skips), so the loss is surfaced rather
+  than dropped.
 - **Walker path normalisation no longer conflates distinct Unix filenames
   (#105).** The relative `file_path` was built with `replace('\\', "/")`, which
   rewrites the literal backslash — a legal filename byte on macOS/Linux — so a
