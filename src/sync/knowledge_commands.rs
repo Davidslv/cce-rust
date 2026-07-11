@@ -382,6 +382,7 @@ fn push_guard(
     remote: &GitRemote,
     corpus_id: &str,
     store: &KnowledgeStore,
+    outgoing_checksum: &str,
     dry_run: bool,
 ) -> Result<Option<String>, String> {
     let pointer_key = knowledge_pointer_address(knowledge_contract_version(), corpus_id);
@@ -403,15 +404,56 @@ fn push_guard(
         }));
     };
     if remote_snapshot == store.snapshot {
-        // The remote current already names this snapshot: re-publish is
-        // idempotent — nothing changes, nothing to diff.
-        return Ok(dry_run.then(|| {
-            format!(
-                "Dry-run: corpus {corpus_id}@{} — the remote `current` already names this \
-                 snapshot; a push would re-publish it unchanged.\nNothing pushed (--dry-run).\n",
-                store.snapshot
-            )
-        }));
+        // #113: the snapshot id is only a hash of the FEED bytes, but the
+        // published `.cck` also depends on `markdown.max_section_tokens` and the
+        // redactor version — two producers with a byte-identical feed but
+        // divergent config yield the SAME snapshot id over DIFFERENT content.
+        // So a matching id does NOT prove identical content: fetch + verify the
+        // remote current and compare manifest checksums before treating this as
+        // an unchanged re-publish. Divergent bytes at the same content-addressed
+        // key would silently overwrite what consumers already recorded.
+        let current =
+            fetch_verified_artifact(remote, corpus_id, &remote_snapshot).map_err(|e| {
+                let hint = if dry_run {
+                    "there is no diff to report (--dry-run). A real `--force` push (without \
+                     --dry-run) would bypass the guard."
+                } else {
+                    "Refusing to replace a corpus the guard cannot read. Pass --force to push \
+                     without the guard."
+                };
+                format!(
+                    "push guard: could not verify the remote's current snapshot \
+                     ({corpus_id}@{remote_snapshot}) — {e}\n{hint}"
+                )
+            })?;
+        if current.manifest.checksum == outgoing_checksum {
+            // Byte-identical re-publish — truly unchanged, proceed as before.
+            return Ok(dry_run.then(|| {
+                format!(
+                    "Dry-run: corpus {corpus_id}@{} — the remote `current` already names this \
+                     snapshot; a push would re-publish it unchanged.\nNothing pushed \
+                     (--dry-run).\n",
+                    store.snapshot
+                )
+            }));
+        }
+        // Same snapshot id, DIFFERENT content — the #113 collision.
+        let msg = format!(
+            "corpus {corpus_id}@{} is already published with DIFFERENT content (remote checksum \
+             {}, outgoing {outgoing_checksum}). The snapshot id hashes only the feed bytes, so a \
+             different `markdown.max_section_tokens` or redactor version produced divergent \
+             `.cck` bytes at the same content-addressed key",
+            store.snapshot, current.manifest.checksum,
+        );
+        if dry_run {
+            return Ok(Some(format!(
+                "Dry-run: {msg}.\nA real `--force` push would overwrite it.\nNothing pushed \
+                 (--dry-run).\n"
+            )));
+        }
+        return Err(format!(
+            "push guard: {msg}. Pass --force to overwrite the published snapshot."
+        ));
     }
     let current = fetch_verified_artifact(remote, corpus_id, &remote_snapshot).map_err(|e| {
         // Flag-aware bypass hint: under --dry-run the user may ALREADY have
@@ -504,7 +546,9 @@ pub fn cmd_knowledge_push(
     // included), so `--dry-run` provably touches nothing. `--force` skips the
     // diff entirely and pushes as before the guard existed.
     if dry_run || !force {
-        if let Some(report) = push_guard(&remote, &corpus_id, &store, dry_run)? {
+        if let Some(report) =
+            push_guard(&remote, &corpus_id, &store, &artifact.manifest.checksum, dry_run)?
+        {
             return Ok(report);
         }
     }
@@ -632,9 +676,22 @@ pub fn cmd_knowledge_pull(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::knowledge::store::ingest;
     use crate::knowledge::{ingest_default, parse_ndjson};
     use crate::sync::git;
     use crate::sync::remote::SyncRemote;
+
+    /// Ingest `feed` at an explicit split budget into a fresh root (LFS off), so
+    /// a test can produce two stores from the SAME feed bytes but DIFFERENT
+    /// `max_section_tokens` — the #113 same-snapshot-id / divergent-content case.
+    fn root_with_store_budget(feed: &str, budget: usize) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".cce")).unwrap();
+        std::fs::write(tmp.path().join(".cce").join("config"), "sync:\n  lfs: false\n").unwrap();
+        let recs = parse_ndjson(feed).unwrap();
+        ingest(&recs, feed.as_bytes(), budget).save(tmp.path()).unwrap();
+        tmp
+    }
 
     /// `cmd_knowledge_push` with the pre-#90 default flags (no force, no
     /// dry-run) — the shape every pre-guard test exercises.
@@ -956,6 +1013,63 @@ mod tests {
             snapshots[3]
         );
         assert!(remote.has(&knowledge_corpus_meta_address("v1", "c1")).unwrap());
+    }
+
+    #[test]
+    fn republishing_same_snapshot_id_with_divergent_content_is_refused() {
+        // #113: the snapshot id hashes only the feed bytes, so two producers with
+        // a byte-identical feed but different `markdown.max_section_tokens` share
+        // one id over different `.cck` content. The guard used to short-circuit on
+        // pointer==snapshot and silently overwrite the content-addressed key; it
+        // must now detect the checksum divergence and refuse without --force.
+        let _home = with_home();
+        let (_bare, url) = bare_remote();
+        let sectioned = "{\"id\":\"kn:1\",\"title\":\"Note\",\"body\":\"## A\\n\\nAlpha.\\n\\n## \
+             B\\n\\nBeta.\\n\\n## C\\n\\nGamma.\",\"source\":\"handbook\",\"updated_at\":\
+             \"2026-01-01T00:00:00Z\"}\n";
+
+        // Producer A: a huge budget keeps the whole doc as one chunk.
+        let a = root_with_store_budget(sectioned, 100_000);
+        push(a.path(), Some("c1".into()), Some(url.clone())).unwrap();
+        let snap_a = KnowledgeStore::load_current(a.path()).unwrap().snapshot;
+
+        // Producer B: a tiny budget splits every section into its own chunk.
+        let b = root_with_store_budget(sectioned, 1);
+        let store_b = KnowledgeStore::load_current(b.path()).unwrap();
+        assert_eq!(snap_a, store_b.snapshot, "same feed ⇒ same snapshot id (#113 collision)");
+        assert!(store_b.chunks.len() > 1, "the tiny budget must produce divergent content");
+
+        // B's push carries the same id but different bytes: refused without --force.
+        let err = push(b.path(), Some("c1".into()), Some(url.clone())).unwrap_err();
+        assert!(err.contains("DIFFERENT content"), "got: {err}");
+        assert!(err.contains("--force"), "got: {err}");
+
+        // The remote key is untouched — still A's single-chunk artifact.
+        let remote = GitRemote::open(&url, false).unwrap();
+        let key = knowledge_content_address("v1", "c1", &snap_a);
+        let ra = KnowledgeArtifact::from_bytes(&remote.get(&key).unwrap()).unwrap();
+        assert_eq!(ra.manifest.chunk_count, 1, "A's bytes must survive the refused push");
+
+        // --force overwrites, as designed.
+        cmd_knowledge_push(b.path(), Some("c1".into()), Some(url.clone()), true, false).unwrap();
+        let rb = KnowledgeArtifact::from_bytes(&remote.get(&key).unwrap()).unwrap();
+        assert!(rb.manifest.chunk_count > 1, "--force replaces it with B's content");
+    }
+
+    #[test]
+    fn republishing_same_snapshot_id_with_identical_content_stays_idempotent() {
+        // #113 control: a genuine re-push (same feed, same budget ⇒ same checksum)
+        // still proceeds quietly — the guard only fires on real divergence.
+        let _home = with_home();
+        let (_bare, url) = bare_remote();
+        let root = root_with_store_budget(
+            "{\"id\":\"kn:1\",\"title\":\"N\",\"body\":\"Body.\",\
+             \"source\":\"handbook\"}\n",
+            400,
+        );
+        push(root.path(), Some("c1".into()), Some(url.clone())).unwrap();
+        let out = push(root.path(), Some("c1".into()), Some(url)).unwrap();
+        assert!(out.starts_with("Pushed corpus c1@"), "got: {out}");
     }
 
     #[test]
