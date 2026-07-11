@@ -513,6 +513,11 @@ pub fn parse_iso(s: &str) -> Option<i64> {
 /// Any other trailing text (e.g. a fractional-seconds tail) yields `None`, so a
 /// non-conforming instant is rejected rather than silently misread (#130).
 fn parse_tz_offset(tz: &str) -> Option<i64> {
+    // A non-ASCII suffix (e.g. a multibyte `+1€`) is malformed; reject it up front so
+    // the fixed-index slicing below can never split a UTF-8 char and panic (#130).
+    if !tz.is_ascii() {
+        return None;
+    }
     if tz.is_empty() || tz == "Z" || tz == "z" {
         return Some(0);
     }

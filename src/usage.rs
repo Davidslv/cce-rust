@@ -515,6 +515,20 @@ mod tests {
     }
 
     #[test]
+    fn parse_since_rejects_multibyte_timezone_without_panicking() {
+        // #130 regression guard: a multibyte / non-ASCII timezone suffix must be a
+        // clean `invalid --since` error, NOT a char-boundary panic from the parser's
+        // fixed-index offset slicing (was RED — panicked at `byte index 2 is not a
+        // char boundary; it is inside '€'`).
+        for bad in ["2026-07-01T09:45:00+1€", "2026-07-01T09:45:00+€€:00", "2026-07-01T09:45:00Zé"]
+        {
+            let err = parse_since(bad, now()).unwrap_err();
+            assert!(err.contains("invalid --since"), "{bad}: {err}");
+            assert!(err.contains("90m, 24h, 7d, 4w"), "{bad}: {err}");
+        }
+    }
+
+    #[test]
     fn parse_since_rejects_malformed_values_with_guidance() {
         for bad in ["", "yesterday", "24", "h", "0d", "-3d", "2026-13-40", "1.5h"] {
             let err = parse_since(bad, now()).unwrap_err();
