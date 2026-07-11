@@ -83,7 +83,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `current` pointer (`src/knowledge/store.rs`), and the store fingerprint
   (`src/fingerprint.rs`). The on-disk bytes are byte-identical to before — only
   the write mechanism changed — so conformance and pinned-store checksums are
-  untouched.
+  untouched. On a re-save the atomic write also carries over the destination
+  file's existing unix mode before the rename, so a user-tightened store (e.g.
+  `chmod 600 .cce/index.json`) keeps its permissions instead of reverting to the
+  umask default — matching main's write-through behaviour; a fresh store still
+  takes the umask default.
 - **`cce init` can no longer destroy user-owned files on a read/parse failure
   (#99).** One root cause, five sub-bugs: a failed read or parse of an
   existing `.mcp.json`, `CLAUDE.md`, or `.gitignore` was silently treated as

@@ -58,6 +58,22 @@ pub fn atomic_write(path: &Path, bytes: &[u8]) -> io::Result<()> {
         return Err(e);
     }
 
+    // temp-file + rename creates the staged file at the umask default and would
+    // DROP the destination's existing mode, silently widening a user-tightened
+    // store (e.g. `chmod 600 index.json`) back to 0o644 — a regression vs main's
+    // write-through `std::fs::write`. So if the destination already exists, carry
+    // its mode over to the temp BEFORE the rename (the sibling `replace_binary`
+    // set_permissions after a temp copy for the same reason). A fresh file keeps
+    // the umask default, matching main's behaviour on a new store. Mode bits are a
+    // unix concept; on other platforms rename-preserves-nothing is left as-is.
+    #[cfg(unix)]
+    if let Ok(meta) = std::fs::metadata(path) {
+        if let Err(e) = std::fs::set_permissions(&tmp, meta.permissions()) {
+            let _ = std::fs::remove_file(&tmp);
+            return Err(e);
+        }
+    }
+
     // The atomic publish. If it fails, clean up the stray temp file and leave the
     // previous destination untouched.
     if let Err(e) = std::fs::rename(&tmp, path) {
@@ -145,5 +161,56 @@ mod tests {
         assert_eq!(std::fs::read(&dest).unwrap(), b"PREVIOUS GOOD STORE");
         // And no half-written temp file was left behind.
         assert!(temp_strays(&dir).is_empty(), "a failed write left a stray temp file");
+    }
+
+    // An atomic re-save must PRESERVE the destination's existing mode: temp-file +
+    // rename would otherwise drop a user-tightened `chmod 600 index.json` back to
+    // the umask default (0o644), silently widening a private store — a regression
+    // vs main's write-through `std::fs::write`. (Skipped as root: mode bits ignored.)
+    #[cfg(unix)]
+    #[test]
+    fn re_save_preserves_the_destination_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        if unsafe { geteuid() } == 0 {
+            return;
+        }
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("index.json");
+        std::fs::write(&dest, b"old").unwrap();
+        std::fs::set_permissions(&dest, std::fs::Permissions::from_mode(0o600)).unwrap();
+
+        atomic_write(&dest, b"new bytes").unwrap();
+
+        assert_eq!(std::fs::read(&dest).unwrap(), b"new bytes");
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "the user-tightened store mode must survive a re-save");
+    }
+
+    // Control: a FRESH atomic_write (no pre-existing dest) keeps the umask default,
+    // matching main's `std::fs::write` on a new file (0o644 under the usual 022).
+    #[cfg(unix)]
+    #[test]
+    fn fresh_write_uses_the_umask_default_mode() {
+        use std::os::unix::fs::PermissionsExt;
+        extern "C" {
+            fn geteuid() -> u32;
+            fn umask(mask: u32) -> u32;
+        }
+        if unsafe { geteuid() } == 0 {
+            return;
+        }
+        // Pin the umask to the conventional 022 for the duration of the test so the
+        // expected 0o644 is deterministic regardless of the caller's environment,
+        // then restore it.
+        let prev = unsafe { umask(0o022) };
+        let tmp = tempfile::tempdir().unwrap();
+        let dest = tmp.path().join("index.json");
+        atomic_write(&dest, b"fresh").unwrap();
+        let mode = std::fs::metadata(&dest).unwrap().permissions().mode() & 0o777;
+        unsafe { umask(prev) };
+        assert_eq!(mode, 0o644, "a fresh store must keep the umask-default mode, like main");
     }
 }
