@@ -45,6 +45,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test/fixture/samples` verified byte-identical.
 
 ### Fixed
+- **One invalid-UTF-8 byte on stdin no longer kills the whole MCP session
+  (#124).** The `cce mcp` read loop read each line into a `String` with
+  `read_line`, which propagates an `InvalidData` ("stream did not contain valid
+  UTF-8") error the moment a line carries a stray non-UTF-8 byte; that error
+  unwound out of `run`, `serve` turned it into process death, and every
+  in-flight and subsequent request went unanswered — while every other form of
+  garbage input got a graceful `-32700`. The loop now reads raw bytes with
+  `read_until(b'\n', …)` and validates them: a non-UTF-8 line is answered with a
+  `-32700` parse error (JSON mandates UTF-8) and the session keeps serving the
+  next request. stdout stays pure JSON-RPC — the parse error is a protocol
+  response, not a stderr diagnostic.
 - **Memory append is a single write with a newline guard, so a torn or
   interleaved append can no longer silently lose entries (#102).** `append`
   in `src/memory.rs` wrote the JSON line and its trailing `\n` as two separate

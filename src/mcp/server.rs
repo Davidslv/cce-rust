@@ -421,18 +421,31 @@ impl McpServer {
     /// Drive the server over any reader/writer: read newline-delimited JSON-RPC,
     /// dispatch, and write each response line. Notifications produce no output.
     pub fn run<R: BufRead, W: Write>(&self, mut reader: R, mut writer: W) -> std::io::Result<()> {
-        let mut line = String::new();
+        let mut buf: Vec<u8> = Vec::new();
         loop {
-            line.clear();
-            let n = reader.read_line(&mut line)?;
+            buf.clear();
+            // Read raw bytes, not a `String`: one stray non-UTF-8 byte on a line
+            // must NOT propagate an `InvalidData` error out of the loop and tear down
+            // the long-lived session (#124). Read to the newline, then validate.
+            let n = reader.read_until(b'\n', &mut buf)?;
             if n == 0 {
                 break; // EOF: the editor closed the pipe.
             }
-            let trimmed = line.trim();
-            if trimmed.is_empty() {
-                continue;
-            }
-            if let Some(response) = self.handle_line(trimmed) {
+            let response = match std::str::from_utf8(&buf) {
+                // Non-UTF-8 bytes are a JSON-RPC parse error, never a fatal stream
+                // error: JSON mandates UTF-8, so answer -32700 and keep serving the
+                // next request instead of exiting (#124).
+                Err(_) => Some(protocol::error(Value::Null, protocol::PARSE_ERROR, "parse error")),
+                Ok(line) => {
+                    let trimmed = line.trim();
+                    if trimmed.is_empty() {
+                        None
+                    } else {
+                        self.handle_line(trimmed)
+                    }
+                }
+            };
+            if let Some(response) = response {
                 writer.write_all(response.as_bytes())?;
                 writer.write_all(b"\n")?;
                 writer.flush()?;
@@ -1102,6 +1115,38 @@ mod tests {
         assert_eq!(lines.len(), 2, "got: {text}");
         assert!(lines[0].contains("protocolVersion"));
         assert!(lines[1].contains("context_search"));
+    }
+
+    #[test]
+    fn invalid_utf8_line_is_a_parse_error_and_the_session_survives() {
+        let tmp = tempfile::tempdir().unwrap();
+        let s = server_for(tmp.path());
+        // ping(id=1), then a line carrying stray non-UTF-8 bytes, then ping(id=2).
+        let mut input: Vec<u8> = Vec::new();
+        input.extend_from_slice(b"{\"id\":1,\"method\":\"ping\"}\n");
+        input.extend_from_slice(&[0xff, 0xfe]);
+        input.push(b'\n');
+        input.extend_from_slice(b"{\"id\":2,\"method\":\"ping\"}\n");
+
+        let mut out: Vec<u8> = Vec::new();
+        // The bad byte must NOT tear down the loop: `run` returns Ok, not an error.
+        s.run(Cursor::new(input), &mut out).unwrap();
+        let text = String::from_utf8(out).unwrap();
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 3, "every request must be answered, got: {text}");
+
+        // id=1 answered.
+        let v1: Value = serde_json::from_str(lines[0]).unwrap();
+        assert_eq!(v1["id"], 1);
+        assert_eq!(v1["result"], json!({}));
+        // The bad-byte line yields a graceful parse error (null id), not a crash.
+        let v2: Value = serde_json::from_str(lines[1]).unwrap();
+        assert_eq!(v2["error"]["code"], protocol::PARSE_ERROR);
+        assert!(v2["id"].is_null());
+        // id=2 is still answered — the session survived.
+        let v3: Value = serde_json::from_str(lines[2]).unwrap();
+        assert_eq!(v3["id"], 2);
+        assert_eq!(v3["result"], json!({}));
     }
 
     /// Copy the workspace fixture into `root`, write its manifest + graph, and index
