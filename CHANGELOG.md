@@ -255,6 +255,40 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `pointer_address` as path segments and escaped the repo namespace. A single
   chokepoint now rejects any id that is not one `Normal` path component
   (`valid_repo_id`, mirroring #121).
+- **`cce knowledge push` verifies content, not just the snapshot id, before
+  treating a re-publish as unchanged (#113).** The snapshot id hashes only the
+  feed bytes, so two producers with a byte-identical feed but different
+  `markdown.max_section_tokens` (or redactor version) share one id over
+  different `.cck` bytes; the guard short-circuited on `pointer == snapshot`
+  and silently overwrote the content-addressed key. It now fetches and
+  checksum-compares the remote current and refuses a divergent overwrite
+  without `--force`.
+- **Superseded local knowledge snapshots are pruned on save (#114).**
+  `KnowledgeStore::save` wrote a new `<snapshot>.json` and repointed `current`
+  but never removed the superseded artifact (each carrying per-chunk
+  embeddings), leaking unbounded disk on routine re-ingestion. `current` now
+  advances first, then superseded `<snapshot>.json` artifacts are pruned
+  (best-effort, scoped strictly to 16-hex snapshot ids — the `synced.json`
+  marker and `current` pointer are never touched).
+- **`cce knowledge pull` advances `current` only after the marker is durable
+  (#122).** The pull moved the `current` pointer (activating the new store)
+  before writing `synced.json`, so a marker-write failure returned `Err` while
+  the active store had already been replaced, misfiring the §5 guard both
+  ways. The snapshot artifact and marker are now written first and `current`
+  advances last, so a marker failure leaves the prior store active and
+  consistent.
+- **A corrupt knowledge marker no longer disarms the pull overwrite guard
+  (#123).** `KnowledgeSyncState::load` mapped any read/parse error to `None`,
+  indistinguishable from "never pulled", so a truncated/empty/corrupt
+  `synced.json` waved a different-corpus overwrite through without `--force`.
+  A new strict load surfaces a corrupt marker as an error (bypassable only with
+  `--force`), and `save` propagates a serialization failure instead of writing
+  an empty marker.
+- **Both sync marker writes route through `atomic::atomic_write` (#150).**
+  `SyncState::save` (`.cce/synced.json`) and the knowledge `synced.json` marker
+  still used a bare truncate-then-write; a crash mid-write could leave either
+  truncated. They now use the #101 atomic temp-file + rename helper, bytes
+  byte-identical.
 - **Memory append is a single write with a newline guard, so a torn or
   interleaved append can no longer silently lose entries (#102).** `append`
   in `src/memory.rs` wrote the JSON line and its trailing `\n` as two separate

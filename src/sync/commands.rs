@@ -76,7 +76,12 @@ impl SyncState {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, serde_json::to_string(self).unwrap_or_default())
+        // #150: route through the atomic temp-file + rename helper (#101) so a
+        // crash mid-write can't leave `.cce/synced.json` truncated. Bytes are
+        // byte-identical to the prior `fs::write` (no trailing newline); a
+        // serialization failure propagates rather than writing an empty marker.
+        let json = serde_json::to_string(self).map_err(std::io::Error::other)?;
+        crate::atomic::atomic_write(&path, json.as_bytes())
     }
 }
 
@@ -2128,6 +2133,40 @@ mod tests {
                 .unwrap_err();
         assert!(err.contains("could not read the `main` pointer"), "got: {err}");
         assert!(!err.contains("no `--latest` pointer"), "read failure misreported: {err}");
+    }
+
+    #[test]
+    fn sync_marker_save_is_atomic_and_overwrites_a_read_only_marker() {
+        // #150: the marker goes through the atomic temp+rename helper — a bare
+        // `fs::write` cannot reopen a read-only marker to truncate it, but an
+        // atomic rename replaces it (the target file's mode is irrelevant), and
+        // no temp residue is left behind.
+        let root = tempfile::tempdir().unwrap();
+        let s1 = SyncState {
+            repo_id: "r".into(),
+            sha: "a".into(),
+            checksum: "c".into(),
+            installed_sha256: None,
+        };
+        s1.save(root.path()).unwrap();
+        let path = SyncState::path(root.path());
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        let s2 = SyncState {
+            repo_id: "r".into(),
+            sha: "b".into(),
+            checksum: "c2".into(),
+            installed_sha256: None,
+        };
+        s2.save(root.path()).unwrap();
+        assert_eq!(SyncState::load(root.path()).unwrap(), s2);
+        let leftover = std::fs::read_dir(root.path().join(".cce"))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".tmp"));
+        assert!(!leftover, "atomic temp file leaked");
     }
 
     #[test]

@@ -72,10 +72,37 @@ impl KnowledgeSyncState {
         KnowledgeStore::dir(root).join("synced.json")
     }
 
-    /// Load the marker, if a pull ever wrote one.
+    /// Load the marker, if a pull ever wrote one. Lenient: a read/parse error is
+    /// treated as "no marker" — used by the best-effort freshness summary where a
+    /// missing answer is acceptable. The §5 overwrite guard uses
+    /// [`load_strict`](Self::load_strict) instead.
     pub fn load(root: &Path) -> Option<KnowledgeSyncState> {
         let text = std::fs::read_to_string(Self::path(root)).ok()?;
         serde_json::from_str(&text).ok()
+    }
+
+    /// Load the marker for the §5 overwrite guard (#123), distinguishing a
+    /// genuinely **absent** marker (`Ok(None)`, never pulled) from one that is
+    /// present but **unreadable/corrupt** (`Err`). The lenient `.load()` maps a
+    /// corrupt marker to `None` — indistinguishable from "never pulled" — which
+    /// silently DISARMED the different-corpus guard, letting a truncated marker
+    /// wave through an overwrite the guard exists to refuse. A corrupt marker is
+    /// now an error the caller surfaces (bypassable only with `--force`).
+    pub fn load_strict(root: &Path) -> Result<Option<KnowledgeSyncState>, String> {
+        let path = Self::path(root);
+        match std::fs::read_to_string(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => {
+                Err(format!("could not read the knowledge sync marker {}: {e}", path.display()))
+            }
+            Ok(text) => serde_json::from_str(&text).map(Some).map_err(|e| {
+                format!(
+                    "the knowledge sync marker {} is unreadable/corrupt: {e}. It records which \
+                     corpus is active — pass --force to overwrite it.",
+                    path.display()
+                )
+            }),
+        }
     }
 
     fn save(&self, root: &Path) -> std::io::Result<()> {
@@ -83,7 +110,13 @@ impl KnowledgeSyncState {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, serde_json::to_string(self).unwrap_or_default())
+        // #123: propagate a serialization failure rather than writing an empty
+        // string (`unwrap_or_default`) that would later parse as a corrupt marker.
+        // #150: route through the atomic temp-file + rename helper (#101), so a
+        // crash mid-write can't truncate the marker. Bytes are byte-identical to
+        // the prior `fs::write` (no trailing newline).
+        let json = serde_json::to_string(self).map_err(std::io::Error::other)?;
+        crate::atomic::atomic_write(&path, json.as_bytes())
     }
 }
 
@@ -382,6 +415,7 @@ fn push_guard(
     remote: &GitRemote,
     corpus_id: &str,
     store: &KnowledgeStore,
+    outgoing_checksum: &str,
     dry_run: bool,
 ) -> Result<Option<String>, String> {
     let pointer_key = knowledge_pointer_address(knowledge_contract_version(), corpus_id);
@@ -403,15 +437,56 @@ fn push_guard(
         }));
     };
     if remote_snapshot == store.snapshot {
-        // The remote current already names this snapshot: re-publish is
-        // idempotent — nothing changes, nothing to diff.
-        return Ok(dry_run.then(|| {
-            format!(
-                "Dry-run: corpus {corpus_id}@{} — the remote `current` already names this \
-                 snapshot; a push would re-publish it unchanged.\nNothing pushed (--dry-run).\n",
-                store.snapshot
-            )
-        }));
+        // #113: the snapshot id is only a hash of the FEED bytes, but the
+        // published `.cck` also depends on `markdown.max_section_tokens` and the
+        // redactor version — two producers with a byte-identical feed but
+        // divergent config yield the SAME snapshot id over DIFFERENT content.
+        // So a matching id does NOT prove identical content: fetch + verify the
+        // remote current and compare manifest checksums before treating this as
+        // an unchanged re-publish. Divergent bytes at the same content-addressed
+        // key would silently overwrite what consumers already recorded.
+        let current =
+            fetch_verified_artifact(remote, corpus_id, &remote_snapshot).map_err(|e| {
+                let hint = if dry_run {
+                    "there is no diff to report (--dry-run). A real `--force` push (without \
+                     --dry-run) would bypass the guard."
+                } else {
+                    "Refusing to replace a corpus the guard cannot read. Pass --force to push \
+                     without the guard."
+                };
+                format!(
+                    "push guard: could not verify the remote's current snapshot \
+                     ({corpus_id}@{remote_snapshot}) — {e}\n{hint}"
+                )
+            })?;
+        if current.manifest.checksum == outgoing_checksum {
+            // Byte-identical re-publish — truly unchanged, proceed as before.
+            return Ok(dry_run.then(|| {
+                format!(
+                    "Dry-run: corpus {corpus_id}@{} — the remote `current` already names this \
+                     snapshot; a push would re-publish it unchanged.\nNothing pushed \
+                     (--dry-run).\n",
+                    store.snapshot
+                )
+            }));
+        }
+        // Same snapshot id, DIFFERENT content — the #113 collision.
+        let msg = format!(
+            "corpus {corpus_id}@{} is already published with DIFFERENT content (remote checksum \
+             {}, outgoing {outgoing_checksum}). The snapshot id hashes only the feed bytes, so a \
+             different `markdown.max_section_tokens` or redactor version produced divergent \
+             `.cck` bytes at the same content-addressed key",
+            store.snapshot, current.manifest.checksum,
+        );
+        if dry_run {
+            return Ok(Some(format!(
+                "Dry-run: {msg}.\nA real `--force` push would overwrite it.\nNothing pushed \
+                 (--dry-run).\n"
+            )));
+        }
+        return Err(format!(
+            "push guard: {msg}. Pass --force to overwrite the published snapshot."
+        ));
     }
     let current = fetch_verified_artifact(remote, corpus_id, &remote_snapshot).map_err(|e| {
         // Flag-aware bypass hint: under --dry-run the user may ALREADY have
@@ -504,7 +579,9 @@ pub fn cmd_knowledge_push(
     // included), so `--dry-run` provably touches nothing. `--force` skips the
     // diff entirely and pushes as before the guard existed.
     if dry_run || !force {
-        if let Some(report) = push_guard(&remote, &corpus_id, &store, dry_run)? {
+        if let Some(report) =
+            push_guard(&remote, &corpus_id, &store, &artifact.manifest.checksum, dry_run)?
+        {
             return Ok(report);
         }
     }
@@ -587,7 +664,9 @@ pub fn cmd_knowledge_pull(
     // snapshot of the same corpus supersedes silently — local re-ingest
     // semantics, which is what makes refresh idempotent.
     if !force {
-        if let Some(state) = KnowledgeSyncState::load(root) {
+        // #123: a corrupt marker is an error here, NOT a silent None that would
+        // disarm the guard and overwrite a different corpus without --force.
+        if let Some(state) = KnowledgeSyncState::load_strict(root)? {
             if state.corpus_id != corpus_id {
                 return Err(format!(
                     "the local knowledge store came from corpus `{}` but you are pulling \
@@ -604,8 +683,16 @@ pub fn cmd_knowledge_pull(
 
     // Install = exactly what a local ingest writes: `<root>/.cce/knowledge/
     // <snapshot>.json` + the one-line `current` pointer (§7 byte-identity).
+    //
+    // #122: advance `current` LAST — write the snapshot artifact, then the sync
+    // marker, and only then repoint `current`. Previously `store.save` moved
+    // `current` (activating the new store) BEFORE the marker was written, so a
+    // marker-write failure returned Err while the active store had already been
+    // replaced — the guard then misfired both ways on the stale marker. With the
+    // pointer moved last, any failure before it leaves the prior store active and
+    // its marker consistent; a re-pull of the intended corpus simply succeeds.
     let store = artifact.into_store();
-    let store_path = store.save(root).map_err(|e| {
+    let store_path = store.write_snapshot(root).map_err(|e| {
         format!("could not write the knowledge store under {}: {e}", root.display())
     })?;
 
@@ -622,6 +709,11 @@ pub fn cmd_knowledge_pull(
     .save(root)
     .map_err(|e| format!("could not write the knowledge sync marker: {e}"))?;
 
+    // Marker durable — now activate the freshly written snapshot.
+    KnowledgeStore::advance_current(root, &store.snapshot).map_err(|e| {
+        format!("could not advance the knowledge `current` pointer under {}: {e}", root.display())
+    })?;
+
     Ok(format!(
         "Pulled corpus {corpus_id}@{snapshot}\n  records  : {records} · chunks : {chunk_count}\n  \
          checksum : {checksum}\n  store    : {}\n",
@@ -632,9 +724,22 @@ pub fn cmd_knowledge_pull(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::knowledge::store::ingest;
     use crate::knowledge::{ingest_default, parse_ndjson};
     use crate::sync::git;
     use crate::sync::remote::SyncRemote;
+
+    /// Ingest `feed` at an explicit split budget into a fresh root (LFS off), so
+    /// a test can produce two stores from the SAME feed bytes but DIFFERENT
+    /// `max_section_tokens` — the #113 same-snapshot-id / divergent-content case.
+    fn root_with_store_budget(feed: &str, budget: usize) -> tempfile::TempDir {
+        let tmp = tempfile::tempdir().unwrap();
+        std::fs::create_dir_all(tmp.path().join(".cce")).unwrap();
+        std::fs::write(tmp.path().join(".cce").join("config"), "sync:\n  lfs: false\n").unwrap();
+        let recs = parse_ndjson(feed).unwrap();
+        ingest(&recs, feed.as_bytes(), budget).save(tmp.path()).unwrap();
+        tmp
+    }
 
     /// `cmd_knowledge_push` with the pre-#90 default flags (no force, no
     /// dry-run) — the shape every pre-guard test exercises.
@@ -867,6 +972,81 @@ mod tests {
     }
 
     #[test]
+    fn pull_marker_write_failure_leaves_the_active_store_unchanged() {
+        // #122: the pull used to advance `current` (activating the new corpus)
+        // BEFORE writing the marker, so a marker-write failure replaced the
+        // active store yet reported failure. `current` must move LAST — a marker
+        // failure must leave the prior store active.
+        let _home = with_home();
+        let (_bare, url) = bare_remote();
+        let p1 = root_with_store(&feed("a"));
+        push(p1.path(), Some("c1".into()), Some(url.clone())).unwrap();
+        let snap1 = KnowledgeStore::load_current(p1.path()).unwrap().snapshot;
+        let p2 = root_with_store(&feed("bb"));
+        push(p2.path(), Some("c2".into()), Some(url.clone())).unwrap();
+        let snap2 = KnowledgeStore::load_current(p2.path()).unwrap().snapshot;
+        assert_ne!(snap1, snap2);
+
+        let consumer = tempfile::tempdir().unwrap();
+        cmd_knowledge_pull(consumer.path(), Some("c1".into()), None, false, Some(url.clone()))
+            .unwrap();
+        assert_eq!(KnowledgeStore::load_current(consumer.path()).unwrap().snapshot, snap1);
+
+        // Wedge the marker write: replace synced.json with a non-empty directory
+        // (fails a bare `fs::write` AND an atomic temp+rename over it).
+        let marker = KnowledgeSyncState::path(consumer.path());
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::create_dir(&marker).unwrap();
+        std::fs::write(marker.join("wedge"), b"x").unwrap();
+
+        // Pull c2 --force: the marker write fails, so the pull errors …
+        let err = cmd_knowledge_pull(consumer.path(), Some("c2".into()), None, true, Some(url))
+            .unwrap_err();
+        assert!(err.contains("sync marker"), "got: {err}");
+        // … but the active store is still c1's snapshot — NOT replaced.
+        assert_eq!(
+            KnowledgeStore::load_current(consumer.path()).unwrap().snapshot,
+            snap1,
+            "current must not have advanced when the marker write failed"
+        );
+    }
+
+    #[test]
+    fn a_corrupt_marker_does_not_disarm_the_different_corpus_guard() {
+        // #123: `load` mapped any read/parse error to None, indistinguishable
+        // from "never pulled", so a truncated/empty/corrupt marker silently
+        // disarmed the §5 guard and let a different corpus overwrite the active
+        // one without --force. A corrupt marker must now be an error.
+        let _home = with_home();
+        let (_bare, url) = bare_remote();
+        let p1 = root_with_store(&feed("a"));
+        push(p1.path(), Some("c1".into()), Some(url.clone())).unwrap();
+        let p2 = root_with_store(&feed("bb"));
+        push(p2.path(), Some("c2".into()), Some(url.clone())).unwrap();
+
+        let consumer = tempfile::tempdir().unwrap();
+        cmd_knowledge_pull(consumer.path(), Some("c1".into()), None, false, Some(url.clone()))
+            .unwrap();
+        let active = KnowledgeStore::load_current(consumer.path()).unwrap().snapshot;
+
+        // Corrupt the marker (an interrupted non-atomic write / disk-full / edit).
+        std::fs::write(KnowledgeSyncState::path(consumer.path()), b"").unwrap();
+
+        // A different-corpus pull WITHOUT --force must refuse, not overwrite.
+        let err =
+            cmd_knowledge_pull(consumer.path(), Some("c2".into()), None, false, Some(url.clone()))
+                .unwrap_err();
+        assert!(err.contains("corrupt"), "got: {err}");
+        assert!(err.contains("--force"), "got: {err}");
+        // Nothing was overwritten — c1 is still active.
+        assert_eq!(KnowledgeStore::load_current(consumer.path()).unwrap().snapshot, active);
+
+        // --force bypasses the guard and re-writes a valid marker.
+        cmd_knowledge_pull(consumer.path(), Some("c2".into()), None, true, Some(url)).unwrap();
+        assert_eq!(KnowledgeSyncState::load(consumer.path()).unwrap().corpus_id, "c2");
+    }
+
+    #[test]
     fn pull_pins_a_named_snapshot() {
         let _home = with_home();
         let (_bare, url) = bare_remote();
@@ -956,6 +1136,63 @@ mod tests {
             snapshots[3]
         );
         assert!(remote.has(&knowledge_corpus_meta_address("v1", "c1")).unwrap());
+    }
+
+    #[test]
+    fn republishing_same_snapshot_id_with_divergent_content_is_refused() {
+        // #113: the snapshot id hashes only the feed bytes, so two producers with
+        // a byte-identical feed but different `markdown.max_section_tokens` share
+        // one id over different `.cck` content. The guard used to short-circuit on
+        // pointer==snapshot and silently overwrite the content-addressed key; it
+        // must now detect the checksum divergence and refuse without --force.
+        let _home = with_home();
+        let (_bare, url) = bare_remote();
+        let sectioned = "{\"id\":\"kn:1\",\"title\":\"Note\",\"body\":\"## A\\n\\nAlpha.\\n\\n## \
+             B\\n\\nBeta.\\n\\n## C\\n\\nGamma.\",\"source\":\"handbook\",\"updated_at\":\
+             \"2026-01-01T00:00:00Z\"}\n";
+
+        // Producer A: a huge budget keeps the whole doc as one chunk.
+        let a = root_with_store_budget(sectioned, 100_000);
+        push(a.path(), Some("c1".into()), Some(url.clone())).unwrap();
+        let snap_a = KnowledgeStore::load_current(a.path()).unwrap().snapshot;
+
+        // Producer B: a tiny budget splits every section into its own chunk.
+        let b = root_with_store_budget(sectioned, 1);
+        let store_b = KnowledgeStore::load_current(b.path()).unwrap();
+        assert_eq!(snap_a, store_b.snapshot, "same feed ⇒ same snapshot id (#113 collision)");
+        assert!(store_b.chunks.len() > 1, "the tiny budget must produce divergent content");
+
+        // B's push carries the same id but different bytes: refused without --force.
+        let err = push(b.path(), Some("c1".into()), Some(url.clone())).unwrap_err();
+        assert!(err.contains("DIFFERENT content"), "got: {err}");
+        assert!(err.contains("--force"), "got: {err}");
+
+        // The remote key is untouched — still A's single-chunk artifact.
+        let remote = GitRemote::open(&url, false).unwrap();
+        let key = knowledge_content_address("v1", "c1", &snap_a);
+        let ra = KnowledgeArtifact::from_bytes(&remote.get(&key).unwrap()).unwrap();
+        assert_eq!(ra.manifest.chunk_count, 1, "A's bytes must survive the refused push");
+
+        // --force overwrites, as designed.
+        cmd_knowledge_push(b.path(), Some("c1".into()), Some(url.clone()), true, false).unwrap();
+        let rb = KnowledgeArtifact::from_bytes(&remote.get(&key).unwrap()).unwrap();
+        assert!(rb.manifest.chunk_count > 1, "--force replaces it with B's content");
+    }
+
+    #[test]
+    fn republishing_same_snapshot_id_with_identical_content_stays_idempotent() {
+        // #113 control: a genuine re-push (same feed, same budget ⇒ same checksum)
+        // still proceeds quietly — the guard only fires on real divergence.
+        let _home = with_home();
+        let (_bare, url) = bare_remote();
+        let root = root_with_store_budget(
+            "{\"id\":\"kn:1\",\"title\":\"N\",\"body\":\"Body.\",\
+             \"source\":\"handbook\"}\n",
+            400,
+        );
+        push(root.path(), Some("c1".into()), Some(url.clone())).unwrap();
+        let out = push(root.path(), Some("c1".into()), Some(url)).unwrap();
+        assert!(out.starts_with("Pushed corpus c1@"), "got: {out}");
     }
 
     #[test]
@@ -1292,6 +1529,39 @@ mod tests {
         assert!(err.contains("could not verify the remote's current snapshot"), "got: {err}");
         assert!(err.contains(&missing), "the failure names the missing key, got: {err}");
         assert!(err.contains("--force"), "got: {err}");
+    }
+
+    #[test]
+    fn knowledge_marker_save_is_atomic_and_overwrites_a_read_only_marker() {
+        // #150: the knowledge marker goes through the atomic temp+rename helper —
+        // a bare `fs::write` cannot reopen a read-only marker to truncate it, but
+        // an atomic rename replaces it, leaving no temp residue.
+        let root = tempfile::tempdir().unwrap();
+        let s1 = KnowledgeSyncState {
+            corpus_id: "c1".into(),
+            snapshot: "s1".into(),
+            checksum: "x".into(),
+            installed_sha256: None,
+        };
+        s1.save(root.path()).unwrap();
+        let path = KnowledgeSyncState::path(root.path());
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        let s2 = KnowledgeSyncState {
+            corpus_id: "c1".into(),
+            snapshot: "s2".into(),
+            checksum: "y".into(),
+            installed_sha256: None,
+        };
+        s2.save(root.path()).unwrap();
+        assert_eq!(KnowledgeSyncState::load(root.path()).unwrap(), s2);
+        let leftover = std::fs::read_dir(KnowledgeStore::dir(root.path()))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".tmp"));
+        assert!(!leftover, "atomic temp file leaked");
     }
 
     #[test]
