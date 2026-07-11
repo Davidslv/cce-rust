@@ -78,6 +78,52 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the platform separator (`std::path::MAIN_SEPARATOR`): a no-op on Unix that
   preserves backslashes, still `\`→`/` on Windows where `\` is never a filename
   byte.
+- **A valid-JSON request with an id but no string `method` now echoes the id as
+  a `-32600` Invalid Request instead of a null-id parse error (#125).**
+  `parse_request` flattened "invalid JSON" and "valid JSON, wrong shape" into one
+  error, so `handle_line` answered a request like `{"jsonrpc":"2.0","id":7,"method":5}`
+  with `-32700` and `id:null` — a conforming client correlates responses by id,
+  cannot match `id:null` to request 7, and leaves the call pending until timeout.
+  `parse_request` now returns a `ParseError` that distinguishes the two: non-JSON
+  stays `-32700` with a null id, while valid JSON that is not a well-formed
+  request is `-32600` "invalid request" with the recoverable id echoed, so the
+  client can correlate and fail the call cleanly.
+- **One invalid-UTF-8 byte on stdin no longer kills the whole MCP session
+  (#124).** The `cce mcp` read loop read each line into a `String` with
+  `read_line`, which propagates an `InvalidData` ("stream did not contain valid
+  UTF-8") error the moment a line carries a stray non-UTF-8 byte; that error
+  unwound out of `run`, `serve` turned it into process death, and every
+  in-flight and subsequent request went unanswered — while every other form of
+  garbage input got a graceful `-32700`. The loop now reads raw bytes with
+  `read_until(b'\n', …)` and validates them: a non-UTF-8 line is answered with a
+  `-32700` parse error (JSON mandates UTF-8) and the session keeps serving the
+  next request. stdout stays pure JSON-RPC — the parse error is a protocol
+  response, not a stderr diagnostic.
+- **`is_code_lookup` now conforms to SPEC §6.1 boundary semantics (#107).**
+  The extension check examined only the FIRST `.ext` occurrence, so a later
+  genuine extension token was shadowed by an earlier non-boundary match
+  ("render in app.tsx or util.ts", "main.python auth.py" → GENERAL instead of
+  CODE_LOOKUP); it now scans every occurrence per the regex `\.(...)\b`. The
+  `.* defined` phrase used `contains("defined")`, firing on "undefined"/
+  "predefined"; it now requires the space the spec mandates. The folded
+  `find .* function` sibling likewise now requires a space before "function"
+  (no longer matching an embedded "malfunction"). This drives `fts_weight`
+  (1.5 vs 1.0), so misclassification skewed every BM25 RRF contribution.
+- **`rank_core` with `top_k=0` now returns an empty result set (#109).** The
+  diversity-cap loop pushed a candidate before testing `kept.len() >= top_k`,
+  and the `(top_k * CANDIDATE_MULTIPLIER).max(1)` candidate floor always
+  supplied one candidate, so `cce search --top-k 0` returned a phantom result
+  (and logged `result_count=1`) while `bm25_only_search` returned none. The cap
+  is now checked before keeping, so both pipelines agree on the degenerate input.
+- **An empty query vector now genuinely disables vector recall (#110).** When
+  the query embedding was unavailable at query time (e.g. Ollama died inside the
+  ping→embed TOCTOU window and `embed` returned an empty vector), `rank_by_cosine`
+  scored every chunk 0.0 and tie-broke by `chunk_id`, so `rank_core` handed full
+  RRF vector-rank credit to the lexicographically smallest chunk_ids — surfacing
+  alphabetical noise with confident-looking scores while the warning claimed
+  "vector recall disabled". `rank_core` now gathers no vector candidates when the
+  query vector is empty, leaving BM25 as the sole recall source (a zero-overlap
+  query returns empty, matching `bm25_only_search`).
 - **Memory append is a single write with a newline guard, so a torn or
   interleaved append can no longer silently lose entries (#102).** `append`
   in `src/memory.rs` wrote the JSON line and its trailing `\n` as two separate
