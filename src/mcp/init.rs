@@ -327,21 +327,40 @@ fn write_claude_md(dir: &Path, level: OutputLevel) -> Result<PathBuf, String> {
     let block = claude_block(level);
     let new_content = match std::fs::read_to_string(&path) {
         Ok(text) => {
-            if let (Some(b), Some(e)) = (text.find(CLAUDE_BEGIN), text.find(CLAUDE_END)) {
-                let end_idx = e + CLAUDE_END.len();
-                let mut s = String::new();
-                s.push_str(&text[..b]);
-                s.push_str(block.trim_end());
-                s.push_str(&text[end_idx..]);
-                s
-            } else {
-                let mut s = text;
-                if !s.is_empty() && !s.ends_with('\n') {
+            // Defensive marker handling (#99): only two shapes are touchable —
+            // no markers at all (append) or exactly one BEGIN before exactly
+            // one END (replace that bounded region). Anything else (an orphan
+            // marker, END before BEGIN, duplicate pairs) used to mangle user
+            // content or grow the file unboundedly; it is refused instead.
+            let begins: Vec<usize> = text.match_indices(CLAUDE_BEGIN).map(|(i, _)| i).collect();
+            let ends: Vec<usize> = text.match_indices(CLAUDE_END).map(|(i, _)| i).collect();
+            match (begins.as_slice(), ends.as_slice()) {
+                ([], []) => {
+                    let mut s = text;
+                    if !s.is_empty() && !s.ends_with('\n') {
+                        s.push('\n');
+                    }
                     s.push('\n');
+                    s.push_str(&block);
+                    s
                 }
-                s.push('\n');
-                s.push_str(&block);
-                s
+                ([b], [e]) if b < e => {
+                    let end_idx = e + CLAUDE_END.len();
+                    let mut s = String::new();
+                    s.push_str(&text[..*b]);
+                    s.push_str(block.trim_end());
+                    s.push_str(&text[end_idx..]);
+                    s
+                }
+                _ => return Err(format!(
+                    "{} has unpaired, misordered, or duplicated CCE markers ({} `{CLAUDE_BEGIN}`, \
+                         {} `{CLAUDE_END}`) — refusing to modify it so your content is not lost; \
+                         repair the file to exactly one BEGIN followed by one END (or remove both \
+                         markers) and re-run `cce init`",
+                    path.display(),
+                    begins.len(),
+                    ends.len()
+                )),
             }
         }
         Err(_) => format!("# CLAUDE.md\n\n{block}"),
@@ -480,6 +499,76 @@ mod tests {
         let claude2 = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
         assert_eq!(claude2.matches(CLAUDE_BEGIN).count(), 1);
         assert!(claude2.starts_with("# My Project"));
+    }
+
+    #[test]
+    fn init_refuses_claude_md_with_an_orphan_begin_marker() {
+        // #99 case A: a BEGIN whose END was lost (e.g. in a merge-conflict
+        // resolution). Run 1 used to append a second block; run 2 then spliced
+        // from the orphan BEGIN to the appended END, silently deleting the
+        // user's own sections in between. init must refuse and leave the file
+        // byte-untouched, on every run.
+        let tmp = tempfile::tempdir().unwrap();
+        write_tiny_repo(tmp.path());
+        let content = format!(
+            "# Proj\n\n{CLAUDE_BEGIN}\n\n## Important team conventions\n\n- never touch prod db\n"
+        );
+        std::fs::write(tmp.path().join("CLAUDE.md"), &content).unwrap();
+
+        for run_n in 1..=2 {
+            let err = run(&opts(tmp.path())).unwrap_err();
+            assert!(err.contains("CLAUDE.md"), "run {run_n}: error must name the file: {err}");
+            let after = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
+            assert_eq!(after, content, "run {run_n}: CLAUDE.md must be left byte-untouched");
+        }
+    }
+
+    #[test]
+    fn init_refuses_claude_md_with_an_orphan_end_marker() {
+        let tmp = tempfile::tempdir().unwrap();
+        write_tiny_repo(tmp.path());
+        let content = format!("# Proj\n\n{CLAUDE_END}\n\n## My stuff\n");
+        std::fs::write(tmp.path().join("CLAUDE.md"), &content).unwrap();
+
+        let err = run(&opts(tmp.path())).unwrap_err();
+        assert!(err.contains("CLAUDE.md"), "error must name the file: {err}");
+        let after = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
+        assert_eq!(after, content, "CLAUDE.md must be left byte-untouched");
+    }
+
+    #[test]
+    fn init_refuses_claude_md_with_misordered_markers_and_does_not_grow_it() {
+        // #99 case B: END before BEGIN. Every run used to duplicate the region
+        // between them, growing the file unboundedly. init must refuse, leave
+        // the file byte-untouched, and stay refused (idempotent) on re-runs.
+        let tmp = tempfile::tempdir().unwrap();
+        write_tiny_repo(tmp.path());
+        let content = format!("{CLAUDE_END}\n\n## My stuff\n\n{CLAUDE_BEGIN}\n");
+        std::fs::write(tmp.path().join("CLAUDE.md"), &content).unwrap();
+
+        for run_n in 1..=3 {
+            let err = run(&opts(tmp.path())).unwrap_err();
+            assert!(err.contains("CLAUDE.md"), "run {run_n}: error must name the file: {err}");
+            let after = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
+            assert_eq!(after, content, "run {run_n}: CLAUDE.md must not grow or change");
+        }
+    }
+
+    #[test]
+    fn init_refuses_claude_md_with_duplicate_marker_pairs() {
+        // Two BEGIN/END pairs: which block is "the" CCE block is ambiguous, so
+        // init must refuse rather than guess and mangle.
+        let tmp = tempfile::tempdir().unwrap();
+        write_tiny_repo(tmp.path());
+        let content = format!(
+            "{CLAUDE_BEGIN}\nold\n{CLAUDE_END}\n\n## Mine\n\n{CLAUDE_BEGIN}\nold2\n{CLAUDE_END}\n"
+        );
+        std::fs::write(tmp.path().join("CLAUDE.md"), &content).unwrap();
+
+        let err = run(&opts(tmp.path())).unwrap_err();
+        assert!(err.contains("CLAUDE.md"), "error must name the file: {err}");
+        let after = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
+        assert_eq!(after, content, "CLAUDE.md must be left byte-untouched");
     }
 
     /// Write a `.cce/config` selecting an L4 output level.
