@@ -228,9 +228,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   (`git checkout <old-sha>`) published an honest artifact but rewound
   `refs/main` to the old sha — silently rewinding every consumer's `--latest`.
   Push now resolves the branch via an explicit `sync.ref` (the CI contract),
-  else the checked-out branch, and **errors** when HEAD is detached with no
-  resolvable ref rather than moving a pointer it cannot attribute. CI's
-  detached-at-tip checkout still works by setting `sync.ref`.
+  else the checked-out branch, and when HEAD is detached with no resolvable ref
+  it **refuses — advancing no pointer** — rather than rewinding one it cannot
+  attribute (fully closing #151, not deferring it). A CI job on a detached-at-SHA
+  checkout sets `sync.ref` to publish; a push-event checkout on an attached
+  branch is unaffected.
 - **`cce sync pull --workspace` now honours the §9.4 `--force` guard per
   member (#118).** The workspace branch returned before the guard and never
   consulted `SyncState`, so a member pinned via `cce sync pull --commit <sha>`

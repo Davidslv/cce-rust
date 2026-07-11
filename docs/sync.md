@@ -328,6 +328,13 @@ Behaviour:
   branches, so a global ref would be wrong for most of them; `sync.ref` is the
   per-member tool. `refs/main`, when present, always wins — byte-identical to
   before.
+- **`sync.ref` also names the *push* pointer on a detached HEAD (#151).** The
+  same key that chooses which ref `--latest` resolves on pull also names which
+  `refs/<branch>` a **push** advances when `HEAD` is detached. A detached push
+  with no `sync.ref` **refuses** (it will not silently rewind `refs/main` to the
+  checked-out commit); a CI job that runs on a detached-at-SHA checkout must set
+  `sync.ref: <branch>` to publish. A normal push on an attached branch is
+  unaffected — it advances `refs/<current-branch>` as before.
 - **Independent shas are the supported shape.** Each member federates at its own
   latest sha — there is no monorepo one-sha assumption on the pull side (that
   assumption exists only in `push --workspace`, which pushes a single checkout).
