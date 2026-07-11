@@ -238,14 +238,47 @@ impl KnowledgeStore {
 
     /// Advance the `current` pointer to `snapshot` (atomically) — the step that
     /// makes a written snapshot the ACTIVE store. Must run after its snapshot
-    /// artifact is on disk.
+    /// artifact is on disk. Then prunes superseded local snapshots (#114).
     pub fn advance_current(root: &Path, snapshot: &str) -> io::Result<()> {
         // #101: atomic temp-file + rename, so a torn pointer a concurrent reader
         // would misresolve can never occur.
         crate::atomic::atomic_write(
             &Self::current_pointer_path(root),
             format!("{snapshot}\n").as_bytes(),
-        )
+        )?;
+        // #114: local retention — a newer snapshot supersedes the old, so the
+        // superseded `<snapshot>.json` artifacts (each carrying a per-chunk
+        // embedding, easily multi-MB) are dropped here; without this, routine
+        // re-ingestion / pull leaks unbounded disk (there is no other local
+        // prune). Runs only AFTER `current` is durably repointed, and is
+        // best-effort: a prune failure never fails the save.
+        Self::prune_superseded_snapshots(root, snapshot);
+        Ok(())
+    }
+
+    /// Remove every `<snapshot>.json` artifact under the store dir except the one
+    /// named `keep` (#114). Scoped tightly to snapshot artifacts — a name must be
+    /// a 16-char lowercase-hex snapshot id — so the `synced.json` sync marker, the
+    /// `current` pointer, and any other file are never touched. Best-effort.
+    fn prune_superseded_snapshots(root: &Path, keep: &str) {
+        let Ok(entries) = std::fs::read_dir(Self::dir(root)) else {
+            return;
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            if path.extension().and_then(|e| e.to_str()) != Some("json") {
+                continue;
+            }
+            let Some(stem) = path.file_stem().and_then(|s| s.to_str()) else {
+                continue;
+            };
+            let is_snapshot_id = stem.len() == 16
+                && stem.bytes().all(|b| b.is_ascii_digit() || (b'a'..=b'f').contains(&b));
+            if !is_snapshot_id || stem == keep {
+                continue;
+            }
+            let _ = std::fs::remove_file(&path);
+        }
     }
 
     /// Load the store for a snapshot artifact path.
@@ -472,6 +505,41 @@ mod tests {
         let loaded = KnowledgeStore::load_current(tmp.path()).unwrap();
         assert_eq!(loaded, s2);
         assert_ne!(s1.snapshot, s2.snapshot);
+    }
+
+    #[test]
+    fn saving_a_new_snapshot_prunes_the_superseded_local_artifact() {
+        // #114: a newer snapshot supersedes the old, so the superseded
+        // `<snapshot>.json` must not accumulate forever under `.cce/knowledge/`.
+        let tmp = tempfile::tempdir().unwrap();
+        // A sync marker in the same dir must SURVIVE pruning.
+        std::fs::create_dir_all(KnowledgeStore::dir(tmp.path())).unwrap();
+        std::fs::write(KnowledgeStore::dir(tmp.path()).join("synced.json"), b"{}").unwrap();
+
+        let s1 = ingest(&[rec("a", "One", "x")], b"feed-v1", 400);
+        s1.save(tmp.path()).unwrap();
+        let s2 = ingest(&[rec("a", "One", "x"), rec("b", "Two", "y")], b"feed-v2", 400);
+        s2.save(tmp.path()).unwrap();
+        assert_ne!(s1.snapshot, s2.snapshot);
+
+        assert!(
+            !KnowledgeStore::snapshot_path(tmp.path(), &s1.snapshot).exists(),
+            "the superseded snapshot artifact leaked"
+        );
+        assert!(KnowledgeStore::snapshot_path(tmp.path(), &s2.snapshot).exists());
+        // Exactly one `<snapshot>.json` remains, and the marker is untouched.
+        let snapshots = std::fs::read_dir(KnowledgeStore::dir(tmp.path()))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                let p = e.path();
+                p.extension().and_then(|x| x.to_str()) == Some("json")
+                    && p.file_name().and_then(|n| n.to_str()) != Some("synced.json")
+            })
+            .count();
+        assert_eq!(snapshots, 1, "only the current snapshot json remains");
+        assert!(KnowledgeStore::dir(tmp.path()).join("synced.json").exists(), "marker pruned");
+        assert_eq!(KnowledgeStore::load_current(tmp.path()).unwrap(), s2);
     }
 
     #[test]
