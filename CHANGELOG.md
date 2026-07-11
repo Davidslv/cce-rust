@@ -64,6 +64,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   well-formed file round-trips byte-identically). `load_entries` still skips a
   legacy malformed line rather than crashing, but now emits a `warning:` naming
   the file and the count of skipped records, so the loss is no longer silent.
+- **`index.json` is now written atomically (temp-file + fsync + rename), so a
+  crash mid-save can't destroy the store (#101).** `Index::save` used a bare
+  `std::fs::write` (open-with-truncate), so a `SIGKILL`/OOM/disk-full mid-write
+  destroyed the previous good `.cce/index.json` and left a truncated/0-byte file,
+  and a concurrent reader (a long-lived MCP server, `sync push`, `stats`) could
+  observe an empty/partial file and spuriously fail with `InvalidData`. Reachable
+  from `cce index`, `cce sync pull` (its `install_artifact` calls the same
+  `save`), and mcp init. The write now stages the bytes to a uniquely-named temp
+  file IN THE SAME DIRECTORY (rename is only atomic within a filesystem), fsyncs
+  it, then `rename`s it over the destination — a reader sees either the old
+  complete file or the new one, never a partial one, and a failed write leaves the
+  previous store byte-for-byte intact with no stray temp file. The temp name
+  carries the pid plus a process-local counter so two concurrent saves never
+  collide, with no nondeterministic randomness. The mechanism is a shared
+  `atomic::atomic_write` helper (mirroring the existing self-update binary swap)
+  now used by the code store, the knowledge store's snapshot artifact and
+  `current` pointer (`src/knowledge/store.rs`), and the store fingerprint
+  (`src/fingerprint.rs`). The on-disk bytes are byte-identical to before — only
+  the write mechanism changed — so conformance and pinned-store checksums are
+  untouched.
 - **`cce init` can no longer destroy user-owned files on a read/parse failure
   (#99).** One root cause, five sub-bugs: a failed read or parse of an
   existing `.mcp.json`, `CLAUDE.md`, or `.gitignore` was silently treated as
