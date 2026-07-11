@@ -500,7 +500,7 @@ pub fn cmd_pull(
     let remote = open_remote(&cfg)?;
 
     if workspace {
-        return pull_workspace(root, &cfg, &remote, &target, git_ref.as_deref());
+        return pull_workspace(root, &cfg, &remote, &target, force, git_ref.as_deref());
     }
 
     let repo_id = resolve_repo_id(root, &cfg)?;
@@ -602,6 +602,7 @@ fn pull_workspace(
     cfg: &SyncConfig,
     remote: &dyn SyncRemote,
     target: &PullTarget,
+    force: bool,
     git_ref: Option<&str>,
 ) -> Result<String, String> {
     let base = resolve_repo_id(root, cfg)?;
@@ -630,6 +631,22 @@ fn pull_workspace(
         let repo_id = format!("{base}__{}", m.name);
         let (sha, noted_ref) =
             resolve_pull_sha(&member_dir, cfg, remote, &repo_id, target, git_ref)?;
+        // §9.4 (#118): a workspace pull must NOT silently clobber a member whose
+        // local cache is pinned at a different sha — the exact overwrite the
+        // single-repo path refuses without --force. The workspace branch used to
+        // skip this guard entirely, so a member pinned via `cce sync pull
+        // --commit <sha>` was silently rewound by a root `pull --workspace`.
+        if !force {
+            if let Some(state) = SyncState::load(&member_dir) {
+                if state.sha != sha {
+                    return Err(format!(
+                        "workspace member `{}` local cache is at {} but you are pulling {sha}. \
+                         Pass --force to overwrite.",
+                        m.name, state.sha
+                    ));
+                }
+            }
+        }
         let key = content_address(HASH_EMBEDDER, &ver, &repo_id, &sha);
         let bytes = remote.get(&key)?;
         let artifact = install_artifact(&member_dir, &bytes)?;
@@ -2206,6 +2223,51 @@ mod tests {
         // Each member now has its own store.
         assert!(dst.path().join("alpha/.cce/index.json").exists());
         assert!(dst.path().join("beta/.cce/index.json").exists());
+        std::env::remove_var("CCE_HOME");
+    }
+
+    #[test]
+    fn workspace_pull_refuses_to_clobber_a_pinned_member_without_force() {
+        // #118: a root `pull --workspace --latest` used to skip the §9.4 guard
+        // entirely and silently rewind members pinned at another sha. The guard
+        // must fire per member, exactly as the single-repo path does.
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let src = workspace_repo();
+        let cfg = || SyncConfig {
+            remote: Some(url.clone()),
+            lfs: false,
+            repo_id: Some("example.com__acme__mono".to_string()),
+            git_ref: None,
+            auto_pull: false,
+            retention: crate::sync::config::Retention::All,
+        };
+        cfg().save(src.path()).unwrap();
+        cmd_push(src.path(), None, true).unwrap();
+        let sha1 = git::head_sha(src.path()).unwrap();
+
+        // Consumer clones and pulls the whole workspace at sha1 (markers recorded).
+        let dst = source_repo_clone(&src);
+        cfg().save(dst.path()).unwrap();
+        cmd_pull(dst.path(), PullTarget::Head, false, true, None).unwrap();
+        assert_eq!(SyncState::load(&dst.path().join("alpha")).unwrap().sha, sha1);
+
+        // A new workspace commit advances refs/main to sha2.
+        std::fs::write(src.path().join("alpha/src/index.js"), "function alpha() { return 2; }\n")
+            .unwrap();
+        git::run_commit(src.path(), &["commit", "-qam", "bump"]).unwrap();
+        cmd_push(src.path(), None, true).unwrap();
+        let sha2 = git::head_sha(src.path()).unwrap();
+        assert_ne!(sha1, sha2);
+
+        // WITHOUT --force the workspace pull must refuse, not silently rewind.
+        let err = cmd_pull(dst.path(), PullTarget::Latest, false, true, None).unwrap_err();
+        assert!(err.contains("Pass --force to overwrite"), "got: {err}");
+        assert_eq!(SyncState::load(&dst.path().join("alpha")).unwrap().sha, sha1, "pin intact");
+
+        // With --force it proceeds and advances the members.
+        cmd_pull(dst.path(), PullTarget::Latest, true, true, None).unwrap();
+        assert_eq!(SyncState::load(&dst.path().join("alpha")).unwrap().sha, sha2);
         std::env::remove_var("CCE_HOME");
     }
 
