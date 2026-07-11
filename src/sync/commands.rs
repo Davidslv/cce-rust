@@ -341,20 +341,42 @@ fn list_ref_names(
         .collect())
 }
 
-/// Read a `refs/<name>` pointer's sha via the artifact-read path (`get`, which
-/// any `SyncRemote` backend supports). The sha comes back trimmed; an absent
-/// pointer is the clear per-ref "no `--latest` pointer" error.
+/// Read a `refs/<name>` pointer's sha, distinguishing a genuinely **absent**
+/// pointer (`Ok(None)`) from a pointer that exists but could not be **read**
+/// (`Err`, #120). `has` first (a `cat-file -e` existence check) decides absence;
+/// only when the pointer exists do we `get` it, so a transient IO/permission
+/// failure surfaces its real cause instead of being mislabelled "no pointer"
+/// and silently pushing resolution into the #72 single-fallback. The sha comes
+/// back trimmed.
+fn read_pointer_opt(
+    remote: &dyn SyncRemote,
+    ver: &str,
+    repo_id: &str,
+    name: &str,
+) -> Result<Option<String>, String> {
+    let pointer = pointer_address(HASH_EMBEDDER, ver, repo_id, name);
+    if !remote
+        .has(&pointer)
+        .map_err(|e| format!("could not check the `{name}` pointer for {repo_id}: {e}"))?
+    {
+        return Ok(None);
+    }
+    let bytes = remote
+        .get(&pointer)
+        .map_err(|e| format!("could not read the `{name}` pointer for {repo_id}: {e}"))?;
+    Ok(Some(String::from_utf8_lossy(&bytes).trim().to_string()))
+}
+
+/// Read a required `refs/<name>` pointer: an absent pointer is the clear per-ref
+/// "no `--latest` pointer" error; a read failure (#120) surfaces its own cause.
 fn read_pointer(
     remote: &dyn SyncRemote,
     ver: &str,
     repo_id: &str,
     name: &str,
 ) -> Result<String, String> {
-    let pointer = pointer_address(HASH_EMBEDDER, ver, repo_id, name);
-    let bytes = remote
-        .get(&pointer)
-        .map_err(|_| format!("no `--latest` pointer for {repo_id} on `{name}`"))?;
-    Ok(String::from_utf8_lossy(&bytes).trim().to_string())
+    read_pointer_opt(remote, ver, repo_id, name)?
+        .ok_or_else(|| format!("no `--latest` pointer for {repo_id} on `{name}`"))
 }
 
 /// Resolve the sha a pull should install. For `--latest` the resolution order
@@ -385,10 +407,12 @@ fn resolve_pull_sha(
                 let noted = (name != crate::sync::DEFAULT_REF).then_some(name);
                 return Ok((sha, noted));
             }
-            if let Ok(sha) = read_pointer(remote, &ver, repo_id, crate::sync::DEFAULT_REF) {
+            // #120: a read FAILURE on refs/main must surface (via `?`), not be
+            // swallowed as absence and mis-resolved through the fallback; only a
+            // genuinely absent pointer proceeds to the #72 single-fallback rule.
+            if let Some(sha) = read_pointer_opt(remote, &ver, repo_id, crate::sync::DEFAULT_REF)? {
                 return Ok((sha, None));
             }
-            // refs/main is absent — the #72 single-fallback rule.
             let refs = list_ref_names(remote, &ver, repo_id)?;
             match refs.as_slice() {
                 [only] => Ok((read_pointer(remote, &ver, repo_id, only)?, Some(only.clone()))),
@@ -2009,6 +2033,52 @@ mod tests {
         assert!(s.contains("local cache   :"));
         assert!(s.contains("remote latest :"));
         std::env::remove_var("CCE_HOME");
+    }
+
+    /// A remote whose pointers EXIST (`has` → true) but cannot be READ (`get`
+    /// → a permission error) — the #120 exists-but-unreadable pointer scenario.
+    struct UnreadablePointerRemote;
+    impl SyncRemote for UnreadablePointerRemote {
+        fn has(&self, _key: &str) -> Result<bool, String> {
+            Ok(true)
+        }
+        fn get(&self, key: &str) -> Result<Vec<u8>, String> {
+            Err(format!("could not read {key} after checkout: Permission denied (os error 13)"))
+        }
+        fn put(&self, _key: &str, _bytes: &[u8]) -> Result<(), String> {
+            unimplemented!()
+        }
+        fn put_many(&self, _entries: &[(String, Vec<u8>)]) -> Result<(), String> {
+            unimplemented!()
+        }
+        fn list(&self, _prefix: &str) -> Result<Vec<String>, String> {
+            unimplemented!()
+        }
+        fn list_keys_with_suffix(&self, _p: &str, _s: &str) -> Result<Vec<String>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn resolve_pull_sha_surfaces_a_pointer_read_failure_instead_of_reporting_absence() {
+        // #120: an exists-but-unreadable `refs/main` (permission blip) used to be
+        // conflated with absence — reported as "no `--latest` pointer" and pushed
+        // into the #72 fallback. The real read error must surface instead.
+        let work = tempfile::tempdir().unwrap();
+        let cfg = SyncConfig {
+            remote: Some("file:///x".into()),
+            lfs: false,
+            repo_id: Some("example__r".into()),
+            git_ref: None,
+            auto_pull: false,
+            retention: crate::sync::config::Retention::All,
+        };
+        let remote = UnreadablePointerRemote;
+        let err =
+            resolve_pull_sha(work.path(), &cfg, &remote, "example__r", &PullTarget::Latest, None)
+                .unwrap_err();
+        assert!(err.contains("could not read the `main` pointer"), "got: {err}");
+        assert!(!err.contains("no `--latest` pointer"), "read failure misreported: {err}");
     }
 
     #[test]
