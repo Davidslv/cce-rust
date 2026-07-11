@@ -45,6 +45,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test/fixture/samples` verified byte-identical.
 
 ### Fixed
+- **Workspace member-name suffixing is now collision-free against real
+  sibling directories (#131).** `detect_members` minted `basename-N` suffixes
+  by a per-basename counter without checking the result against other members'
+  basenames, so a workspace with `a/widget`, `b/widget`, and a directory
+  literally named `widget-2` produced TWO members named `widget-2` — violating
+  the documented "unique member id" invariant, and making federation namespace
+  two members' chunks under one prefix and attribute results to the wrong
+  package. Suffixing now skips any candidate that is already assigned OR
+  reserved as another member's natural basename, so ids are always unique.
 - **Walker no longer silently drops traversal errors (#133).** The walk loop
   used `walker.flatten()`, which discards the `ignore` crate's `Err` entries —
   so a permission-denied or otherwise unreadable directory made every file

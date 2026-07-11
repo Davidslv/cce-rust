@@ -20,7 +20,7 @@
 
 use crate::config::{WORKSPACE_FILE, WORKSPACE_GRAPH_FILE};
 use serde::{Deserialize, Serialize};
-use std::collections::{BTreeMap, BTreeSet};
+use std::collections::BTreeSet;
 use std::path::{Path, PathBuf};
 
 /// A member's detected kind (SPEC-V2.2 §2/§3).
@@ -298,18 +298,31 @@ pub fn detect_members(root: &Path) -> Vec<Member> {
         }
     }
 
-    // Deterministic: sort by path ascending, then assign collision-suffixed names.
+    // Deterministic: sort by path ascending, then assign collision-free names.
     detected.sort_by(|a, b| a.path.cmp(&b.path));
-    let mut used: BTreeMap<String, usize> = BTreeMap::new();
+    // Every member's *natural* basename is reserved: a minted `-N` suffix must
+    // never equal one, or it would collide with the real directory that owns that
+    // basename and mint a duplicate id (issue #131 — e.g. suffixing `widget` to
+    // `widget-2` when a sibling directory is literally named `widget-2`).
+    let reserved: BTreeSet<String> = detected.iter().map(|d| d.basename.clone()).collect();
+    let mut used: BTreeSet<String> = BTreeSet::new();
     let mut members: Vec<Member> = Vec::with_capacity(detected.len());
     for d in detected {
-        let count = used.entry(d.basename.clone()).or_insert(0);
-        *count += 1;
-        let name = if *count == 1 {
+        let name = if !used.contains(&d.basename) {
             d.basename.clone()
         } else {
-            format!("{}-{}", d.basename, count)
+            // Find the smallest `basename-N` (N>=2) that is neither already assigned
+            // nor reserved as another member's natural basename.
+            let mut n = 2usize;
+            loop {
+                let candidate = format!("{}-{}", d.basename, n);
+                if !used.contains(&candidate) && !reserved.contains(&candidate) {
+                    break candidate;
+                }
+                n += 1;
+            }
         };
+        used.insert(name.clone());
         members.push(Member { name, path: d.path, member_type: d.member_type, package: d.package });
     }
     members
@@ -731,6 +744,33 @@ mod tests {
         assert_eq!(names, vec!["widget", "widget-2"]);
         assert_eq!(members[0].path, "a/widget");
         assert_eq!(members[1].path, "b/widget");
+    }
+
+    #[test]
+    fn suffixing_is_collision_free_against_a_real_sibling_directory() {
+        // Issue #131: two members both named "widget" force a "widget-2" suffix —
+        // but a THIRD member is a real directory literally named "widget-2". The
+        // mint must not collide with that real basename, or two different members
+        // get the same id and federation misattributes one member's results to the
+        // other. Every member id must be unique.
+        let tmp = tempfile::tempdir().unwrap();
+        for (sub, pkg) in
+            [("a/widget", "widget-a"), ("b/widget", "widget-b"), ("widget-2", "widget-two")]
+        {
+            let d = tmp.path().join(sub);
+            std::fs::create_dir_all(&d).unwrap();
+            std::fs::write(d.join("package.json"), format!("{{\"name\":\"{pkg}\"}}")).unwrap();
+        }
+        let members = detect_members(tmp.path());
+        let names: Vec<&str> = members.iter().map(|m| m.name.as_str()).collect();
+
+        let unique: std::collections::BTreeSet<&str> = names.iter().copied().collect();
+        assert_eq!(unique.len(), names.len(), "member ids must be unique; got {names:?}");
+        // Path-sorted: a/widget keeps "widget"; b/widget must skip the real
+        // "widget-2" and land on "widget-3"; the real widget-2 keeps its own name.
+        assert_eq!(names, vec!["widget", "widget-3", "widget-2"], "got {names:?}");
+        assert_eq!(members[2].path, "widget-2");
+        assert_eq!(members[2].name, "widget-2");
     }
 
     #[test]
