@@ -57,6 +57,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   quote into a neighbouring assignment, and the closing quote still survives
   outside the redaction. Placeholder-guard and short-value semantics are
   unchanged; output stays deterministic and idempotent.
+- **A corpus_id of `..` or `.` can no longer escape the corpus namespace and
+  destroy other corpora's snapshots (#121).** `valid_corpus_id` accepted any
+  non-empty sanitize-stable id, and `.`/`..` are sanitize-stable in the
+  `[A-Za-z0-9._-]` charset — yet the id is used verbatim as a path segment on
+  the cache, so `knowledge/v1/..` normalizes to `knowledge/` and a
+  keep-last-N retention prune under `--corpus ..` enumerated and deleted
+  EVERY corpus's `.cck` snapshots (cross-corpus data loss, dangling `current`
+  pointers). The validation rule now additionally requires the id to resolve
+  to exactly one `Normal` path component (`Path::new(id).components()`), so
+  `.` and `..` are rejected at the single `resolve_corpus_id` chokepoint —
+  before any filesystem or remote operation — while legitimate dotted ids
+  (`my.corpus.v1`, `.hidden`, `v1.`) remain valid. Push, pull, and retention
+  all inherit the guard. As release-present defense in depth, the retention
+  delete site now confines every key it is about to prune to
+  `knowledge/<ver>/<corpus_id>/` (segment-exact) and errors on any key outside
+  it — this holds in shipped binaries and checks the key set itself, so it
+  refuses the cross-corpus delete even if a traversal id ever reached it.
 - **A sync push that loses a ref race can no longer report success while
   publishing nothing (#92).** The push retry rebased the working clone onto
   the advanced remote with the result discarded, under the assumption that

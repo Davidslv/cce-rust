@@ -190,17 +190,29 @@ readable without smudge, which is what keeps `sync list` read-cheap (§6).
 
 ### 4.1 Corpus identity — `corpus_id` is an adapter-chosen stable slug
 
-`corpus_id` is chosen by the adapter/operator and validated **like `repo_id`**:
-non-empty, charset `[A-Za-z0-9._-]`, and it MUST be **sanitize-stable** (push
-refuses an id that `sanitize_id` would alter, rather than silently rewriting it).
-It is resolved explicitly — `--corpus <id>` or the `knowledge.sync.corpus_id`
-config key — **never derived**: knowledge has no git origin to normalize, and a
-guessed identity would silently fork a corpus. Renaming a corpus is a new key
-prefix; the old one ages out under retention (§4.5).
+`corpus_id` is chosen by the adapter/operator and validated by three normative
+rules: it MUST be **non-empty**; it MUST use only charset `[A-Za-z0-9._-]` and be
+**sanitize-stable** (push refuses an id that `sanitize_id` would alter, rather than
+silently rewriting it); and it MUST be a **single normal path segment** — an id
+that resolves to anything other than exactly one `Normal` path component is
+rejected, which notably bars the traversal tokens `.` and `..`. That third rule is
+load-bearing: `corpus_id` is used verbatim as a path segment on the cache
+(`knowledge/<contract_version>/<corpus_id>/…`), so `.` and `..` — both
+sanitize-stable — would otherwise escape the corpus namespace
+(`knowledge/<ver>/..` normalizes to `knowledge/`) and let a retention prune (§4.5)
+under `--corpus ..` delete OTHER corpora's snapshots. As defense in depth the
+retention delete site independently confines every key it prunes to
+`knowledge/<ver>/<corpus_id>/` before removing it. It is resolved explicitly —
+`--corpus <id>` or the `knowledge.sync.corpus_id` config key — **never derived**:
+knowledge has no git origin to normalize, and a guessed identity would silently
+fork a corpus. Renaming a corpus is a new key prefix; the old one ages out under
+retention (§4.5).
 
-*Rationale:* the same property that makes `repo_id` work — a stable, path-safe,
-human-legible name that the pusher owns — with the derivation dropped because no
-equivalent of "the git origin" exists for a ticket feed.
+*Rationale:* a stable, path-safe, human-legible name that the pusher owns — the
+same property that makes `repo_id` work — with the derivation dropped because no
+equivalent of "the git origin" exists for a ticket feed. Note `corpus_id`
+validation is **stricter** than today's `repo_id`, which does not yet reject the
+traversal tokens (tracked separately as #141); the two are not interchangeable.
 
 ### 4.2 Trust — trust-the-pusher; stated honestly, never implied away
 
