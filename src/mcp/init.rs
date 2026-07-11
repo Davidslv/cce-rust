@@ -198,6 +198,11 @@ fn build_workspace_index(dir: &Path) -> Result<(usize, usize), String> {
 /// Write/merge `<dir>/.mcp.json` with a `cce` MCP server entry (idempotent). Any
 /// existing servers are preserved; the `cce` entry is (re)written to the canonical
 /// value, so a re-run produces byte-identical output.
+///
+/// Fail-safe (#99): `.mcp.json` is user-owned and may hold other servers' config
+/// (commands, env, tokens). A read/parse failure — or a root/`mcpServers` that is
+/// not a JSON object — must NEVER cause a rebuild from scratch; init refuses with
+/// an actionable error and leaves the existing file byte-untouched.
 fn write_mcp_json(dir: &Path, is_workspace: bool) -> Result<PathBuf, String> {
     let path = dir.join(".mcp.json");
     let args: Vec<Value> = if is_workspace {
@@ -208,21 +213,35 @@ fn write_mcp_json(dir: &Path, is_workspace: bool) -> Result<PathBuf, String> {
     let entry = json!({ "command": "cce", "args": args });
 
     let mut root: Value = if path.exists() {
-        let text = std::fs::read_to_string(&path).map_err(|e| e.to_string())?;
-        serde_json::from_str(&text).unwrap_or_else(|_| json!({}))
+        let text = std::fs::read_to_string(&path)
+            .map_err(|e| format!("cannot read {}: {e} — fix the file and re-run `cce init`; refusing to overwrite it", path.display()))?;
+        serde_json::from_str(&text).map_err(|e| {
+            format!(
+                "{} is not valid JSON ({e}) — refusing to rewrite it because that would drop \
+                 your existing MCP servers; fix the syntax and re-run `cce init`",
+                path.display()
+            )
+        })?
     } else {
         json!({})
     };
-    if !root.is_object() {
-        root = json!({});
-    }
     {
-        let obj = root.as_object_mut().expect("root is an object");
+        let obj = root.as_object_mut().ok_or_else(|| {
+            format!(
+                "{} does not contain a JSON object at the top level — refusing to rewrite it; \
+                 fix the file and re-run `cce init`",
+                path.display()
+            )
+        })?;
         let servers = obj.entry("mcpServers").or_insert_with(|| json!({}));
-        if !servers.is_object() {
-            *servers = json!({});
-        }
-        servers.as_object_mut().expect("servers is an object").insert("cce".to_string(), entry);
+        let servers = servers.as_object_mut().ok_or_else(|| {
+            format!(
+                "\"mcpServers\" in {} is not a JSON object — refusing to rewrite it; \
+                 fix the file and re-run `cce init`",
+                path.display()
+            )
+        })?;
+        servers.insert("cce".to_string(), entry);
     }
     let text = serde_json::to_string_pretty(&root).map_err(|e| e.to_string())? + "\n";
     std::fs::write(&path, text).map_err(|e| e.to_string())?;
@@ -408,6 +427,42 @@ mod tests {
                 .unwrap();
         assert_eq!(mcp["mcpServers"]["other"]["command"], "foo");
         assert_eq!(mcp["mcpServers"]["cce"]["command"], "cce");
+    }
+
+    #[test]
+    fn init_refuses_to_rewrite_malformed_mcp_json_preserving_user_servers() {
+        // #99: a user-authored .mcp.json with a real server entry plus one
+        // trailing comma (a JSONC-ism serde rejects). init used to rebuild the
+        // file from `{}`, silently wiping every user server. It must instead
+        // refuse with an error naming the parse problem and leave the file
+        // byte-untouched.
+        let tmp = tempfile::tempdir().unwrap();
+        write_tiny_repo(tmp.path());
+        let malformed =
+            "{\n  \"mcpServers\": {\n    \"github\": {\"command\": \"gh-mcp\"},\n  }\n}\n";
+        std::fs::write(tmp.path().join(".mcp.json"), malformed).unwrap();
+
+        let err = run(&opts(tmp.path())).unwrap_err();
+        assert!(err.contains(".mcp.json"), "error must name the file: {err}");
+        let after = std::fs::read_to_string(tmp.path().join(".mcp.json")).unwrap();
+        assert_eq!(after, malformed, ".mcp.json must be left byte-untouched on a parse failure");
+    }
+
+    #[test]
+    fn init_refuses_mcp_json_whose_root_or_servers_is_not_an_object() {
+        // #99: a non-object root (or a non-object `mcpServers`) used to be
+        // silently replaced with `{}`, causing the same wholesale loss as a
+        // parse failure. Both must be refused, file untouched.
+        for content in ["[1, 2, 3]\n", "{\n  \"mcpServers\": \"oops\"\n}\n"] {
+            let tmp = tempfile::tempdir().unwrap();
+            write_tiny_repo(tmp.path());
+            std::fs::write(tmp.path().join(".mcp.json"), content).unwrap();
+
+            let err = run(&opts(tmp.path())).unwrap_err();
+            assert!(err.contains(".mcp.json"), "error must name the file: {err}");
+            let after = std::fs::read_to_string(tmp.path().join(".mcp.json")).unwrap();
+            assert_eq!(after, content, "input {content:?} must be left byte-untouched");
+        }
     }
 
     #[test]
