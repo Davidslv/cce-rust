@@ -84,6 +84,17 @@ pub struct InitOptions {
     pub force: bool,
 }
 
+/// Append a partial-init note to a later-writer refusal (#99): the file named in
+/// `e` was left untouched, but earlier files in the same `cce init` run may already
+/// have been updated. Every writer is idempotent, so re-running after the fix is
+/// safe and completes the remaining files.
+fn partial_init_note(e: String) -> String {
+    format!(
+        "{e}\nnote: `cce init` had already updated earlier files (e.g. .mcp.json) before this — \
+         fix the file above and re-run `cce init`; it is idempotent and will finish the rest."
+    )
+}
+
 /// Run `cce init` and return a human-readable report (SPEC-MCP §"cce init").
 pub fn run(opts: &InitOptions) -> Result<String, String> {
     if opts.agent != "claude" {
@@ -99,16 +110,20 @@ pub fn run(opts: &InitOptions) -> Result<String, String> {
     let is_workspace = manifest_path(dir).exists();
 
     let index_line = ensure_index(opts, is_workspace)?;
+    // `cce init` wires files in order (.mcp.json, then CLAUDE.md, then
+    // .gitignore). A fail-safe refusal of a LATER file (#99) leaves the
+    // EARLIER ones already updated, so a refusal past the first writer carries
+    // a note that a re-run after the fix is safe (each writer is idempotent).
     let mcp_path = write_mcp_json(dir, is_workspace)?;
     // The CLAUDE.md block honours the configured L4 output level (SPEC-V2.5 §5).
     let output_level = OutputConfig::load(dir).level;
-    let claude_path = write_claude_md(dir, output_level)?;
+    let claude_path = write_claude_md(dir, output_level).map_err(partial_init_note)?;
     // Team-wide fix for issue #24: keep cce's own cache out of the tree so nobody
     // commits their local artifacts (which would then be honored via `.gitignore`
     // on other machines only if committed — but more importantly, they must never
     // pollute the index). Committing `.cce/` to `.gitignore` is the canonical,
     // machine-independent way to ensure that.
-    let gitignore_path = ensure_cce_gitignored(dir)?;
+    let gitignore_path = ensure_cce_gitignored(dir).map_err(partial_init_note)?;
 
     let mode = if is_workspace { " (workspace)" } else { "" };
     let mut out = String::new();
@@ -337,6 +352,34 @@ fn ensure_cce_gitignored(dir: &Path) -> Result<Option<PathBuf>, String> {
     Ok(Some(path))
 }
 
+/// Byte offsets of the `CLAUDE_BEGIN` / `CLAUDE_END` markers that are ALONE on
+/// their own line (`line.trim() == marker`) — the only shape `claude_block` ever
+/// writes, so the only shape treated as a real delimiter (#99). Markers quoted
+/// inline in a user's prose are ignored. Each offset points at the marker
+/// substring within its line, so splicing preserves any surrounding bytes.
+///
+/// Line-anchoring is the required defence. A marker sitting alone on its own line
+/// INSIDE a fenced code block would still be counted (a much rarer shape); a
+/// second heading-confirmation check was considered and deliberately skipped to
+/// keep this simple. Even in that residual case the "exactly one BEGIN before one
+/// END, else refuse" rule downstream still prevents silent data loss — an odd
+/// arrangement is refused, never mangled.
+fn marker_line_offsets(text: &str) -> (Vec<usize>, Vec<usize>) {
+    let mut begins = Vec::new();
+    let mut ends = Vec::new();
+    let mut offset = 0usize;
+    for line in text.split_inclusive('\n') {
+        let trimmed = line.trim();
+        if trimmed == CLAUDE_BEGIN {
+            begins.push(offset + line.find(CLAUDE_BEGIN).expect("line trims to the marker"));
+        } else if trimmed == CLAUDE_END {
+            ends.push(offset + line.find(CLAUDE_END).expect("line trims to the marker"));
+        }
+        offset += line.len();
+    }
+    (begins, ends)
+}
+
 /// Write/merge the bounded CCE block into `<dir>/CLAUDE.md` (idempotent). If the
 /// markers already exist their region is replaced; otherwise the block is appended
 /// (or the file is created). A re-run produces byte-identical output.
@@ -355,8 +398,15 @@ fn write_claude_md(dir: &Path, level: OutputLevel) -> Result<PathBuf, String> {
             // one END (replace that bounded region). Anything else (an orphan
             // marker, END before BEGIN, duplicate pairs) used to mangle user
             // content or grow the file unboundedly; it is refused instead.
-            let begins: Vec<usize> = text.match_indices(CLAUDE_BEGIN).map(|(i, _)| i).collect();
-            let ends: Vec<usize> = text.match_indices(CLAUDE_END).map(|(i, _)| i).collect();
+            //
+            // A marker counts as a real delimiter ONLY when it is ALONE ON ITS
+            // OWN LINE, which is exactly how `claude_block` writes it. A raw
+            // substring scan (the pre-review code) also matched the marker
+            // STRINGS quoted in a user's prose, so the region between two prose
+            // mentions was spliced out — the same #99 data-loss class. We
+            // line-anchor instead: iterate lines, match `line.trim() == marker`,
+            // and record the byte offset of the marker within that line.
+            let (begins, ends) = marker_line_offsets(&text);
             match (begins.as_slice(), ends.as_slice()) {
                 ([], []) => {
                     let mut s = text;
@@ -601,6 +651,98 @@ mod tests {
         assert!(err.contains("CLAUDE.md"), "error must name the file: {err}");
         let after = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
         assert_eq!(after, content, "CLAUDE.md must be left byte-untouched");
+    }
+
+    #[test]
+    fn init_ignores_marker_strings_that_appear_inline_in_user_prose() {
+        // #99 (review): the marker STRINGS can legitimately appear inside a
+        // user's own prose (docs that quote them, backtick-wrapped, mid
+        // sentence). A substring match treats those mentions as the CCE block
+        // delimiters and splices out everything between them — the exact
+        // #99 data-loss class. Only a marker ALONE ON ITS OWN LINE (as
+        // claude_block writes it) is a real delimiter; inline mentions must be
+        // ignored, and with no real block the CCE block is appended.
+        let tmp = tempfile::tempdir().unwrap();
+        write_tiny_repo(tmp.path());
+        let content = format!(
+            "# Team CLAUDE.md\n\n\
+             The CCE block starts with `{CLAUDE_BEGIN}` and is managed by tooling.\n\n\
+             ## CRITICAL SECURITY RULES\n\n\
+             - Never commit secrets. Never disable auth in tests.\n\n\
+             It ends with `{CLAUDE_END}` — do not edit between the markers by hand.\n"
+        );
+        std::fs::write(tmp.path().join("CLAUDE.md"), &content).unwrap();
+
+        run(&opts(tmp.path())).unwrap();
+        let after = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
+        // The user's security section — sitting BETWEEN the two inline mentions —
+        // must survive; the inline mentions were not delimiters.
+        assert!(after.contains("## CRITICAL SECURITY RULES"), "user section spliced out:\n{after}");
+        assert!(after.contains("Never commit secrets"), "user content lost:\n{after}");
+        // The whole original prose is preserved verbatim as a prefix.
+        assert!(after.starts_with(&content), "original prose not preserved verbatim:\n{after}");
+        // With no REAL (own-line) block present, the CCE block is appended once:
+        // one inline BEGIN mention + one appended own-line BEGIN = 2.
+        assert_eq!(after.matches(CLAUDE_BEGIN).count(), 2, "1 inline + 1 appended BEGIN expected");
+        assert_eq!(after.matches(CLAUDE_END).count(), 2, "1 inline + 1 appended END expected");
+        assert!(after.contains("## Code Context Engine (CCE)"), "CCE block not appended:\n{after}");
+
+        // Idempotent: the appended own-line block is now the sole real delimiter
+        // pair, so a re-run updates it in place and changes nothing.
+        run(&opts(tmp.path())).unwrap();
+        let again = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
+        assert_eq!(after, again, "re-run must be byte-idempotent");
+    }
+
+    #[test]
+    fn init_updates_a_real_own_line_block_and_preserves_the_rest() {
+        // Control: a legitimate own-its-own-line BEGIN/END block round-trips —
+        // only the bounded region is replaced, the user's surrounding content
+        // (including prose that MENTIONS the markers inline) is preserved.
+        let tmp = tempfile::tempdir().unwrap();
+        write_tiny_repo(tmp.path());
+        let content = format!(
+            "# Proj\n\nSee `{CLAUDE_BEGIN}` for the managed block.\n\n\
+             {CLAUDE_BEGIN}\nstale cce content\n{CLAUDE_END}\n\n## My notes\n\nkeep me\n"
+        );
+        std::fs::write(tmp.path().join("CLAUDE.md"), &content).unwrap();
+
+        run(&opts(tmp.path())).unwrap();
+        let after = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
+        assert!(after.starts_with("# Proj\n\nSee `<!-- BEGIN CCE MCP -->` for the managed block."));
+        assert!(!after.contains("stale cce content"), "stale block not replaced:\n{after}");
+        assert!(after.contains("## Code Context Engine (CCE)"), "real block not written:\n{after}");
+        assert!(after.contains("## My notes"), "trailing user content lost:\n{after}");
+        assert!(after.contains("keep me"));
+        // Exactly one own-line block; the inline prose mention still stands.
+        run(&opts(tmp.path())).unwrap();
+        let again = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
+        assert_eq!(after, again, "re-run must be byte-idempotent");
+    }
+
+    #[test]
+    fn init_notes_earlier_files_were_written_when_a_later_file_refuses() {
+        // MINOR (#99 review): .mcp.json is written before CLAUDE.md, so a
+        // CLAUDE.md refusal leaves .mcp.json already updated. The error must
+        // say so and point at a safe re-run; .mcp.json indeed carries the cce
+        // entry, while the offending CLAUDE.md is left byte-untouched.
+        let tmp = tempfile::tempdir().unwrap();
+        write_tiny_repo(tmp.path());
+        let bad_claude = format!("{CLAUDE_END}\n\n## Mine\n\n{CLAUDE_BEGIN}\n"); // misordered
+        std::fs::write(tmp.path().join("CLAUDE.md"), &bad_claude).unwrap();
+
+        let err = run(&opts(tmp.path())).unwrap_err();
+        assert!(err.contains("CLAUDE.md"), "error must name the offending file: {err}");
+        assert!(err.contains("re-run `cce init`"), "must point at a safe re-run: {err}");
+        assert!(err.contains("earlier files"), "must note earlier files were written: {err}");
+        // .mcp.json was written before the refusal.
+        let mcp: Value =
+            serde_json::from_str(&std::fs::read_to_string(tmp.path().join(".mcp.json")).unwrap())
+                .unwrap();
+        assert_eq!(mcp["mcpServers"]["cce"]["command"], "cce");
+        // The offending CLAUDE.md is untouched.
+        let after = std::fs::read_to_string(tmp.path().join("CLAUDE.md")).unwrap();
+        assert_eq!(after, bad_claude, "CLAUDE.md must be left byte-untouched");
     }
 
     #[test]

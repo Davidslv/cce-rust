@@ -59,12 +59,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   was overwritten wholesale with just the CCE block. `cce init` now fails
   safe at every seam: a read/parse failure of an existing file aborts that
   file's update with an actionable error naming the problem and leaves the
-  file byte-untouched; CLAUDE.md markers are touched only as exactly one
-  BEGIN followed by exactly one END (anything else is refused with the
-  marker counts and a repair hint); `.gitignore` is handled as raw bytes, so
-  non-UTF-8 content is preserved verbatim with the CCE block appended after
-  it; and only `NotFound` may create a fresh file. The successful-path
-  output is byte-identical to before.
+  file byte-untouched; CLAUDE.md markers are recognised only when ALONE ON
+  THEIR OWN LINE and touched only as exactly one BEGIN followed by exactly one
+  END (anything else is refused with the marker counts and a repair hint) — so
+  the marker strings quoted in a user's prose are no longer mistaken for the
+  block delimiters and the content between two prose mentions is never spliced
+  out; `.gitignore` is handled as raw bytes, so non-UTF-8 content is preserved
+  verbatim with the CCE block appended after it; and only `NotFound` may create
+  a fresh file. A fail-safe refusal of a later file notes that earlier files may
+  already have been updated and that re-running (idempotent) is safe. The
+  successful-path output is byte-identical to before. Scope: this guarantee
+  covers read/parse failures; a crash MID-WRITE can still truncate a file (the
+  writers use non-atomic `std::fs::write` truncate-then-write) — atomic
+  temp-file + rename is a separate change, tracked with the store-atomicity work.
 - **A sync push that loses a ref race can no longer report success while
   publishing nothing (#92).** The push retry rebased the working clone onto
   the advanced remote with the result discarded, under the assumption that
