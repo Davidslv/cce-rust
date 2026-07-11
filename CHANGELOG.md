@@ -45,6 +45,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test/fixture/samples` verified byte-identical.
 
 ### Fixed
+- **Generic-assignment redaction no longer leaks a secret containing a quote
+  or apostrophe (#104).** The row-10 value class `[^\s"']+` stopped at the
+  first `'`/`"`, so `password = don't-…` matched only `don` — under the
+  8-char guard, leaving the whole secret unredacted in the store — and
+  `password = "abcdefghij'tail…"` redacted only the prefix, persisting the
+  tail. The value is now matched by quoting style: a double-quoted value runs
+  to its matching `"` (inner `'` and spaces allowed), a single-quoted value
+  to its matching `'` (inner `"` and spaces allowed), an unquoted value to
+  whitespace/line end — never across a line, never past the first closing
+  quote into a neighbouring assignment, and the closing quote still survives
+  outside the redaction. Placeholder-guard and short-value semantics are
+  unchanged; output stays deterministic and idempotent.
 - **A sync push that loses a ref race can no longer report success while
   publishing nothing (#92).** The push retry rebased the working clone onto
   the advanced remote with the result discarded, under the assumption that

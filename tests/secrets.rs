@@ -121,6 +121,42 @@ fn protected_index_skips_sensitive_and_redacts_secrets() {
 }
 
 #[test]
+fn protected_index_redacts_values_containing_quotes() {
+    // #104: a quote or apostrophe inside a secret value must not defeat the
+    // generic-assignment redaction — neither by truncating an unquoted value
+    // to a short (guard-skipped) prefix nor by ending a quoted value early
+    // and persisting the tail.
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = tmp.path().join("quoted");
+    std::fs::create_dir(&fixture).unwrap();
+    std::fs::write(
+        fixture.join("settings.conf"),
+        concat!(
+            "password = don't-tell-anyone-secretvalue\n",
+            "password = \"abcdefghij'tail-super-secret\"\n",
+            "api_key='qwertyuiop-secret'\n",
+        ),
+    )
+    .unwrap();
+    let store = tmp.path().join("index.json");
+
+    let out = Command::new(bin())
+        .args(["index"])
+        .arg(&fixture)
+        .arg("--store")
+        .arg(&store)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "index failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    let (_, content) = read_store(&store);
+    for leaked in ["tell-anyone-secretvalue", "tail-super-secret", "qwertyuiop"] {
+        assert!(!content.contains(leaked), "secret fragment {leaked:?} leaked into store");
+    }
+    assert!(content.contains("[REDACTED:SECRET]"), "expected redaction marker: {content}");
+}
+
+#[test]
 fn allow_secrets_bypasses_both_layers() {
     let tmp = tempfile::tempdir().unwrap();
     let fixture = tmp.path().join("secrets");

@@ -46,13 +46,17 @@ static SPECIFIC: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
         .collect()
 });
 
-/// The generic assignment pattern (SPEC-V2.1 §1, row 10). Captures, in order:
-/// 1 = secret-ish key, 2 = operator (`=`/`:`) with surrounding spaces, 3 = optional
-/// opening quote, 4 = the value up to the closing quote / whitespace / line end.
-/// The closing quote is deliberately left outside the match so it survives.
+/// The generic assignment pattern (SPEC-V2.1 §1, row 10). Captures:
+/// 1 = secret-ish key, 2 = operator (`=`/`:`) with surrounding spaces, then one
+/// of three value branches (leftmost-first): `dq` = a double-quoted value (runs
+/// to the matching `"`, so it may contain `'` and spaces), `sq` = a
+/// single-quoted value (runs to the matching `'`, so it may contain `"` and
+/// spaces), `uq` = an unquoted value (runs to whitespace/line end, so it may
+/// contain an apostrophe — #104). A quoted value never crosses a line, and the
+/// closing quote is deliberately left outside the match so it survives.
 static GENERIC: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?i)\b(password|passwd|secret[_-]?key|secret|api[_-]?key|access[_-]?key|auth[_-]?token|private[_-]?key|token)\b(\s*[:=]\s*)(["']?)([^\s"']+)"#,
+        r#"(?i)\b(password|passwd|secret[_-]?key|secret|api[_-]?key|access[_-]?key|auth[_-]?token|private[_-]?key|token)\b(\s*[:=]\s*)(?:"(?P<dq>[^"\n]+)|'(?P<sq>[^'\n]+)|(?P<uq>\S+))"#,
     )
     .expect("valid generic-assignment regex")
 });
@@ -72,11 +76,19 @@ pub fn redact(content: &str) -> String {
 
     GENERIC
         .replace_all(&text, |caps: &Captures| {
-            let value = &caps[4];
+            // Exactly one value branch participates; recover the opening quote
+            // (if any) from which branch it was, so it can be re-emitted.
+            let (quote, value) = if let Some(m) = caps.name("dq") {
+                ("\"", m.as_str())
+            } else if let Some(m) = caps.name("sq") {
+                ("'", m.as_str())
+            } else {
+                ("", caps.name("uq").expect("a value branch always matches").as_str())
+            };
             if value.len() < 8 || is_placeholder(value) {
                 caps[0].to_string() // leave the whole match untouched
             } else {
-                format!("{}{}{}[REDACTED:SECRET]", &caps[1], &caps[2], &caps[3])
+                format!("{}{}{quote}[REDACTED:SECRET]", &caps[1], &caps[2])
             }
         })
         .into_owned()
@@ -269,6 +281,74 @@ mod tests {
         // Length < 8 is below the generic threshold (SPEC-V2.1 §1).
         assert_eq!(redact("password = short12"), "password = short12");
         assert_eq!(redact(r#"token = "abc""#), r#"token = "abc""#);
+    }
+
+    #[test]
+    fn redacts_unquoted_value_containing_apostrophe() {
+        // #104 mode (a): an apostrophe inside an unquoted value must not
+        // truncate the match to a short prefix that the len<8 guard then skips.
+        let out = redact("password = don't-tell-anyone-secretvalue");
+        assert_eq!(out, "password = [REDACTED:SECRET]");
+        assert!(!out.contains("tell-anyone"), "secret tail leaked: {out}");
+    }
+
+    #[test]
+    fn redacts_double_quoted_value_containing_apostrophe() {
+        // #104 mode (b): an apostrophe inside a double-quoted value must not
+        // end the value early and leave the tail unredacted. The closing `"`
+        // stays outside the match and survives.
+        let out = redact(r#"password = "abcdefghij'tail-super-secret""#);
+        assert_eq!(out, r#"password = "[REDACTED:SECRET]""#);
+        assert!(!out.contains("tail-super-secret"), "secret tail leaked: {out}");
+    }
+
+    #[test]
+    fn redacts_single_quoted_value_and_preserves_closing_quote() {
+        // #104 use case (c), pinned: a single-quoted value redacts up to (not
+        // including) its closing quote.
+        assert_eq!(redact("api_key='qwertyuiop-secret'"), "api_key='[REDACTED:SECRET]'");
+    }
+
+    #[test]
+    fn redacts_double_quoted_value_containing_single_quote_of_other_kind() {
+        // Symmetric to mode (b): a double quote inside a single-quoted value.
+        let out = redact(r#"password = 'abcdefghij"tail-super-secret'"#);
+        assert_eq!(out, "password = '[REDACTED:SECRET]'");
+        assert!(!out.contains("tail-super-secret"), "secret tail leaked: {out}");
+    }
+
+    #[test]
+    fn redacts_quoted_value_containing_space() {
+        // A quoted value extends to its matching closing quote, so an inner
+        // space must not split it into a short (guard-skipped) prefix.
+        assert_eq!(
+            redact(r#"password = "correct horse battery staple""#),
+            r#"password = "[REDACTED:SECRET]""#
+        );
+    }
+
+    #[test]
+    fn adjacent_assignments_do_not_over_capture_across_closing_quotes() {
+        // The quoted-value fix must stop at the FIRST matching closing quote,
+        // never spanning into a neighbouring assignment on the same line.
+        assert_eq!(
+            redact(r#"password = "a1b2c3d4e5" token = "f6g7h8i9j0""#),
+            r#"password = "[REDACTED:SECRET]" token = "[REDACTED:SECRET]""#
+        );
+    }
+
+    #[test]
+    fn quoted_values_do_not_span_lines() {
+        // An unterminated quote must not swallow the next line.
+        let out = redact("password = \"abcdefghij\ntoken = \"klmnopqrst\"");
+        assert_eq!(out, "password = \"[REDACTED:SECRET]\ntoken = \"[REDACTED:SECRET]\"");
+    }
+
+    #[test]
+    fn empty_or_quote_only_values_are_left_untouched() {
+        for input in [r#"password = """#, "password = ''", r#"password = ""#, "password ="] {
+            assert_eq!(redact(input), input, "input {input:?} must be untouched");
+        }
     }
 
     #[test]
