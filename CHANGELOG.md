@@ -45,6 +45,25 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test/fixture/samples` verified byte-identical.
 
 ### Fixed
+- **Memory append is a single write with a newline guard, so a torn or
+  interleaved append can no longer silently lose entries (#102).** `append`
+  in `src/memory.rs` wrote the JSON line and its trailing `\n` as two separate
+  `write_all` syscalls on an `O_APPEND` handle and never checked that the
+  existing `memory.jsonl` ended with a newline. So a partial append (kill or
+  ENOSPC between the two writes) or an `O_APPEND` interleave between two
+  concurrent `cce mcp` processes concatenated the next entry onto the previous
+  line; `load_entries` then silently skipped the merged malformed line — losing
+  BOTH decisions while `record_decision` still reported success. The append is
+  now built as ONE buffer ending in `\n` and issued in a SINGLE `write_all`,
+  which closes the two-write torn case and, for a normal-size record (the
+  common case — a `write_all` that does not split into multiple `write`
+  syscalls), the concurrent interleave-of-the-pair case, and a
+  leading-newline guard prepends a `\n` when the store does not already end in
+  one, so a previously-torn file self-heals its boundary instead of
+  concatenating onto the broken line. The normal-case bytes are unchanged (a
+  well-formed file round-trips byte-identically). `load_entries` still skips a
+  legacy malformed line rather than crashing, but now emits a `warning:` naming
+  the file and the count of skipped records, so the loss is no longer silent.
 - **`cce init` can no longer destroy user-owned files on a read/parse failure
   (#99).** One root cause, five sub-bugs: a failed read or parse of an
   existing `.mcp.json`, `CLAUDE.md`, or `.gitignore` was silently treated as
