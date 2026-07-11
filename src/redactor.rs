@@ -89,8 +89,10 @@ pub fn redact(content: &str) -> String {
 /// quotes preserved). Assignments are handled left to right; a prefix that lies
 /// INSIDE a value already consumed by an earlier assignment is skipped, so a
 /// `key=` that is itself part of a secret value never fires a second, overlapping
-/// redaction. Because each value is delimited to a single, structurally-bounded
-/// span, the placeholder guard can never short-circuit more than one value.
+/// redaction. A value the scanner over-extended across a further recognised
+/// `<secret-key><op>` boundary (the no-delimiter merge) is never skipped as a
+/// placeholder — see [`contains_nested_secret_key`] — so no nested secret can
+/// survive behind the placeholder guard.
 fn redact_generic(text: &str) -> String {
     let mut out = String::with_capacity(text.len());
     let mut cursor = 0usize;
@@ -112,7 +114,15 @@ fn redact_generic(text: &str) -> String {
         // Emit the untouched text between the cursor and this assignment.
         out.push_str(&text[cursor..whole.start()]);
 
-        if scanned.inner.len() < 8 || is_placeholder(scanned.inner) {
+        // #142 P1: a value may be left untouched ONLY when it is a genuinely
+        // single, short/placeholder value. If the scanned span has swallowed a
+        // FURTHER recognised `<secret-key><op>` boundary (the no-delimiter merge,
+        // `"changeme"token="…"`), skipping it would drop that nested assignment's
+        // secret — so it must be redacted wholesale (fail toward over-redaction,
+        // per the no-delimiter-adjacency contract). Never skip such a span.
+        let skippable = (scanned.inner.len() < 8 || is_placeholder(scanned.inner))
+            && !contains_nested_secret_key(scanned.inner);
+        if skippable {
             // Byte-identical: re-emit the whole key/op/value verbatim.
             out.push_str(&text[whole.start()..value_end]);
         } else {
@@ -137,6 +147,14 @@ fn redact_generic(text: &str) -> String {
     out
 }
 
+/// True if `span` contains a further recognised `<secret-key><op>` boundary — a
+/// second assignment that a merged/over-extended value has swallowed (#142 P1).
+/// Such a span must never be skipped as a placeholder, or the nested secret would
+/// survive; it is redacted wholesale instead.
+fn contains_nested_secret_key(span: &str) -> bool {
+    GENERIC_PREFIX.is_match(span)
+}
+
 /// The delimited extent of an assignment value, as parsed by [`scan_value`].
 struct Scanned<'a> {
     /// The full byte-slice the value occupies (including any surrounding quotes):
@@ -152,15 +170,46 @@ struct Scanned<'a> {
     closed: bool,
 }
 
-/// True when byte `b` glues an inner quote to a longer token: an ASCII word char
-/// (`[A-Za-z0-9_-]`). A candidate closing quote *immediately followed by* such a
-/// char is treated as an INNER quote (the SPEC-V2.1 §1 / #142 same-delimiter
-/// secret-tail shape, `'abc'tail`), so the scan keeps going and no tail can
-/// survive. A quote followed by whitespace, the line end, or ANY other char
-/// (`,` `)` `}` `.` `;` …) is the structural close — so a sibling value or
-/// trailing code (`", host: …`, `".freeze`) is left intact, not over-captured.
+/// True when byte `b` glues an inner quote to a longer token as a plain value
+/// char: an ASCII word char (`[A-Za-z0-9_-]`) OR any non-ASCII byte (a Unicode
+/// letter is a value char, never a structural terminator — #142 P2). A candidate
+/// closing quote *immediately followed by* such a byte is treated as an INNER
+/// quote (the SPEC-V2.1 §1 / #142 same-delimiter secret-tail shape, `'abc'tail`
+/// or `'abc'étail`), so the scan keeps going and no tail can survive.
+///
+/// A quote followed by ASCII *punctuation* is resolved separately by
+/// [`punctuation_closes_value`], and a quote followed by whitespace or the line
+/// end is always the structural close.
 fn is_value_glue(b: u8) -> bool {
-    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-' || !b.is_ascii()
+}
+
+/// Decide whether a candidate closing quote at `close_idx` (followed by ASCII
+/// punctuation) is a TRUE structural close, or whether the punctuation is INSIDE
+/// the value (#142 P2).
+///
+/// The ambiguity is `password = "abc".freeze` (trailing CODE — the `.` is a
+/// method call, must PRESERVE) versus `password = 'abc'.tail'` (a glued secret
+/// tail — the `.` is inside the value, must REDACT through). They are byte-shaped
+/// alike; the distinguisher is a *later matching-style quote on the same line with
+/// no intervening whitespace*: if one exists, the punctuation (and the run up to
+/// it) is part of the value → NOT a close (continue, over-redacting through the
+/// tail); if the run to the next matching quote contains whitespace, or there is
+/// no later matching quote before the line end (`.freeze`), it is trailing
+/// code/a sibling → a TRUE close (preserved).
+fn punctuation_closes_value(bytes: &[u8], close_idx: usize, quote: u8) -> bool {
+    let mut j = close_idx + 1;
+    while j < bytes.len() {
+        let c = bytes[j];
+        if c == b'\n' || c.is_ascii_whitespace() {
+            return true; // whitespace before any later quote → structural close
+        }
+        if c == quote {
+            return false; // a later matching quote, no whitespace → punctuation is internal
+        }
+        j += 1;
+    }
+    true // no later matching quote on the line → trailing code → close
 }
 
 /// Delimit the assignment value at the start of `s` (the text immediately after
@@ -174,9 +223,13 @@ fn is_value_glue(b: u8) -> bool {
 ///     never escapes a newline — a value never crosses a line;
 ///   - a DOUBLED quote (`''`, `""`, ` `` ``) is a literal escaped quote and does
 ///     not close the value;
-///   - a lone quote is the close UNLESS immediately followed by an ASCII word
-///     char (see [`is_value_glue`]), in which case it is an inner quote and the
-///     scan continues.
+///   - a lone quote is the close UNLESS immediately followed by a value char (an
+///     ASCII word char or a non-ASCII byte, see [`is_value_glue`]) — an inner
+///     quote — in which case the scan continues;
+///   - a lone quote followed by ASCII punctuation is resolved by
+///     [`punctuation_closes_value`]: a glued secret tail (`'abc'.tail'`, a later
+///     matching quote with no intervening whitespace) continues, while trailing
+///     code or a sibling (`".freeze`, `", host: "y"`) is a true close.
 ///
 /// A value unterminated at the line end closes at the newline with `closed = false`.
 ///
@@ -212,10 +265,24 @@ fn scan_value(s: &str) -> Option<Scanned<'_>> {
                     i += 2;
                     continue;
                 }
-                // A quote glued to a word char is an inner quote; keep scanning.
-                if bytes.get(i + 1).is_some_and(|&b| is_value_glue(b)) {
-                    i += 1;
-                    continue;
+                match bytes.get(i + 1) {
+                    // Whitespace / line end after the quote → structural close.
+                    None => {}
+                    Some(&nb) if nb.is_ascii_whitespace() => {}
+                    // A word char or non-ASCII byte glues the quote to a longer
+                    // token → inner quote, keep scanning.
+                    Some(&nb) if is_value_glue(nb) => {
+                        i += 1;
+                        continue;
+                    }
+                    // ASCII punctuation that is INTERNAL (a later matching quote,
+                    // no whitespace) → inner quote, keep scanning.
+                    Some(_) if !punctuation_closes_value(bytes, i, quote) => {
+                        i += 1;
+                        continue;
+                    }
+                    // ASCII punctuation that closes (trailing code / sibling).
+                    Some(_) => {}
                 }
                 // Structural close: include the closing quote in `full`.
                 return Some(Scanned {
@@ -721,5 +788,94 @@ mod tests {
         let out = redact(r#"password = "p@ss,realsecret,longenough""#);
         assert!(!out.contains("realsecret"), "value tail leaked: {out}");
         assert_eq!(out, r#"password = "[REDACTED:SECRET]""#);
+    }
+
+    // ------------------------------------------------------------------
+    // Round-3 findings (#142): two leaks the round-2 scanner still had.
+    // ------------------------------------------------------------------
+
+    // P1 — no-delimiter placeholder merge: the word-char glue continues across a
+    // placeholder value's close into the next `key=`, and the placeholder guard
+    // then skips the whole merged span, dropping the nested secret. Fixed by the
+    // nested-secret-key guard (redact the whole span instead of skipping).
+
+    #[test]
+    fn r3_no_delimiter_placeholder_merge_does_not_leak() {
+        let out = redact(r#"password="changeme"token="ZmaskH-mergesecret42""#);
+        assert!(!out.contains("ZmaskH-mergesecret42"), "nested secret leaked: {out}");
+        assert!(!out.contains("mergesecret"), "nested secret fragment leaked: {out}");
+        // Fail-safe over-redaction of the merged, no-delimiter span.
+        assert_eq!(out, r#"password="[REDACTED:SECRET]""#);
+    }
+
+    #[test]
+    fn r3_no_delimiter_your_apikey_merge_does_not_leak() {
+        let out = redact(r#"password="your"api_key="Yourr-realapikey88""#);
+        assert!(!out.contains("Yourr-realapikey88"), "nested secret leaked: {out}");
+        assert_eq!(out, r#"password="[REDACTED:SECRET]""#);
+    }
+
+    #[test]
+    fn r3_comma_delimited_placeholder_sibling_still_works() {
+        // The P1 fix must NOT change the delimited case: the placeholder is
+        // preserved and the neighbour is redacted independently.
+        let out = redact(r#"password = "changeme", token = "realsecrettail123""#);
+        assert!(!out.contains("realsecrettail123"), "nested secret leaked: {out}");
+        assert_eq!(out, r#"password = "changeme", token = "[REDACTED:SECRET]""#);
+    }
+
+    // P2 — a secret whose embedded quote is followed by punctuation or a Unicode
+    // letter. The `.tail'` shape (a later matching quote, no whitespace) must
+    // redact through; `.freeze` (no later quote) must be preserved.
+
+    #[test]
+    fn r3_punctuation_glued_tail_with_trailing_quote_is_redacted() {
+        let out = redact("password = 'abcdefghij'.ZdotM-tailsecret42'");
+        assert!(!out.contains("ZdotM-tailsecret42"), "secret tail leaked: {out}");
+        assert!(!out.contains("tailsecret"), "secret fragment leaked: {out}");
+        assert_eq!(out, "password = '[REDACTED:SECRET]'");
+    }
+
+    #[test]
+    fn r3_unicode_glued_tail_is_redacted() {
+        let out = redact("password = 'abcdefghij'éZuniE-leaksecret777'");
+        assert!(!out.contains("leaksecret777"), "unicode-glued tail leaked: {out}");
+        assert!(!out.contains("éZuniE"), "unicode fragment leaked: {out}");
+        assert_eq!(out, "password = '[REDACTED:SECRET]'");
+    }
+
+    #[test]
+    fn r3_backtick_punctuation_glued_tail_is_redacted() {
+        let out = redact("password = `abcdefghij`.ZdotM-tailsecret42`");
+        assert!(!out.contains("ZdotM-tailsecret42"), "secret tail leaked: {out}");
+        assert_eq!(out, "password = `[REDACTED:SECRET]`");
+    }
+
+    #[test]
+    fn r3_method_chain_preserved_no_later_quote() {
+        // The P2 fix must PRESERVE trailing code: `.freeze` has no later matching
+        // quote, so the quote is a true structural close.
+        assert_eq!(
+            redact(r#"password = "abcdefghij".freeze"#),
+            r#"password = "[REDACTED:SECRET]".freeze"#
+        );
+    }
+
+    #[test]
+    fn r3_json_sibling_preserved_whitespace_before_next_quote() {
+        // A later matching quote exists, but there is whitespace before it, so the
+        // `,` is a structural close and the sibling is preserved.
+        assert_eq!(
+            redact(r#"{password: "abcdefghij", host: "publicdb"}"#),
+            r#"{password: "[REDACTED:SECRET]", host: "publicdb"}"#
+        );
+    }
+
+    #[test]
+    fn r3_whitespace_separated_assignments_stay_two_independent_redactions() {
+        assert_eq!(
+            redact("password = 'a1b2c3d4e5' token = 'f6g7h8i9j0'"),
+            "password = '[REDACTED:SECRET]' token = '[REDACTED:SECRET]'"
+        );
     }
 }

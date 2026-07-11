@@ -84,19 +84,26 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   scanner (replacing a regex value branch that could not express the grammar
   without a fragile "continue-unless-whitespace" heuristic). Per quote style the
   scanner handles BOTH escape conventions — backslash (`\"`) and doubled (`''` /
-  `""` / backtick-pair) — and closes a value at the first quote that is followed
-  by whitespace, the line end, or any punctuation; a quote glued to an ASCII word
-  char is treated as an inner quote (the `'abc'tail` secret-tail shape), so no
-  tail survives, while a structural close (`", host: …`, `".freeze`) leaves the
-  sibling value or trailing code intact. Values never cross a line, and each is a
-  single structurally-bounded span, so the placeholder guard can no longer
-  short-circuit a second, adjacent `key=` assignment. The idempotency guard now
-  skips only a value that is EXACTLY a `[REDACTED:LABEL]` token, re-scrubbing any
-  remainder after a specific-pattern prefix. **Accepted over-redaction contract**
-  (fail toward over-redaction): two same-line assignments with NO delimiter
-  between them (`a='x'b='y'`), or a secret glued to an inner closing quote by a
-  non-word char, are over-redacted into one `[REDACTED:SECRET]` rather than risk a
-  leak. (redactor.rs)
+  `""` / backtick-pair). A closing quote is decided by what immediately follows
+  it: whitespace or the line end is a true close; a value char (an ASCII word char
+  or a Unicode letter) is an inner quote so the scan continues over it; ASCII
+  punctuation is a true close UNLESS a later matching-style quote appears on the
+  line with no intervening whitespace, in which case the punctuation is inside the
+  value and the scan continues through to that quote. Net effect: a glued secret
+  tail (`'abc'tail`, `'abc'.tail'`, `'abc'étail'`) is fully redacted, while
+  trailing code or a sibling with a structural break (`".freeze`, `", host: "y"`)
+  is preserved. Values never cross a line. The idempotency guard now skips only a
+  value that is EXACTLY a `[REDACTED:LABEL]` token, re-scrubbing any remainder
+  after a specific-pattern prefix, and a scanned span that has swallowed a further
+  recognised `key=`/`key:` assignment (a no-delimiter merge) is never skipped as a
+  placeholder — it is redacted wholesale so no nested secret survives.
+  **Accepted over-redaction contract** (fail toward over-redaction): where the
+  value extent is genuinely ambiguous — two same-line assignments with NO
+  delimiter between them (`a='x'b='y'`), a word-char- or doubled-quote-glued
+  boundary, or punctuation with a later same-style quote and no whitespace — the
+  scanner over-redacts the whole span into one `[REDACTED:SECRET]` rather than
+  risk a leak; punctuation followed by whitespace or the line end (no later quote)
+  is instead a structural close that preserves the trailing token. (redactor.rs)
 - **`cce sync pull` no longer overwrites the local index at a different sha when
   the code marker is corrupt, and never activates a pulled store before its
   marker is durable (#163) — the code-side twins of the knowledge-side #123/#122.**
