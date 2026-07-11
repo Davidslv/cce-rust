@@ -169,7 +169,8 @@ is the practical tour.
 ```sh
 # Producer side (usually a CI adapter job — see the reference workflow below):
 cce knowledge index corpus.jsonl                      # ingest (redacts) → .cce/knowledge/
-cce knowledge push [--corpus <id>] [--remote <url>]   # artifact + `current` pointer + corpus.json,
+cce knowledge push [--corpus <id>] [--remote <url>] [--dry-run] [--force]
+                                                      # artifact + `current` pointer + corpus.json,
                                                       # one commit; then retention
 
 # Consumer side:
@@ -187,6 +188,25 @@ cce sync verify --checksum-only     # covers the pulled knowledge store too
   (`knowledge.sync.retention: keep-last-<n>`) prunes the oldest snapshots after
   the push — the snapshot named by `current` is never pruned, and a prune
   failure only warns.
+- **The shrink guard (#90).** Push replaces the corpus's current snapshot
+  wholesale, so before publishing it diffs the outgoing record-id set against
+  the remote's current snapshot (fetched and checksum-verified with the pull
+  machinery). A push that would **drop** record ids live on the remote — e.g. a
+  local store rebuilt from only one of a corpus's feed sources (feedA of
+  feedA+feedB) — prints the diff (record counts plus sorted `added` / `removed`
+  / `changed` id lists; `changed` = a record whose chunk set differs) and
+  refuses without `--force`. Adds-only, changed-only, and unchanged pushes
+  proceed exactly as quietly as before; a first publish (no remote `current`
+  pointer) has nothing to diff and proceeds silently. If the pointer exists but
+  its snapshot cannot be fetched or verified, the push refuses rather than
+  silently replacing what it cannot read — `--force` is the only bypass (it
+  skips the diff entirely).
+- **`--dry-run`** computes and prints the same diff, then exits 0 **without
+  pushing anything** (no artifact, no pointer move, no retention) — the
+  blast-radius preview. Against a corpus with no remote pointer it reports that
+  the push would be the first publish. A CI job that builds from a subset of a
+  corpus's sources should pass `--dry-run` first or be the corpus's sole
+  publisher (see [`docs/ci/cce-knowledge-sync.yml`](ci/cce-knowledge-sync.yml)).
 - **Pull** verifies the artifact checksum (a mismatch fails loudly, naming the
   key), installs into `.cce/knowledge/` **byte-identical to a local ingest**
   (so retrieval needs zero changes), and records a sync marker with the
