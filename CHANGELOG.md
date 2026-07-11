@@ -45,6 +45,17 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test/fixture/samples` verified byte-identical.
 
 ### Fixed
+- **`cce doctor` no longer reports a broken workspace healthy when its
+  `workspace.yml` is corrupt (#126).** The `Manifest::load` `Err(_)` arm
+  conflated an ABSENT manifest (simply not a workspace) with a PRESENT-but-
+  unreadable one, silently degrading to single-directory mode — so a
+  hand-edited/corrupt `workspace.yml` was never reported and, when the root
+  also held its own store, doctor exited 0 with a clean bill of health while
+  every member store went unchecked. doctor now distinguishes the two via the
+  existing `workspace::manifest_path` API: an absent manifest still falls
+  through to single-dir mode unchanged, but a present-but-corrupt one is a
+  definite-corruption FAIL (exit 1) that names the manifest. A valid workspace
+  stays healthy.
 - **Blended `context_search` no longer silently swallows a knowledge-store load
   failure (#143) — the knowledge-side mirror of #132.** A corrupt-but-present
   knowledge store (`current` pointer intact, snapshot unparseable) was mapped
