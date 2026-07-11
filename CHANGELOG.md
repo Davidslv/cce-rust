@@ -233,6 +233,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   attribute (fully closing #151, not deferring it). A CI job on a detached-at-SHA
   checkout sets `sync.ref` to publish; a push-event checkout on an attached
   branch is unaffected.
+  else the checked-out branch, and **errors** when HEAD is detached with no
+  resolvable ref rather than moving a pointer it cannot attribute. CI's
+  detached-at-tip checkout still works by setting `sync.ref`.
 - **`cce sync pull --workspace` now honours the §9.4 `--force` guard per
   member (#118).** The workspace branch returned before the guard and never
   consulted `SyncState`, so a member pinned via `cce sync pull --commit <sha>`
