@@ -24,7 +24,16 @@ use serde_json::Value;
 use std::io::{BufRead, BufReader, Write};
 use std::net::{TcpListener, TcpStream};
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
+
+/// How long a connection may take to deliver its request line before the server
+/// gives up on it and moves on (#128). A browser speculative preconnect (and any
+/// half-open socket) sends no bytes; without this bound `read_line` blocks
+/// FOREVER on that socket, and because connections are served serially every
+/// later request hangs behind it. Loopback clients (curl, the dashboard's own
+/// fetch) send the request line immediately, so a few seconds is ample headroom
+/// while capping the idle-socket stall at a finite, self-recovering value.
+const READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// A minimal HTTP response.
 pub struct HttpResponse {
@@ -124,6 +133,10 @@ pub fn handle_connection_with(
     router: impl Fn(&str) -> HttpResponse,
     stream: &mut TcpStream,
 ) -> std::io::Result<()> {
+    // Bound how long we wait for the request line so an idle/half-open connection
+    // cannot hang this (serially-served) server forever (#128). Best-effort: if the
+    // platform rejects the timeout we still proceed as before.
+    let _ = stream.set_read_timeout(Some(READ_TIMEOUT));
     let path = {
         let mut reader = BufReader::new(&mut *stream);
         let mut line = String::new();
@@ -661,5 +674,50 @@ mod tests {
         // No index events ⇒ freshness panel is a clean null/local-less state.
         assert_eq!(v["index_freshness"]["indexes"], 0);
         assert!(v["index_freshness"]["source"].is_null());
+    }
+
+    #[test]
+    fn normal_request_is_served_over_a_real_socket() {
+        // The read timeout (#128) must not disturb the normal path: a client that
+        // sends its request line immediately still gets a full response.
+        use std::io::Read;
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || serve(listener, fixture_metrics(), 3.00, Some(1)));
+
+        let mut client = TcpStream::connect(addr).unwrap();
+        client.write_all(b"GET /api/health HTTP/1.1\r\nHost: x\r\n\r\n").unwrap();
+        client.set_read_timeout(Some(Duration::from_secs(5))).unwrap();
+        let mut buf = String::new();
+        client.read_to_string(&mut buf).unwrap();
+        assert!(buf.contains("200 OK"), "response: {buf}");
+        assert!(buf.contains("\"status\": \"ok\"") || buf.contains("\"status\":\"ok\""), "{buf}");
+        server.join().unwrap();
+    }
+
+    #[test]
+    fn idle_connection_does_not_hang_the_server() {
+        // #128: an idle/half-open socket that sends no bytes must not stall the
+        // server forever. With the read timeout, `serve` finishes handling the idle
+        // connection (an error) and returns; without it, `read_line` blocks forever
+        // and the join below never completes. Asserting the server RETURNS within a
+        // bound pins the graceful result rather than merely "did not panic".
+        let listener = TcpListener::bind("127.0.0.1:0").unwrap();
+        let addr = listener.local_addr().unwrap();
+        let server = std::thread::spawn(move || serve(listener, fixture_metrics(), 3.00, Some(1)));
+
+        // Connect but send NOTHING (a browser preconnect / half-open socket).
+        let idle = TcpStream::connect(addr).unwrap();
+
+        let (tx, rx) = std::sync::mpsc::channel();
+        std::thread::spawn(move || {
+            let _ = server.join();
+            let _ = tx.send(());
+        });
+        let returned = rx.recv_timeout(READ_TIMEOUT + Duration::from_secs(5)).is_ok();
+        // Hold the idle socket open across the whole wait so the server cannot get a
+        // premature EOF that would mask an absent timeout.
+        drop(idle);
+        assert!(returned, "server hung on an idle connection — no read timeout");
     }
 }

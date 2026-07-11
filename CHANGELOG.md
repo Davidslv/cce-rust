@@ -177,6 +177,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   project config that exists but does not parse is now surfaced with a clear
   warning and the load stays all-local, so the misconfiguration cannot be masked
   by an unrelated global remote.
+- **The dashboard sets a read timeout so an idle or half-open connection can no
+  longer hang the server (#128).** `handle_connection_with` blocked forever in
+  `read_line` on a connection that sent no bytes (e.g. a browser speculative
+  preconnect); because connections are served serially, one such socket stalled
+  every later request indefinitely. The request-line read now has a bounded
+  `set_read_timeout`, so an idle socket is dropped after the timeout and the
+  server recovers. The normal request path is unaffected (covered by a new
+  real-socket serve test).
 - **`parse_iso` applies an explicit timezone offset and rejects impossible
   calendar dates (#130).** The ISO parser validated only the first 19 bytes and
   ignored the timezone suffix, so `--since 2026-07-01T09:45:00+09:00` was read as
