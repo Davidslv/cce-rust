@@ -397,6 +397,29 @@ mod tests {
     }
 
     #[test]
+    fn secret_in_a_title_is_redacted_in_served_provenance() {
+        // #111: the provenance header (`[knowledge] <title> — … · <url>`) must
+        // never serve a raw secret from a record's title or url facet. The key is
+        // split via `concat!` so no contiguous secret literal is committed.
+        let aws = concat!("AKIA", "IOSFODNN7EXAMPLE");
+        let mut r = rec(
+            "leak",
+            &format!("Rotate leaked key {aws} in prod"),
+            "## Fix\n\nRotate the leaked key and lock the account.",
+        );
+        r.url = Some(format!("https://example.test/1?token={aws}"));
+        let store = ingest_default(&[r], b"feed");
+        let hits = search_knowledge(&store, "rotate leaked key prod", 5, 0.30);
+        assert!(!hits.is_empty());
+        let prov = hits[0].provenance();
+        assert!(!prov.contains(aws), "raw secret served in provenance: {prov}");
+        assert!(
+            prov.contains("[knowledge] Rotate leaked key [REDACTED:AWS_ACCESS_KEY] in prod"),
+            "{prov}"
+        );
+    }
+
+    #[test]
     fn not_planned_records_are_dropped() {
         let mut r =
             rec("a", "Rejected idea", "## Detail\n\nWe considered a new login flow and declined.");

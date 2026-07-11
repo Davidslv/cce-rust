@@ -94,6 +94,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   partially-indexed workspace gets an accurate message, never a false
   corruption claim. A workspace whose members were all never indexed stays
   silent. Healthy-path output is byte-unchanged.
+- **A secret in a knowledge record's title (or any other free-text facet) can
+  no longer reach the store, the provenance line, or a pushed corpus (#111).**
+  `ingest()` redacted the rendered document before chunking but then attached
+  the RAW `rec.title` — and raw `url`, `labels`, `group`, `state_reason`, and
+  `links` — as per-chunk facets, so a record titled e.g.
+  `Rotate api_key: … in prod` persisted the secret verbatim in
+  `.cce/knowledge/<snapshot>.json`, served it in every `[knowledge] <title> — …`
+  provenance header, and exported it in the `.cck` on `knowledge push`, while
+  the body was redacted — violating the module's "the store never sees a
+  secret" invariant. The free-text facets now pass through the SAME v2.1
+  redactor at the ingest seam, once per record, before attachment; the
+  breadcrumb `name`/`kind` were already safe (derived from the redacted
+  document). Controlled fields (`state`, `updated_at`, `source`, the record
+  id) stay verbatim. Redaction is identity on clean text, so secret-free
+  stores are byte-unchanged (the pinned ingest checksum golden holds); stores
+  indexed from a secret-bearing feed before this fix should be re-indexed to
+  scrub the persisted facets.
 - **A sync push that loses a ref race can no longer report success while
   publishing nothing (#92).** The push retry rebased the working clone onto
   the advanced remote with the result discarded, under the assumption that

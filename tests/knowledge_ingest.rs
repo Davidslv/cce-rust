@@ -94,6 +94,23 @@ fn secret_in_a_body_is_redacted_in_the_store() {
 }
 
 #[test]
+fn secret_in_a_title_is_redacted_in_the_store() {
+    // #111: a secret in a record TITLE must be scrubbed exactly like one in a
+    // body — the title facet is persisted on every chunk, served in provenance
+    // headers, and exported by `knowledge push`. The key is split via `concat!`
+    // so no contiguous secret literal is committed.
+    let aws = concat!("AKIA", "IOSFODNN7EXAMPLE");
+    let feed = format!(
+        "{{\"id\":\"gh:acme/app#56\",\"title\":\"Rotate leaked key {aws}\",\"body\":\"Rotate it.\",\"source\":\"github-issues\"}}\n"
+    );
+    let recs = parse_ndjson(&feed).unwrap();
+    let store = ingest_default(&recs, feed.as_bytes());
+    let json = serde_json::to_string_pretty(&store).unwrap() + "\n";
+    assert!(!json.contains(aws), "raw title secret leaked into the store: {json}");
+    assert!(store.chunks[0].title.contains("[REDACTED:AWS_ACCESS_KEY]"));
+}
+
+#[test]
 fn save_writes_snapshot_artifact_and_current_pointer() {
     let (store, _) = fixture_store();
     let tmp = tempfile::tempdir().unwrap();
