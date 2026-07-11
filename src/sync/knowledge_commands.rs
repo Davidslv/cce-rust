@@ -72,10 +72,37 @@ impl KnowledgeSyncState {
         KnowledgeStore::dir(root).join("synced.json")
     }
 
-    /// Load the marker, if a pull ever wrote one.
+    /// Load the marker, if a pull ever wrote one. Lenient: a read/parse error is
+    /// treated as "no marker" — used by the best-effort freshness summary where a
+    /// missing answer is acceptable. The §5 overwrite guard uses
+    /// [`load_strict`](Self::load_strict) instead.
     pub fn load(root: &Path) -> Option<KnowledgeSyncState> {
         let text = std::fs::read_to_string(Self::path(root)).ok()?;
         serde_json::from_str(&text).ok()
+    }
+
+    /// Load the marker for the §5 overwrite guard (#123), distinguishing a
+    /// genuinely **absent** marker (`Ok(None)`, never pulled) from one that is
+    /// present but **unreadable/corrupt** (`Err`). The lenient `.load()` maps a
+    /// corrupt marker to `None` — indistinguishable from "never pulled" — which
+    /// silently DISARMED the different-corpus guard, letting a truncated marker
+    /// wave through an overwrite the guard exists to refuse. A corrupt marker is
+    /// now an error the caller surfaces (bypassable only with `--force`).
+    pub fn load_strict(root: &Path) -> Result<Option<KnowledgeSyncState>, String> {
+        let path = Self::path(root);
+        match std::fs::read_to_string(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => {
+                Err(format!("could not read the knowledge sync marker {}: {e}", path.display()))
+            }
+            Ok(text) => serde_json::from_str(&text).map(Some).map_err(|e| {
+                format!(
+                    "the knowledge sync marker {} is unreadable/corrupt: {e}. It records which \
+                     corpus is active — pass --force to overwrite it.",
+                    path.display()
+                )
+            }),
+        }
     }
 
     fn save(&self, root: &Path) -> std::io::Result<()> {
@@ -83,7 +110,10 @@ impl KnowledgeSyncState {
         if let Some(parent) = path.parent() {
             std::fs::create_dir_all(parent)?;
         }
-        std::fs::write(path, serde_json::to_string(self).unwrap_or_default())
+        // #123: propagate a serialization failure rather than writing an empty
+        // string (`unwrap_or_default`) that would later parse as a corrupt marker.
+        let json = serde_json::to_string(self).map_err(std::io::Error::other)?;
+        std::fs::write(path, json)
     }
 }
 
@@ -631,7 +661,9 @@ pub fn cmd_knowledge_pull(
     // snapshot of the same corpus supersedes silently — local re-ingest
     // semantics, which is what makes refresh idempotent.
     if !force {
-        if let Some(state) = KnowledgeSyncState::load(root) {
+        // #123: a corrupt marker is an error here, NOT a silent None that would
+        // disarm the guard and overwrite a different corpus without --force.
+        if let Some(state) = KnowledgeSyncState::load_strict(root)? {
             if state.corpus_id != corpus_id {
                 return Err(format!(
                     "the local knowledge store came from corpus `{}` but you are pulling \
@@ -974,6 +1006,41 @@ mod tests {
             snap1,
             "current must not have advanced when the marker write failed"
         );
+    }
+
+    #[test]
+    fn a_corrupt_marker_does_not_disarm_the_different_corpus_guard() {
+        // #123: `load` mapped any read/parse error to None, indistinguishable
+        // from "never pulled", so a truncated/empty/corrupt marker silently
+        // disarmed the §5 guard and let a different corpus overwrite the active
+        // one without --force. A corrupt marker must now be an error.
+        let _home = with_home();
+        let (_bare, url) = bare_remote();
+        let p1 = root_with_store(&feed("a"));
+        push(p1.path(), Some("c1".into()), Some(url.clone())).unwrap();
+        let p2 = root_with_store(&feed("bb"));
+        push(p2.path(), Some("c2".into()), Some(url.clone())).unwrap();
+
+        let consumer = tempfile::tempdir().unwrap();
+        cmd_knowledge_pull(consumer.path(), Some("c1".into()), None, false, Some(url.clone()))
+            .unwrap();
+        let active = KnowledgeStore::load_current(consumer.path()).unwrap().snapshot;
+
+        // Corrupt the marker (an interrupted non-atomic write / disk-full / edit).
+        std::fs::write(KnowledgeSyncState::path(consumer.path()), b"").unwrap();
+
+        // A different-corpus pull WITHOUT --force must refuse, not overwrite.
+        let err =
+            cmd_knowledge_pull(consumer.path(), Some("c2".into()), None, false, Some(url.clone()))
+                .unwrap_err();
+        assert!(err.contains("corrupt"), "got: {err}");
+        assert!(err.contains("--force"), "got: {err}");
+        // Nothing was overwritten — c1 is still active.
+        assert_eq!(KnowledgeStore::load_current(consumer.path()).unwrap().snapshot, active);
+
+        // --force bypasses the guard and re-writes a valid marker.
+        cmd_knowledge_pull(consumer.path(), Some("c2".into()), None, true, Some(url)).unwrap();
+        assert_eq!(KnowledgeSyncState::load(consumer.path()).unwrap().corpus_id, "c2");
     }
 
     #[test]
