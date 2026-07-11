@@ -124,6 +124,18 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   "vector recall disabled". `rank_core` now gathers no vector candidates when the
   query vector is empty, leaving BM25 as the sole recall source (a zero-overlap
   query returns empty, matching `bm25_only_search`).
+- **Per-store fingerprint filename so two named stores in one directory no
+  longer clobber each other's fingerprint (#100).** `beside_store` in
+  `src/fingerprint.rs` resolved every store in a directory to the same constant
+  `fingerprint.json`, so `cce index dirB --store D/b.json` overwrote the
+  fingerprint written for `D/a.json` and `cce doctor --store D/a.json` then
+  reported a permanent false "store bytes do not match the fingerprint"
+  corruption that re-indexing could never clear. The canonical `index.json`
+  store keeps the historical `fingerprint.json` (existing stores resolve
+  unchanged), but a named store now derives a per-store
+  `<file-name>.fingerprint.json`, so colocated stores keep independent
+  fingerprints. (The non-atomic write half of the report was already closed by
+  #101, which routes the fingerprint write through `crate::atomic::atomic_write`.)
 - **Memory append is a single write with a newline guard, so a torn or
   interleaved append can no longer silently lose entries (#102).** `append`
   in `src/memory.rs` wrote the JSON line and its trailing `\n` as two separate
