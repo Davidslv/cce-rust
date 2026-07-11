@@ -728,6 +728,26 @@ fn build_embedder(kind: EmbedderKind) -> Result<Box<dyn Embedder>, String> {
     }
 }
 
+/// Warn (on stderr) when the walk could not read one or more directories (#133).
+/// A read failure means files under those directories were NOT indexed, so the
+/// index is incomplete and may differ across machines — a silent loss unless we
+/// say so. No output when `walk_errors == 0`. `member` names the workspace member
+/// when indexing a workspace, or `None` for a single-repo index.
+fn warn_on_walk_errors(walk_errors: usize, member: Option<&str>) {
+    if walk_errors == 0 {
+        return;
+    }
+    let scope = match member {
+        Some(name) => format!(" in member '{name}'"),
+        None => String::new(),
+    };
+    let plural = if walk_errors == 1 { "directory" } else { "directories" };
+    eprintln!(
+        "warning: {walk_errors} {plural}{scope} could not be read; files under them were NOT \
+         indexed — the index may be incomplete and may differ across machines"
+    );
+}
+
 fn cmd_index(
     dir: &Path,
     store: Option<PathBuf>,
@@ -785,10 +805,16 @@ fn cmd_index(
     println!("  files indexed     : {}", stats.files_indexed);
     println!("  files skipped     : {}", stats.files_skipped);
     println!("  sensitive skipped : {}", stats.sensitive_skipped);
+    // Only surfaced when nonzero, so the normal-path summary is byte-identical
+    // (#133). A read failure means files under that directory were NOT indexed.
+    if stats.walk_errors > 0 {
+        println!("  walk errors       : {}", stats.walk_errors);
+    }
     println!("  total chunks      : {}", stats.total_chunks);
     println!("  embedder          : {}", index.embedder_name);
     println!("  store             : {}", store_path.display());
     println!("  elapsed           : {elapsed:.3}s");
+    warn_on_walk_errors(stats.walk_errors, None);
     Ok(())
 }
 
@@ -1404,6 +1430,10 @@ fn cmd_index_workspace(
             stats.total_chunks,
             store_path.display()
         );
+        // Same #133 divergence risk per member: an unreadable dir means the
+        // member's store is incomplete. Warn on stderr; leave the stdout line above
+        // byte-identical.
+        warn_on_walk_errors(stats.walk_errors, Some(&m.name));
     }
 
     let graph = build_graph(&root, &manifest);

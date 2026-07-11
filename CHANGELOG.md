@@ -45,6 +45,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test/fixture/samples` verified byte-identical.
 
 ### Fixed
+- **Workspace member-name suffixing is now collision-free against real
+  sibling directories (#131).** `detect_members` minted `basename-N` suffixes
+  by a per-basename counter without checking the result against other members'
+  basenames, so a workspace with `a/widget`, `b/widget`, and a directory
+  literally named `widget-2` produced TWO members named `widget-2` — violating
+  the documented "unique member id" invariant, and making federation namespace
+  two members' chunks under one prefix and attribute results to the wrong
+  package. Suffixing now skips any candidate that is already assigned OR
+  reserved as another member's natural basename, so ids are always unique.
+- **Walker no longer silently drops traversal errors (#133).** The walk loop
+  used `walker.flatten()`, which discards the `ignore` crate's `Err` entries —
+  so a permission-denied or otherwise unreadable directory made every file
+  beneath it vanish from the index with nothing recorded: `skipped` stayed 0,
+  exit was clean, and the artifact silently diverged across machines with
+  different permissions (the same builder-independence violation class as #24).
+  The loop now matches the `Err` arm and tallies it in a new
+  `WalkResult::walk_errors` counter (separate from `skipped`, since these are
+  directory-level failures, not per-file skips). The count is threaded through
+  `BuildStats` and surfaced to the operator: `cce index` prints a `walk errors`
+  summary line and emits a stderr warning ("N directory(ies) could not be
+  read; files under them were NOT indexed…") whenever it is nonzero, and the
+  workspace index warns per member — so the loss and the cross-machine
+  divergence are visible, not silent. When there are no traversal errors the
+  summary is byte-identical to before.
+- **Walker path normalisation no longer conflates distinct Unix filenames
+  (#105).** The relative `file_path` was built with `replace('\\', "/")`, which
+  rewrites the literal backslash — a legal filename byte on macOS/Linux — so a
+  root file named `a\b.py` collapsed onto the same path as a nested `a/b.py`,
+  giving two files identical, order-nondeterministic provenance. The walker
+  (and the workspace member-path builder, the same defect) now normalise ONLY
+  the platform separator (`std::path::MAIN_SEPARATOR`): a no-op on Unix that
+  preserves backslashes, still `\`→`/` on Windows where `\` is never a filename
+  byte.
 - **A valid-JSON request with an id but no string `method` now echoes the id as
   a `-32600` Invalid Request instead of a null-id parse error (#125).**
   `parse_request` flattened "invalid JSON" and "valid JSON, wrong shape" into one
