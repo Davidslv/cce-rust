@@ -504,12 +504,26 @@ fn install_artifact(root: &Path, bytes: &[u8]) -> Result<Artifact, String> {
     // #163 (the code twin of the knowledge-side #122): ACTIVATE the store LAST.
     // `index.save(&store)` replaces `.cce/index.json` in place, so writing it
     // before the marker meant a marker-write failure left the NEW store active
-    // with a stale/absent marker — the §9.4 guard then reasoning off an
-    // inconsistent pair. Stage the new index beside the store, record the marker,
-    // and only then rename the staged file into place: any failure before the
-    // rename leaves the PRIOR index.json active and its marker consistent.
+    // with a stale/absent marker. Stage the new index beside the store, record the
+    // marker, and only then rename the staged file into place. A marker-write
+    // failure leaves the PRIOR index.json active with its own marker intact; a
+    // crash in the narrow window BETWEEN the marker write and the rename leaves
+    // marker=new / store=old — a TRANSIENT inconsistency that `verify`/`doctor`
+    // detect (the recorded `installed_sha256` won't match the on-disk store) and
+    // that the next same-sha pull self-heals, so it errs safe (the #122 design).
     let staged = store.with_extension("json.incoming");
     index.save(&staged).map_err(|e| format!("could not write {}: {e}", staged.display()))?;
+    // A user-tightened store (`chmod 600 index.json`) must keep its mode across a
+    // pull — a raw rename adopts the temp file's umask default and would silently
+    // widen it (the exact regression #101's `atomic_write` finisher guards). Carry
+    // the prior store's mode onto the staged file BEFORE the rename; a fresh
+    // install (no prior store) keeps the umask default. Unix-only, like atomic.rs.
+    #[cfg(unix)]
+    if let Ok(meta) = std::fs::metadata(&store) {
+        std::fs::set_permissions(&staged, meta.permissions()).map_err(|e| {
+            format!("could not preserve store permissions on {}: {e}", staged.display())
+        })?;
+    }
     // #55: hash the EXACT bytes just written (read back from disk) so
     // `verify --checksum-only` has a version-independent baseline — "has this
     // file changed since pull", regardless of which cce version pushed the
@@ -530,8 +544,11 @@ fn install_artifact(root: &Path, bytes: &[u8]) -> Result<Artifact, String> {
     })?;
 
     // Marker durable — activate the freshly written store (rename is atomic).
-    std::fs::rename(&staged, &store)
-        .map_err(|e| format!("could not activate {}: {e}", store.display()))?;
+    std::fs::rename(&staged, &store).map_err(|e| {
+        // No residue: a rename failure must not leak the staged store either.
+        let _ = std::fs::remove_file(&staged);
+        format!("could not activate {}: {e}", store.display())
+    })?;
 
     // #62: stamp a build fingerprint beside the now-active store so `cce doctor`
     // can drift-check pulled stores too. Shareable artifacts are always
@@ -722,7 +739,11 @@ fn pull_workspace(
         // skip this guard entirely, so a member pinned via `cce sync pull
         // --commit <sha>` was silently rewound by a root `pull --workspace`.
         if !force {
-            if let Some(state) = SyncState::load(&member_dir) {
+            // #163: like the single-repo guard (:597), load STRICTLY — a corrupt
+            // member `.cce/synced.json` must surface as an error, not a lenient
+            // None that disarms the guard and lets this member be silently rewound
+            // to a different sha (a torn workspace) without --force.
+            if let Some(state) = SyncState::load_strict(&member_dir)? {
                 if state.sha != sha {
                     return Err(format!(
                         "workspace member `{}` local cache is at {} but you are pulling {sha}. \
@@ -2551,6 +2572,95 @@ mod tests {
         // With --force it proceeds and advances the members.
         cmd_pull(dst.path(), PullTarget::Latest, true, true, None).unwrap();
         assert_eq!(SyncState::load(&dst.path().join("alpha")).unwrap().sha, sha2);
+        std::env::remove_var("CCE_HOME");
+    }
+
+    #[test]
+    fn workspace_pull_corrupt_member_marker_does_not_disarm_the_guard() {
+        // #163: the workspace-member §9.4 guard (:725) loaded the member marker
+        // LENIENTLY, so a corrupt member `.cce/synced.json` read as None and
+        // silently rewound THAT member to a different sha (a torn workspace) while
+        // an intact-marker sibling refused. The member guard must load strictly,
+        // exactly like the single-repo path.
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let src = workspace_repo();
+        let cfg = || SyncConfig {
+            remote: Some(url.clone()),
+            lfs: false,
+            repo_id: Some("example.com__acme__mono".to_string()),
+            git_ref: None,
+            auto_pull: false,
+            retention: crate::sync::config::Retention::All,
+        };
+        cfg().save(src.path()).unwrap();
+        cmd_push(src.path(), None, true).unwrap();
+        let sha1 = git::head_sha(src.path()).unwrap();
+
+        let dst = source_repo_clone(&src);
+        cfg().save(dst.path()).unwrap();
+        cmd_pull(dst.path(), PullTarget::Head, false, true, None).unwrap();
+        let alpha_store = dst.path().join("alpha/.cce/index.json");
+        let alpha_bytes_before = std::fs::read(&alpha_store).unwrap();
+
+        // Advance to sha2 so a re-pull is a DIFFERENT-sha overwrite.
+        std::fs::write(src.path().join("alpha/src/index.js"), "function alpha() { return 2; }\n")
+            .unwrap();
+        git::run_commit(src.path(), &["commit", "-qam", "bump"]).unwrap();
+        cmd_push(src.path(), None, true).unwrap();
+        let sha2 = git::head_sha(src.path()).unwrap();
+        assert_ne!(sha1, sha2);
+
+        // Corrupt alpha's marker (interrupted non-atomic write / disk-full / edit).
+        std::fs::write(SyncState::path(&dst.path().join("alpha")), b"").unwrap();
+
+        // WITHOUT --force the workspace pull must REFUSE (surfacing the corrupt
+        // marker), not silently rewind alpha to sha2.
+        let err = cmd_pull(dst.path(), PullTarget::Latest, false, true, None).unwrap_err();
+        assert!(err.contains("corrupt"), "got: {err}");
+        assert!(err.contains("--force"), "got: {err}");
+        assert_eq!(
+            std::fs::read(&alpha_store).unwrap(),
+            alpha_bytes_before,
+            "the corrupt-marker member was overwritten despite the refusal"
+        );
+
+        // With --force it proceeds and re-writes a valid marker at sha2.
+        cmd_pull(dst.path(), PullTarget::Latest, true, true, None).unwrap();
+        assert_eq!(SyncState::load(&dst.path().join("alpha")).unwrap().sha, sha2);
+        std::env::remove_var("CCE_HOME");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn pull_preserves_a_user_tightened_store_mode() {
+        // #163: the new stage-then-rename publish must carry the destination
+        // store's mode across the rename — a `chmod 600 index.json` must survive a
+        // re-pull, not be widened back to the umask default (the invariant
+        // `atomic_write` guards). Skip as root, where mode bits don't gate access.
+        use std::os::unix::fs::PermissionsExt;
+        extern "C" {
+            fn geteuid() -> u32;
+        }
+        if unsafe { geteuid() } == 0 {
+            return;
+        }
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let src = source_repo();
+        init_cfg(src.path(), &url);
+        cmd_push(src.path(), None, false).unwrap();
+        let dst = source_repo_clone(&src);
+        init_cfg(dst.path(), &url);
+        cmd_pull(dst.path(), PullTarget::Head, false, false, None).unwrap();
+
+        // Tighten the freshly pulled store, then re-pull the SAME sha.
+        let store = default_store_path(dst.path());
+        std::fs::set_permissions(&store, std::fs::Permissions::from_mode(0o600)).unwrap();
+        cmd_pull(dst.path(), PullTarget::Head, false, false, None).unwrap();
+
+        let mode = std::fs::metadata(&store).unwrap().permissions().mode() & 0o777;
+        assert_eq!(mode, 0o600, "a user-tightened store mode must survive a re-pull");
         std::env::remove_var("CCE_HOME");
     }
 

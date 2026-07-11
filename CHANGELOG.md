@@ -58,9 +58,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `install_artifact` replaced `.cce/index.json` in place BEFORE writing the
   marker, so a marker-write failure left the new store active with a stale
   marker; it now stages the new index beside the store, records the marker, and
-  only then renames the staged file into place — a failure before that rename
-  leaves the prior store active and its marker consistent (cleaning up the
-  staged file). Byte-identity of a pulled store is unchanged.
+  only then renames the staged file into place (cleaning up the staged file on
+  any failure). A marker-write failure leaves the prior store active; a crash in
+  the narrow window between the marker write and the rename leaves a transient
+  marker=new/store=old mismatch that `verify`/`doctor` detect and the next
+  same-sha pull self-heals (errs safe, matching the #122 design). The rename now
+  carries over a user-tightened store's mode (`chmod 600 index.json` stays
+  `0o600`), preserving the invariant `atomic_write` guards. Byte-identity and the
+  §9.4 guard now hold on the workspace-member pull path too, not only single-repo.
 - **`cce doctor` no longer reports a broken workspace healthy when its
   `workspace.yml` is corrupt (#126).** The `Manifest::load` `Err(_)` arm
   conflated an ABSENT manifest (simply not a workspace) with a PRESENT-but-
