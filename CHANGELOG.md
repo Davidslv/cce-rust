@@ -177,6 +177,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   project config that exists but does not parse is now surfaced with a clear
   warning and the load stays all-local, so the misconfiguration cannot be masked
   by an unrelated global remote.
+- **Aggregate roll-ups sum `tokens_saved` (and `sensitive_skipped`) with
+  saturating u64 arithmetic, so a corrupt or forged log value can no longer
+  overflow-panic `cce usage` / kill the dashboard process in debug, nor wrap to
+  a garbage total in release (#127).** `compute_totals`, `source_usage`,
+  `savings_window`, `compute_secret_safety` and the daily accumulator in
+  `src/aggregator.rs` now fold with `saturating_add`, clamping at `u64::MAX`,
+  matching the saturating policy already used in `savings.rs`. Verified in a
+  release build: the total clamps instead of wrapping.
 - **Memory append is a single write with a newline guard, so a torn or
   interleaved append can no longer silently lose entries (#102).** `append`
   in `src/memory.rs` wrote the JSON line and its trailing `\n` as two separate

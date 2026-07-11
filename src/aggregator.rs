@@ -281,7 +281,9 @@ fn compute_usage_by_source(searches: &[(usize, &SearchEvent)]) -> UsageBySource 
 
 /// The usage figures for one source bucket.
 fn source_usage(searches: &[&SearchEvent]) -> SourceUsage {
-    let tokens_saved: u64 = searches.iter().map(|s| s.tokens_saved).sum();
+    // Saturating so a corrupt/forged tokens_saved (e.g. u64::MAX) clamps instead of
+    // overflow-panicking (debug) or wrapping to garbage (release) — see #127.
+    let tokens_saved: u64 = searches.iter().map(|s| s.tokens_saved).fold(0u64, u64::saturating_add);
     let ratios: Vec<f64> = searches.iter().map(|s| s.savings_ratio).collect();
     let latencies: Vec<f64> = searches.iter().map(|s| s.latency_ms).collect();
     SourceUsage {
@@ -296,7 +298,10 @@ fn source_usage(searches: &[&SearchEvent]) -> SourceUsage {
 /// Sum the sensitive-files-skipped over the log's index runs (v2.4.1).
 fn compute_secret_safety(indexes: &[(usize, &IndexEvent)]) -> SecretSafety {
     SecretSafety {
-        sensitive_skipped: indexes.iter().map(|(_, x)| x.sensitive_skipped).sum(),
+        sensitive_skipped: indexes
+            .iter()
+            .map(|(_, x)| x.sensitive_skipped)
+            .fold(0u64, u64::saturating_add),
         index_runs: indexes.len() as u64,
     }
 }
@@ -321,7 +326,10 @@ fn compute_totals(
     index_count: u64,
     price: f64,
 ) -> Totals {
-    let tokens_saved: u64 = searches.iter().map(|(_, s)| s.tokens_saved).sum();
+    // Saturating roll-up: a forged/corrupt tokens_saved cannot panic (debug) or
+    // wrap to garbage (release), matching savings.rs's saturating policy — see #127.
+    let tokens_saved: u64 =
+        searches.iter().map(|(_, s)| s.tokens_saved).fold(0u64, u64::saturating_add);
     let ratios: Vec<f64> = searches.iter().map(|(_, s)| s.savings_ratio).collect();
     let all: Vec<&SearchEvent> = searches.iter().map(|(_, s)| *s).collect();
     let helpful = feedback.iter().filter(|(_, f)| f.helpful).count() as u64;
@@ -373,7 +381,7 @@ fn compute_savings(searches: &[(usize, &SearchEvent)], now_secs: i64) -> Savings
 fn savings_window(searches: &[(usize, &SearchEvent)], win: &Window) -> SavingsWindow {
     let in_win: Vec<&SearchEvent> =
         searches.iter().filter(|(_, s)| win.contains(s.secs)).map(|(_, s)| *s).collect();
-    let tokens_saved: u64 = in_win.iter().map(|s| s.tokens_saved).sum();
+    let tokens_saved: u64 = in_win.iter().map(|s| s.tokens_saved).fold(0u64, u64::saturating_add);
     let ratios: Vec<f64> = in_win.iter().map(|s| s.savings_ratio).collect();
     SavingsWindow {
         searches: in_win.len() as u64,
@@ -446,7 +454,7 @@ fn compute_daily(
     for (_, s) in searches {
         let acc = by_day.entry(date_str(s.secs)).or_default();
         acc.searches += 1;
-        acc.tokens_saved += s.tokens_saved;
+        acc.tokens_saved = acc.tokens_saved.saturating_add(s.tokens_saved);
         acc.ratios.push(s.savings_ratio);
         if s.result_count > 0 {
             acc.top_scores.push(s.top_score);
@@ -562,6 +570,34 @@ mod tests {
         assert_eq!(direction(-0.01), "down");
         assert_eq!(direction(0.0), "flat");
         assert_eq!(direction(1e-12), "flat"); // within epsilon
+    }
+
+    #[test]
+    fn adversarial_tokens_saved_saturates_instead_of_overflowing() {
+        // #127: two search events whose tokens_saved sum past u64::MAX must clamp to
+        // u64::MAX, not overflow-panic (debug) or wrap to garbage (release). The
+        // assertion pins the graceful SATURATED result, so it holds in BOTH profiles.
+        let line = |id: &str, ts: &str| {
+            format!(
+                "{{\"schema\":\"cce.metrics/v1\",\"event\":\"search\",\"ts\":\"{ts}\",\
+                 \"id\":\"{id}\",\"query\":\"q\",\"result_count\":1,\
+                 \"tokens_saved\":18446744073709551615,\"savings_ratio\":0.5,\
+                 \"top_score\":0.9,\"empty\":false,\"low_confidence\":false}}"
+            )
+        };
+        let text = format!(
+            "{}\n{}\n",
+            line("aaaaaaaaaaaa", "2026-07-04T10:00:00Z"),
+            line("bbbbbbbbbbbb", "2026-07-04T11:00:00Z")
+        );
+        let events = parse_log(&text).events;
+        let agg = aggregate(&events, now(), 3.00);
+        // Totals, per-source, per-window, and daily roll-ups all clamp at u64::MAX.
+        assert_eq!(agg.totals.tokens_saved, u64::MAX);
+        assert_eq!(agg.by_source.cli.tokens_saved, u64::MAX);
+        assert_eq!(agg.north_star.savings.current.tokens_saved, u64::MAX);
+        let day = agg.series.daily.iter().find(|d| d.date == "2026-07-04").unwrap();
+        assert_eq!(day.tokens_saved, u64::MAX);
     }
 
     #[test]
