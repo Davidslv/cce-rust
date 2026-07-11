@@ -98,9 +98,13 @@ For each record it:
    any of them is scrubbed on disk and in every served header. The record **`id` is
    deliberately not redacted** — it is the addressing key (chunk ids and the
    synthetic document path derive from it), so the `cce.knowledge/v1` contract
-   **requires record ids to be secret-free**; a secret placed in an id can still
-   surface via `expand_chunk`/`related_context` (a redacted-display mitigation is
-   tracked as #144).
+   **requires record ids to be secret-free** (ids are addressing keys; only their
+   *display* is redacted). A secret placed in an id is redacted for **display
+   only** wherever it is served (`expand_chunk` / `related_context` headers), so it
+   never exfiltrates through served output; but because it stays raw *at rest* to
+   preserve addressing, a re-index cannot scrub it — the fix is to correct the id
+   in the source adapter (#144). `cce doctor` scans the store and flags a
+   secret-shaped id (and any un-redacted facet in a pre-#111 / pushed store).
 
 The result is written to a **separate, snapshot-keyed knowledge store** under
 `<root>/.cce/knowledge/` — never the code cache:

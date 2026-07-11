@@ -1608,10 +1608,32 @@ pub fn expand_chunk(server: &McpServer, args: &Value) -> ToolOutput {
     }
 }
 
+/// The redacted DISPLAY form of a knowledge record id (#144). The RAW `record_id`
+/// stays the addressing key — chunk ids and the synthetic document path derive
+/// from it, so it is NEVER redacted at rest (that would break lookup/round-trip).
+/// But a secret placed in an id would otherwise exfiltrate through every served
+/// surface that prints it (the `expand_chunk`/`related_context` headers). Running
+/// the Layer-2 redactor over the id for DISPLAY ONLY closes that leak while
+/// leaving addressing untouched. Determinism: a clean id (the common case —
+/// `gh:123`, `rec-1`, a path) is the identity under the redactor, so served
+/// output stays byte-identical and the served-output goldens do not move; only an
+/// id that CONTAINS a secret changes (to its redacted form).
+fn display_record_id(record_id: &str) -> String {
+    crate::redactor::redact(record_id)
+}
+
 /// A one-line header for a knowledge section in expand/related output:
-/// `«record_id»:«start»-«end» («kind») #«chunk_id»`.
+/// `«record_id»:«start»-«end» («kind») #«chunk_id»`. The record id is rendered in
+/// its redacted DISPLAY form (#144); the chunk id is a content hash (secret-free).
 fn knowledge_chunk_header(kc: &crate::knowledge::KnowledgeChunk) -> String {
-    format!("{}:{}-{} ({}) #{}", kc.record_id, kc.start_line, kc.end_line, kc.kind, kc.chunk_id)
+    format!(
+        "{}:{}-{} ({}) #{}",
+        display_record_id(&kc.record_id),
+        kc.start_line,
+        kc.end_line,
+        kc.kind,
+        kc.chunk_id
+    )
 }
 
 /// Render a titled group of knowledge sections (header + body each). Deterministic.
@@ -1649,7 +1671,11 @@ fn expand_knowledge_chunk(server: &McpServer, chunk_id: &str, scope: &str) -> Op
             let sections = same_document_sections(store, &target.record_id, None);
             let blocks: Vec<(&crate::knowledge::KnowledgeChunk, String)> =
                 sections.iter().map(|c| (*c, c.content.clone())).collect();
-            let title = format!("document {} — {} section(s):", target.record_id, blocks.len());
+            let title = format!(
+                "document {} — {} section(s):",
+                display_record_id(&target.record_id),
+                blocks.len()
+            );
             render_knowledge_group(&title, &blocks)
         }
         _ => {
@@ -1657,13 +1683,16 @@ fn expand_knowledge_chunk(server: &McpServer, chunk_id: &str, scope: &str) -> Op
             if sections.is_empty() {
                 return Some(ToolOutput::ok(format!(
                     "no same-document neighbours for {} in the knowledge store.",
-                    target.record_id
+                    display_record_id(&target.record_id)
                 )));
             }
             let blocks: Vec<(&crate::knowledge::KnowledgeChunk, String)> =
                 sections.iter().map(|c| (*c, c.content.clone())).collect();
-            let title =
-                format!("neighbours of {} — {} section(s):", target.record_id, blocks.len());
+            let title = format!(
+                "neighbours of {} — {} section(s):",
+                display_record_id(&target.record_id),
+                blocks.len()
+            );
             render_knowledge_group(&title, &blocks)
         }
     };
@@ -1736,7 +1765,7 @@ fn related_knowledge_chunk(server: &McpServer, chunk_id: &str, top_k: usize) -> 
     if sections.is_empty() {
         return Some(ToolOutput::ok(format!(
             "no same-document neighbours for {} in the knowledge store.",
-            target.record_id
+            display_record_id(&target.record_id)
         )));
     }
     let blocks: Vec<(&crate::knowledge::KnowledgeChunk, String)> = sections
@@ -1747,7 +1776,7 @@ fn related_knowledge_chunk(server: &McpServer, chunk_id: &str, top_k: usize) -> 
         .collect();
     let title = format!(
         "related to {} in the same document — {} section(s):",
-        target.record_id,
+        display_record_id(&target.record_id),
         blocks.len()
     );
     Some(ToolOutput::ok(render_knowledge_group(&title, &blocks)))
