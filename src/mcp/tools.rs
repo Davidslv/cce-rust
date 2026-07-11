@@ -53,10 +53,10 @@ use crate::metrics::{HexIdSource, MetricsWriter, SystemClock};
 use crate::packs::Registry;
 use crate::retriever::{bm25_only_search, build_search_record, search, SearchResult};
 use crate::session::{short_label, SummaryScope};
-use crate::store::Index;
+use crate::store::{default_store_path, Index};
 use crate::sync::commands::{freshness, IndexSource};
 use crate::sync::knowledge_commands::knowledge_freshness;
-use crate::workspace::{Manifest, WorkspaceGraph};
+use crate::workspace::{manifest_path, Manifest, WorkspaceGraph};
 use serde_json::{json, Value};
 use std::collections::BTreeMap;
 use std::path::{Path, PathBuf};
@@ -612,7 +612,15 @@ fn gather_code_hits_single(server: &McpServer, query: &str, p: &SearchParams) ->
     // Cached across calls (issue #31): reused while the store file is unchanged.
     let index = match server.load_index() {
         Ok(i) => i,
-        Err(_) => return (Vec::new(), None, 0, None, None),
+        // A store that was never built (a knowledge-only project) is true absence —
+        // knowledge-only is then the correct, complete answer, so stay silent. A
+        // store that EXISTS but fails to load (corrupt/unreadable) must NOT be
+        // swallowed into zero code rows (issue #132): surface the pinned notice
+        // through the same channel as OLLAMA_DOWN_NOTICE (issue #30).
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+            return (Vec::new(), None, 0, None, None)
+        }
+        Err(_) => return (Vec::new(), None, 0, Some(CODE_INDEX_LOAD_ERROR_NOTICE), None),
     };
     let start = Instant::now();
     let (results, notice) = match pick_embedder(&index) {
@@ -662,7 +670,14 @@ fn gather_code_hits_workspace(server: &McpServer, query: &str, p: &SearchParams)
     let root = server.root();
     let manifest = match Manifest::load(&root) {
         Ok(m) => m,
-        Err(_) => return (Vec::new(), None, 0, None, None),
+        // Same absent-vs-failed split as the single-repo path (issue #132): a
+        // manifest that is truly absent stays silent; one that EXISTS but fails to
+        // parse means code retrieval is broken and must be visible.
+        Err(_) => {
+            let notice =
+                manifest_path(&root).exists().then_some(WORKSPACE_CODE_INDEX_LOAD_ERROR_NOTICE);
+            return (Vec::new(), None, 0, notice, None);
+        }
     };
     // An empty-but-present `package` is invalid (issue #45); in this path a scope
     // error yields no code rows, exactly like an unknown package below.
@@ -673,7 +688,18 @@ fn gather_code_hits_workspace(server: &McpServer, query: &str, p: &SearchParams)
     // Cached federated union (issue #26): same bundle the code-only path uses.
     let bundle = match server.workspace_bundle(&manifest, scope.as_deref()) {
         Ok(b) => b,
-        Err(_) => return (Vec::new(), None, 0, None, None),
+        // A workspace whose members were ALL never indexed has no member store on
+        // disk — true absence, silent (the knowledge-only case). If any member store
+        // EXISTS while the bundle still fails to load, code retrieval is incomplete —
+        // whether from a corrupt/unreadable member OR a member not yet indexed (the
+        // common partially-indexed case) — so surface the workspace notice, whose
+        // wording covers all of them without a false corruption claim (issue #132).
+        Err(_) => {
+            let any_member_store_exists =
+                manifest.members.iter().any(|m| default_store_path(&root.join(&m.path)).exists());
+            let notice = any_member_store_exists.then_some(WORKSPACE_CODE_INDEX_LOAD_ERROR_NOTICE);
+            return (Vec::new(), None, 0, notice, None);
+        }
     };
     let members = &bundle.members;
     let combined = &bundle.combined;
@@ -953,6 +979,27 @@ embedder but Ollama is unreachable — vector recall is disabled; results are ke
 matches only. Start Ollama, or re-index with the default hash embedder (`cce index <dir>`), to \
 restore semantic search.";
 
+/// The pinned notice line served when the blended path's code store EXISTS on disk
+/// but fails to load (issue #132): a corrupt/unreadable index must be VISIBLE — the
+/// results below it are knowledge-only, missing all code — while a store that is
+/// legitimately absent (a knowledge-only project) stays silent, because
+/// knowledge-only is then the correct, complete answer.
+pub(crate) const CODE_INDEX_LOAD_ERROR_NOTICE: &str = "NOTICE: the code index exists but could \
+not be loaded (corrupt or unreadable store) — code results are MISSING from this answer; \
+anything shown below is knowledge-only. Re-run `cce index` (or `cce index --workspace`) to \
+rebuild it.";
+
+/// The workspace counterpart of [`CODE_INDEX_LOAD_ERROR_NOTICE`] (issue #132). The
+/// federated path only knows that at least one member store is on disk while the
+/// bundle failed — a proxy that lumps together a corrupt/unreadable member AND a
+/// member that was simply never indexed (the common partially-indexed steady state).
+/// The wording therefore covers all three and claims only that code results are
+/// INCOMPLETE, never that a specific store is corrupt.
+pub(crate) const WORKSPACE_CODE_INDEX_LOAD_ERROR_NOTICE: &str = "NOTICE: one or more workspace \
+member code indexes are missing or could not be loaded (corrupt, unreadable, or not yet \
+indexed) — code results are INCOMPLETE for this answer; anything shown below may be missing code \
+rows. Re-run `cce index --workspace` to (re)build them.";
+
 /// The query embedder decision for a loaded store (issue #30).
 enum QueryEmbedder {
     /// The store's own backend is usable — run the full §6 pipeline.
@@ -991,7 +1038,8 @@ fn pick_workspace_embedder(members: &[MemberStore]) -> QueryEmbedder {
     QueryEmbedder::Ready(Box::new(HashEmbedder))
 }
 
-/// Prepend the pinned Ollama-down notice to a rendered result body.
+/// Prepend a pinned degradation notice ([`OLLAMA_DOWN_NOTICE`],
+/// [`CODE_INDEX_LOAD_ERROR_NOTICE`]) to a rendered result body.
 fn with_notice(notice: Option<&'static str>, body: String) -> String {
     match notice {
         Some(n) => format!("{n}\n\n{body}"),
