@@ -555,7 +555,9 @@ fn workspace_blend_surfaces_a_corrupt_member_store() {
     let text = tool_text(&out, 2);
 
     assert!(
-        text.contains("NOTICE: the code index exists but could not be loaded"),
+        text.contains(
+            "NOTICE: one or more workspace member code indexes are missing or could not be loaded"
+        ),
         "corrupt member store was swallowed silently:\n{text}"
     );
     assert!(
@@ -563,6 +565,65 @@ fn workspace_blend_surfaces_a_corrupt_member_store() {
         "knowledge hits must still be served under a member-store failure:\n{text}"
     );
     assert!(!tool_is_error(&out, 2), "degraded workspace blend must not set isError:\n{out}");
+}
+
+/// A two-member JS workspace (`app` + `lib`) with a knowledge store at its root — the
+/// shape of a normal partially-indexed workspace.
+fn write_two_member_workspace(root: &Path) {
+    for (member, func) in [("app", "hashPassword"), ("lib", "verifyPassword")] {
+        let dir = root.join(member);
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("auth.js"), format!("function {func}(pw) {{\n  return pw;\n}}\n"))
+            .unwrap();
+    }
+    std::fs::create_dir_all(root.join(".cce")).unwrap();
+    std::fs::write(
+        root.join(".cce").join("workspace.yml"),
+        "version: 1\nname: ws\nmembers:\n  - name: app\n    path: app\n    type: javascript\n    package: app\n  - name: lib\n    path: lib\n    type: javascript\n    package: lib\n",
+    )
+    .unwrap();
+}
+
+#[test]
+fn partially_indexed_workspace_surfaces_the_incomplete_notice_without_a_false_corruption_claim() {
+    // Issue #132 (reviewer NIT): the common steady state — one member indexed, another
+    // never indexed. Nothing is corrupt, but code retrieval IS incomplete, so the blend
+    // must surface the workspace notice. Its wording must NOT claim corruption, since
+    // the federated path cannot tell "corrupt" from "not yet indexed".
+    let tmp = tempfile::tempdir().unwrap();
+    write_two_member_workspace(tmp.path());
+    // Index ONLY `app`; leave `lib` unindexed (no `lib/.cce/index.json`).
+    let out = Command::new(bin()).args(["index"]).arg(tmp.path().join("app")).output().unwrap();
+    assert!(out.status.success(), "index failed: {}", String::from_utf8_lossy(&out.stderr));
+    index_knowledge(tmp.path(), &feed());
+    let dir = tmp.path().to_string_lossy().to_string();
+
+    let input = format!(
+        "{}{}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+        default_search_call(2, "hash password"),
+    );
+    let out = drive(&["mcp", "--dir", &dir, "--workspace"], &input);
+    let text = tool_text(&out, 2);
+
+    // The incomplete-code notice fires …
+    assert!(
+        text.contains(
+            "NOTICE: one or more workspace member code indexes are missing or could not be loaded"
+        ),
+        "partially-indexed workspace did not surface the incomplete notice:\n{text}"
+    );
+    // … but it must NOT falsely diagnose corruption of a store that was simply
+    // never built.
+    assert!(
+        !text.contains("corrupt or unreadable store"),
+        "partially-indexed workspace got a false corruption claim:\n{text}"
+    );
+    assert!(
+        text.contains("[knowledge] Password hashing policy"),
+        "knowledge hits must still be served:\n{text}"
+    );
+    assert!(!tool_is_error(&out, 2), "an incomplete workspace blend is not an error:\n{out}");
 }
 
 #[test]

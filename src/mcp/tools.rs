@@ -674,7 +674,8 @@ fn gather_code_hits_workspace(server: &McpServer, query: &str, p: &SearchParams)
         // manifest that is truly absent stays silent; one that EXISTS but fails to
         // parse means code retrieval is broken and must be visible.
         Err(_) => {
-            let notice = manifest_path(&root).exists().then_some(CODE_INDEX_LOAD_ERROR_NOTICE);
+            let notice =
+                manifest_path(&root).exists().then_some(WORKSPACE_CODE_INDEX_LOAD_ERROR_NOTICE);
             return (Vec::new(), None, 0, notice, None);
         }
     };
@@ -687,14 +688,16 @@ fn gather_code_hits_workspace(server: &McpServer, query: &str, p: &SearchParams)
     // Cached federated union (issue #26): same bundle the code-only path uses.
     let bundle = match server.workspace_bundle(&manifest, scope.as_deref()) {
         Ok(b) => b,
-        // A workspace whose members were NEVER indexed has no member store on disk —
-        // true absence, silent (the knowledge-only case). Any member store that
-        // EXISTS while the bundle still fails to load (a corrupt/unreadable member)
-        // is a load failure the blend must surface (issue #132).
+        // A workspace whose members were ALL never indexed has no member store on
+        // disk — true absence, silent (the knowledge-only case). If any member store
+        // EXISTS while the bundle still fails to load, code retrieval is incomplete —
+        // whether from a corrupt/unreadable member OR a member not yet indexed (the
+        // common partially-indexed case) — so surface the workspace notice, whose
+        // wording covers all of them without a false corruption claim (issue #132).
         Err(_) => {
             let any_member_store_exists =
                 manifest.members.iter().any(|m| default_store_path(&root.join(&m.path)).exists());
-            let notice = any_member_store_exists.then_some(CODE_INDEX_LOAD_ERROR_NOTICE);
+            let notice = any_member_store_exists.then_some(WORKSPACE_CODE_INDEX_LOAD_ERROR_NOTICE);
             return (Vec::new(), None, 0, notice, None);
         }
     };
@@ -985,6 +988,17 @@ pub(crate) const CODE_INDEX_LOAD_ERROR_NOTICE: &str = "NOTICE: the code index ex
 not be loaded (corrupt or unreadable store) — code results are MISSING from this answer; \
 anything shown below is knowledge-only. Re-run `cce index` (or `cce index --workspace`) to \
 rebuild it.";
+
+/// The workspace counterpart of [`CODE_INDEX_LOAD_ERROR_NOTICE`] (issue #132). The
+/// federated path only knows that at least one member store is on disk while the
+/// bundle failed — a proxy that lumps together a corrupt/unreadable member AND a
+/// member that was simply never indexed (the common partially-indexed steady state).
+/// The wording therefore covers all three and claims only that code results are
+/// INCOMPLETE, never that a specific store is corrupt.
+pub(crate) const WORKSPACE_CODE_INDEX_LOAD_ERROR_NOTICE: &str = "NOTICE: one or more workspace \
+member code indexes are missing or could not be loaded (corrupt, unreadable, or not yet \
+indexed) — code results are INCOMPLETE for this answer; anything shown below may be missing code \
+rows. Re-run `cce index --workspace` to (re)build them.";
 
 /// The query embedder decision for a loaded store (issue #30).
 enum QueryEmbedder {

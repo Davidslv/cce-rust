@@ -86,9 +86,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   the pinned `CODE_INDEX_LOAD_ERROR_NOTICE` through the same visible-
   degradation notice channel as issue #30's Ollama-down notice (knowledge
   hits still served, `isError` still reserved for malformed calls). The
-  workspace variant gets the same split: a corrupt member store or an
-  unparseable manifest surfaces the notice; a workspace whose members were
-  never indexed stays silent. Healthy-path output is byte-unchanged.
+  workspace variant gets the same split, through its own
+  `WORKSPACE_CODE_INDEX_LOAD_ERROR_NOTICE`: because the federated path can
+  only tell that a member store is missing or unloadable (not corrupt vs
+  never-indexed), its wording reports code results as INCOMPLETE and covers
+  corrupt, unreadable, OR not-yet-indexed members — so a normal
+  partially-indexed workspace gets an accurate message, never a false
+  corruption claim. A workspace whose members were all never indexed stays
+  silent. Healthy-path output is byte-unchanged.
 - **A sync push that loses a ref race can no longer report success while
   publishing nothing (#92).** The push retry rebased the working clone onto
   the advanced remote with the result discarded, under the assumption that
