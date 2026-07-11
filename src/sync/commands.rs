@@ -24,8 +24,8 @@ use crate::sync::artifact::{Artifact, ManifestMeta};
 use crate::sync::config::SyncConfig;
 use crate::sync::remote::{GitRemote, SyncRemote};
 use crate::sync::{
-    content_address, git, hex_lower, normalize_repo_id, pointer_address, workspace_graph_address,
-    workspace_manifest_address, HASH_EMBEDDER, SYNC_FORMAT_VERSION,
+    content_address, git, hex_lower, normalize_repo_id, pointer_address, valid_repo_id,
+    workspace_graph_address, workspace_manifest_address, HASH_EMBEDDER, SYNC_FORMAT_VERSION,
 };
 use crate::workspace::{Manifest, Member, MemberType};
 use serde::{Deserialize, Serialize};
@@ -93,17 +93,31 @@ fn short_checksum(s: &str) -> &str {
 /// Resolve the `repo_id` for `root`: the config override, else the normalized git
 /// origin, else an error (we cannot address the cache without one).
 fn resolve_repo_id(root: &Path, cfg: &SyncConfig) -> Result<String, String> {
-    if let Some(id) = &cfg.repo_id {
-        return Ok(id.clone());
+    let id = match &cfg.repo_id {
+        Some(id) => id.clone(),
+        None => match git::origin_url(root) {
+            Some(url) => normalize_repo_id(&url),
+            None => {
+                return Err(
+                    "cannot determine repo_id: no `sync.repo_id` configured and no git origin \
+                     remote. Set one with `cce sync init --repo-id <id>`."
+                        .to_string(),
+                )
+            }
+        },
+    };
+    // #141: the single chokepoint every caller (push, pull, status, init
+    // override) inherits — reject a `repo_id` that is not a single cache path
+    // segment (`.`, `..`, embedded `/`) BEFORE it is built into a content or
+    // pointer address, mirroring the #121 corpus_id fix.
+    if !valid_repo_id(&id) {
+        return Err(format!(
+            "invalid repo_id `{id}`: must be non-empty, charset [A-Za-z0-9._-], and a single \
+             path segment — `.` and `..` are rejected (it is a path segment on the cache, so a \
+             traversal token would escape the repo namespace)"
+        ));
     }
-    match git::origin_url(root) {
-        Some(url) => Ok(normalize_repo_id(&url)),
-        None => {
-            Err("cannot determine repo_id: no `sync.repo_id` configured and no git origin remote. \
-             Set one with `cce sync init --repo-id <id>`."
-                .to_string())
-        }
-    }
+    Ok(id)
 }
 
 /// Open the configured remote, or a clear "no remote" error (offline-first: this is
@@ -1995,6 +2009,31 @@ mod tests {
         assert!(s.contains("local cache   :"));
         assert!(s.contains("remote latest :"));
         std::env::remove_var("CCE_HOME");
+    }
+
+    #[test]
+    fn resolve_repo_id_rejects_path_traversal_ids() {
+        // #141: a config `sync.repo_id` (or `--repo-id` override) of `.`/`..`/an
+        // embedded separator flowed verbatim into content/pointer addresses,
+        // escaping the repo namespace. It must be refused at the resolve
+        // chokepoint every command inherits.
+        let work = tempfile::tempdir().unwrap();
+        let cfg_with = |id: &str| SyncConfig {
+            remote: Some("file:///x".into()),
+            lfs: false,
+            repo_id: Some(id.to_string()),
+            git_ref: None,
+            auto_pull: false,
+            retention: crate::sync::config::Retention::All,
+        };
+        for bad in ["..", ".", "a/b"] {
+            let err = resolve_repo_id(work.path(), &cfg_with(bad)).unwrap_err();
+            assert!(err.contains("invalid repo_id"), "`{bad}` got: {err}");
+        }
+        assert_eq!(
+            resolve_repo_id(work.path(), &cfg_with("example.com__acme__demo")).unwrap(),
+            "example.com__acme__demo"
+        );
     }
 
     #[test]
