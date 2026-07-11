@@ -62,7 +62,9 @@ interchange format** both engines export and import:
   little-endian IEEE-754 `f64` values, so the bytes are identical across Ruby and
   Rust regardless of float→string formatting (the vectors are already bit-equal —
   the hash embedder is deterministic). `checksum` = lowercase-hex SHA-256 over the
-  canonical bytes with the manifest's `checksum` field omitted. Result: the
+  canonical bytes with the manifest's `checksum` field **set to the empty string
+  `""`** (its key is retained, its value blanked — not the key removed), matching
+  SPEC-SYNC-RECONCILE and both engines' verify path. Result: the
   artifact for `repo@sha` is **byte-identical across people and across both
   engines** — so one cache serves everyone and `--verify` works cross-language.
 - Both engines MUST round-trip: export local store → artifact → import into a

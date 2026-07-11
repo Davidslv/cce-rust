@@ -59,6 +59,27 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   channel (code hits still served, `isError` still reserved for malformed calls).
   Code-store and knowledge-store corruption are now surfaced symmetrically, closing
   the asymmetry #132 left. Healthy- and absent-path output is unchanged.
+- **Sync pull no longer rejects a valid pushed artifact as a "checksum
+  mismatch" (#115).** `Artifact::from_bytes` recomputed the checksum by
+  re-serializing the artifact, but reconstructing `file_imports` from the
+  resolved graph edges is lossy (each target file is reduced to a module name),
+  so a module resolvable only via the `.py`/`.js` path-suffix fallback
+  re-resolved to a *different* same-stem corpus file on the pull side, produced a
+  different graph line, and diverged the recomputed checksum — permanently
+  breaking pull for that `repo@sha` with an error falsely implying corruption.
+  Integrity is now verified over the canonical *received* bytes (SHA-256 with the
+  manifest `checksum` blanked), so a byte-identical push always round-trips while
+  genuine corruption is still caught. Canonical pushed bytes and the cross-engine
+  golden are unchanged.
+- **`is_dirty` no longer misparses the first `git status --porcelain` line,
+  keeping the `.cce/` churn exemption correct both ways (#117).** `run()` trims
+  stdout, which strips the leading status column off the first porcelain line
+  (` M .cce/index.json` → `M .cce/index.json`), so the fixed 3-char path offset
+  read the wrong substring: a tracked-modified `.cce/` file was misclassified as
+  real dirt (wrongly blocking `cce sync push`), and a change under a `..cce/`
+  path was misclassified as ignorable churn (wrongly publishing from a dirty
+  tree). `is_dirty` now reads raw, untrimmed porcelain output so every line keeps
+  its status columns.
 - **Workspace member-name suffixing is now collision-free against real
   sibling directories (#131).** `detect_members` minted `basename-N` suffixes
   by a per-basename counter without checking the result against other members'

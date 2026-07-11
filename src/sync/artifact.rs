@@ -213,6 +213,26 @@ fn imports_from_graph(graph: &Value) -> Result<BTreeMap<String, Vec<String>>, St
     Ok(out)
 }
 
+/// SHA-256 over a received artifact stream with the manifest's stored `checksum`
+/// value blanked — the exact definition of the canonical checksum (SPEC-SYNC §2),
+/// but computed over the bytes *as received* rather than over a re-serialization.
+///
+/// This is what makes push→pull→verify lossless. Reconstructing `file_imports`
+/// from the resolved graph edges is intentionally lossy (each `target` file is
+/// reduced to a module name), so re-`build`ing the graph over those names can
+/// re-resolve a module to a *different* same-stem/same-suffix corpus file and
+/// emit a different graph line. Hashing the received bytes directly verifies the
+/// artifact's own integrity without depending on that reconstruction, so a valid,
+/// byte-identical push is never rejected as a "checksum mismatch" (#115).
+fn checksum_over_received(text: &str, stored_checksum: &str) -> String {
+    // The manifest line is canonical compact JSON, so the checksum appears exactly
+    // once as `"checksum":"<hex>"`; blanking it reproduces the stream the checksum
+    // was computed over. `replacen(.., 1)` touches only that first (manifest) hit.
+    let blanked =
+        text.replacen(&format!("\"checksum\":\"{stored_checksum}\""), "\"checksum\":\"\"", 1);
+    hex_lower(&Sha256::digest(blanked.as_bytes()))
+}
+
 /// The manifest JSON `Value`. Keys are sorted by serde_json's `BTreeMap` backing.
 fn manifest_value(m: &Manifest) -> Value {
     json!({
@@ -357,7 +377,12 @@ impl Artifact {
         let file_imports = imports_from_graph(&graph)?;
 
         let artifact = Artifact { manifest, chunks, file_imports };
-        let recomputed = artifact.computed_checksum();
+        // Verify integrity against the CANONICAL RECEIVED bytes, not a
+        // re-serialization: the reconstructed `file_imports` is lossy, so
+        // re-deriving the graph could pick a different same-stem file and falsely
+        // fail (#115). The received bytes are the canonical form the checksum was
+        // computed over — hash them with the checksum field blanked.
+        let recomputed = checksum_over_received(text, &artifact.manifest.checksum);
         if recomputed != artifact.manifest.checksum {
             return Err(format!(
                 "checksum mismatch: manifest says {}, recomputed {}",
@@ -555,6 +580,51 @@ mod tests {
         assert_eq!(
             restored.graph.out_pairs(),
             vec![("payments.py".to_string(), "auth.py".to_string())]
+        );
+    }
+
+    #[test]
+    fn polyglot_suffix_resolved_edge_round_trips_without_checksum_mismatch() {
+        // Repro of #115: `app.js` imports a module that resolves ONLY via the
+        // `.js` path-suffix fallback to `b/myutils.js`, while a same-stem
+        // `a/myutils.ts` sorts first. On push, the graph edge correctly targets
+        // `b/myutils.js`. On pull, `from_bytes` reconstructed `file_imports` by
+        // reducing the target to its stem `myutils`, which re-resolved (stem-first)
+        // to `a/myutils.ts` — a different graph line and thus a different recomputed
+        // checksum — so a valid, byte-identical push was rejected as a "checksum
+        // mismatch" and the repo's cache became permanently unpullable.
+        let file_tokens: BTreeMap<String, usize> = [
+            ("a/myutils.ts".to_string(), 1usize),
+            ("app.js".to_string(), 1usize),
+            ("b/myutils.js".to_string(), 1usize),
+        ]
+        .into_iter()
+        .collect();
+        let file_imports: BTreeMap<String, Vec<String>> =
+            [("app.js".to_string(), vec!["utils".to_string()])].into_iter().collect();
+        let idx = Index::from_parts(Vec::new(), file_imports, file_tokens, "hash".to_string());
+        let a = Artifact::from_index(&idx, meta());
+
+        // The pushed graph edge targets the `.js` suffix match, `b/myutils.js`.
+        let text = String::from_utf8(a.to_bytes()).unwrap();
+        assert!(
+            text.contains("\"source\":\"app.js\",\"target\":\"b/myutils.js\""),
+            "the pushed edge must target the .js file via the suffix fallback; got {text}"
+        );
+
+        // Pull MUST accept its own byte-identical push (this was the P2 bug: the
+        // recomputed checksum diverged and every pull path hard-failed).
+        let parsed = Artifact::from_bytes(&a.to_bytes()).expect(
+            "a valid pushed artifact must round-trip through pull without a checksum mismatch",
+        );
+        assert_eq!(parsed.manifest.checksum, a.manifest.checksum);
+
+        // A single tampered byte anywhere in the stream is still caught — the
+        // integrity check is over the received bytes, not a re-serialization.
+        let tampered = text.replace("\"a/myutils.ts\"", "\"a/OTHER.ts\"");
+        assert!(
+            Artifact::from_bytes(tampered.as_bytes()).unwrap_err().contains("checksum mismatch"),
+            "corruption of the received bytes must still be rejected"
         );
     }
 
