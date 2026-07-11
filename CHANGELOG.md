@@ -69,15 +69,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   successful `put_many` is verified by reading the just-written keys back
   from `origin/<branch>` (byte-compared for pointer/metadata keys; existence
   for possibly-LFS `.cce`/`.cck` artifacts), converting any residual silent
-  failure into a loud one. Clones already poisoned by the old path self-heal:
-  opening a sync clone with a rebase in progress aborts it and restores a
-  clean tree before any operation runs. Deterministic race tests (a
-  pre-receive hook lands a conflicting commit mid-flight, then rejects the
-  first push) cover the conflicted and non-conflicted races, retry
-  exhaustion, and the self-heal, over both the code and knowledge keyspaces,
-  process-level CLI included. `SPEC-SYNC.md` §3/§4, `SPEC-SYNC-KNOWLEDGE.md`
-  §3, `docs/sync.md`, and `docs/DECISIONS.md` no longer claim pushes never
-  conflict in content and now document the re-apply retry.
+  failure into a loud one. The verification is supersede-aware: a competitor
+  who legitimately advances the branch past our commit between our accepted
+  push and the check is NOT a lost publish — when the tip no longer carries
+  an entry, the publish still verifies iff the pushed commit itself carries
+  the content AND is an ancestor of `origin/<branch>`; only a push whose
+  commit never landed errors, and the error names the next step (fetch and
+  inspect the branch; local stores are unaffected; re-run the push). Clones
+  already poisoned by the old path self-heal: opening a sync clone with a
+  rebase in progress aborts it and restores a clean tree before any
+  operation runs (when `--abort` cannot run and the heal falls back to
+  `rebase --quit`, the detached HEAD is re-attached to the cache's real
+  branch — resolved from `origin/HEAD` — never blindly to the default
+  branch name, which would fork a cache living on another branch).
+  Deterministic race tests (a pre-receive hook lands a conflicting commit
+  mid-flight, then rejects the first push; post-receive hooks simulate the
+  supersede and a push whose ref never keeps our commit) cover the
+  conflicted and non-conflicted races, retry exhaustion, the
+  supersede/genuine-loss split, commit-failure propagation, and both heal
+  paths, over both the code and knowledge keyspaces, process-level CLI
+  included. `SPEC-SYNC.md` §3/§4, `SPEC-SYNC-KNOWLEDGE.md` §3/§5,
+  `docs/sync.md` (a troubleshooting row for the `push verification failed`
+  error family included), `docs/knowledge.md`, and `docs/DECISIONS.md` no
+  longer claim pushes never conflict in content, document the re-apply
+  retry, and state plainly that a push that loses the ref race republishes
+  WITHOUT re-running the §5 shrink guard (the behavioral fix is a separate
+  follow-up).
 - **`cce knowledge push` can no longer silently shrink a published corpus (#90).**
   Push replaces the corpus's `current` snapshot wholesale, so a store rebuilt
   locally from only a subset of a corpus's feed sources (feedA of feedA+feedB)

@@ -132,11 +132,57 @@ impl GitRemote {
                     dir.display()
                 )
             })?;
+            // `--quit` leaves HEAD wherever the rebase parked it — usually
+            // DETACHED. Re-attach it to the real cache branch, or `open()`
+            // would resolve no branch and fall back to the default name,
+            // forking a cache that lives on any other branch.
+            Self::reattach_head(dir)?;
         }
         // Drop whatever the aborted rebase left half-applied in the tree.
         git::run(dir, &["reset", "--hard", "--quiet"])
             .map_err(|e| format!("could not restore a clean sync clone at {}: {e}", dir.display()))
             .map(|_| ())
+    }
+
+    /// Re-attach a detached HEAD to the cache branch (resolved from the
+    /// remote's recorded default, falling back to the sole local branch, then
+    /// to [`crate::sync::DEFAULT_REF`]), resetting the branch onto
+    /// `origin/<branch>` when that ref exists.
+    fn reattach_head(dir: &Path) -> Result<(), String> {
+        if git::current_branch(dir).is_some() {
+            return Ok(());
+        }
+        let branch = Self::default_remote_branch(dir);
+        let onto = format!("origin/{branch}");
+        let mut args = vec!["checkout", "--quiet", "--force", "-B", &branch];
+        if git::run(dir, &["rev-parse", "--verify", "--quiet", &onto]).is_ok() {
+            args.push(&onto);
+        } // else: no fetched remote branch to reset onto — attach at HEAD.
+        git::run(dir, &args)
+            .map(|_| ())
+            .map_err(|e| format!("could not re-attach the sync clone at {}: {e}", dir.display()))
+    }
+
+    /// The cache branch a clone with a detached HEAD should re-attach to: the
+    /// remote's recorded default branch (`refs/remotes/origin/HEAD`), else the
+    /// clone's sole local branch, else [`crate::sync::DEFAULT_REF`].
+    fn default_remote_branch(dir: &Path) -> String {
+        if let Ok(sym) = git::run(dir, &["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]) {
+            if let Some(name) = sym.trim().strip_prefix("origin/") {
+                if !name.is_empty() {
+                    return name.to_string();
+                }
+            }
+        }
+        if let Ok(list) =
+            git::run(dir, &["for-each-ref", "--format=%(refname:short)", "refs/heads/"])
+        {
+            let mut branches = list.lines().map(str::trim).filter(|l| !l.is_empty());
+            if let (Some(only), None) = (branches.next(), branches.next()) {
+                return only.to_string();
+            }
+        }
+        crate::sync::DEFAULT_REF.to_string()
     }
 
     /// Write and commit `.gitattributes` for LFS if it is not already present, and
@@ -422,41 +468,76 @@ impl GitRemote {
             .map(|s| s.trim().to_string())
     }
 
-    /// Post-push verification (issue #92): read every just-written key back
-    /// from `origin/<branch>` and confirm the publish actually happened,
-    /// converting any residual silent failure into a loud error. Artifact keys
-    /// (`.cce`/`.cck`) may be git-LFS *pointers* on the remote, so they are
-    /// checked for existence; every other key — exactly the fixed-path pointer
-    /// files this bug lost — is compared byte-for-byte.
-    fn verify_published(&self, entries: &[(String, Vec<u8>)]) -> Result<(), String> {
+    /// Post-push verification (issue #92): confirm the publish actually
+    /// happened, converting any residual silent failure into a loud error.
+    ///
+    /// Fast path: read every just-written key back from the TIP of
+    /// `origin/<branch>`. The preceding fetch is best-effort: when it fails,
+    /// the comparison runs against the remote-tracking ref our own successful
+    /// push just updated — still safe, but a real remote round-trip only when
+    /// the fetch works.
+    ///
+    /// Supersede path: a competitor may legitimately advance `origin/<branch>`
+    /// past our commit between our push and this check — high contention is
+    /// exactly this code's territory, and being superseded is NOT a lost
+    /// publish. When the tip no longer carries an entry, the publish is
+    /// verified iff BOTH (a) `pushed_sha` — the commit our push landed —
+    /// itself carries the entry (guarding against any future commit-swallow
+    /// regression, where ancestry alone would be vacuously true because HEAD
+    /// never left origin's own commit), AND (b) `pushed_sha` is an ancestor of
+    /// `origin/<branch>`, i.e. our commit really landed on the remote branch
+    /// and whatever replaced our bytes built on top of them.
+    fn verify_published(
+        &self,
+        entries: &[(String, Vec<u8>)],
+        pushed_sha: &str,
+    ) -> Result<(), String> {
         self.fetch()?;
+        let tip = format!("origin/{}", self.branch);
+        let next_step = format!(
+            "fetch and inspect origin/{}; local stores are unaffected; re-run the push to retry",
+            self.branch
+        );
+        let mut ancestry_verified = false;
         for (key, bytes) in entries {
-            if key.ends_with(".cce") || key.ends_with(".cck") {
-                if git::run(&self.dir, &["cat-file", "-e", &self.ref_path(key)]).is_err() {
-                    return Err(format!(
-                        "push verification failed: {key} is missing from origin/{} after the \
-                         push — nothing was published",
-                        self.branch
-                    ));
-                }
+            if self.commit_carries(&tip, key, bytes) {
                 continue;
             }
-            let got = git::run_bytes(&self.dir, &["cat-file", "blob", &self.ref_path(key)])
-                .map_err(|e| {
-                    format!(
-                        "push verification failed: cannot read {key} back from origin/{}: {e}",
-                        self.branch
-                    )
-                })?;
-            if got != *bytes {
+            // The tip moved past us: superseded (fine) or lost (loud).
+            if !self.commit_carries(pushed_sha, key, bytes) {
                 return Err(format!(
-                    "push verification failed: {key} on origin/{} does not carry the \
-                     just-pushed bytes — the publish was lost",
+                    "push verification failed: neither origin/{} nor the pushed commit \
+                     {pushed_sha} carries {key} with the just-pushed content — {next_step}",
                     self.branch
                 ));
             }
+            if !ancestry_verified {
+                if git::run(&self.dir, &["merge-base", "--is-ancestor", pushed_sha, &tip]).is_err()
+                {
+                    return Err(format!(
+                        "push verification failed: the pushed commit {pushed_sha} carrying \
+                         {key} never landed on origin/{} — nothing was published; {next_step}",
+                        self.branch
+                    ));
+                }
+                ancestry_verified = true;
+            }
         }
         Ok(())
+    }
+
+    /// Does `treeish` carry `key`? Artifact keys (`.cce`/`.cck`) may be git-LFS
+    /// *pointers* on the remote, so they are checked for existence; every other
+    /// key — exactly the fixed-path pointer files issue #92 lost — is compared
+    /// byte-for-byte against `bytes`.
+    fn commit_carries(&self, treeish: &str, key: &str, bytes: &[u8]) -> bool {
+        let spec = format!("{treeish}:{key}");
+        if key.ends_with(".cce") || key.ends_with(".cck") {
+            return git::run(&self.dir, &["cat-file", "-e", &spec]).is_ok();
+        }
+        git::run_bytes(&self.dir, &["cat-file", "blob", &spec])
+            .map(|got| got == bytes)
+            .unwrap_or(false)
     }
 }
 
@@ -520,9 +601,15 @@ impl SyncRemote for GitRemote {
         };
         apply()?;
         self.push_with_retry(&apply)?;
+        // The exact commit the successful push landed (HEAD after the final
+        // apply): verification must never confuse "superseded by a competitor
+        // right after our push" with "never published".
+        let pushed_sha = git::head_sha(&self.dir).ok_or_else(|| {
+            "push verification failed: cannot resolve the just-pushed commit".to_string()
+        })?;
         // Belt and braces (#92): a push that "succeeded" without publishing our
         // content must error loudly, never report success.
-        self.verify_published(entries)
+        self.verify_published(entries, &pushed_sha)
     }
 
     /// Keys ending in `suffix` under `prefix` (moved verbatim from the former
@@ -999,6 +1086,165 @@ mod tests {
         healed.put(key, b"bbbb2222\n").unwrap();
         let published = git::run(bare.path(), &["show", &format!("main:{key}")]).unwrap();
         assert_eq!(published, "bbbb2222");
+        std::env::remove_var("CCE_HOME");
+    }
+
+    /// Install an arbitrary post-receive hook on the bare remote.
+    #[cfg(unix)]
+    fn arm_post_receive_hook(bare: &Path, script: &str) {
+        use std::os::unix::fs::PermissionsExt;
+        let hook = bare.join("hooks").join("post-receive");
+        std::fs::write(&hook, script).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn superseding_competitor_push_after_ours_is_not_a_lost_publish() {
+        // A competitor can legitimately advance origin/<branch> past our
+        // commit BETWEEN our accepted push and the verification fetch — high
+        // contention is exactly what #92 targets. Being superseded is not a
+        // lost publish: our commit landed and the competitor built on top of
+        // it, so put_many must return Ok (an Err here would steer the
+        // operator into a retry that clobbers the competitor). Simulated with
+        // a post-receive hook that commits a conflicting rewrite of the same
+        // fixed path on top of our just-accepted push.
+        let _home = with_home();
+        let (bare, url) = bare_remote();
+        let remote = GitRemote::open(&url, false).unwrap();
+        let key = "knowledge/v1/corpus/current";
+        remote.put(key, b"aaaa1111\n").unwrap();
+
+        arm_post_receive_hook(
+            bare.path(),
+            "#!/bin/sh\n\
+             [ -f \"$GIT_DIR/superseded\" ] && exit 0\n\
+             touch \"$GIT_DIR/superseded\"\n\
+             blob=$(printf 'competitor\\n' | git hash-object -w --stdin)\n\
+             export GIT_INDEX_FILE=\"$GIT_DIR/tmp-index\"\n\
+             git read-tree main\n\
+             git update-index --add --cacheinfo \"100644,$blob,knowledge/v1/corpus/current\"\n\
+             tree=$(git write-tree)\n\
+             commit=$(GIT_AUTHOR_NAME=r GIT_AUTHOR_EMAIL=r@e GIT_COMMITTER_NAME=r \
+             GIT_COMMITTER_EMAIL=r@e git commit-tree \"$tree\" -p main -m supersede)\n\
+             git update-ref refs/heads/main \"$commit\"\n\
+             exit 0\n",
+        );
+        // Our push is ACCEPTED, then immediately superseded: still a success.
+        remote.put(key, b"bbbb2222\n").unwrap();
+
+        // The remote tip is the competitor's, with our commit as its parent.
+        let tip = git::run(bare.path(), &["show", &format!("main:{key}")]).unwrap();
+        assert_eq!(tip, "competitor");
+        let ours = git::run(bare.path(), &["show", &format!("main~1:{key}")]).unwrap();
+        assert_eq!(ours, "bbbb2222");
+        std::env::remove_var("CCE_HOME");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn push_accepted_but_never_landing_on_the_ref_is_a_loud_error() {
+        // The other half of the supersede fix, and the mutation-test pin for
+        // verify_published (deleting the verify call must fail THIS test): a
+        // push git reports as accepted whose ref never carries our commit —
+        // post-receive resets the ref to its old value, discarding ours — is
+        // a lost publish and must be a real Err, never Ok.
+        let _home = with_home();
+        let (bare, url) = bare_remote();
+        let remote = GitRemote::open(&url, false).unwrap();
+        let key = "knowledge/v1/corpus/current";
+        remote.put(key, b"aaaa1111\n").unwrap();
+
+        arm_post_receive_hook(
+            bare.path(),
+            "#!/bin/sh\n\
+             while read old new ref; do git update-ref \"$ref\" \"$old\"; done\n\
+             exit 0\n",
+        );
+        let err = remote.put(key, b"bbbb2222\n").unwrap_err();
+        assert!(err.contains("push verification failed"), "got {err}");
+        assert!(err.contains("re-run the push"), "the error must name a next step: {err}");
+        // The remote really kept the old state; the clone is clean.
+        let kept = git::run(bare.path(), &["show", &format!("main:{key}")]).unwrap();
+        assert_eq!(kept, "aaaa1111");
+        assert!(no_rebase_in_progress(&remote), "clone left mid-rebase");
+        std::env::remove_var("CCE_HOME");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn commit_failure_in_put_many_is_a_real_error_not_a_silent_no_op() {
+        // The mutation-test pin for commit-error propagation: restoring the
+        // old `Err(_) => { /* fall through */ }` swallow must fail THIS test.
+        // A pre-commit hook inside the clone vetoes the commit; put_many must
+        // surface THAT failure (the veto marker), not blunder on to a push of
+        // stale HEAD (which post-push verification would report differently).
+        use std::os::unix::fs::PermissionsExt;
+        let _home = with_home();
+        let (_bare, url) = bare_remote();
+        let remote = GitRemote::open(&url, false).unwrap();
+        remote.put("knowledge/v1/corpus/current", b"aaaa1111\n").unwrap();
+
+        let hook = remote.dir().join(".git").join("hooks").join("pre-commit");
+        std::fs::create_dir_all(hook.parent().unwrap()).unwrap();
+        std::fs::write(&hook, "#!/bin/sh\necho 'pre-commit veto' >&2\nexit 1\n").unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        let err = remote.put("knowledge/v1/corpus/current", b"bbbb2222\n").unwrap_err();
+        assert!(err.contains("pre-commit veto"), "commit failure must propagate, got: {err}");
+        std::env::remove_var("CCE_HOME");
+    }
+
+    #[test]
+    fn heal_reattaches_a_detached_head_on_a_non_default_branch() {
+        // When `rebase --abort` cannot run and the heal falls back to
+        // `rebase --quit`, HEAD stays detached. The heal must re-attach it to
+        // the REAL cache branch (from origin/HEAD) — falling back to the
+        // default branch name on a cache living on another branch would push
+        // refs/heads/main and fork the cache.
+        let _home = with_home();
+        let bare = tempfile::tempdir().unwrap();
+        git::run_commit(bare.path(), &["init", "--bare", "-q", "-b", "trunk"]).unwrap();
+        let url = format!("file://{}", bare.path().to_string_lossy());
+        let remote = GitRemote::open(&url, false).unwrap();
+        assert_eq!(remote.branch(), "trunk");
+        let key = "knowledge/v1/corpus/current";
+        remote.put(key, b"aaaa1111\n").unwrap();
+
+        // Poison: doomed local commit + conflicting remote commit + a rebase
+        // that stops on the conflict, then break `--abort` by removing the
+        // rebase bookkeeping it restores from (the fall-back `--quit` path).
+        let dir = remote.dir().to_path_buf();
+        std::fs::write(dir.join(key), b"local5555\n").unwrap();
+        git::run_commit(&dir, &["add", "--", key]).unwrap();
+        git::run_commit(&dir, &["commit", "-q", "-m", "doomed local commit"]).unwrap();
+        let other_home = tempfile::tempdir().unwrap();
+        std::env::set_var("CCE_HOME", other_home.path());
+        let other = GitRemote::open(&url, false).unwrap();
+        other.put(key, b"remote7777\n").unwrap();
+        std::env::set_var("CCE_HOME", _home.path());
+        git::run(&dir, &["fetch", "--quiet", "origin"]).unwrap();
+        assert!(git::run_commit(&dir, &["rebase", "--quiet", "origin/trunk"]).is_err());
+        let state = dir.join(".git").join("rebase-merge");
+        assert!(state.exists(), "test setup failed to leave a rebase in progress");
+        let _ = std::fs::remove_file(state.join("orig-head"));
+        let _ = std::fs::remove_file(state.join("head"));
+        assert!(
+            git::run(&dir, &["rebase", "--abort"]).is_err(),
+            "test setup: --abort should be broken so the --quit path is exercised"
+        );
+
+        // Re-open: heal quits the rebase, re-attaches HEAD to trunk (never the
+        // DEFAULT_REF fallback), and the next push publishes to trunk.
+        let healed = GitRemote::open(&url, false).unwrap();
+        assert!(no_rebase_in_progress(&healed), "open did not heal the mid-rebase clone");
+        assert_eq!(healed.branch(), "trunk");
+        assert_eq!(git::current_branch(healed.dir()).as_deref(), Some("trunk"));
+        healed.put(key, b"bbbb2222\n").unwrap();
+        let published = git::run(bare.path(), &["show", &format!("trunk:{key}")]).unwrap();
+        assert_eq!(published, "bbbb2222");
+        // No forked default branch was created on the remote.
+        assert!(git::run(bare.path(), &["show-ref", "--verify", "refs/heads/main"]).is_err());
         std::env::remove_var("CCE_HOME");
     }
 }

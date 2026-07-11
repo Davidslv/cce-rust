@@ -390,6 +390,9 @@ Rules (normative):
   engine's push path, so engine parity (§13) requires other engines to
   implement the same rule — and a read-then-publish guard, not a transaction:
   two concurrent pushers can each pass it against the same remote state.
+  A push that loses the ref race re-applies and republishes WITHOUT
+  re-running the guard, so a racing competitor's additions can be
+  unpublished without warning.
 - **`--dry-run`:** compute and print the same diff report, then exit 0 having
   published **nothing** — no artifact, no pointer move, no `corpus.json`, no
   retention. Against a corpus with no remote pointer it reports that the push

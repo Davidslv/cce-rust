@@ -204,7 +204,10 @@ cce sync verify --checksum-only     # covers the pulled knowledge store too
   silently replacing what it cannot read — `--force` is the only bypass (it
   skips the diff entirely). The guard reads remote state before publishing, so
   two simultaneous builders can both pass it — it is a guard, not a
-  transaction. It is also client-side: older cce versions push without it.
+  transaction; a push that loses the ref race re-applies and republishes
+  without re-running the guard, so a racing competitor's additions can be
+  unpublished without warning. It is also client-side: older cce versions push
+  without it.
 - **`--dry-run`** computes and prints the same diff, then exits 0 **without
   pushing anything** (no artifact, no pointer move, no retention) — the
   blast-radius preview. Against a corpus with no remote pointer it reports that

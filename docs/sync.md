@@ -154,7 +154,9 @@ the artifact at its content path, commits, and `git push` (a lost ref race
 fetches, re-applies the write on the new remote state, and retries). `get`
 fetches and reads the file back. A working clone found with a rebase in progress
 (a state older versions could leave behind after a lost race) is recovered
-automatically the next time any sync operation opens it.
+automatically the next time any sync operation opens it. The clone directory is
+program-owned and disposable — operations hard-reset it to the remote state, so
+never keep work of your own under `~/.cce/sync/`.
 
 Artifacts are large, so `*.cce` blobs use **git-LFS** by default (`sync.lfs: true`).
 `cce sync init --lfs` writes the `.gitattributes` and runs `git lfs install`.
@@ -479,6 +481,8 @@ access to the cache repo to `pull`; members with write access may also push
 | `no install checksum recorded (pulled by an older cce)` | the `.cce/synced.json` marker predates `installed_sha256` | not a failure (exit 0) — re-pull with `cce sync pull --force` to record the hash |
 | LFS: `git-lfs` filter errors on `get` | `.gitattributes` routes `*.cce` through LFS but `git-lfs` is not installed | `git lfs install`, or `cce sync init --no-lfs` for a plain-git cache |
 | `local cache is at … but you are pulling …` | pulling a different sha over an existing cache | `cce sync pull --force` (only if you intend to overwrite) |
+| `push failed after 5 attempts …` | the push kept losing the ref race, or the remote kept refusing (auth, hooks) | nothing was published and local stores are unaffected; check remote access and re-run the push |
+| `push verification failed …` | the push was reported accepted but the just-written keys could not be confirmed on the remote branch (e.g. a server-side hook moved the ref) | fetch and inspect `origin/<branch>`; local stores are unaffected; re-run the push to retry |
 
 Offline is never fatal: with no remote, or an unreachable one, `cce index`,
 `cce search`, and `cce sync status` all still work — `status` simply reports the
