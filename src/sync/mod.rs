@@ -28,7 +28,7 @@ pub mod knowledge_commands;
 pub mod remote;
 
 use sha2::{Digest, Sha256};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 
 /// The only shareable embedder id (SPEC-SYNC §1/§3): the deterministic hash
 /// embedder. Ollama/semantic indexes are non-reproducible and never pushed.
@@ -168,6 +168,7 @@ pub fn knowledge_contract_version() -> &'static str {
 /// prefix is disjoint from every `<embedder_id>/…` prefix, so introducing it is
 /// additive — no existing key or old-client read path can collide with it.
 pub fn knowledge_content_address(contract_ver: &str, corpus_id: &str, snapshot: &str) -> String {
+    debug_assert!(valid_corpus_id(corpus_id), "unvalidated corpus_id `{corpus_id}` (#121)");
     format!("knowledge/{contract_ver}/{corpus_id}/{snapshot}.cck")
 }
 
@@ -175,6 +176,7 @@ pub fn knowledge_content_address(contract_ver: &str, corpus_id: &str, snapshot: 
 /// naming the corpus's active snapshot — the exact analogue of the code cache's
 /// `refs/<ref>` pointers (and of the local store's `.cce/knowledge/current`).
 pub fn knowledge_pointer_address(contract_ver: &str, corpus_id: &str) -> String {
+    debug_assert!(valid_corpus_id(corpus_id), "unvalidated corpus_id `{corpus_id}` (#121)");
     format!("knowledge/{contract_ver}/{corpus_id}/current")
 }
 
@@ -182,15 +184,28 @@ pub fn knowledge_pointer_address(contract_ver: &str, corpus_id: &str) -> String 
 /// non-LFS `corpus.json` blob carrying `pushed_at` (deliberately OUTSIDE the
 /// reproducible artifact) — the #55 well-known-key pattern.
 pub fn knowledge_corpus_meta_address(contract_ver: &str, corpus_id: &str) -> String {
+    debug_assert!(valid_corpus_id(corpus_id), "unvalidated corpus_id `{corpus_id}` (#121)");
     format!("knowledge/{contract_ver}/{corpus_id}/corpus.json")
 }
 
 /// Validate a `corpus_id` (SPEC-SYNC-KNOWLEDGE §4.1): non-empty, charset
-/// `[A-Za-z0-9._-]`, and **sanitize-stable** — push refuses an id `sanitize_id`
+/// `[A-Za-z0-9._-]`, **sanitize-stable** — push refuses an id `sanitize_id`
 /// would alter rather than silently rewriting it (the repo_id discipline, with
-/// derivation dropped: knowledge has no git origin to normalize).
+/// derivation dropped: knowledge has no git origin to normalize) — and a
+/// **single normal path segment**. `.` and `..` are sanitize-stable yet resolve
+/// OUT of the corpus namespace once used as a path segment on the cache
+/// (`knowledge/<ver>/..` normalizes to `knowledge/`), which let a retention
+/// prune under `--corpus ..` delete other corpora's artifacts (#121). The
+/// charset already excludes path separators; the component check pins down the
+/// two traversal tokens (belt and braces: any id that does not resolve to
+/// exactly one `Normal` component is rejected).
 pub fn valid_corpus_id(id: &str) -> bool {
-    !id.is_empty() && sanitize_id(id) == id
+    if id.is_empty() || sanitize_id(id) != id {
+        return false;
+    }
+    let mut components = Path::new(id).components();
+    matches!(components.next(), Some(std::path::Component::Normal(_)))
+        && components.next().is_none()
 }
 
 /// The base directory that holds every remote's local working clone. It is
@@ -315,6 +330,25 @@ mod tests {
         assert!(!valid_corpus_id("has space"));
         assert!(!valid_corpus_id("has/slash"));
         assert!(!valid_corpus_id("emoji✨"));
+    }
+
+    #[test]
+    fn corpus_id_validation_rejects_path_traversal_tokens() {
+        // #121: `.` and `..` are sanitize-stable, yet as a path segment on the
+        // cache they escape the corpus namespace (`knowledge/v1/..` normalizes
+        // to `knowledge/`), so retention pruning under such an id can delete
+        // OTHER corpora's artifacts. Both must be rejected outright.
+        assert!(!valid_corpus_id(".."));
+        assert!(!valid_corpus_id("."));
+        // Dots INSIDE a name are not traversal — legitimate dotted ids stay valid.
+        assert!(valid_corpus_id("my.corpus.v1"));
+        assert!(valid_corpus_id("a-b_c.2"));
+        assert!(valid_corpus_id("team.handbook"));
+        // Leading/trailing single dots in a longer id are a single harmless
+        // path segment; only exactly-`.`/`..` resolve elsewhere.
+        assert!(valid_corpus_id(".hidden"));
+        assert!(valid_corpus_id("v1."));
+        assert!(valid_corpus_id("..."));
     }
 
     #[test]

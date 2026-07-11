@@ -174,8 +174,9 @@ fn resolve_corpus_id(
     })?;
     if !valid_corpus_id(&id) {
         return Err(format!(
-            "invalid corpus_id `{id}`: must be non-empty, charset [A-Za-z0-9._-] \
-             (sanitize-stable — it is a path segment on the cache)"
+            "invalid corpus_id `{id}`: must be non-empty, charset [A-Za-z0-9._-], and a \
+             single path segment — `.` and `..` are rejected (it is a path segment on \
+             the cache, so a traversal token would escape the corpus namespace)"
         ));
     }
     Ok(id)
@@ -217,6 +218,9 @@ fn apply_retention(
         return Ok(Vec::new());
     };
     let ver = knowledge_contract_version();
+    // Defense in depth (#121): retention is the destructive consumer of this
+    // prefix — a traversal token here would enumerate (and prune) EVERY corpus.
+    debug_assert!(valid_corpus_id(corpus_id), "unvalidated corpus_id `{corpus_id}` (#121)");
     let prefix = format!("knowledge/{ver}/{corpus_id}");
     let keys = remote.list_keys_with_suffix(&prefix, ".cck")?;
     // Oldest first by first-added COMMIT ORDER (not timestamps — two pushes in
@@ -664,6 +668,32 @@ mod tests {
         let tmp = tempfile::tempdir().unwrap();
         let err = push(tmp.path(), Some("c1".into()), Some("file:///x".into())).unwrap_err();
         assert!(err.contains("no local knowledge store"), "got: {err}");
+    }
+
+    #[test]
+    fn push_and_pull_reject_traversal_corpus_ids_before_any_remote_operation() {
+        let _home = with_home();
+        let root = root_with_store(&feed("a"));
+        // #121: `--corpus ..` used to pass validation and become the path
+        // segment `knowledge/v1/..` on the cache — escaping the corpus
+        // namespace and letting retention prune delete OTHER corpora's
+        // artifacts. The rejection must fire BEFORE any filesystem or remote
+        // operation: the remote URL below points nowhere, so reaching it
+        // (clone attempt) would surface a different error than the one asserted.
+        for id in ["..", "."] {
+            let err =
+                push(root.path(), Some(id.into()), Some("file:///nonexistent".into())).unwrap_err();
+            assert!(err.contains("invalid corpus_id"), "push `{id}` got: {err}");
+            let err = cmd_knowledge_pull(
+                root.path(),
+                Some(id.into()),
+                None,
+                false,
+                Some("file:///nonexistent".into()),
+            )
+            .unwrap_err();
+            assert!(err.contains("invalid corpus_id"), "pull `{id}` got: {err}");
+        }
     }
 
     #[test]
