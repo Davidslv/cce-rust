@@ -144,6 +144,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   vector coincidence inside the `top_k` window could consume a slot and drop a
   qualifying entry ranked just below it. Recall now ranks the whole corpus,
   filters, then truncates to `top_k`.
+- **Punt phrase `n/a` no longer substring-matches file paths, so correct
+  answers are not silently misgraded as punts (#106).** `is_punt` in
+  `src/eval.rs` did a raw case-insensitive substring scan, so an answer citing a
+  multi-segment path like `common/auth.py` (`…commo·n/a·uth…`) graded `Punt`,
+  zeroing the correctness-gated A/B paired set. Punt phrases now match only on
+  non-alphanumeric word boundaries, so `N/A` as a real non-answer still fires
+  while a path segment never does.
 - **Memory append is a single write with a newline guard, so a torn or
   interleaved append can no longer silently lose entries (#102).** `append`
   in `src/memory.rs` wrote the JSON line and its trailing `\n` as two separate
