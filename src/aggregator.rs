@@ -199,6 +199,33 @@ pub fn direction(delta: f64) -> &'static str {
     }
 }
 
+/// Sum `u64` metric values, clamping at `u64::MAX` instead of overflowing (#127).
+/// If the clamp actually engages — only possible with a corrupt or forged log
+/// value — emit a one-line warning to STDERR (never STDOUT: this can run under the
+/// dashboard server) so the resulting nonsense figure, which flows into
+/// `cost_saved_usd`, is not silently trusted.
+fn saturating_metric_sum(vals: impl IntoIterator<Item = u64>, what: &str) -> u64 {
+    let mut total: u64 = 0;
+    let mut clamped = false;
+    for v in vals {
+        match total.checked_add(v) {
+            Some(t) => total = t,
+            None => {
+                total = u64::MAX;
+                clamped = true;
+            }
+        }
+    }
+    if clamped {
+        eprintln!(
+            "warning: {what} overflowed u64 and was clamped to u64::MAX; the reported \
+             total (and any cost derived from it) is not meaningful — check the metrics \
+             log for a corrupt or forged value"
+        );
+    }
+    total
+}
+
 /// Mean of `xs`, or 0.0 when empty.
 fn mean(xs: &[f64]) -> f64 {
     if xs.is_empty() {
@@ -281,7 +308,10 @@ fn compute_usage_by_source(searches: &[(usize, &SearchEvent)]) -> UsageBySource 
 
 /// The usage figures for one source bucket.
 fn source_usage(searches: &[&SearchEvent]) -> SourceUsage {
-    let tokens_saved: u64 = searches.iter().map(|s| s.tokens_saved).sum();
+    // Saturating so a corrupt/forged tokens_saved (e.g. u64::MAX) clamps instead of
+    // overflow-panicking (debug) or wrapping to garbage (release) — see #127.
+    let tokens_saved =
+        saturating_metric_sum(searches.iter().map(|s| s.tokens_saved), "tokens_saved (by source)");
     let ratios: Vec<f64> = searches.iter().map(|s| s.savings_ratio).collect();
     let latencies: Vec<f64> = searches.iter().map(|s| s.latency_ms).collect();
     SourceUsage {
@@ -296,7 +326,10 @@ fn source_usage(searches: &[&SearchEvent]) -> SourceUsage {
 /// Sum the sensitive-files-skipped over the log's index runs (v2.4.1).
 fn compute_secret_safety(indexes: &[(usize, &IndexEvent)]) -> SecretSafety {
     SecretSafety {
-        sensitive_skipped: indexes.iter().map(|(_, x)| x.sensitive_skipped).sum(),
+        sensitive_skipped: saturating_metric_sum(
+            indexes.iter().map(|(_, x)| x.sensitive_skipped),
+            "sensitive_skipped",
+        ),
         index_runs: indexes.len() as u64,
     }
 }
@@ -321,7 +354,12 @@ fn compute_totals(
     index_count: u64,
     price: f64,
 ) -> Totals {
-    let tokens_saved: u64 = searches.iter().map(|(_, s)| s.tokens_saved).sum();
+    // Saturating roll-up: a forged/corrupt tokens_saved cannot panic (debug) or
+    // wrap to garbage (release), matching savings.rs's saturating policy — see #127.
+    let tokens_saved = saturating_metric_sum(
+        searches.iter().map(|(_, s)| s.tokens_saved),
+        "tokens_saved (totals)",
+    );
     let ratios: Vec<f64> = searches.iter().map(|(_, s)| s.savings_ratio).collect();
     let all: Vec<&SearchEvent> = searches.iter().map(|(_, s)| *s).collect();
     let helpful = feedback.iter().filter(|(_, f)| f.helpful).count() as u64;
@@ -373,7 +411,10 @@ fn compute_savings(searches: &[(usize, &SearchEvent)], now_secs: i64) -> Savings
 fn savings_window(searches: &[(usize, &SearchEvent)], win: &Window) -> SavingsWindow {
     let in_win: Vec<&SearchEvent> =
         searches.iter().filter(|(_, s)| win.contains(s.secs)).map(|(_, s)| *s).collect();
-    let tokens_saved: u64 = in_win.iter().map(|s| s.tokens_saved).sum();
+    let tokens_saved = saturating_metric_sum(
+        in_win.iter().map(|s| s.tokens_saved),
+        "tokens_saved (savings window)",
+    );
     let ratios: Vec<f64> = in_win.iter().map(|s| s.savings_ratio).collect();
     SavingsWindow {
         searches: in_win.len() as u64,
@@ -443,10 +484,17 @@ fn compute_daily(
     // BTreeMap keyed by date gives ascending order. A date appears iff it has at
     // least one search or feedback event (index-only days do not appear).
     let mut by_day: BTreeMap<String, DayAcc> = BTreeMap::new();
+    let mut clamped = false;
     for (_, s) in searches {
         let acc = by_day.entry(date_str(s.secs)).or_default();
         acc.searches += 1;
-        acc.tokens_saved += s.tokens_saved;
+        match acc.tokens_saved.checked_add(s.tokens_saved) {
+            Some(t) => acc.tokens_saved = t,
+            None => {
+                acc.tokens_saved = u64::MAX;
+                clamped = true;
+            }
+        }
         acc.ratios.push(s.savings_ratio);
         if s.result_count > 0 {
             acc.top_scores.push(s.top_score);
@@ -465,6 +513,13 @@ fn compute_daily(
         } else {
             acc.not_helpful += 1;
         }
+    }
+    if clamped {
+        eprintln!(
+            "warning: daily tokens_saved overflowed u64 and was clamped to u64::MAX; the \
+             affected day's total is not meaningful — check the metrics log for a corrupt \
+             or forged value"
+        );
     }
     by_day
         .into_iter()
@@ -562,6 +617,45 @@ mod tests {
         assert_eq!(direction(-0.01), "down");
         assert_eq!(direction(0.0), "flat");
         assert_eq!(direction(1e-12), "flat"); // within epsilon
+    }
+
+    #[test]
+    fn saturating_metric_sum_clamps_on_overflow() {
+        // #127 observability: the shared fold clamps at u64::MAX on overflow (and
+        // emits a STDERR warning — exercised here, asserted by value). A normal sum
+        // is unaffected.
+        assert_eq!(saturating_metric_sum([1u64, 2, 3], "test"), 6);
+        assert_eq!(saturating_metric_sum([u64::MAX, u64::MAX], "test"), u64::MAX);
+        assert_eq!(saturating_metric_sum([u64::MAX, 1], "test"), u64::MAX);
+        assert_eq!(saturating_metric_sum(std::iter::empty(), "test"), 0);
+    }
+
+    #[test]
+    fn adversarial_tokens_saved_saturates_instead_of_overflowing() {
+        // #127: two search events whose tokens_saved sum past u64::MAX must clamp to
+        // u64::MAX, not overflow-panic (debug) or wrap to garbage (release). The
+        // assertion pins the graceful SATURATED result, so it holds in BOTH profiles.
+        let line = |id: &str, ts: &str| {
+            format!(
+                "{{\"schema\":\"cce.metrics/v1\",\"event\":\"search\",\"ts\":\"{ts}\",\
+                 \"id\":\"{id}\",\"query\":\"q\",\"result_count\":1,\
+                 \"tokens_saved\":18446744073709551615,\"savings_ratio\":0.5,\
+                 \"top_score\":0.9,\"empty\":false,\"low_confidence\":false}}"
+            )
+        };
+        let text = format!(
+            "{}\n{}\n",
+            line("aaaaaaaaaaaa", "2026-07-04T10:00:00Z"),
+            line("bbbbbbbbbbbb", "2026-07-04T11:00:00Z")
+        );
+        let events = parse_log(&text).events;
+        let agg = aggregate(&events, now(), 3.00);
+        // Totals, per-source, per-window, and daily roll-ups all clamp at u64::MAX.
+        assert_eq!(agg.totals.tokens_saved, u64::MAX);
+        assert_eq!(agg.by_source.cli.tokens_saved, u64::MAX);
+        assert_eq!(agg.north_star.savings.current.tokens_saved, u64::MAX);
+        let day = agg.series.daily.iter().find(|d| d.date == "2026-07-04").unwrap();
+        assert_eq!(day.tokens_saved, u64::MAX);
     }
 
     #[test]

@@ -177,6 +177,51 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   project config that exists but does not parse is now surfaced with a clear
   warning and the load stays all-local, so the misconfiguration cannot be masked
   by an unrelated global remote.
+- **The dashboard sets a read timeout so an idle or half-open connection can no
+  longer hang the server (#128).** `handle_connection_with` blocked forever in
+  `read_line` on a connection that sent no bytes (e.g. a browser speculative
+- **The dashboard sets a read timeout so an idle connection that sends no bytes
+  can no longer hang the server (#128).** `handle_connection_with` blocked forever
+  in `read_line` on a connection that sent no bytes (e.g. a browser speculative
+  preconnect); because connections are served serially, one such socket stalled
+  every later request indefinitely. The request-line read now has a bounded
+  `set_read_timeout`, so a fully-idle socket is dropped after the timeout and the
+  server recovers. The normal request path is unaffected (covered by a new
+  real-socket serve test). Note this is a per-read deadline (it resets on each
+  byte received), so it fixes the reported zero-byte / preconnect hang but not a
+  slowloris that dribbles one byte per window; a whole-request deadline is tracked
+  as follow-up #160.
+- **`parse_iso` applies an explicit timezone offset and rejects impossible
+  calendar dates (#130).** The ISO parser validated only the first 19 bytes and
+  ignored the timezone suffix, so `--since 2026-07-01T09:45:00+09:00` was read as
+  `09:45Z` (should be `00:45Z`), silently excluding in-window events, and
+  `2026-02-31` was accepted and normalized to March 3. It now parses and applies
+  `Z` / `±HH` / `±HHMM` / `±HH:MM` offsets, rejects any other trailing text, and
+  rejects a day that fails the civil-date round-trip. Self-written timestamps
+  (always `…Z`) are unaffected. Behavior change: a `--since` value that was
+  previously accepted loosely — an impossible date like `2026-02-31` (silently
+  normalized to March 3) or a fractional-second instant like
+  `2026-07-01T09:45:00.500Z` — is now rejected with a clean `invalid --since`
+  error instead of being accepted or misread.
+- **`cce usage --since` rejects an overflowing relative duration with a clear
+  error instead of panicking or wrapping (#129).** `parse_since` in
+  `src/usage.rs` multiplied the parsed count by the unit seconds with unchecked
+  i64 arithmetic, so a count like `999999999999999d` panicked in debug and
+  wrapped to a garbage cutoff in release. It now uses `checked_mul` (surfacing
+  the standard `invalid --since` guidance on overflow) and a saturating
+  subtraction for the cutoff. Verified in a release build: the overflow is an
+  error, not a wrapped cutoff.
+- **Aggregate roll-ups sum `tokens_saved` (and `sensitive_skipped`) with
+  saturating u64 arithmetic, so a corrupt or forged log value can no longer
+  overflow-panic `cce usage` / kill the dashboard process in debug, nor wrap to
+  a garbage total in release (#127).** `compute_totals`, `source_usage`,
+  `savings_window`, `compute_secret_safety` and the daily accumulator in
+  `src/aggregator.rs` now sum through a shared clamping fold (clamping at
+  `u64::MAX`), matching the saturating policy already used in `savings.rs`. When
+  the clamp actually engages the fold emits a warning to STDERR (never STDOUT — it
+  can run under the dashboard), so the resulting nonsense figure that flows into
+  `cost_saved_usd` is no longer silent. Verified in a release build: the total
+  clamps instead of wrapping.
 - **Memory append is a single write with a newline guard, so a torn or
   interleaved append can no longer silently lose entries (#102).** `append`
   in `src/memory.rs` wrote the JSON line and its trailing `\n` as two separate

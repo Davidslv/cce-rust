@@ -473,8 +473,11 @@ fn civil_from_days(days: i64) -> (i64, i64, i64) {
     (if m <= 2 { y + 1 } else { y }, m, d)
 }
 
-/// Parse an ISO-8601 UTC timestamp `YYYY-MM-DDTHH:MM:SS[Z]` to epoch seconds.
-/// Returns `None` on any malformation. A trailing timezone is assumed UTC.
+/// Parse an ISO-8601 timestamp `YYYY-MM-DDTHH:MM:SS[Z|±HH:MM]` to epoch seconds
+/// (UTC). Returns `None` on any malformation. An explicit timezone offset is
+/// PARSED AND APPLIED (an instant at `+09:00` normalizes to its UTC instant), and
+/// an impossible calendar date (e.g. `2026-02-31`) is rejected — a bare `Z` or no
+/// suffix is UTC (#130).
 pub fn parse_iso(s: &str) -> Option<i64> {
     let b = s.as_bytes();
     if b.len() < 19 || b[4] != b'-' || b[7] != b'-' || b[13] != b':' || b[16] != b':' {
@@ -487,13 +490,58 @@ pub fn parse_iso(s: &str) -> Option<i64> {
     let hour: i64 = s.get(11..13)?.parse().ok()?;
     let min: i64 = s.get(14..16)?.parse().ok()?;
     let sec: i64 = s.get(17..19)?.parse().ok()?;
-    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+    if !(1..=12).contains(&month) {
         return None;
     }
     if hour > 23 || min > 59 || sec > 60 {
         return None;
     }
-    Some(days_from_civil(year, month, day) * 86400 + hour * 3600 + min * 60 + sec)
+    // Reject an impossible calendar day (e.g. 2026-02-31): the Hinnant civil<->days
+    // pair normalizes an out-of-range day, so a date that does not survive the
+    // round-trip is not a real instant (#130).
+    let days = days_from_civil(year, month, day);
+    if civil_from_days(days) != (year, month, day) {
+        return None;
+    }
+    // Apply any explicit timezone offset instead of silently reading it as UTC (#130).
+    let offset_secs = parse_tz_offset(&s[19..])?;
+    Some((days * 86400 + hour * 3600 + min * 60 + sec) - offset_secs)
+}
+
+/// Parse an ISO-8601 timezone designator into an offset in seconds EAST of UTC.
+/// `""`, `"Z"`, `"z"` are UTC (`0`); `±HH`, `±HHMM`, `±HH:MM` are explicit offsets.
+/// Any other trailing text (e.g. a fractional-seconds tail) yields `None`, so a
+/// non-conforming instant is rejected rather than silently misread (#130).
+fn parse_tz_offset(tz: &str) -> Option<i64> {
+    // A non-ASCII suffix (e.g. a multibyte `+1€`) is malformed; reject it up front so
+    // the fixed-index slicing below can never split a UTF-8 char and panic (#130).
+    if !tz.is_ascii() {
+        return None;
+    }
+    if tz.is_empty() || tz == "Z" || tz == "z" {
+        return Some(0);
+    }
+    let sign = match tz.as_bytes()[0] {
+        b'+' => 1,
+        b'-' => -1,
+        _ => return None,
+    };
+    let rest = &tz[1..];
+    let (hh, mm) = match rest.len() {
+        2 => (rest, "00"),                                           // ±HH
+        4 => (&rest[..2], &rest[2..]),                               // ±HHMM
+        5 if rest.as_bytes()[2] == b':' => (&rest[..2], &rest[3..]), // ±HH:MM
+        _ => return None,
+    };
+    if !hh.bytes().all(|c| c.is_ascii_digit()) || !mm.bytes().all(|c| c.is_ascii_digit()) {
+        return None;
+    }
+    let oh: i64 = hh.parse().ok()?;
+    let om: i64 = mm.parse().ok()?;
+    if oh > 23 || om > 59 {
+        return None;
+    }
+    Some(sign * (oh * 3600 + om * 60))
 }
 
 /// Format epoch seconds as an ISO-8601 UTC second-precision timestamp.
@@ -568,6 +616,26 @@ mod tests {
         assert_eq!(parse_iso("not-a-date"), None);
         assert_eq!(parse_iso("2026-13-01T00:00:00Z"), None); // bad month
         assert_eq!(parse_iso("2026-07-01T99:00:00Z"), None); // bad hour
+    }
+
+    #[test]
+    fn explicit_offset_is_applied_and_impossible_dates_rejected() {
+        // #130: a non-UTC offset must be applied, not silently read as UTC.
+        // 09:45:00+09:00 is the instant 00:45:00Z.
+        assert_eq!(parse_iso("2026-07-01T09:45:00+09:00"), parse_iso("2026-07-01T00:45:00Z"));
+        // A negative offset shifts the other way: 00:45:00-05:00 is 05:45:00Z.
+        assert_eq!(parse_iso("2026-07-01T00:45:00-05:00"), parse_iso("2026-07-01T05:45:00Z"));
+        // Compact forms parse identically to the colon form.
+        assert_eq!(parse_iso("2026-07-01T09:45:00+0900"), parse_iso("2026-07-01T00:45:00Z"));
+        // An impossible calendar day is rejected, not normalized into the next month.
+        // (April has 30 days; 2025 is not a leap year.)
+        assert_eq!(parse_iso("2026-02-31T00:00:00Z"), None);
+        assert_eq!(parse_iso("2026-04-31T00:00:00Z"), None);
+        assert_eq!(parse_iso("2025-02-29T00:00:00Z"), None);
+        // A leap day in an actual leap year is still accepted.
+        assert!(parse_iso("2024-02-29T00:00:00Z").is_some());
+        // An unrecognized trailing tail (e.g. fractional seconds) is rejected.
+        assert_eq!(parse_iso("2026-07-01T09:45:00.500Z"), None);
     }
 
     #[test]
