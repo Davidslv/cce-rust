@@ -205,6 +205,60 @@ fn protected_index_closes_142_residual_tail_leaks() {
 }
 
 #[test]
+fn protected_index_closes_142_round2_leaks_and_preserves_siblings() {
+    // #142 round 2: doubled-quote escaping, comma-adjacent merge, and clean
+    // sibling / trailing-code preservation — all verified against the persisted
+    // store with the real binary.
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = tmp.path().join("round2");
+    std::fs::create_dir(&fixture).unwrap();
+    std::fs::write(
+        fixture.join("settings.conf"),
+        concat!(
+            // Finding 1: doubled-quote escaping (single/double/backtick).
+            "password = 'abcdefghij''tail-super-secret'\n",
+            "password = 'abc''realsecret-here'\n",
+            "password = \"abcdefghij\"\"tail-super-secret\"\n",
+            "password = `abcdefghij``tail-super-secret`\n",
+            // Finding 2: comma-adjacent placeholder must not shield the neighbour.
+            "password = \"changeme\", token = \"realsecrettail123\"\n",
+            "password = \"realsecrettail123\", token = \"anotherrealsecret999\"\n",
+            // Finding 3: clean sibling + trailing code must survive.
+            "{password: \"abcdefghij\", host: \"publicdb\"}\n",
+            "password = \"abcdefghij\".freeze\n",
+        ),
+    )
+    .unwrap();
+    let store = tmp.path().join("index.json");
+
+    let out = Command::new(bin())
+        .args(["index"])
+        .arg(&fixture)
+        .arg("--store")
+        .arg(&store)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "index failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    let (_, content) = read_store(&store);
+    // (a) NEVER LEAK — no secret fragment survives.
+    for leaked in
+        ["tail-super-secret", "realsecret-here", "realsecrettail123", "anotherrealsecret999"]
+    {
+        assert!(
+            !content.contains(leaked),
+            "secret fragment {leaked:?} leaked into store: {content}"
+        );
+    }
+    // (b) MINIMIZE over-redaction — clean sibling content and trailing code stay.
+    assert!(content.contains("host: \"publicdb\""), "clean sibling deleted: {content}");
+    assert!(content.contains(".freeze"), "trailing code deleted: {content}");
+    // The comma-adjacent documentation placeholder is preserved (single-value scope).
+    assert!(content.contains("changeme"), "placeholder deleted: {content}");
+    assert!(content.contains("[REDACTED:SECRET]"), "expected redaction marker: {content}");
+}
+
+#[test]
 fn allow_secrets_bypasses_both_layers() {
     let tmp = tempfile::tempdir().unwrap();
     let fixture = tmp.path().join("secrets");

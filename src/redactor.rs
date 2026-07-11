@@ -19,7 +19,7 @@
 //! - Own the generic-assignment placeholder guard (SPEC-V2.1 §1).
 //! - It does NOT decide which files to read (Layer 1) or perform chunking.
 
-use regex::{Captures, Regex};
+use regex::Regex;
 use std::sync::LazyLock;
 
 /// The nine specific, high-confidence patterns (SPEC-V2.1 §1, rows 1–9), applied
@@ -46,28 +46,23 @@ static SPECIFIC: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
         .collect()
 });
 
-/// The generic assignment pattern (SPEC-V2.1 §1, row 10). Captures:
-/// 1 = secret-ish key, 2 = operator (`=`/`:`) with surrounding spaces, then one
-/// of four value branches (leftmost-first): `dq` = a double-quoted value, `sq` =
-/// a single-quoted value, `bq` = a backtick-quoted value, `uq` = an unquoted
-/// value (runs to whitespace/line end, so it may contain an apostrophe — #104).
+/// The generic assignment PREFIX (SPEC-V2.1 §1, row 10): a secret-ish key
+/// (group 1) and its `=`/`:` operator with surrounding spaces (group 2). The
+/// VALUE that follows is deliberately NOT part of this regex — it is delimited by
+/// [`scan_value`], a small explicit quote/escape-aware scanner.
 ///
-/// **Quote-aware extent (#142).** A quoted value runs to its TRUE closing quote,
-/// not merely the first inner same-style quote. Inside a `"…"` value the body
-/// consumes: a backslash-escape (`\\.`, so `\"` never ends the value), any
-/// non-quote/non-newline char, OR a same-style quote that is *immediately
-/// followed by a non-whitespace char* (`"[^\s"\n]`) — the latter is what makes
-/// `"abc"def"` a single value while keeping `"abc" k="def"` two separate ones:
-/// a closing quote is one followed by whitespace or the line end. The closing
-/// quote is captured in an optional `*c` group and re-emitted, so it still
-/// survives; when a value is unterminated at the line end that group is empty
-/// and nothing is re-emitted. `\n` is excluded everywhere, so a value never
-/// crosses a line. `sq`/`bq` are symmetric.
-static GENERIC: LazyLock<Regex> = LazyLock::new(|| {
+/// **Why a scanner, not a regex value branch (#142).** A quoted value's true
+/// extent depends on TWO escape conventions (backslash `\"` and doubled `''` /
+/// `""` / backtick-pair) and on telling a structural close from an inner quote.
+/// Encoding that in the crate's regex (no look-around, no back-references) forced
+/// a "continue-unless-whitespace" heuristic that both leaked (doubled quotes) and
+/// over-captured (merging `"a", "b"` and swallowing `.freeze` / a JSON sibling).
+/// A single explicit pass expresses the real grammar without that fragility.
+static GENERIC_PREFIX: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?i)\b(password|passwd|secret[_-]?key|secret|api[_-]?key|access[_-]?key|auth[_-]?token|private[_-]?key|token)\b(\s*[:=]\s*)(?:"(?P<dq>(?:\\.|[^"\n]|"[^\s"\n])*)(?P<dqc>")?|'(?P<sq>(?:\\.|[^'\n]|'[^\s'\n])*)(?P<sqc>')?|`(?P<bq>(?:\\.|[^`\n]|`[^\s`\n])*)(?P<bqc>`)?|(?P<uq>\S+))"#,
+        r#"(?i)\b(password|passwd|secret[_-]?key|secret|api[_-]?key|access[_-]?key|auth[_-]?token|private[_-]?key|token)\b(\s*[:=]\s*)"#,
     )
-    .expect("valid generic-assignment regex")
+    .expect("valid generic-assignment prefix regex")
 });
 
 /// Redact every high-confidence secret in `content` per SPEC-V2.1 §1.
@@ -83,30 +78,170 @@ pub fn redact(content: &str) -> String {
         text = re.replace_all(&text, regex::NoExpand(&replacement)).into_owned();
     }
 
-    GENERIC
-        .replace_all(&text, |caps: &Captures| {
-            // Exactly one value branch participates; recover the opening quote
-            // (if any) and whether the matching closing quote was consumed, so
-            // both can be re-emitted around the redaction (#142).
-            let (quote, value, closed) = if let Some(m) = caps.name("dq") {
-                ("\"", m.as_str(), caps.name("dqc").is_some())
-            } else if let Some(m) = caps.name("sq") {
-                ("'", m.as_str(), caps.name("sqc").is_some())
-            } else if let Some(m) = caps.name("bq") {
-                ("`", m.as_str(), caps.name("bqc").is_some())
-            } else {
-                ("", caps.name("uq").expect("a value branch always matches").as_str(), false)
-            };
-            if value.len() < 8 || is_placeholder(value) {
-                caps[0].to_string() // leave the whole match untouched
-            } else {
-                // Re-emit the closing quote only if the value was actually
-                // terminated (an unterminated line-end value re-emits nothing).
-                let close = if closed { quote } else { "" };
-                format!("{}{}{quote}[REDACTED:SECRET]{close}", &caps[1], &caps[2])
+    redact_generic(&text)
+}
+
+/// Run the generic assignment redaction (SPEC-V2.1 §1, row 10) over `text`.
+///
+/// For each secret-ish `key = ` / `key: ` prefix, the value that follows is
+/// delimited by [`scan_value`] and — unless it is shorter than 8 bytes or a
+/// documentation placeholder — replaced with `[REDACTED:SECRET]` (any surrounding
+/// quotes preserved). Assignments are handled left to right; a prefix that lies
+/// INSIDE a value already consumed by an earlier assignment is skipped, so a
+/// `key=` that is itself part of a secret value never fires a second, overlapping
+/// redaction. Because each value is delimited to a single, structurally-bounded
+/// span, the placeholder guard can never short-circuit more than one value.
+fn redact_generic(text: &str) -> String {
+    let mut out = String::with_capacity(text.len());
+    let mut cursor = 0usize;
+
+    for caps in GENERIC_PREFIX.captures_iter(text) {
+        let whole = caps.get(0).expect("group 0 always present");
+        // Skip a prefix that falls within a value we already consumed/redacted.
+        if whole.start() < cursor {
+            continue;
+        }
+        let value_start = whole.end();
+        let Some(scanned) = scan_value(&text[value_start..]) else {
+            // No value after the operator: leave the prefix in place (it will be
+            // emitted verbatim as part of a later gap or the final tail).
+            continue;
+        };
+        let value_end = value_start + scanned.full.len();
+
+        // Emit the untouched text between the cursor and this assignment.
+        out.push_str(&text[cursor..whole.start()]);
+
+        if scanned.inner.len() < 8 || is_placeholder(scanned.inner) {
+            // Byte-identical: re-emit the whole key/op/value verbatim.
+            out.push_str(&text[whole.start()..value_end]);
+        } else {
+            out.push_str(caps.get(1).expect("key group").as_str());
+            out.push_str(caps.get(2).expect("operator group").as_str());
+            match scanned.quote {
+                Some(q) => {
+                    out.push(q);
+                    out.push_str("[REDACTED:SECRET]");
+                    // Re-emit the closing quote only when the value was actually
+                    // terminated (an unterminated line-end value has none).
+                    if scanned.closed {
+                        out.push(q);
+                    }
+                }
+                None => out.push_str("[REDACTED:SECRET]"),
             }
-        })
-        .into_owned()
+        }
+        cursor = value_end;
+    }
+    out.push_str(&text[cursor..]);
+    out
+}
+
+/// The delimited extent of an assignment value, as parsed by [`scan_value`].
+struct Scanned<'a> {
+    /// The full byte-slice the value occupies (including any surrounding quotes):
+    /// what a redaction replaces, or what an untouched value re-emits verbatim.
+    full: &'a str,
+    /// The content used for the length and placeholder checks — the text between
+    /// the quotes (quoted), or the whole run (unquoted).
+    inner: &'a str,
+    /// The opening quote character, if the value was quoted.
+    quote: Option<char>,
+    /// Whether a matching closing quote was consumed at the value's end (false for
+    /// an unquoted value or a quoted value left unterminated at the line end).
+    closed: bool,
+}
+
+/// True when byte `b` glues an inner quote to a longer token: an ASCII word char
+/// (`[A-Za-z0-9_-]`). A candidate closing quote *immediately followed by* such a
+/// char is treated as an INNER quote (the SPEC-V2.1 §1 / #142 same-delimiter
+/// secret-tail shape, `'abc'tail`), so the scan keeps going and no tail can
+/// survive. A quote followed by whitespace, the line end, or ANY other char
+/// (`,` `)` `}` `.` `;` …) is the structural close — so a sibling value or
+/// trailing code (`", host: …`, `".freeze`) is left intact, not over-captured.
+fn is_value_glue(b: u8) -> bool {
+    b.is_ascii_alphanumeric() || b == b'_' || b == b'-'
+}
+
+/// Delimit the assignment value at the start of `s` (the text immediately after
+/// the operator). Returns `None` when no value is present (empty, or the operator
+/// is followed by whitespace or the line end).
+///
+/// **Quoted values (#142).** A value opened with `"`, `'`, or `` ` `` runs to its
+/// TRUE structural close, handling BOTH escape conventions so no secret tail can
+/// survive past a mid-value quote:
+///   - a backslash escapes the next char (`\"` does not close the value), but it
+///     never escapes a newline — a value never crosses a line;
+///   - a DOUBLED quote (`''`, `""`, ` `` ``) is a literal escaped quote and does
+///     not close the value;
+///   - a lone quote is the close UNLESS immediately followed by an ASCII word
+///     char (see [`is_value_glue`]), in which case it is an inner quote and the
+///     scan continues.
+///
+/// A value unterminated at the line end closes at the newline with `closed = false`.
+///
+/// **Unquoted values (#104).** Run to the next ASCII whitespace or the line end,
+/// so an apostrophe or an inner structural char (a connection string's `,`) stays
+/// in the value rather than leaking as a truncated tail.
+fn scan_value(s: &str) -> Option<Scanned<'_>> {
+    let bytes = s.as_bytes();
+    let &first = bytes.first()?;
+    if first.is_ascii_whitespace() {
+        return None;
+    }
+
+    if first == b'"' || first == b'\'' || first == b'`' {
+        let quote = first;
+        let mut i = 1;
+        while i < bytes.len() {
+            let c = bytes[i];
+            if c == b'\n' {
+                break; // unterminated at the line end
+            }
+            if c == b'\\' {
+                // Escape the next char, but never a newline (no line crossing).
+                i += 1;
+                if i < bytes.len() && bytes[i] != b'\n' {
+                    i += 1;
+                }
+                continue;
+            }
+            if c == quote {
+                // A doubled quote (`''`) is a literal escaped quote — consume both.
+                if bytes.get(i + 1) == Some(&quote) {
+                    i += 2;
+                    continue;
+                }
+                // A quote glued to a word char is an inner quote; keep scanning.
+                if bytes.get(i + 1).is_some_and(|&b| is_value_glue(b)) {
+                    i += 1;
+                    continue;
+                }
+                // Structural close: include the closing quote in `full`.
+                return Some(Scanned {
+                    full: &s[..=i],
+                    inner: &s[1..i],
+                    quote: Some(quote as char),
+                    closed: true,
+                });
+            }
+            i += 1;
+        }
+        // Unterminated: the value runs to the newline / end of input.
+        return Some(Scanned {
+            full: &s[..i],
+            inner: &s[1..i],
+            quote: Some(quote as char),
+            closed: false,
+        });
+    }
+
+    // Unquoted: run to the next ASCII whitespace (matches the old `\S+`).
+    let mut i = 0;
+    while i < bytes.len() && !bytes[i].is_ascii_whitespace() {
+        i += 1;
+    }
+    Some(Scanned { full: &s[..i], inner: &s[..i], quote: None, closed: false })
 }
 
 /// Should the generic assignment (row 10) leave this value alone? True for
@@ -441,8 +576,11 @@ mod tests {
     }
 
     #[test]
-    fn leak142_backtick_value_no_tail() {
-        // Backtick-quoted value with an inner same-delimiter quote.
+    fn backtick_quoted_value_is_redacted_as_a_new_feature() {
+        // NOT a pre-existing leak (an inner-quote backtick value has no spaces,
+        // so the old `\S+` unquoted branch already caught it whole). This pins
+        // the new first-class backtick handling: the value redacts to a single
+        // token with its backticks preserved, and no fragment survives.
         let out = redact("password = `abcdefghij`tail-super-secret`");
         assert!(!out.contains("tail-super-secret"), "secret tail leaked: {out}");
         assert_eq!(out, "password = `[REDACTED:SECRET]`");
@@ -493,5 +631,95 @@ mod tests {
         ] {
             assert_eq!(redact(input), input, "input {input:?} must be byte-identical");
         }
+    }
+
+    // ------------------------------------------------------------------
+    // Round-2 findings (#142): the "continue-unless-whitespace" heuristic is
+    // replaced by an explicit escape/close-aware scanner. Each RED case below
+    // either leaked or over-captured under the heuristic.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn r2_doubled_single_quote_no_tail() {
+        // Finding 1: SQL/CSV-style doubled-quote escaping (`''`). The heuristic
+        // stopped at the first `'`, redacted the prefix, and left the tail.
+        let out = redact("password = 'abcdefghij''tail-super-secret'");
+        assert!(!out.contains("tail-super-secret"), "secret tail leaked: {out}");
+        assert_eq!(out, "password = '[REDACTED:SECRET]'");
+    }
+
+    #[test]
+    fn r2_doubled_single_quote_short_prefix_fully_redacted() {
+        // Finding 1 amplifier: with a <8 prefix the whole value used to pass the
+        // len guard and persist UNREDACTED. The doubled-quote-aware extent makes
+        // the value the full `abc''realsecret-here`, so it redacts.
+        let out = redact("password = 'abc''realsecret-here'");
+        assert!(!out.contains("realsecret"), "secret leaked: {out}");
+        assert_eq!(out, "password = '[REDACTED:SECRET]'");
+    }
+
+    #[test]
+    fn r2_doubled_double_quote_and_backtick_no_tail() {
+        let dq = redact(r#"password = "abcdefghij""tail-super-secret""#);
+        assert!(!dq.contains("tail-super-secret"), "secret tail leaked: {dq}");
+        assert_eq!(dq, r#"password = "[REDACTED:SECRET]""#);
+
+        let bq = redact("password = `abcdefghij``tail-super-secret`");
+        assert!(!bq.contains("tail-super-secret"), "secret tail leaked: {bq}");
+        assert_eq!(bq, "password = `[REDACTED:SECRET]`");
+    }
+
+    #[test]
+    fn r2_comma_adjacent_not_merged_and_placeholder_scoped() {
+        // Finding 2 (regression the heuristic introduced): the close quote of
+        // value 1 is followed by `,` (non-whitespace), so the heuristic MERGED
+        // the two assignments, then the placeholder guard saw the merged span
+        // start with `changeme` and skipped BOTH — leaking `token`'s secret.
+        // The scanner closes value 1 at the structural `,`, so `token` is scanned
+        // and redacted independently.
+        let out = redact(r#"password = "changeme", token = "realsecrettail123""#);
+        assert!(!out.contains("realsecrettail123"), "secret tail leaked: {out}");
+        assert_eq!(out, r#"password = "changeme", token = "[REDACTED:SECRET]""#);
+    }
+
+    #[test]
+    fn r2_two_adjacent_real_secrets_each_redacted() {
+        let out = redact(r#"password = "realsecrettail123", token = "anotherrealsecret999""#);
+        assert!(!out.contains("realsecrettail123"), "first secret leaked: {out}");
+        assert!(!out.contains("anotherrealsecret999"), "second secret leaked: {out}");
+        assert_eq!(out, r#"password = "[REDACTED:SECRET]", token = "[REDACTED:SECRET]""#);
+    }
+
+    #[test]
+    fn r2_clean_json_sibling_is_preserved() {
+        // Finding 3: the heuristic over-consumed across `,` and deleted the clean
+        // sibling `host: "publicdb"` and the closing brace. The structural close
+        // at `,` preserves everything after the secret value.
+        let out = redact(r#"{password: "abcdefghij", host: "publicdb"}"#);
+        assert!(out.contains(r#"host: "publicdb""#), "clean sibling was deleted: {out}");
+        assert!(out.ends_with('}'), "closing brace was deleted: {out}");
+        assert_eq!(out, r#"{password: "[REDACTED:SECRET]", host: "publicdb"}"#);
+    }
+
+    #[test]
+    fn r2_method_chain_after_value_is_preserved() {
+        // Finding 3: `"…".freeze` — the `.` after the close quote is a structural
+        // boundary, so the method call survives.
+        assert_eq!(
+            redact(r#"password = "abcdefghij".freeze"#),
+            r#"password = "[REDACTED:SECRET]".freeze"#
+        );
+        // A short value keeps its trailing code untouched too.
+        assert_eq!(redact(r#"password = "x".freeze"#), r#"password = "x".freeze"#);
+    }
+
+    #[test]
+    fn r2_connection_string_with_comma_inside_quotes_not_cut_short() {
+        // The structural-close check only applies AFTER a candidate close quote,
+        // never to a `,` INSIDE the quotes — so a value that legitimately holds a
+        // comma redacts whole and never leaks its tail.
+        let out = redact(r#"password = "p@ss,realsecret,longenough""#);
+        assert!(!out.contains("realsecret"), "value tail leaked: {out}");
+        assert_eq!(out, r#"password = "[REDACTED:SECRET]""#);
     }
 }

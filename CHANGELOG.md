@@ -75,8 +75,28 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   closing quote — one followed by whitespace or the line end — consuming escaped
   and inner same-style quotes, bounded to the current line so it never merges a
   following assignment; adds a backtick branch), and the idempotency guard now
+- **Layer-2 redaction no longer leaks a secret tail on quoted values with an
+  inner same-style quote, doubled-quote escaping, or a specific-pattern prefix,
+  and no longer over-captures across a structural boundary (#142).** Several
+  pre-existing paths let a real secret survive into the shareable
+  `.cce/index.json` store, or deleted clean sibling content from it. The
+  generic-assignment value is now delimited by a small explicit quote/escape-aware
+  scanner (replacing a regex value branch that could not express the grammar
+  without a fragile "continue-unless-whitespace" heuristic). Per quote style the
+  scanner handles BOTH escape conventions — backslash (`\"`) and doubled (`''` /
+  `""` / backtick-pair) — and closes a value at the first quote that is followed
+  by whitespace, the line end, or any punctuation; a quote glued to an ASCII word
+  char is treated as an inner quote (the `'abc'tail` secret-tail shape), so no
+  tail survives, while a structural close (`", host: …`, `".freeze`) leaves the
+  sibling value or trailing code intact. Values never cross a line, and each is a
+  single structurally-bounded span, so the placeholder guard can no longer
+  short-circuit a second, adjacent `key=` assignment. The idempotency guard now
   skips only a value that is EXACTLY a `[REDACTED:LABEL]` token, re-scrubbing any
-  remainder. Both changes fail toward over-redaction. (redactor.rs)
+  remainder after a specific-pattern prefix. **Accepted over-redaction contract**
+  (fail toward over-redaction): two same-line assignments with NO delimiter
+  between them (`a='x'b='y'`), or a secret glued to an inner closing quote by a
+  non-word char, are over-redacted into one `[REDACTED:SECRET]` rather than risk a
+  leak. (redactor.rs)
 - **`cce sync pull` no longer overwrites the local index at a different sha when
   the code marker is corrupt, and never activates a pulled store before its
   marker is durable (#163) — the code-side twins of the knowledge-side #123/#122.**
