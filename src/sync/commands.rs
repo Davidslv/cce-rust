@@ -67,9 +67,36 @@ impl SyncState {
     fn path(root: &Path) -> PathBuf {
         root.join(".cce").join("synced.json")
     }
+    /// Lenient load: a read/parse error is treated as "no marker". Used by the
+    /// best-effort `status`/`verify` display where a missing answer is
+    /// acceptable. The §9.4 overwrite guard uses [`load_strict`](Self::load_strict).
     pub(crate) fn load(root: &Path) -> Option<SyncState> {
         let text = std::fs::read_to_string(Self::path(root)).ok()?;
         serde_json::from_str(&text).ok()
+    }
+
+    /// Load the marker for the §9.4 overwrite guard (#163, the code twin of the
+    /// knowledge-side #123), distinguishing a genuinely **absent** marker
+    /// (`Ok(None)`, never pulled) from one that is present but
+    /// **unreadable/corrupt** (`Err`). The lenient [`load`](Self::load) maps a
+    /// corrupt marker to `None` — indistinguishable from "never pulled" — which
+    /// silently DISARMED the different-sha guard, so a truncated/empty
+    /// `.cce/synced.json` read as "nothing pinned" and `cce sync pull` would
+    /// overwrite the local index at a DIFFERENT sha without `--force`. A corrupt
+    /// marker is now an error the caller surfaces (bypassable only with `--force`).
+    pub(crate) fn load_strict(root: &Path) -> Result<Option<SyncState>, String> {
+        let path = Self::path(root);
+        match std::fs::read_to_string(&path) {
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => Ok(None),
+            Err(e) => Err(format!("could not read the sync marker {}: {e}", path.display())),
+            Ok(text) => serde_json::from_str(&text).map(Some).map_err(|e| {
+                format!(
+                    "the sync marker {} is unreadable/corrupt: {e}. It records which sha the \
+                     local cache is pinned to — pass --force to overwrite it.",
+                    path.display()
+                )
+            }),
+        }
     }
     fn save(&self, root: &Path) -> std::io::Result<()> {
         let path = Self::path(root);
@@ -473,21 +500,22 @@ fn install_artifact(root: &Path, bytes: &[u8]) -> Result<Artifact, String> {
     let artifact = Artifact::from_bytes(bytes)?;
     let index = artifact.clone().into_index();
     let store = default_store_path(root);
-    index.save(&store).map_err(|e| format!("could not write {}: {e}", store.display()))?;
-    // #55: hash the EXACT bytes just installed (read back from disk) so
+
+    // #163 (the code twin of the knowledge-side #122): ACTIVATE the store LAST.
+    // `index.save(&store)` replaces `.cce/index.json` in place, so writing it
+    // before the marker meant a marker-write failure left the NEW store active
+    // with a stale/absent marker — the §9.4 guard then reasoning off an
+    // inconsistent pair. Stage the new index beside the store, record the marker,
+    // and only then rename the staged file into place: any failure before the
+    // rename leaves the PRIOR index.json active and its marker consistent.
+    let staged = store.with_extension("json.incoming");
+    index.save(&staged).map_err(|e| format!("could not write {}: {e}", staged.display()))?;
+    // #55: hash the EXACT bytes just written (read back from disk) so
     // `verify --checksum-only` has a version-independent baseline — "has this
     // file changed since pull", regardless of which cce version pushed the
-    // artifact. Best-effort: an unreadable store leaves the field absent and
-    // verify reports the re-pull notice.
-    let installed_sha256 = std::fs::read(&store).ok().map(|b| hex_lower(&Sha256::digest(&b)));
-    // #62: stamp a build fingerprint beside the installed store so `cce doctor`
-    // can drift-check pulled stores too. Shareable artifacts are always
-    // hash-embedded and redaction-protected (push refuses otherwise), and the
-    // remaining fields are pinned by the artifact format. Best-effort — a
-    // failed write only disables drift detection, never the pull.
-    if let Err(e) = crate::fingerprint::write_for_store(&store, &index, true) {
-        eprintln!("warning: could not write the store fingerprint: {e}");
-    }
+    // artifact. The staged bytes are renamed unchanged, so this equals the final
+    // `index.json` hash. Best-effort: an unreadable file leaves the field absent.
+    let installed_sha256 = std::fs::read(&staged).ok().map(|b| hex_lower(&Sha256::digest(&b)));
     SyncState {
         repo_id: artifact.manifest.repo_id.clone(),
         sha: artifact.manifest.sha.clone(),
@@ -495,7 +523,24 @@ fn install_artifact(root: &Path, bytes: &[u8]) -> Result<Artifact, String> {
         installed_sha256,
     }
     .save(root)
-    .map_err(|e| format!("could not write sync marker: {e}"))?;
+    .map_err(|e| {
+        // No residue: a failed pull must not leave a stray staged store behind.
+        let _ = std::fs::remove_file(&staged);
+        format!("could not write sync marker: {e}")
+    })?;
+
+    // Marker durable — activate the freshly written store (rename is atomic).
+    std::fs::rename(&staged, &store)
+        .map_err(|e| format!("could not activate {}: {e}", store.display()))?;
+
+    // #62: stamp a build fingerprint beside the now-active store so `cce doctor`
+    // can drift-check pulled stores too. Shareable artifacts are always
+    // hash-embedded and redaction-protected (push refuses otherwise), and the
+    // remaining fields are pinned by the artifact format. Best-effort — a
+    // failed write only disables drift detection, never the pull.
+    if let Err(e) = crate::fingerprint::write_for_store(&store, &index, true) {
+        eprintln!("warning: could not write the store fingerprint: {e}");
+    }
 
     // Best-effort: record a `sync-pull` index event so the dashboard's freshness
     // panel shows the pulled provenance (purely log-derived — the dashboard makes no
@@ -546,7 +591,10 @@ pub fn cmd_pull(
 
     // §9.4: do not silently overwrite a newer local index for a different sha.
     if !force {
-        if let Some(state) = SyncState::load(root) {
+        // #163: a corrupt marker is an error here, NOT a silent None that would
+        // disarm the guard and overwrite a different sha without --force (twin of
+        // the knowledge-side #123).
+        if let Some(state) = SyncState::load_strict(root)? {
             if state.sha != sha {
                 return Err(format!(
                     "local cache is at {} but you are pulling {sha}. Pass --force to overwrite.",
@@ -2047,6 +2095,110 @@ mod tests {
                 .unwrap_err();
         assert!(err.contains("--force to overwrite"), "got: {err}");
         std::env::remove_var("CCE_HOME");
+    }
+
+    #[test]
+    fn a_corrupt_marker_does_not_disarm_the_different_sha_guard() {
+        // #163 (the code twin of the knowledge-side #123): `SyncState::load`'s
+        // `.ok()` mapped a read/parse error to None — indistinguishable from
+        // "never pulled" — so a corrupt `.cce/synced.json` silently disarmed the
+        // §9.4 guard and let `pull` overwrite the local index at a DIFFERENT sha
+        // without --force. A corrupt marker must now be an error.
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let src = source_repo();
+        init_cfg(src.path(), &url);
+        cmd_push(src.path(), None, false).unwrap();
+        let sha1 = git::head_sha(src.path()).unwrap();
+
+        // A second commit → a DIFFERENT sha with DIFFERENT content (so its index
+        // bytes differ), pushed to the same remote so it is actually pullable.
+        std::fs::write(src.path().join("app.py"), "import auth\n\ndef run():\n    return 2\n")
+            .unwrap();
+        git::run_commit(src.path(), &["add", "-A"]).unwrap();
+        git::run_commit(src.path(), &["commit", "-q", "-m", "v2"]).unwrap();
+        cmd_push(src.path(), None, false).unwrap();
+        let sha2 = git::head_sha(src.path()).unwrap();
+        assert_ne!(sha1, sha2);
+
+        let dst = source_repo_clone(&src);
+        init_cfg(dst.path(), &url);
+        cmd_pull(dst.path(), PullTarget::Commit(sha1.clone()), false, false, None).unwrap();
+        let store_before = std::fs::read(default_store_path(dst.path())).unwrap();
+
+        // Corrupt the marker (an interrupted non-atomic write / disk-full / edit).
+        std::fs::write(SyncState::path(dst.path()), b"").unwrap();
+
+        // A different-sha pull WITHOUT --force must refuse, not overwrite.
+        let res = cmd_pull(dst.path(), PullTarget::Commit(sha2.clone()), false, false, None);
+        assert!(res.is_err(), "a corrupt marker must not silently allow a different-sha overwrite");
+        let err = res.unwrap_err();
+        assert!(err.contains("corrupt"), "got: {err}");
+        assert!(err.contains("--force"), "got: {err}");
+        assert_eq!(
+            std::fs::read(default_store_path(dst.path())).unwrap(),
+            store_before,
+            "the store was overwritten despite the refusal"
+        );
+
+        // --force bypasses the guard and DOES overwrite to sha2.
+        cmd_pull(dst.path(), PullTarget::Commit(sha2.clone()), true, false, None).unwrap();
+        assert_ne!(
+            std::fs::read(default_store_path(dst.path())).unwrap(),
+            store_before,
+            "--force should have overwritten the local index to sha2"
+        );
+        std::env::remove_var("CCE_HOME");
+    }
+
+    #[test]
+    fn install_artifact_marker_write_failure_leaves_the_prior_store_active() {
+        // #163 (the code twin of #122): `install_artifact` used to write
+        // (activate) `.cce/index.json` BEFORE the marker, so a marker-write
+        // failure left the NEW store active with a stale/absent marker. The store
+        // must be activated LAST — a marker failure must leave the prior store
+        // active and coherent.
+        let root = tempfile::tempdir().unwrap();
+
+        // Prior store A: index one tree and write it as the active store.
+        let src_a = source_repo();
+        let (idx_a, _) =
+            Index::build_protected(src_a.path(), &HashEmbedder, |_| true, true).unwrap();
+        idx_a.save(&default_store_path(root.path())).unwrap();
+        let store_a = std::fs::read(default_store_path(root.path())).unwrap();
+
+        // Artifact B: a DIFFERENT tree (changed file → different bytes).
+        let src_b = source_repo();
+        std::fs::write(src_b.path().join("auth.py"), "def login(u):\n    return 1\n").unwrap();
+        git::run_commit(src_b.path(), &["add", "-A"]).unwrap();
+        git::run_commit(src_b.path(), &["commit", "-q", "-m", "b"]).unwrap();
+        let (idx_b, _) =
+            Index::build_protected(src_b.path(), &HashEmbedder, |_| true, true).unwrap();
+        let bytes_b =
+            Artifact::from_index(&idx_b, ManifestMeta { repo_id: "r".into(), sha: "bbbb".into() })
+                .to_bytes();
+
+        // Wedge the marker write: make synced.json a non-empty directory (fails a
+        // bare write AND an atomic temp+rename over it).
+        let marker = SyncState::path(root.path());
+        std::fs::create_dir_all(marker.parent().unwrap()).unwrap();
+        std::fs::create_dir(&marker).unwrap();
+        std::fs::write(marker.join("wedge"), b"x").unwrap();
+
+        // Install B: the marker write fails, so install errors …
+        let err = install_artifact(root.path(), &bytes_b).unwrap_err();
+        assert!(err.contains("sync marker"), "got: {err}");
+        // … but the active store is still A — NOT replaced by B.
+        assert_eq!(
+            std::fs::read(default_store_path(root.path())).unwrap(),
+            store_a,
+            "index.json must not have been activated when the marker write failed"
+        );
+        // And no staged residue is left behind.
+        assert!(
+            !default_store_path(root.path()).with_extension("json.incoming").exists(),
+            "the staged store must be cleaned up on a marker-write failure"
+        );
     }
 
     #[test]

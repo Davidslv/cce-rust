@@ -45,6 +45,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test/fixture/samples` verified byte-identical.
 
 ### Fixed
+- **`cce sync pull` no longer overwrites the local index at a different sha when
+  the code marker is corrupt, and never activates a pulled store before its
+  marker is durable (#163) — the code-side twins of the knowledge-side #123/#122.**
+  `SyncState::load`'s `.ok()` mapped a present-but-corrupt `.cce/synced.json` to
+  `None`, indistinguishable from "never pulled", so a truncated marker read as
+  "nothing pinned" and disarmed the §9.4 different-sha overwrite guard — a pull
+  at a divergent sha proceeded without `--force`. The guard now loads through a
+  new `SyncState::load_strict`, which returns `Ok(None)` only for a genuinely
+  absent marker and an error (naming `--force`) for a corrupt one; the lenient
+  `load` is retained for best-effort `status`/`verify` display. Separately,
+  `install_artifact` replaced `.cce/index.json` in place BEFORE writing the
+  marker, so a marker-write failure left the new store active with a stale
+  marker; it now stages the new index beside the store, records the marker, and
+  only then renames the staged file into place — a failure before that rename
+  leaves the prior store active and its marker consistent (cleaning up the
+  staged file). Byte-identity of a pulled store is unchanged.
 - **`cce doctor` no longer reports a broken workspace healthy when its
   `workspace.yml` is corrupt (#126).** The `Manifest::load` `Err(_)` arm
   conflated an ABSENT manifest (simply not a workspace) with a PRESENT-but-
