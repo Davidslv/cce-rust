@@ -359,14 +359,18 @@ pub fn rank_core(index: &Index, qvec: &[f64], query: &str, top_k: usize) -> Vec<
     let mut per_file: HashMap<String, usize> = HashMap::new();
     let mut kept: Vec<(usize, f64)> = Vec::new();
     for (idx, sc) in &scored {
+        // The top_k cap is tested BEFORE keeping a candidate so top_k=0 yields an
+        // empty set (issue #109) rather than the one result the post-push check let
+        // through — the (top_k * CANDIDATE_MULTIPLIER).max(1) candidate floor always
+        // supplied at least one candidate on a non-empty index.
+        if kept.len() >= top_k {
+            break;
+        }
         let fp = &chunks[*idx].file_path;
         let count = per_file.entry(fp.clone()).or_insert(0);
         if *count < MAX_CHUNKS_PER_FILE {
             *count += 1;
             kept.push((*idx, *sc));
-            if kept.len() >= top_k {
-                break;
-            }
         }
     }
 
@@ -559,6 +563,18 @@ mod tests {
         let e = HashEmbedder;
         assert!(search(&idx, &e, "", 5, false).is_empty());
         assert!(search(&idx, &e, "   ", 5, false).is_empty());
+    }
+
+    #[test]
+    fn top_k_zero_returns_empty() {
+        // Issue #109: the diversity cap pushed a candidate before testing
+        // kept.len() >= top_k, so top_k=0 yielded one result. It must yield none,
+        // matching bm25_only_search's `.take(0)`.
+        let idx = fixture_index();
+        let e = HashEmbedder;
+        assert!(search(&idx, &e, "hash password", 0, false).is_empty());
+        assert!(rank_core(&idx, &e.embed("hash password"), "hash password", 0).is_empty());
+        assert!(bm25_only_search(&idx, "hash password", 0).is_empty());
     }
 
     #[test]

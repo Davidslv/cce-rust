@@ -76,6 +76,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `find .* function` sibling likewise now requires a space before "function"
   (no longer matching an embedded "malfunction"). This drives `fts_weight`
   (1.5 vs 1.0), so misclassification skewed every BM25 RRF contribution.
+- **`rank_core` with `top_k=0` now returns an empty result set (#109).** The
+  diversity-cap loop pushed a candidate before testing `kept.len() >= top_k`,
+  and the `(top_k * CANDIDATE_MULTIPLIER).max(1)` candidate floor always
+  supplied one candidate, so `cce search --top-k 0` returned a phantom result
+  (and logged `result_count=1`) while `bm25_only_search` returned none. The cap
+  is now checked before keeping, so both pipelines agree on the degenerate input.
 - **Memory append is a single write with a newline guard, so a torn or
   interleaved append can no longer silently lose entries (#102).** `append`
   in `src/memory.rs` wrote the JSON line and its trailing `\n` as two separate
