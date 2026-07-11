@@ -51,10 +51,14 @@ pub fn is_code_lookup(query: &str) -> bool {
             return true;
         }
     }
-    // (2) file-extension token .(py|js|jsx|ts|go|rb|rs|java) with a word boundary
+    // (2) file-extension token .(py|js|jsx|ts|go|rb|rs|java) with a word boundary.
+    // SPEC §6.1 uses the regex `\.(...)\b`, which matches ANY occurrence — so scan
+    // EVERY `.ext` match, not just the first (issue #107): an earlier occurrence
+    // that fails the boundary (e.g. ".ts" inside "app.tsx") must not shadow a later
+    // genuine extension token (e.g. "util.ts").
     for ext in ["py", "js", "jsx", "ts", "go", "rb", "rs", "java"] {
         let pat = format!(".{ext}");
-        if let Some(pos) = lower.find(&pat) {
+        for (pos, _) in lower.match_indices(&pat) {
             let after = lower[pos + pat.len()..].chars().next();
             let boundary = match after {
                 None => true,
@@ -69,11 +73,15 @@ pub fn is_code_lookup(query: &str) -> bool {
     if lower.contains("where is ") {
         return true;
     }
-    if lower.contains("defined") {
+    // SPEC §6.1 phrase `.* defined` requires a SPACE before "defined", so bare
+    // "undefined"/"predefined" must NOT classify as CODE_LOOKUP (issue #107).
+    if lower.contains(" defined") {
         return true;
     }
-    if let Some(fp) = lower.find("find") {
-        if lower[fp..].contains("function") {
+    // SPEC §6.1 phrase `find .* function`: a space precedes "function", so an
+    // embedded "function" ("malfunction") must not match (folded sibling of #107).
+    if let Some(fp) = lower.find("find ") {
+        if lower[fp..].contains(" function") {
             return true;
         }
     }
@@ -265,15 +273,23 @@ pub fn rank_core(index: &Index, qvec: &[f64], query: &str, top_k: usize) -> Vec<
     };
 
     // --- Vector candidates (SPEC §6.2) ---
-    let ranked = rank_by_cosine(qvec, chunks); // all chunks, best first
+    // An empty query vector means the embedding was unavailable at query time (e.g.
+    // Ollama died inside the ping→embed TOCTOU window, issue #110). cosine(&[], _)
+    // is 0.0 for every chunk, so rank_by_cosine would rank all chunks by chunk_id
+    // ascending and inject that alphabetical noise as full-credit vector candidates.
+    // Vector recall is genuinely disabled here: no vector candidates are gathered,
+    // leaving BM25 as the sole recall source (consistent with the caller's warning).
     let mut cosine_by_idx = vec![0.0f64; chunks.len()];
-    for (idx, cos) in &ranked {
-        cosine_by_idx[*idx] = *cos;
-    }
-    let vcand_n = (top_k * CANDIDATE_MULTIPLIER).max(1);
     let mut vrank: HashMap<usize, usize> = HashMap::new();
-    for (rank, (idx, _)) in ranked.iter().take(vcand_n).enumerate() {
-        vrank.insert(*idx, rank);
+    if !qvec.is_empty() {
+        let ranked = rank_by_cosine(qvec, chunks); // all chunks, best first
+        for (idx, cos) in &ranked {
+            cosine_by_idx[*idx] = *cos;
+        }
+        let vcand_n = (top_k * CANDIDATE_MULTIPLIER).max(1);
+        for (rank, (idx, _)) in ranked.iter().take(vcand_n).enumerate() {
+            vrank.insert(*idx, rank);
+        }
     }
 
     // --- BM25 candidates (SPEC §6.3) ---
@@ -351,14 +367,18 @@ pub fn rank_core(index: &Index, qvec: &[f64], query: &str, top_k: usize) -> Vec<
     let mut per_file: HashMap<String, usize> = HashMap::new();
     let mut kept: Vec<(usize, f64)> = Vec::new();
     for (idx, sc) in &scored {
+        // The top_k cap is tested BEFORE keeping a candidate so top_k=0 yields an
+        // empty set (issue #109) rather than the one result the post-push check let
+        // through — the (top_k * CANDIDATE_MULTIPLIER).max(1) candidate floor always
+        // supplied at least one candidate on a non-empty index.
+        if kept.len() >= top_k {
+            break;
+        }
         let fp = &chunks[*idx].file_path;
         let count = per_file.entry(fp.clone()).or_insert(0);
         if *count < MAX_CHUNKS_PER_FILE {
             *count += 1;
             kept.push((*idx, *sc));
-            if kept.len() >= top_k {
-                break;
-            }
         }
     }
 
@@ -494,6 +514,28 @@ mod tests {
     }
 
     #[test]
+    fn intent_classification_conforms_to_spec_6_1_boundaries() {
+        // Issue #107. SPEC §6.1 uses the regex `\.(py|js|jsx|ts|go|rb|rs|java)\b`
+        // (ANY occurrence) and the phrase `.* defined` (a SPACE before "defined").
+        //
+        // (a) Missed-later-occurrence: the first `.ts`/`.py` fails the boundary
+        // check (inside "app.tsx"/"main.python"), but a LATER occurrence is a real
+        // extension token, so the whole query is CODE_LOOKUP.
+        assert!(is_code_lookup("render in app.tsx or util.ts"));
+        assert!(is_code_lookup("main.python auth.py"));
+        // (b) "undefined"/"predefined" must NOT match `.* defined` (no space before).
+        assert!(!is_code_lookup("undefined variable error"));
+        assert!(!is_code_lookup("predefined constant list"));
+        // Folded sibling: `find .* function` requires a space before "function",
+        // so an embedded "function" ("malfunction") must NOT match.
+        assert!(!is_code_lookup("find malfunction reports"));
+        // Genuine boundary hits still classify as CODE_LOOKUP.
+        assert!(is_code_lookup("open util.ts"));
+        assert!(is_code_lookup("where hash_password is defined"));
+        assert!(is_code_lookup("find the parse function"));
+    }
+
+    #[test]
     fn conformance_q1_top1_is_hash_password() {
         let idx = fixture_index();
         let e = HashEmbedder;
@@ -529,6 +571,18 @@ mod tests {
         let e = HashEmbedder;
         assert!(search(&idx, &e, "", 5, false).is_empty());
         assert!(search(&idx, &e, "   ", 5, false).is_empty());
+    }
+
+    #[test]
+    fn top_k_zero_returns_empty() {
+        // Issue #109: the diversity cap pushed a candidate before testing
+        // kept.len() >= top_k, so top_k=0 yielded one result. It must yield none,
+        // matching bm25_only_search's `.take(0)`.
+        let idx = fixture_index();
+        let e = HashEmbedder;
+        assert!(search(&idx, &e, "hash password", 0, false).is_empty());
+        assert!(rank_core(&idx, &e.embed("hash password"), "hash password", 0).is_empty());
+        assert!(bm25_only_search(&idx, "hash password", 0).is_empty());
     }
 
     #[test]
@@ -574,6 +628,34 @@ mod tests {
         // Empty / no-overlap queries return empty, like the main pipeline.
         assert!(bm25_only_search(&idx, "", 5).is_empty());
         assert!(bm25_only_search(&idx, "zzz qqq xxx", 5).is_empty());
+    }
+
+    #[test]
+    fn empty_query_vector_disables_vector_recall() {
+        // Issue #110: when the query embedding is empty/unavailable (e.g. Ollama
+        // dies inside the ping→embed TOCTOU window), vector candidates must be
+        // genuinely disabled — not turned into chunk_id-ascending alphabetical
+        // noise scored by cosine(&[], _) == 0.0 for every chunk.
+        let idx = fixture_index();
+
+        // A query with zero BM25 overlap must return EMPTY (like bm25_only_search),
+        // not a full top_k of alphabetical chunk_id noise with confident scores.
+        assert!(rank_core(&idx, &[], "zzz qqq xxx", 5).is_empty());
+        assert_eq!(bm25_only_search(&idx, "zzz qqq xxx", 5).len(), 0);
+
+        // With a genuine query, every empty-vector result must have real BM25
+        // support (its file's tokens actually overlap the query) — no result may
+        // be admitted on vector rank alone.
+        let res = rank_core(&idx, &[], "hash password", 5);
+        assert!(!res.is_empty());
+        for r in &res {
+            let hay = r.content.to_ascii_lowercase();
+            assert!(
+                hay.contains("hash") || hay.contains("password"),
+                "empty-vector result {} admitted without BM25 support",
+                r.file_path
+            );
+        }
     }
 
     #[test]

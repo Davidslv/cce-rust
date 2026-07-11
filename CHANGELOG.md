@@ -66,6 +66,31 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `-32700` parse error (JSON mandates UTF-8) and the session keeps serving the
   next request. stdout stays pure JSON-RPC — the parse error is a protocol
   response, not a stderr diagnostic.
+- **`is_code_lookup` now conforms to SPEC §6.1 boundary semantics (#107).**
+  The extension check examined only the FIRST `.ext` occurrence, so a later
+  genuine extension token was shadowed by an earlier non-boundary match
+  ("render in app.tsx or util.ts", "main.python auth.py" → GENERAL instead of
+  CODE_LOOKUP); it now scans every occurrence per the regex `\.(...)\b`. The
+  `.* defined` phrase used `contains("defined")`, firing on "undefined"/
+  "predefined"; it now requires the space the spec mandates. The folded
+  `find .* function` sibling likewise now requires a space before "function"
+  (no longer matching an embedded "malfunction"). This drives `fts_weight`
+  (1.5 vs 1.0), so misclassification skewed every BM25 RRF contribution.
+- **`rank_core` with `top_k=0` now returns an empty result set (#109).** The
+  diversity-cap loop pushed a candidate before testing `kept.len() >= top_k`,
+  and the `(top_k * CANDIDATE_MULTIPLIER).max(1)` candidate floor always
+  supplied one candidate, so `cce search --top-k 0` returned a phantom result
+  (and logged `result_count=1`) while `bm25_only_search` returned none. The cap
+  is now checked before keeping, so both pipelines agree on the degenerate input.
+- **An empty query vector now genuinely disables vector recall (#110).** When
+  the query embedding was unavailable at query time (e.g. Ollama died inside the
+  ping→embed TOCTOU window and `embed` returned an empty vector), `rank_by_cosine`
+  scored every chunk 0.0 and tie-broke by `chunk_id`, so `rank_core` handed full
+  RRF vector-rank credit to the lexicographically smallest chunk_ids — surfacing
+  alphabetical noise with confident-looking scores while the warning claimed
+  "vector recall disabled". `rank_core` now gathers no vector candidates when the
+  query vector is empty, leaving BM25 as the sole recall source (a zero-overlap
+  query returns empty, matching `bm25_only_search`).
 - **Memory append is a single write with a newline guard, so a torn or
   interleaved append can no longer silently lose entries (#102).** `append`
   in `src/memory.rs` wrote the JSON line and its trailing `\n` as two separate
