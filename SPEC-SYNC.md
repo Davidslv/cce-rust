@@ -154,6 +154,20 @@ cce sync verify --checksum-only        # consumer integrity: re-hash the pulled 
 Rules:
 - `push` refuses a **dirty working tree** (must push a committed `sha`) and a
   **non-hash embedder** (§1). It is best-effort and never blocks other work.
+- `push --commit <sha>` is a **sanity assertion, not a backfill selector**: push
+  rebuilds the artifact from the working tree, so it can only publish HEAD
+  (`artifact == build(HEAD)`). A `--commit` that is not a valid commit, or does
+  not resolve to the current HEAD, is **rejected** — otherwise it would launder
+  build(HEAD) under another sha's key and rewind `refs/<branch>`, poisoning the
+  shared cache. To publish an older commit, check it out first — but note the
+  warning below.
+- **Publish from a branch, not a detached HEAD.** The ref pointer push writes is
+  `refs/<current-branch>`, and on a **detached HEAD** (e.g. after
+  `git checkout <old-sha>`) there is no branch, so push falls back to the default
+  ref (`refs/main`) and advances it to the checked-out commit — rewinding
+  `--latest` for consumers. So checking out an old commit to publish it will move
+  `refs/main` back; publish from a branch instead. Refusing (or better-targeting)
+  the detached-HEAD push is tracked as a follow-up (#151).
 - `pull` installs the artifact into the local `.cce/` store (importing the
   interchange format into the engine's native store). If the local working tree
   matches `sha`, the pulled index is used as-is.

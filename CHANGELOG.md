@@ -88,6 +88,23 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `chmod 600 .cce/index.json`) keeps its permissions instead of reverting to the
   umask default — matching main's write-through behaviour; a fresh store still
   takes the umask default.
+- **`cce sync push --commit <sha>` can no longer poison the content-addressed
+  cache (#116).** `resolve_push_sha` accepted any `--commit` value without checking
+  it existed or equalled HEAD, while `ensure_hash_index` always rebuilds from the
+  working tree. So `cce sync push --commit <old-sha>` at a clean HEAD published
+  `build(HEAD)` under the old sha's content-address key **and** moved `refs/<branch>`
+  back to it — violating the `artifact == build(sha)` invariant, so consumers pulling
+  that sha (or `--latest`, now rewound) failed `cce sync verify`. `--commit` is a
+  sanity assertion, not a backfill selector: push can only publish HEAD (it builds
+  from the working tree), so a `--commit` that is not a valid commit, or does not
+  resolve to the current HEAD, is now rejected before any build/put/ref move. This
+  fully closes the **content** invariant (`artifact == build(sha)`). Note a
+  remaining, separately-tracked gap (#151): a **detached-HEAD** push (e.g. after
+  `git checkout <old-sha>`) has no branch, so the ref pointer falls back to
+  `refs/main` and still advances it to the checked-out commit — publish from a
+  branch. Default (no `--commit`) behavior is unchanged. New `git::resolve_commit`
+  helper validates/normalizes the commit-ish (rejecting leading-dash values so no
+  git flag can be smuggled in); SPEC-SYNC §5 documents the contract.
 - **`cce init` can no longer destroy user-owned files on a read/parse failure
   (#99).** One root cause, five sub-bugs: a failed read or parse of an
   existing `.mcp.json`, `CLAUDE.md`, or `.gitignore` was silently treated as
