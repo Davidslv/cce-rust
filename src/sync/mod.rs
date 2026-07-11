@@ -168,7 +168,6 @@ pub fn knowledge_contract_version() -> &'static str {
 /// prefix is disjoint from every `<embedder_id>/…` prefix, so introducing it is
 /// additive — no existing key or old-client read path can collide with it.
 pub fn knowledge_content_address(contract_ver: &str, corpus_id: &str, snapshot: &str) -> String {
-    debug_assert!(valid_corpus_id(corpus_id), "unvalidated corpus_id `{corpus_id}` (#121)");
     format!("knowledge/{contract_ver}/{corpus_id}/{snapshot}.cck")
 }
 
@@ -176,7 +175,6 @@ pub fn knowledge_content_address(contract_ver: &str, corpus_id: &str, snapshot: 
 /// naming the corpus's active snapshot — the exact analogue of the code cache's
 /// `refs/<ref>` pointers (and of the local store's `.cce/knowledge/current`).
 pub fn knowledge_pointer_address(contract_ver: &str, corpus_id: &str) -> String {
-    debug_assert!(valid_corpus_id(corpus_id), "unvalidated corpus_id `{corpus_id}` (#121)");
     format!("knowledge/{contract_ver}/{corpus_id}/current")
 }
 
@@ -184,7 +182,6 @@ pub fn knowledge_pointer_address(contract_ver: &str, corpus_id: &str) -> String 
 /// non-LFS `corpus.json` blob carrying `pushed_at` (deliberately OUTSIDE the
 /// reproducible artifact) — the #55 well-known-key pattern.
 pub fn knowledge_corpus_meta_address(contract_ver: &str, corpus_id: &str) -> String {
-    debug_assert!(valid_corpus_id(corpus_id), "unvalidated corpus_id `{corpus_id}` (#121)");
     format!("knowledge/{contract_ver}/{corpus_id}/corpus.json")
 }
 

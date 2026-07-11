@@ -180,9 +180,11 @@ cce sync pull --all --into <dir> [--corpus <id>]   # code members AND the corpus
 cce sync verify --checksum-only     # covers the pulled knowledge store too
 ```
 
-- **Identity.** `corpus_id` is an adapter-chosen stable slug (validated like a
-  `repo_id`), resolved from `--corpus` or `knowledge.sync.corpus_id` — never
-  derived: knowledge has no git origin to normalize.
+- **Identity.** `corpus_id` is an adapter-chosen stable slug — non-empty, charset
+  `[A-Za-z0-9._-]`, sanitize-stable, and a single path segment (the traversal
+  tokens `.` and `..` are rejected so the id cannot escape its cache namespace) —
+  resolved from `--corpus` or `knowledge.sync.corpus_id`, never derived: knowledge
+  has no git origin to normalize.
 - **Push** refuses a missing store, an unresolved/invalid corpus_id, and an
   embedding-less (pre-v2.6.1) store; it never blocks local work. Retention
   (`knowledge.sync.retention: keep-last-<n>`) prunes the oldest snapshots after

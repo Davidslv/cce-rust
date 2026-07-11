@@ -218,9 +218,6 @@ fn apply_retention(
         return Ok(Vec::new());
     };
     let ver = knowledge_contract_version();
-    // Defense in depth (#121): retention is the destructive consumer of this
-    // prefix — a traversal token here would enumerate (and prune) EVERY corpus.
-    debug_assert!(valid_corpus_id(corpus_id), "unvalidated corpus_id `{corpus_id}` (#121)");
     let prefix = format!("knowledge/{ver}/{corpus_id}");
     let keys = remote.list_keys_with_suffix(&prefix, ".cck")?;
     // Oldest first by first-added COMMIT ORDER (not timestamps — two pushes in
@@ -234,8 +231,37 @@ fn apply_retention(
     let current_key = knowledge_content_address(ver, corpus_id, current_snapshot);
     let prune: Vec<String> =
         ordered[..keep_from].iter().map(|(_, k)| k.clone()).filter(|k| *k != current_key).collect();
+    confine_to_corpus(&prune, ver, corpus_id)?;
     remote.remove_many(&prune, &format!("cce knowledge sync: retention prune ({corpus_id})"))?;
     Ok(prune)
+}
+
+/// Release-present confinement guard for the retention delete site (#121). This
+/// is the destructive seam: every key about to be pruned MUST be a direct child
+/// of `knowledge/<ver>/<corpus_id>/` — i.e. its 3rd path segment equals the
+/// resolved `corpus_id`. Unlike a `debug_assert!` (compiled out of release
+/// binaries) this holds in shipped builds, and it checks the actual key SET
+/// rather than the id string, so it catches a broadened enumeration even if a
+/// traversal id slipped past `valid_corpus_id`: under the original `..` bug the
+/// enumerated keys were `knowledge/v1/prod/…` whose 3rd segment (`prod`) ≠ the
+/// resolved id `..`, so this refuses the cross-corpus delete on its own. A key
+/// outside the prefix is a should-never-happen invariant breach — hard error,
+/// never a silent skip.
+fn confine_to_corpus(keys: &[String], ver: &str, corpus_id: &str) -> Result<(), String> {
+    for key in keys {
+        let mut segs = key.split('/');
+        let confined = segs.next() == Some("knowledge")
+            && segs.next() == Some(ver)
+            && segs.next() == Some(corpus_id);
+        if !confined {
+            return Err(format!(
+                "retention refused: key `{key}` is not confined to \
+                 `knowledge/{ver}/{corpus_id}/` — refusing to prune outside the corpus \
+                 namespace (should-never-happen invariant breach; see #121)"
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Fetch the `.cck` at `corpus_id@snapshot` and verify the manifest checksum
@@ -694,6 +720,31 @@ mod tests {
             .unwrap_err();
             assert!(err.contains("invalid corpus_id"), "pull `{id}` got: {err}");
         }
+    }
+
+    #[test]
+    fn retention_refuses_to_prune_a_foreign_corpus_key() {
+        // #121 release-present delete-site guard: even if a traversal id somehow
+        // reached retention, the enumerated key set carries the real corpus's
+        // path segment (`prod`), which does not equal the resolved id (`..`), so
+        // the confinement check refuses the cross-corpus delete. This test pins
+        // the guard in RELEASE (a debug_assert would not run here).
+        let foreign = vec![
+            "knowledge/v1/prod/aaaa.cck".to_string(),
+            "knowledge/v1/prod/bbbb.cck".to_string(),
+        ];
+        let err = confine_to_corpus(&foreign, "v1", "..").unwrap_err();
+        assert!(err.contains("not confined"), "got: {err}");
+        assert!(err.contains("knowledge/v1/prod/aaaa.cck"), "names the offending key: {err}");
+        // A key whose 3rd segment is a mere PREFIX of the id is also foreign
+        // (segment-exact, not starts_with): `production` ≠ `prod`.
+        let sibling = vec!["knowledge/v1/production/cccc.cck".to_string()];
+        assert!(confine_to_corpus(&sibling, "v1", "prod").is_err());
+        // The honest, in-namespace key set passes unchanged.
+        let own = vec!["knowledge/v1/prod/dddd.cck".to_string()];
+        assert!(confine_to_corpus(&own, "v1", "prod").is_ok());
+        // Empty prune set is trivially confined.
+        assert!(confine_to_corpus(&[], "v1", "prod").is_ok());
     }
 
     #[test]
