@@ -273,15 +273,23 @@ pub fn rank_core(index: &Index, qvec: &[f64], query: &str, top_k: usize) -> Vec<
     };
 
     // --- Vector candidates (SPEC §6.2) ---
-    let ranked = rank_by_cosine(qvec, chunks); // all chunks, best first
+    // An empty query vector means the embedding was unavailable at query time (e.g.
+    // Ollama died inside the ping→embed TOCTOU window, issue #110). cosine(&[], _)
+    // is 0.0 for every chunk, so rank_by_cosine would rank all chunks by chunk_id
+    // ascending and inject that alphabetical noise as full-credit vector candidates.
+    // Vector recall is genuinely disabled here: no vector candidates are gathered,
+    // leaving BM25 as the sole recall source (consistent with the caller's warning).
     let mut cosine_by_idx = vec![0.0f64; chunks.len()];
-    for (idx, cos) in &ranked {
-        cosine_by_idx[*idx] = *cos;
-    }
-    let vcand_n = (top_k * CANDIDATE_MULTIPLIER).max(1);
     let mut vrank: HashMap<usize, usize> = HashMap::new();
-    for (rank, (idx, _)) in ranked.iter().take(vcand_n).enumerate() {
-        vrank.insert(*idx, rank);
+    if !qvec.is_empty() {
+        let ranked = rank_by_cosine(qvec, chunks); // all chunks, best first
+        for (idx, cos) in &ranked {
+            cosine_by_idx[*idx] = *cos;
+        }
+        let vcand_n = (top_k * CANDIDATE_MULTIPLIER).max(1);
+        for (rank, (idx, _)) in ranked.iter().take(vcand_n).enumerate() {
+            vrank.insert(*idx, rank);
+        }
     }
 
     // --- BM25 candidates (SPEC §6.3) ---
@@ -620,6 +628,34 @@ mod tests {
         // Empty / no-overlap queries return empty, like the main pipeline.
         assert!(bm25_only_search(&idx, "", 5).is_empty());
         assert!(bm25_only_search(&idx, "zzz qqq xxx", 5).is_empty());
+    }
+
+    #[test]
+    fn empty_query_vector_disables_vector_recall() {
+        // Issue #110: when the query embedding is empty/unavailable (e.g. Ollama
+        // dies inside the ping→embed TOCTOU window), vector candidates must be
+        // genuinely disabled — not turned into chunk_id-ascending alphabetical
+        // noise scored by cosine(&[], _) == 0.0 for every chunk.
+        let idx = fixture_index();
+
+        // A query with zero BM25 overlap must return EMPTY (like bm25_only_search),
+        // not a full top_k of alphabetical chunk_id noise with confident scores.
+        assert!(rank_core(&idx, &[], "zzz qqq xxx", 5).is_empty());
+        assert_eq!(bm25_only_search(&idx, "zzz qqq xxx", 5).len(), 0);
+
+        // With a genuine query, every empty-vector result must have real BM25
+        // support (its file's tokens actually overlap the query) — no result may
+        // be admitted on vector rank alone.
+        let res = rank_core(&idx, &[], "hash password", 5);
+        assert!(!res.is_empty());
+        for r in &res {
+            let hay = r.content.to_ascii_lowercase();
+            assert!(
+                hay.contains("hash") || hay.contains("password"),
+                "empty-vector result {} admitted without BM25 support",
+                r.file_path
+            );
+        }
     }
 
     #[test]

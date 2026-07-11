@@ -82,6 +82,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   supplied one candidate, so `cce search --top-k 0` returned a phantom result
   (and logged `result_count=1`) while `bm25_only_search` returned none. The cap
   is now checked before keeping, so both pipelines agree on the degenerate input.
+- **An empty query vector now genuinely disables vector recall (#110).** When
+  the query embedding was unavailable at query time (e.g. Ollama died inside the
+  ping→embed TOCTOU window and `embed` returned an empty vector), `rank_by_cosine`
+  scored every chunk 0.0 and tie-broke by `chunk_id`, so `rank_core` handed full
+  RRF vector-rank credit to the lexicographically smallest chunk_ids — surfacing
+  alphabetical noise with confident-looking scores while the warning claimed
+  "vector recall disabled". `rank_core` now gathers no vector candidates when the
+  query vector is empty, leaving BM25 as the sole recall source (a zero-overlap
+  query returns empty, matching `bm25_only_search`).
 - **Memory append is a single write with a newline guard, so a torn or
   interleaved append can no longer silently lose entries (#102).** `append`
   in `src/memory.rs` wrote the JSON line and its trailing `\n` as two separate
