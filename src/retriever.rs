@@ -51,10 +51,14 @@ pub fn is_code_lookup(query: &str) -> bool {
             return true;
         }
     }
-    // (2) file-extension token .(py|js|jsx|ts|go|rb|rs|java) with a word boundary
+    // (2) file-extension token .(py|js|jsx|ts|go|rb|rs|java) with a word boundary.
+    // SPEC §6.1 uses the regex `\.(...)\b`, which matches ANY occurrence — so scan
+    // EVERY `.ext` match, not just the first (issue #107): an earlier occurrence
+    // that fails the boundary (e.g. ".ts" inside "app.tsx") must not shadow a later
+    // genuine extension token (e.g. "util.ts").
     for ext in ["py", "js", "jsx", "ts", "go", "rb", "rs", "java"] {
         let pat = format!(".{ext}");
-        if let Some(pos) = lower.find(&pat) {
+        for (pos, _) in lower.match_indices(&pat) {
             let after = lower[pos + pat.len()..].chars().next();
             let boundary = match after {
                 None => true,
@@ -69,11 +73,15 @@ pub fn is_code_lookup(query: &str) -> bool {
     if lower.contains("where is ") {
         return true;
     }
-    if lower.contains("defined") {
+    // SPEC §6.1 phrase `.* defined` requires a SPACE before "defined", so bare
+    // "undefined"/"predefined" must NOT classify as CODE_LOOKUP (issue #107).
+    if lower.contains(" defined") {
         return true;
     }
-    if let Some(fp) = lower.find("find") {
-        if lower[fp..].contains("function") {
+    // SPEC §6.1 phrase `find .* function`: a space precedes "function", so an
+    // embedded "function" ("malfunction") must not match (folded sibling of #107).
+    if let Some(fp) = lower.find("find ") {
+        if lower[fp..].contains(" function") {
             return true;
         }
     }
@@ -491,6 +499,28 @@ mod tests {
         assert!(is_code_lookup("where hash_password is defined"));
         assert!(!is_code_lookup("hash password"));
         assert!(!is_code_lookup("process payment amount"));
+    }
+
+    #[test]
+    fn intent_classification_conforms_to_spec_6_1_boundaries() {
+        // Issue #107. SPEC §6.1 uses the regex `\.(py|js|jsx|ts|go|rb|rs|java)\b`
+        // (ANY occurrence) and the phrase `.* defined` (a SPACE before "defined").
+        //
+        // (a) Missed-later-occurrence: the first `.ts`/`.py` fails the boundary
+        // check (inside "app.tsx"/"main.python"), but a LATER occurrence is a real
+        // extension token, so the whole query is CODE_LOOKUP.
+        assert!(is_code_lookup("render in app.tsx or util.ts"));
+        assert!(is_code_lookup("main.python auth.py"));
+        // (b) "undefined"/"predefined" must NOT match `.* defined` (no space before).
+        assert!(!is_code_lookup("undefined variable error"));
+        assert!(!is_code_lookup("predefined constant list"));
+        // Folded sibling: `find .* function` requires a space before "function",
+        // so an embedded "function" ("malfunction") must NOT match.
+        assert!(!is_code_lookup("find malfunction reports"));
+        // Genuine boundary hits still classify as CODE_LOOKUP.
+        assert!(is_code_lookup("open util.ts"));
+        assert!(is_code_lookup("where hash_password is defined"));
+        assert!(is_code_lookup("find the parse function"));
     }
 
     #[test]

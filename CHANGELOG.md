@@ -66,6 +66,16 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `-32700` parse error (JSON mandates UTF-8) and the session keeps serving the
   next request. stdout stays pure JSON-RPC — the parse error is a protocol
   response, not a stderr diagnostic.
+- **`is_code_lookup` now conforms to SPEC §6.1 boundary semantics (#107).**
+  The extension check examined only the FIRST `.ext` occurrence, so a later
+  genuine extension token was shadowed by an earlier non-boundary match
+  ("render in app.tsx or util.ts", "main.python auth.py" → GENERAL instead of
+  CODE_LOOKUP); it now scans every occurrence per the regex `\.(...)\b`. The
+  `.* defined` phrase used `contains("defined")`, firing on "undefined"/
+  "predefined"; it now requires the space the spec mandates. The folded
+  `find .* function` sibling likewise now requires a space before "function"
+  (no longer matching an embedded "malfunction"). This drives `fts_weight`
+  (1.5 vs 1.0), so misclassification skewed every BM25 RRF contribution.
 - **Memory append is a single write with a newline guard, so a torn or
   interleaved append can no longer silently lose entries (#102).** `append`
   in `src/memory.rs` wrote the JSON line and its trailing `\n` as two separate
