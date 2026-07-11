@@ -167,6 +167,14 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   ranked-result/heading lines. Free-text provenance fields now neutralize any
   control character to a space; a clean title stays byte-identical, so every
   pinned provenance golden is unchanged.
+- **`SyncConfig::load` surfaces a malformed project config instead of silently
+  using the global remote (#119).** `load` in `src/sync/config.rs` mapped a
+  failed parse of an existing `.cce/config` to `None` via `.ok()`, treating a
+  typo'd config exactly like an absent one and falling back to the global
+  remote — so `sync push`/`pull` could target the wrong cache with no warning. A
+  project config that exists but does not parse is now surfaced with a clear
+  warning and the load stays all-local, so the misconfiguration cannot be masked
+  by an unrelated global remote.
 - **Memory append is a single write with a newline guard, so a torn or
   interleaved append can no longer silently lose entries (#102).** `append`
   in `src/memory.rs` wrote the JSON line and its trailing `\n` as two separate

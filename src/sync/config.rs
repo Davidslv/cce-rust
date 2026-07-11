@@ -157,10 +157,29 @@ impl SyncConfig {
     /// Load the config for `root`: the per-project `.cce/config` if it exists, else
     /// the global config, else the default. When the project file exists but sets no
     /// remote, the global remote (if any) is inherited.
+    ///
+    /// A project config that EXISTS but does not parse is NOT treated like an absent
+    /// one (#119): silently mapping a parse failure to `None` would fall back to the
+    /// global remote, so `sync push`/`pull` would land in the wrong cache without a
+    /// word. Instead the malformed file is surfaced with a clear warning and the
+    /// load stays all-local (no remote), so the misconfiguration cannot be masked by
+    /// an unrelated global remote.
     pub fn load(root: &Path) -> SyncConfig {
-        let project = std::fs::read_to_string(config_path(root))
-            .ok()
-            .and_then(|t| SyncConfig::from_yaml(&t).ok());
+        let project_path = config_path(root);
+        let project = match std::fs::read_to_string(&project_path) {
+            Ok(text) => match SyncConfig::from_yaml(&text) {
+                Ok(cfg) => Some(cfg),
+                Err(e) => {
+                    eprintln!(
+                        "warning: project sync config {} is malformed and was ignored ({e}); \
+                         staying all-local — fix the file or run `cce sync init` to rewrite it",
+                        project_path.display()
+                    );
+                    return SyncConfig::default();
+                }
+            },
+            Err(_) => None,
+        };
         let global = global_config_path()
             .and_then(|p| std::fs::read_to_string(p).ok())
             .and_then(|t| SyncConfig::from_yaml(&t).ok());
@@ -387,6 +406,43 @@ mod tests {
         let runtime = crate::config::KnowledgeConfig::from_yaml(text);
         assert!(!runtime.enabled);
         assert_eq!(runtime.min_score, 0.5);
+    }
+
+    #[test]
+    fn malformed_project_config_does_not_silently_use_the_global_remote() {
+        // #119: a project `.cce/config` that EXISTS but does not parse must NOT be
+        // treated like an absent file. The old `.ok()` mapped a parse failure to
+        // `None`, so `load` fell back to the GLOBAL remote — a `sync push`/`pull`
+        // would then target the wrong cache with no warning. The malformed file
+        // must instead be surfaced and the load stay all-local.
+        let _lock = crate::sync::test_support::env_lock();
+        // A global config naming a DIFFERENT remote.
+        let home = tempfile::tempdir().unwrap();
+        std::fs::write(
+            home.path().join("config.yml"),
+            "sync:\n  remote: file:///global/other-cache.git\n",
+        )
+        .unwrap();
+        std::env::set_var("CCE_HOME", home.path());
+
+        // A project config that names a real remote but has a YAML syntax error
+        // (a tab indent is invalid YAML), so `from_yaml` fails.
+        let proj = tempfile::tempdir().unwrap();
+        let cfg_path = config_path(proj.path());
+        std::fs::create_dir_all(cfg_path.parent().unwrap()).unwrap();
+        std::fs::write(&cfg_path, "sync:\n\tremote: file:///real/project-cache.git\n").unwrap();
+
+        let loaded = SyncConfig::load(proj.path());
+        std::env::remove_var("CCE_HOME");
+
+        // The malformed project config must NOT cause the global remote to be used.
+        assert_ne!(
+            loaded.remote.as_deref(),
+            Some("file:///global/other-cache.git"),
+            "a malformed project config silently fell back to the global remote"
+        );
+        // It stays all-local (no remote), not the misspelled project remote either.
+        assert_eq!(loaded.remote, None);
     }
 
     #[test]
