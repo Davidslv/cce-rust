@@ -63,6 +63,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   record id, flags any that still carry a secret-shaped value (naming the facet,
   never printing the raw value), and calls out a secret-bearing id separately as
   needing a source-adapter fix rather than a re-index. Advisory, exit 0.
+- **Layer-2 redaction no longer leaks a secret tail on same-delimiter quoted
+  values or on a specific-pattern prefix (#142).** Two pre-existing paths let a
+  real secret survive into the shareable `.cce/index.json` store: (1) a
+  same-style quote inside a quoted value (`password = 'abcdefghij'tail-secret'`,
+  or a JSON-escaped `\"`) ended the value at the first inner quote, redacting the
+  ≥8-char prefix while the tail persisted; (2) after a specific pattern redacted
+  a *prefix* of a longer value (`"AKIA…EXAMPLEsuffix-secret"`), the idempotency
+  guard skipped the whole value because it merely *began* with `[REDACTED:`. Fix:
+  the generic-assignment value scan is now quote-aware (extends to the true
+  closing quote — one followed by whitespace or the line end — consuming escaped
+  and inner same-style quotes, bounded to the current line so it never merges a
+  following assignment; adds a backtick branch), and the idempotency guard now
+  skips only a value that is EXACTLY a `[REDACTED:LABEL]` token, re-scrubbing any
+  remainder. Both changes fail toward over-redaction. (redactor.rs)
 - **`cce sync pull` no longer overwrites the local index at a different sha when
   the code marker is corrupt, and never activates a pulled store before its
   marker is durable (#163) — the code-side twins of the knowledge-side #123/#122.**

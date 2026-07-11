@@ -48,15 +48,24 @@ static SPECIFIC: LazyLock<Vec<(Regex, &'static str)>> = LazyLock::new(|| {
 
 /// The generic assignment pattern (SPEC-V2.1 §1, row 10). Captures:
 /// 1 = secret-ish key, 2 = operator (`=`/`:`) with surrounding spaces, then one
-/// of three value branches (leftmost-first): `dq` = a double-quoted value (runs
-/// to the matching `"`, so it may contain `'` and spaces), `sq` = a
-/// single-quoted value (runs to the matching `'`, so it may contain `"` and
-/// spaces), `uq` = an unquoted value (runs to whitespace/line end, so it may
-/// contain an apostrophe — #104). A quoted value never crosses a line, and the
-/// closing quote is deliberately left outside the match so it survives.
+/// of four value branches (leftmost-first): `dq` = a double-quoted value, `sq` =
+/// a single-quoted value, `bq` = a backtick-quoted value, `uq` = an unquoted
+/// value (runs to whitespace/line end, so it may contain an apostrophe — #104).
+///
+/// **Quote-aware extent (#142).** A quoted value runs to its TRUE closing quote,
+/// not merely the first inner same-style quote. Inside a `"…"` value the body
+/// consumes: a backslash-escape (`\\.`, so `\"` never ends the value), any
+/// non-quote/non-newline char, OR a same-style quote that is *immediately
+/// followed by a non-whitespace char* (`"[^\s"\n]`) — the latter is what makes
+/// `"abc"def"` a single value while keeping `"abc" k="def"` two separate ones:
+/// a closing quote is one followed by whitespace or the line end. The closing
+/// quote is captured in an optional `*c` group and re-emitted, so it still
+/// survives; when a value is unterminated at the line end that group is empty
+/// and nothing is re-emitted. `\n` is excluded everywhere, so a value never
+/// crosses a line. `sq`/`bq` are symmetric.
 static GENERIC: LazyLock<Regex> = LazyLock::new(|| {
     Regex::new(
-        r#"(?i)\b(password|passwd|secret[_-]?key|secret|api[_-]?key|access[_-]?key|auth[_-]?token|private[_-]?key|token)\b(\s*[:=]\s*)(?:"(?P<dq>[^"\n]+)|'(?P<sq>[^'\n]+)|(?P<uq>\S+))"#,
+        r#"(?i)\b(password|passwd|secret[_-]?key|secret|api[_-]?key|access[_-]?key|auth[_-]?token|private[_-]?key|token)\b(\s*[:=]\s*)(?:"(?P<dq>(?:\\.|[^"\n]|"[^\s"\n])*)(?P<dqc>")?|'(?P<sq>(?:\\.|[^'\n]|'[^\s'\n])*)(?P<sqc>')?|`(?P<bq>(?:\\.|[^`\n]|`[^\s`\n])*)(?P<bqc>`)?|(?P<uq>\S+))"#,
     )
     .expect("valid generic-assignment regex")
 });
@@ -77,18 +86,24 @@ pub fn redact(content: &str) -> String {
     GENERIC
         .replace_all(&text, |caps: &Captures| {
             // Exactly one value branch participates; recover the opening quote
-            // (if any) from which branch it was, so it can be re-emitted.
-            let (quote, value) = if let Some(m) = caps.name("dq") {
-                ("\"", m.as_str())
+            // (if any) and whether the matching closing quote was consumed, so
+            // both can be re-emitted around the redaction (#142).
+            let (quote, value, closed) = if let Some(m) = caps.name("dq") {
+                ("\"", m.as_str(), caps.name("dqc").is_some())
             } else if let Some(m) = caps.name("sq") {
-                ("'", m.as_str())
+                ("'", m.as_str(), caps.name("sqc").is_some())
+            } else if let Some(m) = caps.name("bq") {
+                ("`", m.as_str(), caps.name("bqc").is_some())
             } else {
-                ("", caps.name("uq").expect("a value branch always matches").as_str())
+                ("", caps.name("uq").expect("a value branch always matches").as_str(), false)
             };
             if value.len() < 8 || is_placeholder(value) {
                 caps[0].to_string() // leave the whole match untouched
             } else {
-                format!("{}{}{quote}[REDACTED:SECRET]", &caps[1], &caps[2])
+                // Re-emit the closing quote only if the value was actually
+                // terminated (an unterminated line-end value re-emits nothing).
+                let close = if closed { quote } else { "" };
+                format!("{}{}{quote}[REDACTED:SECRET]{close}", &caps[1], &caps[2])
             }
         })
         .into_owned()
@@ -98,10 +113,15 @@ pub fn redact(content: &str) -> String {
 /// documentation placeholders, interpolations, literals, and a value an earlier
 /// specific pattern already turned into `[REDACTED:…]` (SPEC-V2.1 §1 guard).
 fn is_placeholder(value: &str) -> bool {
-    // A value a specific pattern already redacted must not be re-redacted; this
-    // keeps output idempotent and preserves the specific label (e.g. a
+    // A value that is EXACTLY a `[REDACTED:LABEL]` token must not be re-redacted;
+    // this keeps output idempotent and preserves the specific label (e.g. a
     // `token = "[REDACTED:GITHUB_TOKEN]"` stays GITHUB_TOKEN, not SECRET).
-    if value.starts_with("[REDACTED:") {
+    //
+    // #142: the guard must be EXACT. A value that merely *begins* with a
+    // placeholder and continues with more content (e.g. a specific pattern
+    // redacted only a prefix — `[REDACTED:AWS_ACCESS_KEY]suffix-secret`) still
+    // hides a real secret tail, so it must fall through and be scrubbed.
+    if is_exact_redacted_token(value) {
         return true;
     }
 
@@ -138,6 +158,17 @@ fn is_placeholder(value: &str) -> bool {
 
     // A single repeated character (e.g. `--------`, `00000000`).
     is_single_repeated_char(value)
+}
+
+/// True iff `value` is EXACTLY a single `[REDACTED:LABEL]` token — i.e. it opens
+/// with `[REDACTED:` and the first `]` is the final character, with nothing after
+/// it. A value that begins with such a token but carries a trailing tail (#142)
+/// is deliberately NOT matched, so its remainder is still scrubbed.
+fn is_exact_redacted_token(value: &str) -> bool {
+    match value.strip_prefix("[REDACTED:") {
+        Some(inner) => matches!(inner.find(']'), Some(i) if i == inner.len() - 1),
+        None => false,
+    }
 }
 
 /// True if `value` is one character repeated (length ≥ 1).
@@ -363,5 +394,104 @@ mod tests {
         let input = format!(r#"AWS = "{AWS_KEY}""#);
         let once = redact(&input);
         assert_eq!(redact(&once), once);
+    }
+
+    // ------------------------------------------------------------------
+    // #142 — the two residual tail-leaks (RED-first leak matrix).
+    // Each of these leaked a real secret tail into the persisted store on
+    // pre-#142 code; after the fix, NO secret fragment may survive.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn leak142_same_single_quote_prefix_ge8_no_tail() {
+        // Residual 1a: a same-style quote INSIDE a single-quoted value. The
+        // old lazy scan stopped at the inner `'`, redacted the ≥8 prefix, and
+        // left `tail-super-secret` behind. Quote-aware extent now consumes the
+        // whole value up to the true closing quote.
+        let out = redact("password = 'abcdefghij'tail-super-secret'");
+        assert!(!out.contains("tail-super-secret"), "secret tail leaked: {out}");
+        assert_eq!(out, "password = '[REDACTED:SECRET]'");
+    }
+
+    #[test]
+    fn leak142_same_double_quote_escaped_inner_no_tail() {
+        // Residual 1b: a JSON-escaped inner double quote (`\"`). The old scan
+        // stopped at the backslash-quote and leaked the tail.
+        let out = redact(r#"password = "abcdefghij\"tail-super-secret""#);
+        assert!(!out.contains("tail-super-secret"), "secret tail leaked: {out}");
+        assert_eq!(out, r#"password = "[REDACTED:SECRET]""#);
+    }
+
+    #[test]
+    fn leak142_specific_prefix_then_secret_no_tail() {
+        // Residual 2: a specific pattern (AWS) redacts a PREFIX of a longer
+        // concatenated value; the over-broad idempotency guard then skipped the
+        // whole value, leaking `suffix-secret`. Now only an EXACT `[REDACTED:…]`
+        // value is skipped; a value that merely begins with one is re-scrubbed.
+        let out = redact(&format!(r#"password = "{AWS_KEY}suffix-secret""#));
+        assert!(!out.contains("suffix-secret"), "secret tail leaked: {out}");
+        assert_eq!(out, r#"password = "[REDACTED:SECRET]""#);
+    }
+
+    #[test]
+    fn leak142_specific_prefix_then_secret_unquoted_no_tail() {
+        let out = redact(&format!("password = {AWS_KEY}suffix-secret"));
+        assert!(!out.contains("suffix-secret"), "secret tail leaked: {out}");
+        assert_eq!(out, "password = [REDACTED:SECRET]");
+    }
+
+    #[test]
+    fn leak142_backtick_value_no_tail() {
+        // Backtick-quoted value with an inner same-delimiter quote.
+        let out = redact("password = `abcdefghij`tail-super-secret`");
+        assert!(!out.contains("tail-super-secret"), "secret tail leaked: {out}");
+        assert_eq!(out, "password = `[REDACTED:SECRET]`");
+    }
+
+    #[test]
+    fn leak142_multiple_inner_quotes_no_tail() {
+        let out = redact("password = 'abcdefgh'mid'tail-super-secret'");
+        assert!(!out.contains("tail-super-secret"), "secret tail leaked: {out}");
+        assert!(!out.contains("mid"), "inner fragment leaked: {out}");
+        assert_eq!(out, "password = '[REDACTED:SECRET]'");
+    }
+
+    // ------------------------------------------------------------------
+    // #142 — controls: the fix must not over-capture or regress.
+    // ------------------------------------------------------------------
+
+    #[test]
+    fn ctrl142_adjacent_same_delimiter_assignments_not_merged() {
+        // Two genuinely separate same-line assignments (whitespace-delimited)
+        // must each redact independently — the quote-aware scan must NOT merge
+        // them into one over-captured span.
+        assert_eq!(
+            redact("password = 'a1b2c3d4e5' token = 'f6g7h8i9j0'"),
+            "password = '[REDACTED:SECRET]' token = '[REDACTED:SECRET]'"
+        );
+    }
+
+    #[test]
+    fn ctrl142_value_beginning_with_placeholder_but_continuing_is_scrubbed() {
+        // The idempotency guard skips a value that is EXACTLY a placeholder,
+        // but NOT one that merely begins with one and continues with content.
+        assert!(is_placeholder("[REDACTED:AWS_ACCESS_KEY]"), "exact placeholder must be skipped");
+        assert!(
+            !is_placeholder("[REDACTED:AWS_ACCESS_KEY]suffix-secret"),
+            "value continuing past a placeholder must be re-scrubbed"
+        );
+    }
+
+    #[test]
+    fn ctrl142_clean_non_secret_assignment_is_byte_identical() {
+        // A recognised-key assignment whose value is a documentation placeholder
+        // is returned byte-for-byte unchanged.
+        for input in [
+            r#"password = "changeme""#,
+            r#"api_key = "<your-api-key>""#,
+            r#"secret = "${VAULT_SECRET}""#,
+        ] {
+            assert_eq!(redact(input), input, "input {input:?} must be byte-identical");
+        }
     }
 }

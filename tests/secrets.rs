@@ -157,6 +157,54 @@ fn protected_index_redacts_values_containing_quotes() {
 }
 
 #[test]
+fn protected_index_closes_142_residual_tail_leaks() {
+    // #142: two residual tail-leak shapes reached the persisted store on
+    // pre-#142 code. Drive the real binary over a file containing each shape
+    // and assert the store holds NO secret fragment.
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = tmp.path().join("leaks142");
+    std::fs::create_dir(&fixture).unwrap();
+    std::fs::write(
+        fixture.join("settings.conf"),
+        format!(
+            concat!(
+                // 1a: same single-delimiter quote inside a single-quoted value.
+                "password = 'abcdefghij'tail-super-secret'\n",
+                // 1b: JSON-escaped inner double quote.
+                "password = \"abcdefghij\\\"tail-super-secret\"\n",
+                // backtick + multiple inner quotes.
+                "password = `abcdefghij`tail-super-secret`\n",
+                "password = 'abcdefgh'mid'tail-super-secret'\n",
+                // 2: a specific (AWS) prefix consumes part of a longer value.
+                "password = \"{aws}suffix-secret\"\n",
+                "password = {aws}suffix-secret\n",
+            ),
+            aws = AWS_KEY,
+        ),
+    )
+    .unwrap();
+    let store = tmp.path().join("index.json");
+
+    let out = Command::new(bin())
+        .args(["index"])
+        .arg(&fixture)
+        .arg("--store")
+        .arg(&store)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "index failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    let (_, content) = read_store(&store);
+    for leaked in ["tail-super-secret", "suffix-secret", "mid'tail", AWS_KEY] {
+        assert!(
+            !content.contains(leaked),
+            "secret fragment {leaked:?} leaked into store: {content}"
+        );
+    }
+    assert!(content.contains("[REDACTED:SECRET]"), "expected redaction marker: {content}");
+}
+
+#[test]
 fn allow_secrets_bypasses_both_layers() {
     let tmp = tempfile::tempdir().unwrap();
     let fixture = tmp.path().join("secrets");
