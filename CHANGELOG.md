@@ -54,9 +54,10 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   concurrent `cce mcp` processes concatenated the next entry onto the previous
   line; `load_entries` then silently skipped the merged malformed line — losing
   BOTH decisions while `record_decision` still reported success. The append is
-  now built as ONE buffer ending in `\n` and issued in a SINGLE `write_all`
-  (the atomic-append unit POSIX guarantees for a normal-size record, closing
-  both the two-write torn case and the interleave-of-the-pair case), and a
+  now built as ONE buffer ending in `\n` and issued in a SINGLE `write_all`,
+  which closes the two-write torn case and, for a normal-size record (the
+  common case — a `write_all` that does not split into multiple `write`
+  syscalls), the concurrent interleave-of-the-pair case, and a
   leading-newline guard prepends a `\n` when the store does not already end in
   one, so a previously-torn file self-heals its boundary instead of
   concatenating onto the broken line. The normal-case bytes are unchanged (a
