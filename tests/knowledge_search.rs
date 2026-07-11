@@ -651,3 +651,130 @@ fn workspace_blend_stays_silent_when_no_member_was_ever_indexed() {
     assert!(!text.contains("NOTICE:"), "a truly absent member store must stay silent:\n{text}");
     assert!(!tool_is_error(&out, 2), "a never-indexed workspace is not an error:\n{out}");
 }
+
+// --- issue #143: a knowledge-store LOAD FAILURE must be visible (mirror of #132) ---
+
+/// Corrupt the active knowledge snapshot in place: keep the `current` pointer intact,
+/// scribble the snapshot artifact it names — present-but-unparseable, tagged
+/// `InvalidData` by the loader (issue #143). Mirrors the code side's in-place
+/// `index.json` corruption.
+fn corrupt_knowledge_snapshot(root: &Path) {
+    let kdir = root.join(".cce").join("knowledge");
+    let snapshot = std::fs::read_to_string(kdir.join("current")).unwrap();
+    std::fs::write(kdir.join(format!("{}.json", snapshot.trim())), "{ not knowledge").unwrap();
+}
+
+#[test]
+fn blended_default_surfaces_a_corrupt_knowledge_store_instead_of_swallowing_it() {
+    // Issue #143: the knowledge store EXISTS on disk but cannot be loaded. The blended
+    // default must NOT silently downgrade that to zero knowledge rows and serve a
+    // code-only answer as if it were complete — the mirror of the code-side #132 bug.
+    let tmp = tempfile::tempdir().unwrap();
+    write_tiny_repo(tmp.path());
+    index_dir(tmp.path());
+    index_knowledge(tmp.path(), &feed());
+    corrupt_knowledge_snapshot(tmp.path());
+    let dir = tmp.path().to_string_lossy().to_string();
+
+    let input = format!(
+        "{}{}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+        default_search_call(2, "hash password"),
+    );
+    let out = drive(&["mcp", "--dir", &dir], &input);
+    let text = tool_text(&out, 2);
+
+    // The degradation is VISIBLE (the issue #30 notice-channel precedent) …
+    assert!(
+        text.contains("NOTICE: the knowledge store exists but could not be loaded"),
+        "corrupt knowledge store was swallowed silently:\n{text}"
+    );
+    // … the code hits are still served (degraded, not withheld) …
+    assert!(
+        text.contains("auth.py"),
+        "code hits must still be served under a knowledge-store failure:\n{text}"
+    );
+    // … and it is a degraded RESULT, not a tool error (`isError` stays reserved for
+    // malformed calls, per the ToolOutput contract).
+    assert!(!tool_is_error(&out, 2), "degraded blend must not set isError:\n{out}");
+}
+
+#[test]
+fn explicit_knowledge_source_surfaces_a_corrupt_store_not_zero_chunks() {
+    // Issue #143: even the explicit `source:"knowledge"` path masked corruption as
+    // emptiness ("The index has 0 chunk(s)"). It must surface the load-failure notice.
+    let tmp = tempfile::tempdir().unwrap();
+    write_tiny_repo(tmp.path());
+    index_dir(tmp.path());
+    index_knowledge(tmp.path(), &feed());
+    corrupt_knowledge_snapshot(tmp.path());
+    let dir = tmp.path().to_string_lossy().to_string();
+
+    let input = format!(
+        "{}{}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+        search_call(2, "hash password", "knowledge"),
+    );
+    let out = drive(&["mcp", "--dir", &dir], &input);
+    let text = tool_text(&out, 2);
+
+    assert!(
+        text.contains("NOTICE: the knowledge store exists but could not be loaded"),
+        "explicit knowledge source masked corruption as emptiness:\n{text}"
+    );
+    assert!(!tool_is_error(&out, 2), "degraded knowledge-only path must not set isError:\n{out}");
+}
+
+#[test]
+fn knowledge_absent_project_blends_silently_without_a_knowledge_notice() {
+    // CONTROL (issue #143): a knowledge store that was NEVER ingested is NOT a failure —
+    // code-only is then the correct, complete answer, with no knowledge notice.
+    let tmp = tempfile::tempdir().unwrap();
+    write_tiny_repo(tmp.path());
+    index_dir(tmp.path()); // healthy code; no knowledge store at all
+    let dir = tmp.path().to_string_lossy().to_string();
+
+    let input = format!(
+        "{}{}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+        default_search_call(2, "hash password"),
+    );
+    let out = drive(&["mcp", "--dir", &dir], &input);
+    let text = tool_text(&out, 2);
+
+    assert!(
+        text.contains("auth.py"),
+        "knowledge-absent project must return its code hits:\n{text}"
+    );
+    assert!(
+        !text.contains("NOTICE: the knowledge store"),
+        "a truly absent knowledge store must stay silent:\n{text}"
+    );
+    assert!(!tool_is_error(&out, 2), "a knowledge-absent project is not an error:\n{out}");
+}
+
+#[test]
+fn healthy_blend_serves_both_pools_with_no_knowledge_notice() {
+    // CONTROL (issue #143): both stores healthy — code + knowledge rows, no degradation
+    // marker anywhere in the output.
+    let tmp = tempfile::tempdir().unwrap();
+    write_tiny_repo(tmp.path());
+    index_dir(tmp.path());
+    index_knowledge(tmp.path(), &feed());
+    let dir = tmp.path().to_string_lossy().to_string();
+
+    let input = format!(
+        "{}{}",
+        "{\"jsonrpc\":\"2.0\",\"id\":1,\"method\":\"initialize\",\"params\":{}}\n",
+        default_search_call(2, "hash password"),
+    );
+    let out = drive(&["mcp", "--dir", &dir], &input);
+    let text = tool_text(&out, 2);
+
+    assert!(text.contains("auth.py"), "healthy blend missing code:\n{text}");
+    assert!(
+        text.contains("[knowledge] Password hashing policy"),
+        "healthy blend missing knowledge:\n{text}"
+    );
+    assert!(!text.contains("NOTICE:"), "healthy blend must carry no notice:\n{text}");
+}

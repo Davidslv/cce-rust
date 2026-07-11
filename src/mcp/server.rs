@@ -65,6 +65,31 @@ fn knowledge_fingerprint(root: &Path) -> Option<Vec<Fingerprint>> {
 /// One cached workspace bundle plus the member-store fingerprints it was built from.
 type FingerprintedWorkspace = (Vec<Fingerprint>, Rc<CachedWorkspace>);
 
+/// The outcome of loading the knowledge store. Splitting `Absent` from `Failed`
+/// mirrors the code side (#132) so knowledge-store corruption is surfaced, not
+/// silently swallowed into zero rows (#143): a store that was never ingested is
+/// legitimately absent (knowledge-only-absent is the correct, complete answer,
+/// stay silent), while a store that EXISTS but cannot be loaded (corrupt/unreadable)
+/// must be VISIBLE to the caller.
+pub(crate) enum KnowledgeLoad {
+    /// The store loaded (with its lazily built ranking index).
+    Loaded(Rc<LoadedKnowledge>),
+    /// No store on disk — never ingested. The knowledge-only-absent case; silent.
+    Absent,
+    /// A store IS on disk but could not be loaded (corrupt/unreadable). Must surface.
+    Failed,
+}
+
+impl KnowledgeLoad {
+    /// Whether a store is on disk at all — loaded OR present-but-failed — as opposed
+    /// to truly absent. A present-but-failed store must still route to the
+    /// knowledge-aware default `source` so its load failure is surfaced (#143), rather
+    /// than silently falling back to code-only as if no knowledge context existed.
+    pub(crate) fn is_present(&self) -> bool {
+        !matches!(self, KnowledgeLoad::Absent)
+    }
+}
+
 /// The resolved context for a CCE MCP session (SPEC-MCP §"The server").
 pub struct McpServer {
     /// `--dir`: the project directory (also the sync/metrics root when set).
@@ -196,28 +221,51 @@ impl McpServer {
     /// A re-ingest changes both files, so the next call reloads; a deleted store
     /// drops the cache — never a stale answer.
     pub fn knowledge(&self) -> Option<Rc<LoadedKnowledge>> {
+        match self.load_knowledge() {
+            KnowledgeLoad::Loaded(k) => Some(k),
+            KnowledgeLoad::Absent | KnowledgeLoad::Failed => None,
+        }
+    }
+
+    /// The knowledge load outcome, distinguishing a store that is truly absent (never
+    /// ingested) from one that EXISTS but cannot be loaded (corrupt/unreadable) — the
+    /// distinction [`knowledge`](Self::knowledge)'s `Option` throws away. This is the
+    /// knowledge-side mirror of the code side's `NotFound`-vs-other split (#132/#143):
+    /// callers use it to surface a present-but-corrupt store instead of silently
+    /// downgrading the blend to code-only. Caching is identical to `knowledge()`.
+    pub(crate) fn load_knowledge(&self) -> KnowledgeLoad {
         let root = self.root();
         let fp = match knowledge_fingerprint(&root) {
             Some(fp) => fp,
             None => {
+                // No `current` pointer or no snapshot artifact on disk — the store was
+                // never ingested. True absence; stay silent.
                 self.knowledge_cache.borrow_mut().take();
-                return None;
+                return KnowledgeLoad::Absent;
             }
         };
         if let Some((cached_fp, k)) = self.knowledge_cache.borrow().as_ref() {
             if *cached_fp == fp {
-                return Some(Rc::clone(k));
+                return KnowledgeLoad::Loaded(Rc::clone(k));
             }
         }
         match KnowledgeStore::load_current(&root) {
             Ok(store) => {
                 let k = Rc::new(LoadedKnowledge::new(store));
                 *self.knowledge_cache.borrow_mut() = Some((fp, Rc::clone(&k)));
-                Some(k)
+                KnowledgeLoad::Loaded(k)
+            }
+            // A store file that vanished between the fingerprint probe and the load is
+            // true absence (a race); anything else — a corrupt snapshot tagged
+            // `InvalidData` by `KnowledgeStore::load` (#132 precedent), an unreadable
+            // file — is a present-but-failed store that must be surfaced (#143).
+            Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                self.knowledge_cache.borrow_mut().take();
+                KnowledgeLoad::Absent
             }
             Err(_) => {
                 self.knowledge_cache.borrow_mut().take();
-                None
+                KnowledgeLoad::Failed
             }
         }
     }

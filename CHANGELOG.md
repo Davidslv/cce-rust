@@ -45,6 +45,20 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test/fixture/samples` verified byte-identical.
 
 ### Fixed
+- **Blended `context_search` no longer silently swallows a knowledge-store load
+  failure (#143) — the knowledge-side mirror of #132.** A corrupt-but-present
+  knowledge store (`current` pointer intact, snapshot unparseable) was mapped
+  `load_current` `Err → None → empty`, so the default blend routed to code-only
+  and served a confident answer with `isError:false` and no hint that knowledge
+  context was missing — even explicit `source:"knowledge"` masked the corruption
+  as "0 chunk(s)". The fix splits absent from failed exactly as #132 did for the
+  code side: a store that was NEVER ingested stays silent (knowledge-only-absent
+  is then the correct, complete answer), but a store that EXISTS and fails to load
+  (`InvalidData`) now routes to the knowledge-aware default AND prepends the pinned
+  `KNOWLEDGE_STORE_LOAD_ERROR_NOTICE` through the same visible-degradation notice
+  channel (code hits still served, `isError` still reserved for malformed calls).
+  Code-store and knowledge-store corruption are now surfaced symmetrically, closing
+  the asymmetry #132 left. Healthy- and absent-path output is unchanged.
 - **Workspace member-name suffixing is now collision-free against real
   sibling directories (#131).** `detect_members` minted `basename-N` suffixes
   by a per-basename counter without checking the result against other members'
