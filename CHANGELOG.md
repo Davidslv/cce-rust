@@ -222,6 +222,39 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   can run under the dashboard), so the resulting nonsense figure that flows into
   `cost_saved_usd` is no longer silent. Verified in a release build: the total
   clamps instead of wrapping.
+- **`cce sync push` from a detached HEAD no longer silently rewinds
+  `refs/main` (#151).** `push_one` derived the pointer branch as
+  `current_branch(root).unwrap_or("main")`, so a detached checkout
+  (`git checkout <old-sha>`) published an honest artifact but rewound
+  `refs/main` to the old sha — silently rewinding every consumer's `--latest`.
+  Push now resolves the branch via an explicit `sync.ref` (the CI contract),
+  else the checked-out branch, and when HEAD is detached with no resolvable ref
+  it **refuses — advancing no pointer** — rather than rewinding one it cannot
+  attribute (fully closing #151, not deferring it). A CI job on a detached-at-SHA
+  checkout sets `sync.ref` to publish; a push-event checkout on an attached
+  branch is unaffected.
+- **`cce sync pull --workspace` now honours the §9.4 `--force` guard per
+  member (#118).** The workspace branch returned before the guard and never
+  consulted `SyncState`, so a member pinned via `cce sync pull --commit <sha>`
+  was silently clobbered by a root `pull --workspace --latest`. Each member is
+  now checked against its local marker and refuses without `--force`, exactly
+  as the single-repo path does.
+- **`resolve_pull_sha` distinguishes a `refs/main` read failure from pointer
+  absence (#120).** A transient IO/permission failure reading `refs/main` was
+  mapped to "no `--latest` pointer" and pushed into the #72 single-fallback;
+  a `has`-first check now surfaces the real read error and only a genuinely
+  absent pointer proceeds to the fallback.
+- **`cce sync status` no longer panics on a short checksum marker (#134).**
+  `&state.checksum[..12]` panicked when `.cce/synced.json` (which can come from
+  an older/sibling engine or a hand-edit) carried a checksum under 12 bytes or
+  with a multi-byte char at the boundary. All such slices now use a
+  byte-boundary-safe `short_checksum` helper.
+- **Code-sync `repo_id` gets the same path-segment validation as `corpus_id`
+  (#141).** `resolve_repo_id` returned the config/override id verbatim, so
+  `.`, `..`, and embedded separators flowed into `content_address` /
+  `pointer_address` as path segments and escaped the repo namespace. A single
+  chokepoint now rejects any id that is not one `Normal` path component
+  (`valid_repo_id`, mirroring #121).
 - **Memory append is a single write with a newline guard, so a torn or
   interleaved append can no longer silently lose entries (#102).** `append`
   in `src/memory.rs` wrote the JSON line and its trailing `\n` as two separate

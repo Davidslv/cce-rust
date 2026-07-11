@@ -24,8 +24,8 @@ use crate::sync::artifact::{Artifact, ManifestMeta};
 use crate::sync::config::SyncConfig;
 use crate::sync::remote::{GitRemote, SyncRemote};
 use crate::sync::{
-    content_address, git, hex_lower, normalize_repo_id, pointer_address, workspace_graph_address,
-    workspace_manifest_address, HASH_EMBEDDER, SYNC_FORMAT_VERSION,
+    content_address, git, hex_lower, normalize_repo_id, pointer_address, valid_repo_id,
+    workspace_graph_address, workspace_manifest_address, HASH_EMBEDDER, SYNC_FORMAT_VERSION,
 };
 use crate::workspace::{Manifest, Member, MemberType};
 use serde::{Deserialize, Serialize};
@@ -80,20 +80,44 @@ impl SyncState {
     }
 }
 
+/// The short 12-char prefix of a checksum for display, sliced on a **byte- and
+/// char-boundary-safe** basis (#134). `&s[..12]` panics when `s` is shorter than
+/// 12 bytes or when byte 12 splits a multi-byte char — and the checksum can come
+/// from an untrusted `.cce/synced.json` marker (an older/sibling engine or a
+/// hand-edit), so the diagnostic `status`/`verify` commands must render it
+/// without panicking. A value under 12 bytes renders whole.
+fn short_checksum(s: &str) -> &str {
+    s.get(..12).unwrap_or(s)
+}
+
 /// Resolve the `repo_id` for `root`: the config override, else the normalized git
 /// origin, else an error (we cannot address the cache without one).
 fn resolve_repo_id(root: &Path, cfg: &SyncConfig) -> Result<String, String> {
-    if let Some(id) = &cfg.repo_id {
-        return Ok(id.clone());
+    let id = match &cfg.repo_id {
+        Some(id) => id.clone(),
+        None => match git::origin_url(root) {
+            Some(url) => normalize_repo_id(&url),
+            None => {
+                return Err(
+                    "cannot determine repo_id: no `sync.repo_id` configured and no git origin \
+                     remote. Set one with `cce sync init --repo-id <id>`."
+                        .to_string(),
+                )
+            }
+        },
+    };
+    // #141: the single chokepoint every caller (push, pull, status, init
+    // override) inherits — reject a `repo_id` that is not a single cache path
+    // segment (`.`, `..`, embedded `/`) BEFORE it is built into a content or
+    // pointer address, mirroring the #121 corpus_id fix.
+    if !valid_repo_id(&id) {
+        return Err(format!(
+            "invalid repo_id `{id}`: must be non-empty, charset [A-Za-z0-9._-], and a single \
+             path segment — `.` and `..` are rejected (it is a path segment on the cache, so a \
+             traversal token would escape the repo namespace)"
+        ));
     }
-    match git::origin_url(root) {
-        Some(url) => Ok(normalize_repo_id(&url)),
-        None => {
-            Err("cannot determine repo_id: no `sync.repo_id` configured and no git origin remote. \
-             Set one with `cce sync init --repo-id <id>`."
-                .to_string())
-        }
-    }
+    Ok(id)
 }
 
 /// Open the configured remote, or a clear "no remote" error (offline-first: this is
@@ -221,13 +245,41 @@ fn resolve_push_sha(root: &Path, commit: Option<String>) -> Result<String, Strin
     }
 }
 
+/// Resolve which `refs/<branch>` pointer a push should advance (#151). An
+/// explicit `sync.ref` wins — the contract a CI runner (or anyone pushing from
+/// a **detached HEAD**) uses to name the branch — else the checked-out branch.
+///
+/// **It never silently falls back to `main` when HEAD is detached.** `push_one`
+/// used to derive the branch as `current_branch(root).unwrap_or(DEFAULT_REF)`,
+/// so a detached checkout (`git checkout <old-sha>`, exactly what #116's "check
+/// it out first" guidance leads to) resolved to `main` and rewound `refs/main`
+/// to the old sha — silently rewinding every consumer's `--latest`. When the
+/// branch cannot be attributed we now error rather than move a pointer we cannot
+/// justify. CI's detached-at-tip checkout still works: it sets `sync.ref` (or is
+/// on a branch), and advancing the tip pointer is the intended no-op.
+fn resolve_push_branch(root: &Path, cfg: &SyncConfig) -> Result<String, String> {
+    if let Some(git_ref) = &cfg.git_ref {
+        return Ok(git_ref.clone());
+    }
+    git::current_branch(root).ok_or_else(|| {
+        "cannot determine which ref to advance: HEAD is detached and no `sync.ref` is set. A \
+         detached push would rewind the default ref (`main`) to this commit and silently rewind \
+         every consumer's `--latest`. Set `sync.ref <branch>` in .cce/config (CI can set it from \
+         its branch env), or check out the branch before pushing."
+            .to_string()
+    })
+}
+
 /// Export a single repo's index at `sha` to an artifact and put it on the remote,
-/// updating the ref pointer. Returns the artifact checksum.
+/// updating the `refs/<branch>` pointer. Returns the artifact checksum. `branch`
+/// is resolved once by the caller (#151) so a detached HEAD cannot default to
+/// `main` and rewind it.
 fn push_one(
     root: &Path,
     remote: &dyn SyncRemote,
     repo_id: &str,
     sha: &str,
+    branch: &str,
 ) -> Result<(String, String), String> {
     let index = ensure_hash_index(root, sha)?;
     let meta = ManifestMeta { repo_id: repo_id.to_string(), sha: sha.to_string() };
@@ -237,8 +289,7 @@ fn push_one(
     let key = content_address(HASH_EMBEDDER, &ver, repo_id, sha);
 
     // Update the ref pointer to this sha alongside the artifact, in one commit/push.
-    let branch = git::current_branch(root).unwrap_or_else(|| crate::sync::DEFAULT_REF.to_string());
-    let pointer_key = pointer_address(HASH_EMBEDDER, &ver, repo_id, &branch);
+    let pointer_key = pointer_address(HASH_EMBEDDER, &ver, repo_id, branch);
     remote.put_many(&[(key.clone(), bytes), (pointer_key, format!("{sha}\n").into_bytes())])?;
     Ok((key, artifact.manifest.checksum))
 }
@@ -254,7 +305,8 @@ pub fn cmd_push(root: &Path, commit: Option<String>, workspace: bool) -> Result<
 
     let sha = resolve_push_sha(root, commit)?;
     let repo_id = resolve_repo_id(root, &cfg)?;
-    let (key, checksum) = push_one(root, &remote, &repo_id, &sha)?;
+    let branch = resolve_push_branch(root, &cfg)?;
+    let (key, checksum) = push_one(root, &remote, &repo_id, &sha, &branch)?;
     Ok(format!("Pushed {repo_id}@{sha}\n  key      : {key}\n  checksum : {checksum}\n"))
 }
 
@@ -276,12 +328,16 @@ fn push_workspace(
     let manifest = Manifest::load(root)?;
     let base = resolve_repo_id(root, cfg)?;
     let sha = resolve_push_sha(root, None)?;
+    // #151: resolve the pointer branch ONCE at the workspace root (all members
+    // share the one checkout) so a detached HEAD errors rather than rewinding
+    // `main` for every member.
+    let branch = resolve_push_branch(root, cfg)?;
     let mut out = format!("Pushing workspace {} @ {sha}\n", manifest.name);
     for m in &manifest.members {
         let member_dir = root.join(&m.path);
         let repo_id = format!("{base}__{}", m.name);
-        let (key, checksum) = push_one(&member_dir, remote, &repo_id, &sha)?;
-        out.push_str(&format!("  {:<16} {key}  ({})\n", m.name, &checksum[..12]));
+        let (key, checksum) = push_one(&member_dir, remote, &repo_id, &sha, &branch)?;
+        out.push_str(&format!("  {:<16} {key}  ({})\n", m.name, short_checksum(&checksum)));
     }
     let ver = SYNC_FORMAT_VERSION.to_string();
     let graph = crate::workspace::build_graph(root, &manifest);
@@ -317,20 +373,42 @@ fn list_ref_names(
         .collect())
 }
 
-/// Read a `refs/<name>` pointer's sha via the artifact-read path (`get`, which
-/// any `SyncRemote` backend supports). The sha comes back trimmed; an absent
-/// pointer is the clear per-ref "no `--latest` pointer" error.
+/// Read a `refs/<name>` pointer's sha, distinguishing a genuinely **absent**
+/// pointer (`Ok(None)`) from a pointer that exists but could not be **read**
+/// (`Err`, #120). `has` first (a `cat-file -e` existence check) decides absence;
+/// only when the pointer exists do we `get` it, so a transient IO/permission
+/// failure surfaces its real cause instead of being mislabelled "no pointer"
+/// and silently pushing resolution into the #72 single-fallback. The sha comes
+/// back trimmed.
+fn read_pointer_opt(
+    remote: &dyn SyncRemote,
+    ver: &str,
+    repo_id: &str,
+    name: &str,
+) -> Result<Option<String>, String> {
+    let pointer = pointer_address(HASH_EMBEDDER, ver, repo_id, name);
+    if !remote
+        .has(&pointer)
+        .map_err(|e| format!("could not check the `{name}` pointer for {repo_id}: {e}"))?
+    {
+        return Ok(None);
+    }
+    let bytes = remote
+        .get(&pointer)
+        .map_err(|e| format!("could not read the `{name}` pointer for {repo_id}: {e}"))?;
+    Ok(Some(String::from_utf8_lossy(&bytes).trim().to_string()))
+}
+
+/// Read a required `refs/<name>` pointer: an absent pointer is the clear per-ref
+/// "no `--latest` pointer" error; a read failure (#120) surfaces its own cause.
 fn read_pointer(
     remote: &dyn SyncRemote,
     ver: &str,
     repo_id: &str,
     name: &str,
 ) -> Result<String, String> {
-    let pointer = pointer_address(HASH_EMBEDDER, ver, repo_id, name);
-    let bytes = remote
-        .get(&pointer)
-        .map_err(|_| format!("no `--latest` pointer for {repo_id} on `{name}`"))?;
-    Ok(String::from_utf8_lossy(&bytes).trim().to_string())
+    read_pointer_opt(remote, ver, repo_id, name)?
+        .ok_or_else(|| format!("no `--latest` pointer for {repo_id} on `{name}`"))
 }
 
 /// Resolve the sha a pull should install. For `--latest` the resolution order
@@ -361,10 +439,12 @@ fn resolve_pull_sha(
                 let noted = (name != crate::sync::DEFAULT_REF).then_some(name);
                 return Ok((sha, noted));
             }
-            if let Ok(sha) = read_pointer(remote, &ver, repo_id, crate::sync::DEFAULT_REF) {
+            // #120: a read FAILURE on refs/main must surface (via `?`), not be
+            // swallowed as absence and mis-resolved through the fallback; only a
+            // genuinely absent pointer proceeds to the #72 single-fallback rule.
+            if let Some(sha) = read_pointer_opt(remote, &ver, repo_id, crate::sync::DEFAULT_REF)? {
                 return Ok((sha, None));
             }
-            // refs/main is absent — the #72 single-fallback rule.
             let refs = list_ref_names(remote, &ver, repo_id)?;
             match refs.as_slice() {
                 [only] => Ok((read_pointer(remote, &ver, repo_id, only)?, Some(only.clone()))),
@@ -452,7 +532,7 @@ pub fn cmd_pull(
     let remote = open_remote(&cfg)?;
 
     if workspace {
-        return pull_workspace(root, &cfg, &remote, &target, git_ref.as_deref());
+        return pull_workspace(root, &cfg, &remote, &target, force, git_ref.as_deref());
     }
 
     let repo_id = resolve_repo_id(root, &cfg)?;
@@ -554,6 +634,7 @@ fn pull_workspace(
     cfg: &SyncConfig,
     remote: &dyn SyncRemote,
     target: &PullTarget,
+    force: bool,
     git_ref: Option<&str>,
 ) -> Result<String, String> {
     let base = resolve_repo_id(root, cfg)?;
@@ -582,6 +663,22 @@ fn pull_workspace(
         let repo_id = format!("{base}__{}", m.name);
         let (sha, noted_ref) =
             resolve_pull_sha(&member_dir, cfg, remote, &repo_id, target, git_ref)?;
+        // §9.4 (#118): a workspace pull must NOT silently clobber a member whose
+        // local cache is pinned at a different sha — the exact overwrite the
+        // single-repo path refuses without --force. The workspace branch used to
+        // skip this guard entirely, so a member pinned via `cce sync pull
+        // --commit <sha>` was silently rewound by a root `pull --workspace`.
+        if !force {
+            if let Some(state) = SyncState::load(&member_dir) {
+                if state.sha != sha {
+                    return Err(format!(
+                        "workspace member `{}` local cache is at {} but you are pulling {sha}. \
+                         Pass --force to overwrite.",
+                        m.name, state.sha
+                    ));
+                }
+            }
+        }
         let key = content_address(HASH_EMBEDDER, &ver, &repo_id, &sha);
         let bytes = remote.get(&key)?;
         let artifact = install_artifact(&member_dir, &bytes)?;
@@ -591,7 +688,7 @@ fn pull_workspace(
             "  {:<16} {sha}  chunks {}  ({}){note}\n",
             m.name,
             artifact.manifest.chunk_count,
-            &artifact.manifest.checksum[..12]
+            short_checksum(&artifact.manifest.checksum)
         ));
     }
     // #55: adopt the published member metadata and install the published graph.
@@ -639,9 +736,11 @@ pub fn cmd_status(root: &Path) -> Result<String, String> {
     out.push_str(&format!("repo_id       : {repo_id}\n"));
 
     match SyncState::load(root) {
-        Some(state) => {
-            out.push_str(&format!("local cache   : {} ({})\n", state.sha, &state.checksum[..12]))
-        }
+        Some(state) => out.push_str(&format!(
+            "local cache   : {} ({})\n",
+            state.sha,
+            short_checksum(&state.checksum)
+        )),
         None => out.push_str("local cache   : (none pulled yet)\n"),
     }
 
@@ -1228,7 +1327,7 @@ pub fn cmd_pull_all(
                     "  {name:<16} pulled      {}@{sha}  chunks {}  ({}){note}\n",
                     r.repo_id,
                     artifact.manifest.chunk_count,
-                    &artifact.manifest.checksum[..12]
+                    short_checksum(&artifact.manifest.checksum)
                 ));
                 pulled += 1;
             }
@@ -1635,7 +1734,7 @@ pub fn cmd_verify_checksum_only(root: &Path) -> Result<String, String> {
             "knowledge",
             state.corpus_id,
             state.snapshot,
-            &checksum[..12]
+            short_checksum(checksum)
         ),
         KnowledgeChecksumVerify::NoRecord(_) => {
             format!("  {:<16} {KNOWLEDGE_NO_RECORD_NOTICE}\n", "knowledge")
@@ -1654,7 +1753,7 @@ pub fn cmd_verify_checksum_only(root: &Path) -> Result<String, String> {
                             m.name,
                             state.repo_id,
                             state.sha,
-                            &checksum[..12]
+                            short_checksum(&checksum)
                         ));
                         verified += 1;
                     }
@@ -1985,6 +2084,157 @@ mod tests {
         std::env::remove_var("CCE_HOME");
     }
 
+    /// A remote whose pointers EXIST (`has` → true) but cannot be READ (`get`
+    /// → a permission error) — the #120 exists-but-unreadable pointer scenario.
+    struct UnreadablePointerRemote;
+    impl SyncRemote for UnreadablePointerRemote {
+        fn has(&self, _key: &str) -> Result<bool, String> {
+            Ok(true)
+        }
+        fn get(&self, key: &str) -> Result<Vec<u8>, String> {
+            Err(format!("could not read {key} after checkout: Permission denied (os error 13)"))
+        }
+        fn put(&self, _key: &str, _bytes: &[u8]) -> Result<(), String> {
+            unimplemented!()
+        }
+        fn put_many(&self, _entries: &[(String, Vec<u8>)]) -> Result<(), String> {
+            unimplemented!()
+        }
+        fn list(&self, _prefix: &str) -> Result<Vec<String>, String> {
+            unimplemented!()
+        }
+        fn list_keys_with_suffix(&self, _p: &str, _s: &str) -> Result<Vec<String>, String> {
+            Ok(Vec::new())
+        }
+    }
+
+    #[test]
+    fn resolve_pull_sha_surfaces_a_pointer_read_failure_instead_of_reporting_absence() {
+        // #120: an exists-but-unreadable `refs/main` (permission blip) used to be
+        // conflated with absence — reported as "no `--latest` pointer" and pushed
+        // into the #72 fallback. The real read error must surface instead.
+        let work = tempfile::tempdir().unwrap();
+        let cfg = SyncConfig {
+            remote: Some("file:///x".into()),
+            lfs: false,
+            repo_id: Some("example__r".into()),
+            git_ref: None,
+            auto_pull: false,
+            retention: crate::sync::config::Retention::All,
+        };
+        let remote = UnreadablePointerRemote;
+        let err =
+            resolve_pull_sha(work.path(), &cfg, &remote, "example__r", &PullTarget::Latest, None)
+                .unwrap_err();
+        assert!(err.contains("could not read the `main` pointer"), "got: {err}");
+        assert!(!err.contains("no `--latest` pointer"), "read failure misreported: {err}");
+    }
+
+    #[test]
+    fn resolve_repo_id_rejects_path_traversal_ids() {
+        // #141: a config `sync.repo_id` (or `--repo-id` override) of `.`/`..`/an
+        // embedded separator flowed verbatim into content/pointer addresses,
+        // escaping the repo namespace. It must be refused at the resolve
+        // chokepoint every command inherits.
+        let work = tempfile::tempdir().unwrap();
+        let cfg_with = |id: &str| SyncConfig {
+            remote: Some("file:///x".into()),
+            lfs: false,
+            repo_id: Some(id.to_string()),
+            git_ref: None,
+            auto_pull: false,
+            retention: crate::sync::config::Retention::All,
+        };
+        for bad in ["..", ".", "a/b"] {
+            let err = resolve_repo_id(work.path(), &cfg_with(bad)).unwrap_err();
+            assert!(err.contains("invalid repo_id"), "`{bad}` got: {err}");
+        }
+        assert_eq!(
+            resolve_repo_id(work.path(), &cfg_with("example.com__acme__demo")).unwrap(),
+            "example.com__acme__demo"
+        );
+    }
+
+    #[test]
+    fn status_renders_a_short_checksum_marker_without_panicking() {
+        // #134: `.cce/synced.json` can carry a checksum shorter than 12 bytes
+        // (an older/sibling engine such as cce-ruby, or a hand-edit). `cce sync
+        // status` — the very command run to inspect a suspect marker — used to
+        // panic with "byte index 12 is out of bounds" on `&state.checksum[..12]`.
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let work = tempfile::tempdir().unwrap();
+        init_cfg(work.path(), &url);
+        std::fs::write(
+            work.path().join(".cce").join("synced.json"),
+            "{\"repo_id\":\"example.com__acme__demo\",\"sha\":\"abc123\",\"checksum\":\"short\"}",
+        )
+        .unwrap();
+        let s = cmd_status(work.path()).unwrap();
+        assert!(s.contains("local cache   : abc123 (short)"), "got: {s}");
+        std::env::remove_var("CCE_HOME");
+    }
+
+    #[test]
+    fn detached_head_push_refuses_instead_of_rewinding_main() {
+        // #151: pushing from a detached HEAD (the `git checkout <sha>` state
+        // #116's guidance leads to) used to fall back to `main` and rewind
+        // refs/main to the detached sha. It must error instead of moving a
+        // pointer it cannot attribute.
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let src = source_repo();
+        init_cfg(src.path(), &url);
+        let sha = git::head_sha(src.path()).unwrap();
+        git::run_commit(src.path(), &["checkout", "-q", &sha]).unwrap();
+        assert!(git::current_branch(src.path()).is_none(), "HEAD must be detached");
+
+        let err = cmd_push(src.path(), None, false).unwrap_err();
+        assert!(err.contains("HEAD is detached"), "got: {err}");
+        assert!(err.contains("sync.ref"), "got: {err}");
+
+        // Nothing was published: refs/main was not moved.
+        let remote = GitRemote::open(&url, false).unwrap();
+        let ver = SYNC_FORMAT_VERSION.to_string();
+        let ptr = pointer_address(
+            HASH_EMBEDDER,
+            &ver,
+            "example.com__acme__demo",
+            crate::sync::DEFAULT_REF,
+        );
+        assert!(!remote.has(&ptr).unwrap(), "refs/main must not have been written");
+        std::env::remove_var("CCE_HOME");
+    }
+
+    #[test]
+    fn detached_head_push_with_explicit_sync_ref_advances_that_pointer() {
+        // #151: the CI contract — a detached checkout at the tip sets `sync.ref`
+        // to name the pointer to advance, so the intended publish still works.
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let src = source_repo();
+        SyncConfig {
+            remote: Some(url.clone()),
+            lfs: false,
+            repo_id: Some("example.com__acme__demo".to_string()),
+            git_ref: Some("main".to_string()),
+            auto_pull: false,
+            retention: crate::sync::config::Retention::All,
+        }
+        .save(src.path())
+        .unwrap();
+        let sha = git::head_sha(src.path()).unwrap();
+        git::run_commit(src.path(), &["checkout", "-q", &sha]).unwrap();
+
+        let out = cmd_push(src.path(), None, false).unwrap();
+        assert!(out.contains("Pushed example.com__acme__demo@"), "got: {out}");
+        let remote = GitRemote::open(&url, false).unwrap();
+        let ver = SYNC_FORMAT_VERSION.to_string();
+        let ptr = pointer_address(HASH_EMBEDDER, &ver, "example.com__acme__demo", "main");
+        assert_eq!(remote.read_blob_text(&ptr).unwrap(), sha);
+        std::env::remove_var("CCE_HOME");
+    }
+
     #[test]
     fn init_writes_config_and_clone() {
         let _home = set_home();
@@ -2065,6 +2315,51 @@ mod tests {
         // Each member now has its own store.
         assert!(dst.path().join("alpha/.cce/index.json").exists());
         assert!(dst.path().join("beta/.cce/index.json").exists());
+        std::env::remove_var("CCE_HOME");
+    }
+
+    #[test]
+    fn workspace_pull_refuses_to_clobber_a_pinned_member_without_force() {
+        // #118: a root `pull --workspace --latest` used to skip the §9.4 guard
+        // entirely and silently rewind members pinned at another sha. The guard
+        // must fire per member, exactly as the single-repo path does.
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let src = workspace_repo();
+        let cfg = || SyncConfig {
+            remote: Some(url.clone()),
+            lfs: false,
+            repo_id: Some("example.com__acme__mono".to_string()),
+            git_ref: None,
+            auto_pull: false,
+            retention: crate::sync::config::Retention::All,
+        };
+        cfg().save(src.path()).unwrap();
+        cmd_push(src.path(), None, true).unwrap();
+        let sha1 = git::head_sha(src.path()).unwrap();
+
+        // Consumer clones and pulls the whole workspace at sha1 (markers recorded).
+        let dst = source_repo_clone(&src);
+        cfg().save(dst.path()).unwrap();
+        cmd_pull(dst.path(), PullTarget::Head, false, true, None).unwrap();
+        assert_eq!(SyncState::load(&dst.path().join("alpha")).unwrap().sha, sha1);
+
+        // A new workspace commit advances refs/main to sha2.
+        std::fs::write(src.path().join("alpha/src/index.js"), "function alpha() { return 2; }\n")
+            .unwrap();
+        git::run_commit(src.path(), &["commit", "-qam", "bump"]).unwrap();
+        cmd_push(src.path(), None, true).unwrap();
+        let sha2 = git::head_sha(src.path()).unwrap();
+        assert_ne!(sha1, sha2);
+
+        // WITHOUT --force the workspace pull must refuse, not silently rewind.
+        let err = cmd_pull(dst.path(), PullTarget::Latest, false, true, None).unwrap_err();
+        assert!(err.contains("Pass --force to overwrite"), "got: {err}");
+        assert_eq!(SyncState::load(&dst.path().join("alpha")).unwrap().sha, sha1, "pin intact");
+
+        // With --force it proceeds and advances the members.
+        cmd_pull(dst.path(), PullTarget::Latest, true, true, None).unwrap();
+        assert_eq!(SyncState::load(&dst.path().join("alpha")).unwrap().sha, sha2);
         std::env::remove_var("CCE_HOME");
     }
 
@@ -2164,7 +2459,8 @@ mod tests {
         let remote = GitRemote::open(&url, false).unwrap();
         for m in &manifest.members {
             let repo_id = format!("example.com__acme__mono__{}", m.name);
-            push_one(&src.path().join(&m.path), &remote, &repo_id, &sha).unwrap();
+            push_one(&src.path().join(&m.path), &remote, &repo_id, &sha, crate::sync::DEFAULT_REF)
+                .unwrap();
         }
 
         let dst = source_repo_clone(&src);

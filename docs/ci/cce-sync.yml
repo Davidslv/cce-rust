@@ -26,6 +26,12 @@ jobs:
         with:
           # Full history so the pushed sha's commit metadata resolves.
           fetch-depth: 0
+          # This is a push-event checkout: HEAD is on the ATTACHED branch, so
+          # `cce sync push` advances refs/<that-branch> as expected — nothing
+          # extra is needed. If you instead pin a detached checkout (e.g.
+          # `ref: ${{ github.sha }}`), HEAD is detached and the push would
+          # refuse rather than rewind refs/main (#151) — set `sync.ref: <branch>`
+          # in .cce/config to name the pointer the push should advance.
 
       - name: Install git-LFS
         run: |

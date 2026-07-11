@@ -161,13 +161,17 @@ Rules:
   build(HEAD) under another sha's key and rewind `refs/<branch>`, poisoning the
   shared cache. To publish an older commit, check it out first — but note the
   warning below.
-- **Publish from a branch, not a detached HEAD.** The ref pointer push writes is
-  `refs/<current-branch>`, and on a **detached HEAD** (e.g. after
-  `git checkout <old-sha>`) there is no branch, so push falls back to the default
-  ref (`refs/main`) and advances it to the checked-out commit — rewinding
-  `--latest` for consumers. So checking out an old commit to publish it will move
-  `refs/main` back; publish from a branch instead. Refusing (or better-targeting)
-  the detached-HEAD push is tracked as a follow-up (#151).
+- **A detached-HEAD push refuses rather than rewinding a ref (#151).** The ref
+  pointer push writes is `refs/<current-branch>`. On a **detached HEAD** (e.g.
+  after `git checkout <old-sha>`) there is no branch to attribute the pointer to,
+  so push does **not** advance any ref — it errors, naming the ambiguity. This
+  prevents the old failure mode where a detached push silently fell back to
+  `refs/main` and rewound `--latest` for every consumer. Two ways forward: check
+  out the branch and publish from there, or set **`sync.ref <branch>`** to name
+  which pointer to advance while detached — the explicit escape hatch a CI runner
+  on a detached-at-SHA checkout uses (a push-event checkout on an attached branch
+  needs nothing). `sync.ref` thus names the pointer on both sides: which ref
+  `--latest` resolves on pull, and which ref a detached push advances.
 - `pull` installs the artifact into the local `.cce/` store (importing the
   interchange format into the engine's native store). If the local working tree
   matches `sha`, the pulled index is used as-is.

@@ -197,6 +197,30 @@ pub fn knowledge_corpus_meta_address(contract_ver: &str, corpus_id: &str) -> Str
 /// two traversal tokens (belt and braces: any id that does not resolve to
 /// exactly one `Normal` component is rejected).
 pub fn valid_corpus_id(id: &str) -> bool {
+    is_valid_id_segment(id)
+}
+
+/// Validate a `repo_id` as a cache path segment (#141) — the sibling of
+/// `valid_corpus_id` (#121), applying the SAME rule: non-empty,
+/// `sanitize_id`-stable, and exactly one `Normal` path component. The code-sync
+/// `repo_id` reaches `content_address`/`pointer_address` as a path segment just
+/// as `corpus_id` does, and its config/override path (`sync.repo_id`,
+/// `--repo-id`) previously had NO validation at all — accepting `.`, `..`, and
+/// embedded separators, which resolve OUT of the repo namespace on the cache
+/// (`hash/<ver>/..` normalizes to `hash/<ver>`), a namespace-escape /
+/// pointer-overwrite hazard. Rejecting the two traversal tokens and any
+/// multi-segment id at the resolve chokepoint closes it for every caller (push,
+/// pull, status, init override) at once.
+pub fn valid_repo_id(id: &str) -> bool {
+    is_valid_id_segment(id)
+}
+
+/// The shared cache-path-segment rule behind `valid_corpus_id` (#121) and
+/// `valid_repo_id` (#141): non-empty, `sanitize_id`-stable (charset
+/// `[A-Za-z0-9._-]`, no path separators), and resolving to exactly one `Normal`
+/// path component — so `.` and `..` (sanitize-stable yet traversal tokens) are
+/// rejected outright.
+fn is_valid_id_segment(id: &str) -> bool {
     if id.is_empty() || sanitize_id(id) != id {
         return false;
     }
@@ -346,6 +370,21 @@ mod tests {
         assert!(valid_corpus_id(".hidden"));
         assert!(valid_corpus_id("v1."));
         assert!(valid_corpus_id("..."));
+    }
+
+    #[test]
+    fn repo_id_validation_mirrors_the_corpus_id_rule() {
+        // #141: `repo_id` gets the same single-path-segment rule as `corpus_id`.
+        assert!(valid_repo_id("example.com__acme__demo"));
+        assert!(valid_repo_id("runbooks_v2.1"));
+        assert!(!valid_repo_id(""));
+        assert!(!valid_repo_id("."));
+        assert!(!valid_repo_id(".."));
+        assert!(!valid_repo_id("a/b"));
+        assert!(!valid_repo_id("has space"));
+        // Dotted names that are a single harmless segment stay valid.
+        assert!(valid_repo_id("v1."));
+        assert!(valid_repo_id(".hidden"));
     }
 
     #[test]

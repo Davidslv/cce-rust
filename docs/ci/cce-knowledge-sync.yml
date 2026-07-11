@@ -50,6 +50,12 @@ jobs:
           # WRITE access to the CACHE repo only — never the source tool.
           CCE_SYNC_TOKEN: ${{ secrets.CCE_SYNC_TOKEN }}
         run: |
+          # `corpus-root` is a plain directory, not a git checkout, and
+          # `cce knowledge push` advances the corpus `current` (snapshot)
+          # pointer — NOT a git `refs/<branch>` pointer — so it is unaffected by
+          # the detached-HEAD push guard (#151); no `sync.ref` is needed here.
+          # (Only a code `cce sync push` from a detached checkout requires
+          # `sync.ref: <branch>` in .cce/config — see docs/ci/cce-sync.yml.)
           cd corpus-root
           cce sync init \
             --remote "https://x-access-token:${CCE_SYNC_TOKEN}@github.com/acme/cce-cache.git"
