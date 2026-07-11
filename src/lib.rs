@@ -13,6 +13,7 @@
 //! - It deliberately does NOT contain algorithm logic; each concern lives in its
 //!   own file per SPEC §2.
 
+pub mod atomic;
 pub mod config;
 pub mod tokenizer;
 pub mod pricing;

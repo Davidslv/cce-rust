@@ -136,7 +136,10 @@ impl Fingerprint {
     /// Persist beside `store_path` (single-line JSON, like `.cce/synced.json`).
     pub fn save_beside_store(&self, store_path: &Path) -> io::Result<PathBuf> {
         let path = beside_store(store_path);
-        std::fs::write(&path, serde_json::to_string(self).map_err(io::Error::other)?)?;
+        // #101: same atomic temp-file + rename as the store it sits beside, so a
+        // torn write can't leave `cce doctor` reading a truncated fingerprint.
+        let json = serde_json::to_string(self).map_err(io::Error::other)?;
+        crate::atomic::atomic_write(&path, json.as_bytes())?;
         Ok(path)
     }
 

@@ -262,7 +262,10 @@ impl Index {
             file_tokens: self.file_tokens.clone(),
         };
         let json = serde_json::to_string(&data).map_err(io::Error::other)?;
-        std::fs::write(path, json)
+        // #101: atomic temp-file + rename, never a bare truncate-then-write — a
+        // crash/OOM/disk-full mid-save must not destroy the previous good store,
+        // and a concurrent reader must never observe a truncated/0-byte index.json.
+        crate::atomic::atomic_write(path, json.as_bytes())
     }
 
     /// Load an index from `path`, recomputing BM25 and the graph.
@@ -434,6 +437,49 @@ mod tests {
         assert_eq!(loaded.chunks.len(), idx.chunks.len());
         // embeddings survive the round-trip
         assert_eq!(loaded.chunks[0].embedding, idx.chunks[0].embedding);
+    }
+
+    #[test]
+    fn save_persists_exactly_the_serialized_bytes() {
+        // #101: switching to an atomic temp-file + rename must change ONLY the
+        // write mechanism — the on-disk bytes stay byte-identical to a direct
+        // `serde_json::to_string` of the same `IndexData`, so conformance/golden
+        // stores and pinned checksums are untouched.
+        let e = HashEmbedder;
+        let (idx, _) = Index::build_from_dir(&fixture_dir(), &e).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let path = tmp.path().join("index.json");
+        idx.save(&path).unwrap();
+        let expected = serde_json::to_string(&IndexData {
+            spec_version: SPEC_VERSION.to_string(),
+            embedder: idx.embedder_name.clone(),
+            chunks: idx.chunks.clone(),
+            file_imports: idx.file_imports.clone(),
+            file_tokens: idx.file_tokens.clone(),
+        })
+        .unwrap();
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), expected);
+    }
+
+    #[test]
+    fn save_leaves_no_temp_file_and_writes_a_complete_store() {
+        // #101 use case: after a save the store directory holds ONLY index.json —
+        // no leftover temp/partial file — and the destination is the complete,
+        // loadable store (never a 0-byte torn read).
+        let e = HashEmbedder;
+        let (idx, _) = Index::build_from_dir(&fixture_dir(), &e).unwrap();
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join(".cce");
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("index.json");
+        idx.save(&path).unwrap();
+        let entries: Vec<String> = std::fs::read_dir(&dir)
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(entries, vec!["index.json".to_string()]);
+        assert!(std::fs::metadata(&path).unwrap().len() > 0);
+        Index::load(&path).unwrap();
     }
 
     #[test]

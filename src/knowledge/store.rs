@@ -214,8 +214,14 @@ impl KnowledgeStore {
         std::fs::create_dir_all(&dir)?;
         let path = Self::snapshot_path(root, &self.snapshot);
         let json = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
-        std::fs::write(&path, format!("{json}\n"))?;
-        std::fs::write(Self::current_pointer_path(root), format!("{}\n", self.snapshot))?;
+        // #101: atomic temp-file + rename for both the snapshot artifact and the
+        // `current` pointer, so an interrupted ingest can neither destroy a prior
+        // snapshot nor leave a torn pointer a concurrent reader would misresolve.
+        crate::atomic::atomic_write(&path, format!("{json}\n").as_bytes())?;
+        crate::atomic::atomic_write(
+            &Self::current_pointer_path(root),
+            format!("{}\n", self.snapshot).as_bytes(),
+        )?;
         Ok(path)
     }
 
