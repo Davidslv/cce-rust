@@ -245,13 +245,41 @@ fn resolve_push_sha(root: &Path, commit: Option<String>) -> Result<String, Strin
     }
 }
 
+/// Resolve which `refs/<branch>` pointer a push should advance (#151). An
+/// explicit `sync.ref` wins — the contract a CI runner (or anyone pushing from
+/// a **detached HEAD**) uses to name the branch — else the checked-out branch.
+///
+/// **It never silently falls back to `main` when HEAD is detached.** `push_one`
+/// used to derive the branch as `current_branch(root).unwrap_or(DEFAULT_REF)`,
+/// so a detached checkout (`git checkout <old-sha>`, exactly what #116's "check
+/// it out first" guidance leads to) resolved to `main` and rewound `refs/main`
+/// to the old sha — silently rewinding every consumer's `--latest`. When the
+/// branch cannot be attributed we now error rather than move a pointer we cannot
+/// justify. CI's detached-at-tip checkout still works: it sets `sync.ref` (or is
+/// on a branch), and advancing the tip pointer is the intended no-op.
+fn resolve_push_branch(root: &Path, cfg: &SyncConfig) -> Result<String, String> {
+    if let Some(git_ref) = &cfg.git_ref {
+        return Ok(git_ref.clone());
+    }
+    git::current_branch(root).ok_or_else(|| {
+        "cannot determine which ref to advance: HEAD is detached and no `sync.ref` is set. A \
+         detached push would rewind the default ref (`main`) to this commit and silently rewind \
+         every consumer's `--latest`. Set `sync.ref <branch>` in .cce/config (CI can set it from \
+         its branch env), or check out the branch before pushing."
+            .to_string()
+    })
+}
+
 /// Export a single repo's index at `sha` to an artifact and put it on the remote,
-/// updating the ref pointer. Returns the artifact checksum.
+/// updating the `refs/<branch>` pointer. Returns the artifact checksum. `branch`
+/// is resolved once by the caller (#151) so a detached HEAD cannot default to
+/// `main` and rewind it.
 fn push_one(
     root: &Path,
     remote: &dyn SyncRemote,
     repo_id: &str,
     sha: &str,
+    branch: &str,
 ) -> Result<(String, String), String> {
     let index = ensure_hash_index(root, sha)?;
     let meta = ManifestMeta { repo_id: repo_id.to_string(), sha: sha.to_string() };
@@ -261,8 +289,7 @@ fn push_one(
     let key = content_address(HASH_EMBEDDER, &ver, repo_id, sha);
 
     // Update the ref pointer to this sha alongside the artifact, in one commit/push.
-    let branch = git::current_branch(root).unwrap_or_else(|| crate::sync::DEFAULT_REF.to_string());
-    let pointer_key = pointer_address(HASH_EMBEDDER, &ver, repo_id, &branch);
+    let pointer_key = pointer_address(HASH_EMBEDDER, &ver, repo_id, branch);
     remote.put_many(&[(key.clone(), bytes), (pointer_key, format!("{sha}\n").into_bytes())])?;
     Ok((key, artifact.manifest.checksum))
 }
@@ -278,7 +305,8 @@ pub fn cmd_push(root: &Path, commit: Option<String>, workspace: bool) -> Result<
 
     let sha = resolve_push_sha(root, commit)?;
     let repo_id = resolve_repo_id(root, &cfg)?;
-    let (key, checksum) = push_one(root, &remote, &repo_id, &sha)?;
+    let branch = resolve_push_branch(root, &cfg)?;
+    let (key, checksum) = push_one(root, &remote, &repo_id, &sha, &branch)?;
     Ok(format!("Pushed {repo_id}@{sha}\n  key      : {key}\n  checksum : {checksum}\n"))
 }
 
@@ -300,11 +328,15 @@ fn push_workspace(
     let manifest = Manifest::load(root)?;
     let base = resolve_repo_id(root, cfg)?;
     let sha = resolve_push_sha(root, None)?;
+    // #151: resolve the pointer branch ONCE at the workspace root (all members
+    // share the one checkout) so a detached HEAD errors rather than rewinding
+    // `main` for every member.
+    let branch = resolve_push_branch(root, cfg)?;
     let mut out = format!("Pushing workspace {} @ {sha}\n", manifest.name);
     for m in &manifest.members {
         let member_dir = root.join(&m.path);
         let repo_id = format!("{base}__{}", m.name);
-        let (key, checksum) = push_one(&member_dir, remote, &repo_id, &sha)?;
+        let (key, checksum) = push_one(&member_dir, remote, &repo_id, &sha, &branch)?;
         out.push_str(&format!("  {:<16} {key}  ({})\n", m.name, short_checksum(&checksum)));
     }
     let ver = SYNC_FORMAT_VERSION.to_string();
@@ -2144,6 +2176,66 @@ mod tests {
     }
 
     #[test]
+    fn detached_head_push_refuses_instead_of_rewinding_main() {
+        // #151: pushing from a detached HEAD (the `git checkout <sha>` state
+        // #116's guidance leads to) used to fall back to `main` and rewind
+        // refs/main to the detached sha. It must error instead of moving a
+        // pointer it cannot attribute.
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let src = source_repo();
+        init_cfg(src.path(), &url);
+        let sha = git::head_sha(src.path()).unwrap();
+        git::run_commit(src.path(), &["checkout", "-q", &sha]).unwrap();
+        assert!(git::current_branch(src.path()).is_none(), "HEAD must be detached");
+
+        let err = cmd_push(src.path(), None, false).unwrap_err();
+        assert!(err.contains("HEAD is detached"), "got: {err}");
+        assert!(err.contains("sync.ref"), "got: {err}");
+
+        // Nothing was published: refs/main was not moved.
+        let remote = GitRemote::open(&url, false).unwrap();
+        let ver = SYNC_FORMAT_VERSION.to_string();
+        let ptr = pointer_address(
+            HASH_EMBEDDER,
+            &ver,
+            "example.com__acme__demo",
+            crate::sync::DEFAULT_REF,
+        );
+        assert!(!remote.has(&ptr).unwrap(), "refs/main must not have been written");
+        std::env::remove_var("CCE_HOME");
+    }
+
+    #[test]
+    fn detached_head_push_with_explicit_sync_ref_advances_that_pointer() {
+        // #151: the CI contract — a detached checkout at the tip sets `sync.ref`
+        // to name the pointer to advance, so the intended publish still works.
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let src = source_repo();
+        SyncConfig {
+            remote: Some(url.clone()),
+            lfs: false,
+            repo_id: Some("example.com__acme__demo".to_string()),
+            git_ref: Some("main".to_string()),
+            auto_pull: false,
+            retention: crate::sync::config::Retention::All,
+        }
+        .save(src.path())
+        .unwrap();
+        let sha = git::head_sha(src.path()).unwrap();
+        git::run_commit(src.path(), &["checkout", "-q", &sha]).unwrap();
+
+        let out = cmd_push(src.path(), None, false).unwrap();
+        assert!(out.contains("Pushed example.com__acme__demo@"), "got: {out}");
+        let remote = GitRemote::open(&url, false).unwrap();
+        let ver = SYNC_FORMAT_VERSION.to_string();
+        let ptr = pointer_address(HASH_EMBEDDER, &ver, "example.com__acme__demo", "main");
+        assert_eq!(remote.read_blob_text(&ptr).unwrap(), sha);
+        std::env::remove_var("CCE_HOME");
+    }
+
+    #[test]
     fn init_writes_config_and_clone() {
         let _home = set_home();
         let (_bare, url) = bare_remote();
@@ -2367,7 +2459,8 @@ mod tests {
         let remote = GitRemote::open(&url, false).unwrap();
         for m in &manifest.members {
             let repo_id = format!("example.com__acme__mono__{}", m.name);
-            push_one(&src.path().join(&m.path), &remote, &repo_id, &sha).unwrap();
+            push_one(&src.path().join(&m.path), &remote, &repo_id, &sha, crate::sync::DEFAULT_REF)
+                .unwrap();
         }
 
         let dst = source_repo_clone(&src);
