@@ -133,24 +133,46 @@ pub fn cmd_doctor(dir: Option<PathBuf>, store: Option<PathBuf>) -> Result<Doctor
                 check_knowledge(&root, &mut r);
                 manifest.members.len()
             }
-            Err(_) => {
-                let store_path = default_store_path(&root);
-                r.line(&format!("cce doctor — {}", root.display()));
-                let has_knowledge =
-                    crate::knowledge::store::KnowledgeStore::current_pointer_path(&root).exists();
-                if !store_path.exists() && !has_knowledge {
-                    return Err(format!(
-                        "no store at {} — index first (`cce index {}`)",
-                        store_path.display(),
-                        root.display()
+            Err(e) => {
+                // #126: distinguish an ABSENT manifest (simply not a workspace —
+                // fall through to single-dir mode, as before) from one that is
+                // PRESENT but unreadable/corrupt. The old `Err(_)` arm conflated
+                // the two, silently degrading a broken workspace to single-dir
+                // mode: the manifest corruption was never surfaced and — when the
+                // root also held its own store — doctor reported the broken
+                // workspace HEALTHY (exit 0), skipping every member store. A
+                // corrupt/unreadable workspace.yml is DEFINITE corruption; report
+                // it as a failure (exit 1) instead of degrading past it.
+                if crate::workspace::manifest_path(&root).exists() {
+                    r.line(&format!("cce doctor — {}", root.display()));
+                    r.fail(&format!(
+                        "workspace.yml is present but unreadable/corrupt: {e}\n\
+                         fix or remove {} — doctor will not fall back to single-directory \
+                         mode past a corrupt manifest (that hides the corruption and skips \
+                         every member store).",
+                        crate::workspace::manifest_path(&root).display()
                     ));
+                    0
+                } else {
+                    let store_path = default_store_path(&root);
+                    r.line(&format!("cce doctor — {}", root.display()));
+                    let has_knowledge =
+                        crate::knowledge::store::KnowledgeStore::current_pointer_path(&root)
+                            .exists();
+                    if !store_path.exists() && !has_knowledge {
+                        return Err(format!(
+                            "no store at {} — index first (`cce index {}`)",
+                            store_path.display(),
+                            root.display()
+                        ));
+                    }
+                    if store_path.exists() {
+                        check_store(&store_path, &mut r);
+                        check_sync_marker(&root, &mut r);
+                    }
+                    check_knowledge(&root, &mut r);
+                    1
                 }
-                if store_path.exists() {
-                    check_store(&store_path, &mut r);
-                    check_sync_marker(&root, &mut r);
-                }
-                check_knowledge(&root, &mut r);
-                1
             }
         }
     };
@@ -720,6 +742,49 @@ mod tests {
         let out = run(tmp.path());
         assert!(!out.healthy());
         assert!(out.report.contains("chunker changed"), "{}", out.report);
+    }
+
+    #[test]
+    fn corrupt_workspace_manifest_is_a_definite_failure_not_silent_single_dir() {
+        // #126: doctor's `Err(_)` arm on Manifest::load conflated an ABSENT
+        // manifest (not a workspace) with a PRESENT-but-corrupt one, silently
+        // degrading to single-dir mode — so a broken workspace whose root also
+        // holds a store was reported HEALTHY (exit 0) and the manifest
+        // corruption never surfaced. A corrupt workspace.yml is definite
+        // corruption: it must fail the run.
+        use crate::workspace::{manifest_path, Manifest, Member, MemberType};
+        let tmp = tempfile::tempdir().unwrap();
+        // A root-level store: the single-dir fallback WOULD find it healthy.
+        indexed_root(tmp.path());
+
+        // A valid workspace.yml stays healthy (member `.` re-uses the root store).
+        let manifest = Manifest {
+            version: 1,
+            name: "demo".to_string(),
+            members: vec![Member {
+                name: "api".to_string(),
+                path: ".".to_string(),
+                member_type: MemberType::StoreOnly,
+                package: "api".to_string(),
+            }],
+        };
+        manifest.save(tmp.path()).unwrap();
+        assert!(run(tmp.path()).healthy(), "a valid workspace must stay healthy");
+
+        // Corrupt it: unparseable YAML. doctor must NOT report healthy.
+        std::fs::write(manifest_path(tmp.path()), "version: 1\nname: demo\nmembers: [oops\n")
+            .unwrap();
+        let out = run(tmp.path());
+        assert!(!out.healthy(), "a corrupt workspace.yml must fail the run:\n{}", out.report);
+        assert!(
+            out.report.contains("workspace.yml"),
+            "the finding must name the manifest:\n{}",
+            out.report
+        );
+
+        // With NO workspace.yml the same tree is unaffected (single-dir, healthy).
+        std::fs::remove_file(manifest_path(tmp.path())).unwrap();
+        assert!(run(tmp.path()).healthy(), "an absent manifest → single-dir, unaffected");
     }
 
     #[test]

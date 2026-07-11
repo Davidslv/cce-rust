@@ -45,6 +45,38 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   `test/fixture/samples` verified byte-identical.
 
 ### Fixed
+- **`cce sync pull` no longer overwrites the local index at a different sha when
+  the code marker is corrupt, and never activates a pulled store before its
+  marker is durable (#163) — the code-side twins of the knowledge-side #123/#122.**
+  `SyncState::load`'s `.ok()` mapped a present-but-corrupt `.cce/synced.json` to
+  `None`, indistinguishable from "never pulled", so a truncated marker read as
+  "nothing pinned" and disarmed the §9.4 different-sha overwrite guard — a pull
+  at a divergent sha proceeded without `--force`. The guard now loads through a
+  new `SyncState::load_strict`, which returns `Ok(None)` only for a genuinely
+  absent marker and an error (naming `--force`) for a corrupt one; the lenient
+  `load` is retained for best-effort `status`/`verify` display. Separately,
+  `install_artifact` replaced `.cce/index.json` in place BEFORE writing the
+  marker, so a marker-write failure left the new store active with a stale
+  marker; it now stages the new index beside the store, records the marker, and
+  only then renames the staged file into place (cleaning up the staged file on
+  any failure). A marker-write failure leaves the prior store active; a crash in
+  the narrow window between the marker write and the rename leaves a transient
+  marker=new/store=old mismatch that `verify`/`doctor` detect and the next
+  same-sha pull self-heals (errs safe, matching the #122 design). The rename now
+  carries over a user-tightened store's mode (`chmod 600 index.json` stays
+  `0o600`), preserving the invariant `atomic_write` guards. Byte-identity and the
+  §9.4 guard now hold on the workspace-member pull path too, not only single-repo.
+- **`cce doctor` no longer reports a broken workspace healthy when its
+  `workspace.yml` is corrupt (#126).** The `Manifest::load` `Err(_)` arm
+  conflated an ABSENT manifest (simply not a workspace) with a PRESENT-but-
+  unreadable one, silently degrading to single-directory mode — so a
+  hand-edited/corrupt `workspace.yml` was never reported and, when the root
+  also held its own store, doctor exited 0 with a clean bill of health while
+  every member store went unchecked. doctor now distinguishes the two via the
+  existing `workspace::manifest_path` API: an absent manifest still falls
+  through to single-dir mode unchanged, but a present-but-corrupt one is a
+  definite-corruption FAIL (exit 1) that names the manifest. A valid workspace
+  stays healthy.
 - **Blended `context_search` no longer silently swallows a knowledge-store load
   failure (#143) — the knowledge-side mirror of #132.** A corrupt-but-present
   knowledge store (`current` pointer intact, snapshot unparseable) was mapped
