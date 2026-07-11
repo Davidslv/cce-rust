@@ -80,6 +80,16 @@ impl SyncState {
     }
 }
 
+/// The short 12-char prefix of a checksum for display, sliced on a **byte- and
+/// char-boundary-safe** basis (#134). `&s[..12]` panics when `s` is shorter than
+/// 12 bytes or when byte 12 splits a multi-byte char — and the checksum can come
+/// from an untrusted `.cce/synced.json` marker (an older/sibling engine or a
+/// hand-edit), so the diagnostic `status`/`verify` commands must render it
+/// without panicking. A value under 12 bytes renders whole.
+fn short_checksum(s: &str) -> &str {
+    s.get(..12).unwrap_or(s)
+}
+
 /// Resolve the `repo_id` for `root`: the config override, else the normalized git
 /// origin, else an error (we cannot address the cache without one).
 fn resolve_repo_id(root: &Path, cfg: &SyncConfig) -> Result<String, String> {
@@ -281,7 +291,7 @@ fn push_workspace(
         let member_dir = root.join(&m.path);
         let repo_id = format!("{base}__{}", m.name);
         let (key, checksum) = push_one(&member_dir, remote, &repo_id, &sha)?;
-        out.push_str(&format!("  {:<16} {key}  ({})\n", m.name, &checksum[..12]));
+        out.push_str(&format!("  {:<16} {key}  ({})\n", m.name, short_checksum(&checksum)));
     }
     let ver = SYNC_FORMAT_VERSION.to_string();
     let graph = crate::workspace::build_graph(root, &manifest);
@@ -591,7 +601,7 @@ fn pull_workspace(
             "  {:<16} {sha}  chunks {}  ({}){note}\n",
             m.name,
             artifact.manifest.chunk_count,
-            &artifact.manifest.checksum[..12]
+            short_checksum(&artifact.manifest.checksum)
         ));
     }
     // #55: adopt the published member metadata and install the published graph.
@@ -639,9 +649,11 @@ pub fn cmd_status(root: &Path) -> Result<String, String> {
     out.push_str(&format!("repo_id       : {repo_id}\n"));
 
     match SyncState::load(root) {
-        Some(state) => {
-            out.push_str(&format!("local cache   : {} ({})\n", state.sha, &state.checksum[..12]))
-        }
+        Some(state) => out.push_str(&format!(
+            "local cache   : {} ({})\n",
+            state.sha,
+            short_checksum(&state.checksum)
+        )),
         None => out.push_str("local cache   : (none pulled yet)\n"),
     }
 
@@ -1228,7 +1240,7 @@ pub fn cmd_pull_all(
                     "  {name:<16} pulled      {}@{sha}  chunks {}  ({}){note}\n",
                     r.repo_id,
                     artifact.manifest.chunk_count,
-                    &artifact.manifest.checksum[..12]
+                    short_checksum(&artifact.manifest.checksum)
                 ));
                 pulled += 1;
             }
@@ -1635,7 +1647,7 @@ pub fn cmd_verify_checksum_only(root: &Path) -> Result<String, String> {
             "knowledge",
             state.corpus_id,
             state.snapshot,
-            &checksum[..12]
+            short_checksum(checksum)
         ),
         KnowledgeChecksumVerify::NoRecord(_) => {
             format!("  {:<16} {KNOWLEDGE_NO_RECORD_NOTICE}\n", "knowledge")
@@ -1654,7 +1666,7 @@ pub fn cmd_verify_checksum_only(root: &Path) -> Result<String, String> {
                             m.name,
                             state.repo_id,
                             state.sha,
-                            &checksum[..12]
+                            short_checksum(&checksum)
                         ));
                         verified += 1;
                     }
@@ -1982,6 +1994,26 @@ mod tests {
         assert!(s.contains("remote        : file://"));
         assert!(s.contains("local cache   :"));
         assert!(s.contains("remote latest :"));
+        std::env::remove_var("CCE_HOME");
+    }
+
+    #[test]
+    fn status_renders_a_short_checksum_marker_without_panicking() {
+        // #134: `.cce/synced.json` can carry a checksum shorter than 12 bytes
+        // (an older/sibling engine such as cce-ruby, or a hand-edit). `cce sync
+        // status` — the very command run to inspect a suspect marker — used to
+        // panic with "byte index 12 is out of bounds" on `&state.checksum[..12]`.
+        let _home = set_home();
+        let (_bare, url) = bare_remote();
+        let work = tempfile::tempdir().unwrap();
+        init_cfg(work.path(), &url);
+        std::fs::write(
+            work.path().join(".cce").join("synced.json"),
+            "{\"repo_id\":\"example.com__acme__demo\",\"sha\":\"abc123\",\"checksum\":\"short\"}",
+        )
+        .unwrap();
+        let s = cmd_status(work.path()).unwrap();
+        assert!(s.contains("local cache   : abc123 (short)"), "got: {s}");
         std::env::remove_var("CCE_HOME");
     }
 
