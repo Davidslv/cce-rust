@@ -46,7 +46,7 @@ use crate::federation::{
     workspace_stats, CachedWorkspace, MemberStore,
 };
 use crate::knowledge::{same_document_sections, KnowledgeHit};
-use crate::mcp::server::McpServer;
+use crate::mcp::server::{KnowledgeLoad, McpServer};
 use crate::mcp::MCP_DEFAULT_TOP_K;
 use crate::memory::{self, RecallHit};
 use crate::metrics::{HexIdSource, MetricsWriter, SystemClock};
@@ -310,7 +310,11 @@ fn resolve_source(server: &McpServer, args: &Value) -> SourceSel {
     }
     let root = server.root();
     let cfg = KnowledgeConfig::load(&root);
-    if cfg.enabled && server.knowledge().is_some() {
+    // A store that is on disk but corrupt (`is_present` && !loaded) must STILL take the
+    // knowledge-aware default (#143): otherwise a corrupt store would silently fall back
+    // to code-only here, and the blend that surfaces the load-failure notice would never
+    // run. Only a truly absent store keeps today's code-only default.
+    if cfg.enabled && server.load_knowledge().is_present() {
         match cfg.default_source.as_str() {
             "code" => SourceSel::Code,
             "knowledge" => SourceSel::Knowledge,
@@ -533,16 +537,26 @@ fn parse_params(server: &McpServer, args: &Value) -> SearchParams {
 }
 
 /// Load the ranked knowledge hits for a query (SPEC-V2.6 §5), honouring
-/// `knowledge.enabled` and `knowledge.min_score`. No store (or disabled) ⇒ empty.
-/// The loaded+embedded store is cached across calls by the server (issue #31).
-fn load_knowledge_hits(server: &McpServer, query: &str, top_k: usize) -> Vec<KnowledgeHit> {
+/// `knowledge.enabled` and `knowledge.min_score`, plus the pinned degradation notice to
+/// surface when the store EXISTS but fails to load. Disabled, or a store that was never
+/// ingested ⇒ empty and silent (knowledge-only-absent is the correct answer). A store
+/// that is present-but-corrupt ⇒ empty hits AND [`KNOWLEDGE_STORE_LOAD_ERROR_NOTICE`],
+/// so the failure is VISIBLE rather than swallowed into "0 chunk(s)" (issue #143 — the
+/// knowledge-side mirror of the code side's #132 fix). The loaded+embedded store is
+/// cached across calls by the server (issue #31).
+fn load_knowledge_hits(
+    server: &McpServer,
+    query: &str,
+    top_k: usize,
+) -> (Vec<KnowledgeHit>, Option<&'static str>) {
     let cfg = KnowledgeConfig::load(&server.root());
     if !cfg.enabled {
-        return Vec::new();
+        return (Vec::new(), None);
     }
-    match server.knowledge() {
-        Some(k) => k.search(query, top_k, cfg.min_score),
-        None => Vec::new(),
+    match server.load_knowledge() {
+        KnowledgeLoad::Loaded(k) => (k.search(query, top_k, cfg.min_score), None),
+        KnowledgeLoad::Absent => (Vec::new(), None),
+        KnowledgeLoad::Failed => (Vec::new(), Some(KNOWLEDGE_STORE_LOAD_ERROR_NOTICE)),
     }
 }
 
@@ -777,13 +791,16 @@ fn gather_code_hits_workspace(server: &McpServer, query: &str, p: &SearchParams)
 /// The knowledge-only path (SPEC-V2.6 §5, `source:"knowledge"`).
 fn context_search_knowledge(server: &McpServer, args: &Value, query: &str) -> ToolOutput {
     let p = parse_params(server, args);
-    let hits = load_knowledge_hits(server, query, p.top_k);
+    let (hits, knotice) = load_knowledge_hits(server, query, p.top_k);
     // Record the knowledge search in the session ledger (its query + returned ids/docs).
     let chunk_ids: Vec<String> = hits.iter().map(|h| h.chunk_id.clone()).collect();
     let record_ids: Vec<String> = hits.iter().map(|h| h.record_id.clone()).collect();
     server.record_search(query, &chunk_ids, &record_ids);
     let items: Vec<BlendItem> = hits.into_iter().map(BlendItem::Knowledge).collect();
-    ToolOutput::ok(render_blend(items, None, &p, knowledge_total_chunks(server)))
+    // A present-but-corrupt store must not masquerade as "0 chunk(s)" even on the
+    // explicit knowledge-only path (issue #143): surface the notice.
+    let text = render_blend(items, None, &p, knowledge_total_chunks(server));
+    ToolOutput::ok(with_notice(knotice, text))
 }
 
 /// The blended path (SPEC-V2.6 §5, `source:"both"`): code + knowledge candidates merged
@@ -791,7 +808,7 @@ fn context_search_knowledge(server: &McpServer, args: &Value, query: &str) -> To
 fn context_search_both(server: &McpServer, args: &Value, query: &str) -> ToolOutput {
     let p = parse_params(server, args);
     let (code_rows, query_id, code_chunks, notice, facts) = gather_code_hits(server, query, &p);
-    let khits = load_knowledge_hits(server, query, p.top_k);
+    let (khits, knotice) = load_knowledge_hits(server, query, p.top_k);
     let mut items: Vec<BlendItem> = Vec::with_capacity(code_rows.len() + khits.len());
     items.extend(code_rows.into_iter().map(BlendItem::Code));
     items.extend(khits.into_iter().map(BlendItem::Knowledge));
@@ -803,7 +820,10 @@ fn context_search_both(server: &McpServer, args: &Value, query: &str) -> ToolOut
         f.total_chunks = total as u64;
         text = append_usage_footer(server, &f, text);
     }
-    ToolOutput::ok(with_notice(notice, text))
+    // Surface BOTH degradation notices: a corrupt code store (#132) and a corrupt
+    // knowledge store (#143) can each downgrade the blend, and neither may be
+    // swallowed. Each is present only when its store exists-but-failed to load.
+    ToolOutput::ok(with_notice(notice, with_notice(knotice, text)))
 }
 
 /// The knowledge store's chunk count (for the "no matches" hint), 0 if none/disabled.
@@ -1000,6 +1020,17 @@ member code indexes are missing or could not be loaded (corrupt, unreadable, or 
 indexed) — code results are INCOMPLETE for this answer; anything shown below may be missing code \
 rows. Re-run `cce index --workspace` to (re)build them.";
 
+/// The knowledge-side mirror of [`CODE_INDEX_LOAD_ERROR_NOTICE`] (issue #143). Served
+/// when the knowledge store EXISTS on disk but fails to load — a corrupt/unreadable
+/// snapshot (tagged `InvalidData` by `KnowledgeStore::load`): the failure must be
+/// VISIBLE — the results below it are code-only, missing all knowledge — while a store
+/// that was legitimately never ingested (knowledge-only-absent) stays silent, because
+/// code-only is then the correct, complete answer. This closes the asymmetry #132 left:
+/// after this, code-store and knowledge-store corruption are both surfaced.
+pub(crate) const KNOWLEDGE_STORE_LOAD_ERROR_NOTICE: &str = "NOTICE: the knowledge store exists \
+but could not be loaded (corrupt or unreadable store) — knowledge results are MISSING from this \
+answer; anything shown below is code-only. Re-run `cce knowledge index <feed>` to rebuild it.";
+
 /// The query embedder decision for a loaded store (issue #30).
 enum QueryEmbedder {
     /// The store's own backend is usable — run the full §6 pipeline.
@@ -1039,7 +1070,9 @@ fn pick_workspace_embedder(members: &[MemberStore]) -> QueryEmbedder {
 }
 
 /// Prepend a pinned degradation notice ([`OLLAMA_DOWN_NOTICE`],
-/// [`CODE_INDEX_LOAD_ERROR_NOTICE`]) to a rendered result body.
+/// [`CODE_INDEX_LOAD_ERROR_NOTICE`], [`KNOWLEDGE_STORE_LOAD_ERROR_NOTICE`]) to a
+/// rendered result body. Nesting two calls prepends both, keeping each notice a
+/// separate line block above the body.
 fn with_notice(notice: Option<&'static str>, body: String) -> String {
     match notice {
         Some(n) => format!("{n}\n\n{body}"),
