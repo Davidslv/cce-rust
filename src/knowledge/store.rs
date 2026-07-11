@@ -206,23 +206,46 @@ impl KnowledgeStore {
         Self::dir(root).join("current")
     }
 
-    /// Persist this store under `root`: write the snapshot artifact and update the
-    /// `current` pointer to name it (superseding any prior snapshot). Deterministic
-    /// (pretty JSON, declaration-order fields). Returns the artifact path.
+    /// Persist this store under `root`: write the snapshot artifact and then
+    /// advance the `current` pointer to name it (superseding any prior snapshot).
+    /// Deterministic (pretty JSON, declaration-order fields). Returns the artifact
+    /// path.
+    ///
+    /// The two steps are split ([`write_snapshot`](Self::write_snapshot) +
+    /// [`advance_current`](Self::advance_current)) so a caller that must record
+    /// another marker in between (the sync pull, #122) can make the `current`
+    /// move the LAST durable step — never advancing the active store before the
+    /// marker that describes it is on disk.
     pub fn save(&self, root: &Path) -> io::Result<PathBuf> {
+        let path = self.write_snapshot(root)?;
+        Self::advance_current(root, &self.snapshot)?;
+        Ok(path)
+    }
+
+    /// Write ONLY the `<snapshot>.json` artifact (atomically), WITHOUT touching
+    /// the `current` pointer — so the snapshot exists on disk but is not yet the
+    /// active store. Returns the artifact path.
+    pub fn write_snapshot(&self, root: &Path) -> io::Result<PathBuf> {
         let dir = Self::dir(root);
         std::fs::create_dir_all(&dir)?;
         let path = Self::snapshot_path(root, &self.snapshot);
         let json = serde_json::to_string_pretty(self).map_err(io::Error::other)?;
-        // #101: atomic temp-file + rename for both the snapshot artifact and the
-        // `current` pointer, so an interrupted ingest can neither destroy a prior
-        // snapshot nor leave a torn pointer a concurrent reader would misresolve.
+        // #101: atomic temp-file + rename, so an interrupted ingest can never
+        // destroy a prior snapshot.
         crate::atomic::atomic_write(&path, format!("{json}\n").as_bytes())?;
+        Ok(path)
+    }
+
+    /// Advance the `current` pointer to `snapshot` (atomically) — the step that
+    /// makes a written snapshot the ACTIVE store. Must run after its snapshot
+    /// artifact is on disk.
+    pub fn advance_current(root: &Path, snapshot: &str) -> io::Result<()> {
+        // #101: atomic temp-file + rename, so a torn pointer a concurrent reader
+        // would misresolve can never occur.
         crate::atomic::atomic_write(
             &Self::current_pointer_path(root),
-            format!("{}\n", self.snapshot).as_bytes(),
-        )?;
-        Ok(path)
+            format!("{snapshot}\n").as_bytes(),
+        )
     }
 
     /// Load the store for a snapshot artifact path.

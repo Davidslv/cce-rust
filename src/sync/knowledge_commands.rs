@@ -648,8 +648,16 @@ pub fn cmd_knowledge_pull(
 
     // Install = exactly what a local ingest writes: `<root>/.cce/knowledge/
     // <snapshot>.json` + the one-line `current` pointer (§7 byte-identity).
+    //
+    // #122: advance `current` LAST — write the snapshot artifact, then the sync
+    // marker, and only then repoint `current`. Previously `store.save` moved
+    // `current` (activating the new store) BEFORE the marker was written, so a
+    // marker-write failure returned Err while the active store had already been
+    // replaced — the guard then misfired both ways on the stale marker. With the
+    // pointer moved last, any failure before it leaves the prior store active and
+    // its marker consistent; a re-pull of the intended corpus simply succeeds.
     let store = artifact.into_store();
-    let store_path = store.save(root).map_err(|e| {
+    let store_path = store.write_snapshot(root).map_err(|e| {
         format!("could not write the knowledge store under {}: {e}", root.display())
     })?;
 
@@ -665,6 +673,11 @@ pub fn cmd_knowledge_pull(
     }
     .save(root)
     .map_err(|e| format!("could not write the knowledge sync marker: {e}"))?;
+
+    // Marker durable — now activate the freshly written snapshot.
+    KnowledgeStore::advance_current(root, &store.snapshot).map_err(|e| {
+        format!("could not advance the knowledge `current` pointer under {}: {e}", root.display())
+    })?;
 
     Ok(format!(
         "Pulled corpus {corpus_id}@{snapshot}\n  records  : {records} · chunks : {chunk_count}\n  \
@@ -921,6 +934,46 @@ mod tests {
         // --force replaces the corpus.
         cmd_knowledge_pull(consumer.path(), Some("c2".into()), None, true, Some(url)).unwrap();
         assert_eq!(KnowledgeSyncState::load(consumer.path()).unwrap().corpus_id, "c2");
+    }
+
+    #[test]
+    fn pull_marker_write_failure_leaves_the_active_store_unchanged() {
+        // #122: the pull used to advance `current` (activating the new corpus)
+        // BEFORE writing the marker, so a marker-write failure replaced the
+        // active store yet reported failure. `current` must move LAST — a marker
+        // failure must leave the prior store active.
+        let _home = with_home();
+        let (_bare, url) = bare_remote();
+        let p1 = root_with_store(&feed("a"));
+        push(p1.path(), Some("c1".into()), Some(url.clone())).unwrap();
+        let snap1 = KnowledgeStore::load_current(p1.path()).unwrap().snapshot;
+        let p2 = root_with_store(&feed("bb"));
+        push(p2.path(), Some("c2".into()), Some(url.clone())).unwrap();
+        let snap2 = KnowledgeStore::load_current(p2.path()).unwrap().snapshot;
+        assert_ne!(snap1, snap2);
+
+        let consumer = tempfile::tempdir().unwrap();
+        cmd_knowledge_pull(consumer.path(), Some("c1".into()), None, false, Some(url.clone()))
+            .unwrap();
+        assert_eq!(KnowledgeStore::load_current(consumer.path()).unwrap().snapshot, snap1);
+
+        // Wedge the marker write: replace synced.json with a non-empty directory
+        // (fails a bare `fs::write` AND an atomic temp+rename over it).
+        let marker = KnowledgeSyncState::path(consumer.path());
+        std::fs::remove_file(&marker).unwrap();
+        std::fs::create_dir(&marker).unwrap();
+        std::fs::write(marker.join("wedge"), b"x").unwrap();
+
+        // Pull c2 --force: the marker write fails, so the pull errors …
+        let err = cmd_knowledge_pull(consumer.path(), Some("c2".into()), None, true, Some(url))
+            .unwrap_err();
+        assert!(err.contains("sync marker"), "got: {err}");
+        // … but the active store is still c1's snapshot — NOT replaced.
+        assert_eq!(
+            KnowledgeStore::load_current(consumer.path()).unwrap().snapshot,
+            snap1,
+            "current must not have advanced when the marker write failed"
+        );
     }
 
     #[test]
