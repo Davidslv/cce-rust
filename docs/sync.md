@@ -184,7 +184,11 @@ Rules:
   snapshot-keyed and never enters the byte-identical code cache. Knowledge
   corpora travel through their own additive `knowledge/…` key space via
   `cce knowledge push`/`pull` (SPEC-SYNC-KNOWLEDGE; see
-  [`knowledge.md`](knowledge.md)).
+  [`knowledge.md`](knowledge.md)). `cce knowledge push` replaces the corpus's
+  current snapshot wholesale, so it diffs record ids against the remote first
+  and **refuses a push that would drop remote-live records** without `--force`;
+  `cce knowledge push --dry-run` prints the full added/removed/changed diff and
+  pushes nothing (#90 — details in [`knowledge.md`](knowledge.md)).
 - `pull` installs the artifact into `.cce/`. If the local working tree matches
   `sha`, the pulled index is used as-is. It never silently overwrites a local cache
   for a **different** sha without `--force`.

@@ -58,6 +58,13 @@ jobs:
 # The feed (corpus.jsonl) is ephemeral builder input: it is never committed,
 # uploaded, or cached (§4.6) — only the redacted store travels.
 #
+# Multi-source corpora (the §5 push guard, #90): a job that builds from only a
+# SUBSET of a corpus's feed sources would drop the other sources' records on
+# push — the guard refuses such a shrink. Either make this job the corpus's
+# sole publisher (emit the full superset feed here), or run
+# `cce knowledge push --dry-run` first and treat a non-empty `removed` list as
+# a build error. `--force` is the manual, intentional-shrink override only.
+#
 # ---------------------------------------------------------------------------
 # Credential note (SPEC-SYNC §6/§7, plus the §9 addition)
 # ---------------------------------------------------------------------------

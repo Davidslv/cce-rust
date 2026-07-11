@@ -377,6 +377,55 @@ fn planted_secret_arrives_redacted_in_the_pushed_artifact() {
     assert!(!text.contains("allow-secrets"), "a redaction-bypass flag appeared:\n{text}");
 }
 
+/// §5 push guard (#90), end to end at the CLI: a partial local rebuild that
+/// would DROP a published record is refused naming the removed ids and
+/// `--force`; `--dry-run` prints the diff and leaves the remote byte-untouched;
+/// `--force` publishes the shrink.
+#[test]
+fn push_guard_refuses_a_shrink_dry_run_pushes_nothing_and_force_overrides() {
+    let home = tempfile::tempdir().unwrap();
+    let (_bare, url) = bare_remote();
+    let root = project_root(&url, "fixture", "all");
+    // Publish the full two-record corpus (kn:1 + kn:2)…
+    let published = index_knowledge(home.path(), root.path(), &feed());
+    assert_ok(
+        &cce(home.path(), &["knowledge", "push", "--dir", root.path().to_str().unwrap()]),
+        "first push",
+    );
+    // …then rebuild locally from a one-record subset feed (kn:1 only).
+    let subset = feed().lines().next().unwrap().to_string() + "\n";
+    let shrunk = index_knowledge(home.path(), root.path(), &subset);
+    assert_ne!(published, shrunk);
+
+    // --dry-run: the diff prints, exit 0, and NOTHING lands on the remote.
+    let out = cce(
+        home.path(),
+        &["knowledge", "push", "--dry-run", "--dir", root.path().to_str().unwrap()],
+    );
+    let stdout = assert_ok(&out, "push --dry-run");
+    assert!(stdout.contains(&format!("outgoing {shrunk} vs remote current {published}")));
+    assert!(stdout.contains("removed : 1 — kn:2"), "got: {stdout}");
+    assert!(stdout.contains("Nothing pushed (--dry-run)."), "got: {stdout}");
+    let co = checkout_of(&url);
+    let corpus = co.path().join("cache").join("knowledge").join("v1").join("fixture");
+    assert_eq!(std::fs::read_to_string(corpus.join("current")).unwrap().trim(), published);
+    assert!(!corpus.join(format!("{shrunk}.cck")).exists(), "dry-run must upload nothing");
+
+    // A plain push refuses the shrink, naming the removed id and the override.
+    let out = cce(home.path(), &["knowledge", "push", "--dir", root.path().to_str().unwrap()]);
+    assert_err(&out, "removed : 1 — kn:2", "shrinking push");
+    assert_err(&out, "--force", "shrinking push");
+
+    // --force publishes it.
+    let out =
+        cce(home.path(), &["knowledge", "push", "--force", "--dir", root.path().to_str().unwrap()]);
+    let stdout = assert_ok(&out, "push --force");
+    assert!(stdout.contains(&format!("Pushed corpus fixture@{shrunk}")), "got: {stdout}");
+    let co = checkout_of(&url);
+    let corpus = co.path().join("cache").join("knowledge").join("v1").join("fixture");
+    assert_eq!(std::fs::read_to_string(corpus.join("current")).unwrap().trim(), shrunk);
+}
+
 /// §4.5: push N+2 snapshots with keep-last-N ⇒ the oldest are pruned, the
 /// snapshot named by `current` survives, pointer + corpus.json intact.
 #[test]
@@ -396,7 +445,13 @@ fn retention_prunes_oldest_snapshots_and_current_survives() {
         });
         let feed_text = format!("{}\n", serde_json::to_string(&extra).unwrap());
         snapshots.push(index_knowledge(home.path(), root.path(), &feed_text));
-        let out = cce(home.path(), &["knowledge", "push", "--dir", root.path().to_str().unwrap()]);
+        // Each snapshot carries a DIFFERENT single record, so every re-push is
+        // an intentional replacement — --force past the §5 shrink guard (#90);
+        // this test exercises retention, not the guard.
+        let out = cce(
+            home.path(),
+            &["knowledge", "push", "--force", "--dir", root.path().to_str().unwrap()],
+        );
         assert_ok(&out, "push");
     }
 
