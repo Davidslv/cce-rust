@@ -12,10 +12,12 @@
 //! reaches the store and chunk ids derive from redacted text — mirroring the code
 //! index's Layer 2), heading-chunks it with M1, and attaches the record's metadata
 //! (`state`, `state_reason`, `updated_at`, `group`, `url`, `labels`, `source`, id) as
-//! facets. The free-text facets (`title`, `url`, `labels`, `group`, `state_reason`,
-//! `links`) pass through the SAME redactor before attachment (#111), so no facet
-//! carries a raw secret either. The result is deterministic and byte-pinned;
-//! save/load round-trips JSON.
+//! facets. EVERY facet except the record id (`title`, `state`, `state_reason`,
+//! `updated_at`, `source`, `group`, `url`, `labels`, `links`) passes through the SAME
+//! redactor before attachment (#111), so no facet carries a raw secret either — the
+//! schema validates none of them, and `state`/`updated_at` are served in provenance.
+//! The `record_id` is the one exception (an addressing key, documented residual —
+//! #144). The result is deterministic and byte-pinned; save/load round-trips JSON.
 //!
 //! **Responsibilities:**
 //! - Own `KnowledgeChunk`, `KnowledgeStore`, the snapshot id, and JSON persistence.
@@ -130,16 +132,28 @@ pub fn ingest(
         let doc = render_document(rec);
         let redacted = crate::redactor::redact(&doc);
         let md_chunks = chunk_markdown(&rec.id, &redacted, max_section_tokens);
-        // The free-text facets (#111): title, url, labels, group, state_reason,
-        // and links arrive raw from the adapter and are persisted verbatim, served
-        // in provenance lines, and exported by `knowledge push` — so they get the
-        // SAME Layer-2 pass as the document, once per record, BEFORE attachment.
-        // `state`/`updated_at`/`source`/id stay verbatim: controlled vocab,
-        // timestamps, and identity keys, not free text. Redaction is identity on
-        // clean text, so secret-free stores are byte-unchanged.
+        // The facets (#111): EVERY facet except the record id arrives raw from the
+        // adapter and is persisted, exported by `knowledge push`, and — for `title`,
+        // `state`, `updated_at`, `url` — SERVED in the provenance line. The
+        // `cce.knowledge/v1` schema enforces no enum/format on any of them (`state`,
+        // `updated_at`, `source` are plain `Option<String>`/`String`, NOT a validated
+        // vocabulary), so each gets the SAME Layer-2 pass as the document, once per
+        // record, BEFORE attachment. Redaction is the identity on clean text (an
+        // `open`/`closed` state, an ISO timestamp, a `github-issues` tag are not
+        // secret-shaped), so secret-free stores are byte-unchanged.
+        //
+        // `record_id` (from `rec.id`) is DELIBERATELY not redacted: it is the
+        // addressing key — chunk ids and the synthetic document path derive from it,
+        // so scrubbing it would break lookup/round-trip. A secret in a record id can
+        // therefore still surface via `expand_chunk`/`related_context` headers; the
+        // `cce.knowledge/v1` contract requires ids to be secret-free (see
+        // docs/knowledge.md), and the redacted-display mitigation is tracked as #144.
         let title = crate::redactor::redact(rec.title.trim());
         let url = rec.url.as_deref().map(crate::redactor::redact);
+        let state = rec.state.as_deref().map(crate::redactor::redact);
         let state_reason = rec.state_reason.as_deref().map(crate::redactor::redact);
+        let updated_at = rec.updated_at.as_deref().map(crate::redactor::redact);
+        let source = crate::redactor::redact(&rec.source);
         let group = rec.group.as_deref().map(crate::redactor::redact);
         let labels: Vec<String> = rec.labels.iter().map(|l| crate::redactor::redact(l)).collect();
         let links: Vec<String> = rec.links.iter().map(|l| crate::redactor::redact(l)).collect();
@@ -154,11 +168,11 @@ pub fn ingest(
                 end_line: mc.end_line,
                 token_count: mc.token_count,
                 content: mc.content,
-                source: rec.source.clone(),
+                source: source.clone(),
                 url: url.clone(),
-                state: rec.state.clone(),
+                state: state.clone(),
                 state_reason: state_reason.clone(),
-                updated_at: rec.updated_at.clone(),
+                updated_at: updated_at.clone(),
                 group: group.clone(),
                 labels: labels.clone(),
                 title: title.clone(),
@@ -330,13 +344,20 @@ mod tests {
 
     #[test]
     fn secrets_in_free_text_facets_are_redacted_before_write() {
-        // #111 audit: url, labels, group, state_reason, and links are adapter
-        // free text persisted verbatim — each gets the same Layer-2 pass as the
-        // body. (`state`/`updated_at`/`source`/id are controlled vocab / keys.)
+        // #111 audit: every persisted/served facet EXCEPT the record id is adapter
+        // free text — the `cce.knowledge/v1` schema enforces no enum/format on any
+        // of them (`state`/`updated_at`/`source` are `Option<String>`/`String`, not
+        // a validated vocabulary), so each gets the same Layer-2 pass as the body.
+        // (`state` + `updated_at` are additionally SERVED in the provenance line —
+        // the exact leak class of #111.) Only `id`/`record_id` stays raw: it is the
+        // addressing key (see the seam's rustdoc note + #144).
         let mut r = rec("gh:4", "Clean title", "body");
         r.url = Some(format!("https://example.test/1?token={GH_TOKEN}"));
         r.labels = vec![format!("leak-{AWS_KEY}"), "bug".into()];
         r.group = Some(format!("Ops {AWS_KEY}"));
+        r.state = Some(format!("open; leaked {AWS_KEY}"));
+        r.updated_at = Some(format!("2026-01-02 token={GH_TOKEN}"));
+        r.source = format!("github-issues {AWS_KEY}");
         r.state_reason = Some("rotated; old api_key = s3cr3tvalue123".into());
         r.links = vec![format!("https://example.test/pull/7?auth_token={GH_TOKEN}")];
         let store = ingest(&[r], b"x", 400);
@@ -348,6 +369,9 @@ mod tests {
         assert_eq!(c.url.as_deref(), Some("https://example.test/1?token=[REDACTED:GITHUB_TOKEN]"));
         assert_eq!(c.labels, vec!["leak-[REDACTED:AWS_ACCESS_KEY]".to_string(), "bug".to_string()]);
         assert_eq!(c.group.as_deref(), Some("Ops [REDACTED:AWS_ACCESS_KEY]"));
+        assert_eq!(c.state.as_deref(), Some("open; leaked [REDACTED:AWS_ACCESS_KEY]"));
+        assert_eq!(c.updated_at.as_deref(), Some("2026-01-02 token=[REDACTED:GITHUB_TOKEN]"));
+        assert_eq!(c.source, "github-issues [REDACTED:AWS_ACCESS_KEY]");
         assert_eq!(c.state_reason.as_deref(), Some("rotated; old api_key = [REDACTED:SECRET]"));
         assert_eq!(
             c.links,
@@ -369,6 +393,11 @@ mod tests {
             assert_eq!(c.url.as_deref(), Some("https://x/gh:5"));
             assert_eq!(c.group.as_deref(), Some("Checkout"));
             assert_eq!(c.labels, vec!["bug".to_string()]);
+            // Legitimate state/updated_at/source values are not secret-shaped, so
+            // redaction is the identity on them — they persist byte-for-byte.
+            assert_eq!(c.state.as_deref(), Some("open"));
+            assert_eq!(c.updated_at.as_deref(), Some("2026-01-02T03:04:05Z"));
+            assert_eq!(c.source, "github-issues");
             assert_eq!(c.state_reason.as_deref(), Some("completed"));
             assert_eq!(c.links, vec!["https://example.test/pull/40".to_string()]);
         }

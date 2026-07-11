@@ -94,23 +94,29 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   partially-indexed workspace gets an accurate message, never a false
   corruption claim. A workspace whose members were all never indexed stays
   silent. Healthy-path output is byte-unchanged.
-- **A secret in a knowledge record's title (or any other free-text facet) can
-  no longer reach the store, the provenance line, or a pushed corpus (#111).**
-  `ingest()` redacted the rendered document before chunking but then attached
-  the RAW `rec.title` — and raw `url`, `labels`, `group`, `state_reason`, and
-  `links` — as per-chunk facets, so a record titled e.g.
-  `Rotate api_key: … in prod` persisted the secret verbatim in
+- **A secret in a knowledge record's title (or any other facet) can no longer
+  reach the store, the provenance line, or a pushed corpus (#111).** `ingest()`
+  redacted the rendered document before chunking but then attached the RAW
+  `rec.title` — and raw `url`, `labels`, `group`, `state`, `state_reason`,
+  `updated_at`, `source`, and `links` — as per-chunk facets, so a record titled
+  e.g. `Rotate api_key: … in prod` persisted the secret verbatim in
   `.cce/knowledge/<snapshot>.json`, served it in every `[knowledge] <title> — …`
-  provenance header, and exported it in the `.cck` on `knowledge push`, while
-  the body was redacted — violating the module's "the store never sees a
-  secret" invariant. The free-text facets now pass through the SAME v2.1
-  redactor at the ingest seam, once per record, before attachment; the
-  breadcrumb `name`/`kind` were already safe (derived from the redacted
-  document). Controlled fields (`state`, `updated_at`, `source`, the record
-  id) stay verbatim. Redaction is identity on clean text, so secret-free
-  stores are byte-unchanged (the pinned ingest checksum golden holds); stores
-  indexed from a secret-bearing feed before this fix should be re-indexed to
-  scrub the persisted facets.
+  provenance header (which also renders `state` and `updated_at`), and exported
+  it in the `.cck` on `knowledge push`, while the body was redacted — violating
+  the module's "the store never sees a secret" invariant. The `cce.knowledge/v1`
+  schema validates none of these facets (`state`/`updated_at`/`source` are plain
+  `Option<String>`/`String`, not an enum or ISO-checked format), so EVERY facet
+  except the record id now passes through the SAME v2.1 redactor at the ingest
+  seam, once per record, before attachment; the breadcrumb `name`/`kind` were
+  already safe (derived from the redacted document). The record `id` is an
+  **accepted, documented residual**: it is the addressing key (chunk ids and the
+  synthetic document path derive from it), so it stays verbatim, the contract
+  now requires ids to be secret-free (`docs/knowledge.md`), and the
+  redacted-display mitigation for `expand_chunk`/`related_context` is tracked as
+  #144. Redaction is the identity on clean text, so secret-free stores are
+  byte-unchanged (the pinned ingest checksum and `conformance.json` goldens
+  hold); stores indexed from a secret-bearing feed before this fix should be
+  re-indexed to scrub the persisted facets.
 - **A sync push that loses a ref race can no longer report success while
   publishing nothing (#92).** The push retry rebased the working clone onto
   the advanced remote with the result discarded, under the assumption that

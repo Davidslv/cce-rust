@@ -420,6 +420,31 @@ mod tests {
     }
 
     #[test]
+    fn secret_in_state_or_updated_at_is_redacted_in_served_provenance() {
+        // #111: `state` and `updated_at` are BOTH rendered into the provenance line
+        // (`[knowledge] <title> — <state> · <updated_at> · <url>`) and both are
+        // free `Option<String>` in the schema — a secret placed in either must not
+        // reach the served header. Keys split via `concat!` (no committed literal).
+        let aws = concat!("AKIA", "IOSFODNN7EXAMPLE");
+        let ghp = concat!("ghp", "_", "0123456789abcdefghijklmnopqrstuvwx01");
+        let mut r = rec(
+            "leak",
+            "Login policy",
+            "## Rule\n\nLock the account after five failed login attempts.",
+        );
+        r.state = Some(format!("open; leaked {aws}"));
+        r.updated_at = Some(format!("2026-06-01 token={ghp}"));
+        let store = ingest_default(&[r], b"feed");
+        let hits = search_knowledge(&store, "login attempts lock account", 5, 0.30);
+        assert!(!hits.is_empty());
+        let prov = hits[0].provenance();
+        assert!(!prov.contains(aws), "raw state secret served in provenance: {prov}");
+        assert!(!prov.contains(ghp), "raw updated_at secret served in provenance: {prov}");
+        assert!(prov.contains("open; leaked [REDACTED:AWS_ACCESS_KEY]"), "{prov}");
+        assert!(prov.contains("token=[REDACTED:GITHUB_TOKEN]"), "{prov}");
+    }
+
+    #[test]
     fn not_planned_records_are_dropped() {
         let mut r =
             rec("a", "Rejected idea", "## Detail\n\nWe considered a new login flow and declined.");
