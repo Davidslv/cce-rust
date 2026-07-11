@@ -1275,3 +1275,188 @@ fn end_to_end_bare_dir_pull_all_then_context_search_both_blends_knowledge_with_p
     // Blended with a code hit from the pulled member.
     assert!(text.contains("auth.py"), "missing the blended code hit: {text}");
 }
+
+// --- issue #92: the conflicted push race over the knowledge keyspace ---
+//
+// The knowledge `current` pointer and `corpus.json` are FIXED paths rewritten
+// by every push, so two racing pushes genuinely conflict in content. The race
+// is simulated deterministically with a pre-receive hook on the bare remote:
+// the first push triggers a conflicting out-of-band push from a separate racer
+// clone and is rejected — a lost ref race landed mid-flight between the
+// client's fetch and its push. Later pushes pass. Pinned behavior: the push
+// either publishes for real (re-apply, last-writer-wins) or exits nonzero —
+// never exit 0 with nothing published — and the sync clone is never left with
+// a rebase in progress.
+
+/// A separate clone of the cache with conflicting `(path, content)` rewrites
+/// committed but NOT pushed — the commit the race hook publishes mid-flight.
+#[cfg(unix)]
+fn conflicting_racer(url: &str, files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
+    let tmp = checkout_of(url);
+    let dir = tmp.path().join("cache");
+    for (path, content) in files {
+        let p = dir.join(path);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, content).unwrap();
+    }
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-q", "-m", "racer"]);
+    (tmp, dir)
+}
+
+/// Install a pre-receive hook on the bare remote: the first push publishes
+/// `racer`'s HEAD (the mid-flight ref race) and is rejected; later pushes
+/// pass. With `racer` = None every push is rejected.
+#[cfg(unix)]
+fn arm_race_hook(bare: &Path, racer: Option<&Path>) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::env::var("PATH").unwrap_or_default();
+    let script = match racer {
+        Some(r) => format!(
+            "#!/bin/sh\nif [ -f \"$GIT_DIR/race-done\" ]; then exit 0; fi\n\
+             touch \"$GIT_DIR/race-done\"\n\
+             env -i PATH=\"{path}\" git -C \"{}\" push --quiet origin \
+             HEAD:refs/heads/main >&2\n\
+             echo 'simulated ref race' >&2\nexit 1\n",
+            r.display()
+        ),
+        None => "#!/bin/sh\necho 'rejected by test hook' >&2\nexit 1\n".to_string(),
+    };
+    let hook = bare.join("hooks").join("pre-receive");
+    std::fs::write(&hook, script).unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Read `spec` (e.g. `main:knowledge/v1/fixture/current`) out of the bare repo.
+#[cfg(unix)]
+fn show(bare: &Path, spec: &str) -> String {
+    let out = Command::new("git").arg("-C").arg(bare).args(["show", spec]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "git show {spec} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// Every sync working clone under `home` must be free of in-progress rebases.
+#[cfg(unix)]
+fn assert_no_rebase_in_progress(home: &Path) {
+    let sync = home.join("sync");
+    for entry in std::fs::read_dir(&sync).unwrap() {
+        let clone = entry.unwrap().path();
+        let git_dir = clone.join(".git");
+        assert!(
+            !git_dir.join("rebase-merge").exists() && !git_dir.join("rebase-apply").exists(),
+            "sync clone {} was left with a rebase in progress",
+            clone.display()
+        );
+    }
+}
+
+/// The feed plus one extra record — an adds-only regrow, so the #90 shrink
+/// guard proceeds silently and the store gets a NEW snapshot id.
+#[cfg(unix)]
+fn feed_plus_one() -> String {
+    let extra = serde_json::json!({
+        "id": "kn:3",
+        "title": "Credential rotation policy",
+        "body": "## Rule\n\nRotate service credentials quarterly.",
+        "source": "handbook",
+        "state": "open",
+        "updated_at": "2026-03-01T00:00:00Z",
+        "labels": ["security"],
+    });
+    format!("{}{}\n", feed(), serde_json::to_string(&extra).unwrap())
+}
+
+#[cfg(unix)]
+#[test]
+fn knowledge_push_race_on_the_current_pointer_republishes_and_the_clone_stays_clean() {
+    let home = tempfile::tempdir().unwrap();
+    let (bare, url) = bare_remote();
+    let root = project_root(&url, "fixture", "all");
+    let _snap1 = index_knowledge(home.path(), root.path(), &feed());
+    assert_ok(
+        &cce(home.path(), &["knowledge", "push", "--dir", root.path().to_str().unwrap()]),
+        "priming push",
+    );
+
+    // Regrow the store (adds-only ⇒ the #90 guard proceeds) → a new snapshot.
+    let snap2 = index_knowledge(home.path(), root.path(), &feed_plus_one());
+
+    // Mid-push, a conflicting rewrite of the SAME fixed paths lands first and
+    // our push is rejected once — the exact #92 failure mode.
+    let (_racer_tmp, racer) = conflicting_racer(
+        &url,
+        &[
+            ("knowledge/v1/fixture/current", "0000000000000000\n"),
+            ("knowledge/v1/fixture/corpus.json", "{\"current\":\"raced\"}\n"),
+        ],
+    );
+    arm_race_hook(bare.path(), Some(&racer));
+
+    let out = cce(home.path(), &["knowledge", "push", "--dir", root.path().to_str().unwrap()]);
+    let stdout = assert_ok(&out, "raced knowledge push");
+    assert!(stdout.contains(&format!("Pushed corpus fixture@{snap2}")), "{stdout}");
+
+    // Success was not a lie: the remote REALLY carries our publish — the
+    // pointer, the metadata, and the artifact (last-writer-wins on the race).
+    assert_eq!(show(bare.path(), "main:knowledge/v1/fixture/current").trim(), snap2);
+    let meta: serde_json::Value =
+        serde_json::from_str(&show(bare.path(), "main:knowledge/v1/fixture/corpus.json")).unwrap();
+    assert_eq!(meta["current"], serde_json::Value::String(snap2.clone()));
+
+    // The sync clone is clean — no rebase in progress, no poisoned state.
+    assert_no_rebase_in_progress(home.path());
+
+    // And a fresh consumer resolves the raced-but-published snapshot.
+    let consumer = tempfile::tempdir().unwrap();
+    let out = cce(
+        home.path(),
+        &[
+            "knowledge",
+            "pull",
+            "--corpus",
+            "fixture",
+            "--latest",
+            "--remote",
+            &url,
+            "--dir",
+            consumer.path().to_str().unwrap(),
+        ],
+    );
+    let stdout = assert_ok(&out, "pull after the raced push");
+    assert!(stdout.contains(&format!("Pulled corpus fixture@{snap2}")), "{stdout}");
+}
+
+#[cfg(unix)]
+#[test]
+fn knowledge_push_that_cannot_publish_exits_nonzero_and_the_next_push_recovers() {
+    let home = tempfile::tempdir().unwrap();
+    let (bare, url) = bare_remote();
+    let root = project_root(&url, "fixture", "all");
+    let snap1 = index_knowledge(home.path(), root.path(), &feed());
+    assert_ok(
+        &cce(home.path(), &["knowledge", "push", "--dir", root.path().to_str().unwrap()]),
+        "priming push",
+    );
+    let snap2 = index_knowledge(home.path(), root.path(), &feed_plus_one());
+
+    // A remote that keeps refusing: the push must FAIL loudly (issue #92: the
+    // old path exited 0 and printed a success report while publishing
+    // nothing), and the remote must keep its pre-race state.
+    arm_race_hook(bare.path(), None);
+    let out = cce(home.path(), &["knowledge", "push", "--dir", root.path().to_str().unwrap()]);
+    assert_err(&out, "push", "knowledge push against a refusing remote");
+    assert_eq!(show(bare.path(), "main:knowledge/v1/fixture/current").trim(), snap1);
+    assert_no_rebase_in_progress(home.path());
+
+    // The clone is not poisoned: once the remote accepts pushes again, the
+    // very next push publishes for real.
+    std::fs::remove_file(bare.path().join("hooks").join("pre-receive")).unwrap();
+    let out = cce(home.path(), &["knowledge", "push", "--dir", root.path().to_str().unwrap()]);
+    let stdout = assert_ok(&out, "recovery push");
+    assert!(stdout.contains(&format!("Pushed corpus fixture@{snap2}")), "{stdout}");
+    assert_eq!(show(bare.path(), "main:knowledge/v1/fixture/current").trim(), snap2);
+}

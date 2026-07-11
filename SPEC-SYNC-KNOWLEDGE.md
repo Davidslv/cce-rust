@@ -159,8 +159,12 @@ knowledge/<contract_version>/<corpus_id>/corpus.json       # published metadata 
   reading `v1`, exactly the `cce_version` cache-window behaviour of SPEC-SYNC §3.
 - `corpus_id` — §4.1.
 - `<snapshot>` — the M3 snapshot id. Distinct snapshots are distinct files, so
-  concurrent pushes never conflict in content (only ref advancement races —
-  handled by the existing fetch-rebase-retry).
+  concurrent pushes of `.cck` artifacts never conflict in content. The
+  fixed-path keys below (`current`, `corpus.json`) ARE rewritten by every push
+  and genuinely conflict under a race; every key is whole-file
+  last-writer-wins, so a lost push race re-applies the write on the freshly
+  fetched remote state and retries (bounded) — a push that cannot land fails
+  loudly, never reporting success without publishing.
 - `current` — a one-line pointer naming the corpus's active snapshot, the exact
   analogue of the code cache's `refs/<ref>` pointer files (and of the local
   store's `.cce/knowledge/current`). `knowledge pull` resolves it by default.

@@ -87,8 +87,12 @@ A cache is addressed by a path (in the git remote) built from its identity:
 - `sha` = the commit the index was built from.
 
 Distinct shas are distinct files → concurrent pushes for different shas never
-conflict in content (only git-ref advancement can race — handle with
-fetch-rebase-retry).
+conflict in content. Fixed-path keys (the `refs/<ref>` pointers, the workspace
+metadata) ARE rewritten by every push, so two racing pushes genuinely conflict
+there; every key is whole-file last-writer-wins, and a lost push race is
+handled by re-applying the write on the freshly fetched remote state and
+retrying (bounded). A push that cannot land MUST fail loudly — never report
+success without publishing.
 
 **Adding new keys is additive (normative).** Beside the `<sha>.cce` artifact
 keys and the `refs/<ref>` pointer files, a repo_id prefix MAY carry other
@@ -120,7 +124,9 @@ A `SyncRemote` interface: `has(key) -> bool`, `get(key) -> artifact`,
 - The remote is a git repository (URL configured). A local working clone lives
   under `~/.cce/sync/<remote-id>/`.
 - `put` = write the artifact at its content-addressed path, commit, `git push`
-  (with `fetch`+rebase+retry on ref race). `get` = `git fetch` + read the file.
+  (a lost ref race fetches, re-applies the write on the new remote state, and
+  retries — pointer keys conflict for real, so a rebase would wedge). `get` =
+  `git fetch` + read the file.
 - **Large blobs:** artifacts are large; use **git-LFS** for `*.cce` by default
   (`cce sync init` writes the `.gitattributes`). Alternative: a retention policy
   (keep the last N shas per repo + tagged releases) — configurable.

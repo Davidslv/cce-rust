@@ -137,9 +137,12 @@ A cache is addressed by a path in the git remote built from its identity:
 - `sha` = the commit the index was built from.
 
 Distinct shas are distinct files, so concurrent pushes for different shas never
-conflict in content — only git-ref advancement can race, handled with
-fetch-rebase-retry. A small pointer file `…/<repo_id>/refs/<branch>` records the
-latest sha pushed for a branch; that is what `cce sync pull --latest` reads.
+conflict in content. A small pointer file `…/<repo_id>/refs/<branch>` records the
+latest sha pushed for a branch; that is what `cce sync pull --latest` reads. The
+pointer is a fixed path rewritten by every push, so two racing pushes genuinely
+conflict there: every key is whole-file last-writer-wins, and a lost push race
+is retried by re-applying the write on the freshly fetched remote state. A push
+that cannot land fails loudly — it never reports success without publishing.
 
 ---
 
@@ -147,8 +150,11 @@ latest sha pushed for a branch; that is what `cce sync pull --latest` reads.
 
 The remote is a **git repository** (`sync.remote`). A local working clone lives
 under `~/.cce/sync/<remote-id>/` (override the base with `CCE_HOME`). `put` writes
-the artifact at its content path, commits, and `git push` (fetch-rebase-retry on a
-ref race). `get` fetches and reads the file back.
+the artifact at its content path, commits, and `git push` (a lost ref race
+fetches, re-applies the write on the new remote state, and retries). `get`
+fetches and reads the file back. A working clone found with a rebase in progress
+(a state older versions could leave behind after a lost race) is recovered
+automatically the next time any sync operation opens it.
 
 Artifacts are large, so `*.cce` blobs use **git-LFS** by default (`sync.lfs: true`).
 `cce sync init --lfs` writes the `.gitattributes` and runs `git lfs install`.

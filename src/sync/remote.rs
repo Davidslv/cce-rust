@@ -4,8 +4,10 @@
 //! backends stay possible without CLI changes, and picks a git repository as the
 //! first, recommended backend. The content-addressed cache lives in a git repo; a
 //! local working clone under `~/.cce/sync/<remote-id>/` is the transport. `put`
-//! writes the artifact at its content path and pushes (fetch-rebase-retry on a ref
-//! race); `get` fetches and reads it back.
+//! writes the artifact at its content path and pushes (a lost ref race is retried
+//! by RE-APPLYING the write on the fresh remote state — fixed-path pointer keys
+//! make racing commits genuinely conflict, so a rebase would wedge; issue #92);
+//! `get` fetches and reads it back.
 //!
 //! **What it is / does:** Declares `SyncRemote` and implements `GitRemote` over the
 //! `git` CLI. Blobs use git-LFS for `*.cce` when enabled (a `.gitattributes` written
@@ -22,7 +24,8 @@
 use crate::sync::{git, remote_slug, sync_home};
 use std::path::{Path, PathBuf};
 
-/// The number of fetch-rebase-retry attempts on a push ref race (SPEC-SYNC §4).
+/// The number of fetch-and-re-apply retry attempts on a push ref race
+/// (SPEC-SYNC §4).
 const PUSH_RETRIES: usize = 5;
 
 /// The `.gitattributes` line that routes `*.cce` blobs through git-LFS.
@@ -83,6 +86,11 @@ impl GitRemote {
             let dir_str = dir.to_string_lossy().to_string();
             git::run_commit(Path::new("."), &["clone", "--quiet", url, &dir_str])
                 .map_err(|e| format!("could not clone remote {url}: {e}"))?;
+        } else {
+            // Reusing an existing clone: self-heal one left mid-rebase by an
+            // interrupted run or the pre-#92 retry path, BEFORE resolving the
+            // branch (a rebase detaches HEAD, so `symbolic-ref` would lie).
+            Self::heal_interrupted_rebase(&dir)?;
         }
         let branch =
             git::current_branch(&dir).unwrap_or_else(|| crate::sync::DEFAULT_REF.to_string());
@@ -101,6 +109,34 @@ impl GitRemote {
     /// The cache branch.
     pub fn branch(&self) -> &str {
         &self.branch
+    }
+
+    /// Recover a working clone left with a rebase in progress (issue #92: the
+    /// old retry path could conflict mid-rebase and leave the clone poisoned —
+    /// every later push silently no-opped until the clone was deleted by
+    /// hand). Abort the rebase and restore a clean tree; every operation then
+    /// re-bases itself on `origin/<branch>` before writing, so nothing of the
+    /// half-applied state can leak into a future commit.
+    fn heal_interrupted_rebase(dir: &Path) -> Result<(), String> {
+        let git_dir = dir.join(".git");
+        if !git_dir.join("rebase-merge").exists() && !git_dir.join("rebase-apply").exists() {
+            return Ok(());
+        }
+        // `--abort` restores the pre-rebase HEAD and tree; fall back to
+        // `--quit` (clears the rebase state, keeps HEAD) if abort cannot run.
+        if git::run(dir, &["rebase", "--abort"]).is_err() {
+            git::run(dir, &["rebase", "--quit"]).map_err(|e| {
+                format!(
+                    "the sync clone at {} was left mid-rebase and could not recover \
+                     (delete the directory to reset it): {e}",
+                    dir.display()
+                )
+            })?;
+        }
+        // Drop whatever the aborted rebase left half-applied in the tree.
+        git::run(dir, &["reset", "--hard", "--quiet"])
+            .map_err(|e| format!("could not restore a clean sync clone at {}: {e}", dir.display()))
+            .map(|_| ())
     }
 
     /// Write and commit `.gitattributes` for LFS if it is not already present, and
@@ -122,55 +158,112 @@ impl GitRemote {
         let attrs = self.dir.join(".gitattributes");
         let already = std::fs::read_to_string(&attrs).map(|s| s.contains(pattern)).unwrap_or(false);
         if !already {
-            let mut content = std::fs::read_to_string(&attrs).unwrap_or_default();
-            if !content.is_empty() && !content.ends_with('\n') {
-                content.push('\n');
-            }
-            content.push_str(line);
-            std::fs::write(&attrs, content)
-                .map_err(|e| format!("cannot write .gitattributes: {e}"))?;
             // `git lfs install` is best-effort: absent git-lfs must not abort init.
             let _ = git::run(&self.dir, &["lfs", "install", "--local"]);
-            git::run_commit(&self.dir, &["add", ".gitattributes"])?;
-            // Commit may be empty if attrs already tracked; ignore that specific case.
             let msg = format!("cce sync: enable git-LFS for {pattern}");
-            let _ = git::run_commit(&self.dir, &["commit", "-q", "-m", &msg]);
-            self.push_with_retry()?;
+            // Idempotent (re-)apply: a push race resets the clone onto the new
+            // origin state, so the retry must re-check and re-append there.
+            let apply = || -> Result<(), String> {
+                let mut content = std::fs::read_to_string(&attrs).unwrap_or_default();
+                if !content.contains(pattern) {
+                    if !content.is_empty() && !content.ends_with('\n') {
+                        content.push('\n');
+                    }
+                    content.push_str(line);
+                    std::fs::write(&attrs, content)
+                        .map_err(|e| format!("cannot write .gitattributes: {e}"))?;
+                }
+                git::run_commit(&self.dir, &["add", ".gitattributes"])?;
+                // Attrs already tracked and identical stages nothing: fine.
+                self.commit_staged(&msg)
+            };
+            apply()?;
+            self.push_with_retry(&apply)?;
         }
         Ok(())
     }
 
-    /// Fetch the cache branch into `origin/<branch>` (best effort; a fresh empty
-    /// remote has nothing to fetch).
+    /// Fetch the cache branch into `origin/<branch>`. Best effort by design: a
+    /// fresh empty remote has nothing to fetch, and an offline fetch simply
+    /// leaves `origin/<branch>` at its last-known state — reads then see stale
+    /// data and pushes surface the failure loudly at push time (SPEC-SYNC §9).
     fn fetch(&self) -> Result<(), String> {
-        // `--` guards against the branch name being read as a path; ignore the
-        // "couldn't find remote ref" case an empty remote produces.
         let _ = git::run(&self.dir, &["fetch", "--quiet", "origin"]);
         Ok(())
     }
 
-    /// Push HEAD to `origin/<branch>`, retrying with fetch+rebase on a ref race.
-    fn push_with_retry(&self) -> Result<(), String> {
+    /// Does `origin/<branch>` exist locally (i.e. has the remote branch been
+    /// born and fetched)? A fresh empty remote has not.
+    fn origin_branch_exists(&self) -> bool {
+        let onto = format!("origin/{}", self.branch);
+        git::run(&self.dir, &["rev-parse", "--verify", "--quiet", &onto]).is_ok()
+    }
+
+    /// Force the working clone onto `origin/<branch>` (discarding any local
+    /// commits or tree state), so the next commit descends from the latest
+    /// fetched remote state. A no-op when the remote branch is unborn — the
+    /// first commit will create it.
+    fn checkout_branch_at_origin(&self) -> Result<(), String> {
+        if !self.origin_branch_exists() {
+            return Ok(());
+        }
+        let onto = format!("origin/{}", self.branch);
+        git::run(&self.dir, &["checkout", "--quiet", "--force", "-B", &self.branch, &onto])
+            .map(|_| ())
+            .map_err(|e| format!("could not reset the sync clone onto {onto}: {e}"))
+    }
+
+    /// Commit whatever is staged with `msg`. Nothing staged is success, not
+    /// failure — it means HEAD (the state about to be pushed) already carries
+    /// the change: an identical re-push, or a race the other writer resolved
+    /// to the same bytes. Detected via `diff --cached`, never by parsing
+    /// git's output; any REAL commit failure propagates (issue #92 — the old
+    /// swallow here turned commit failures into silent publish no-ops).
+    fn commit_staged(&self, msg: &str) -> Result<(), String> {
+        if git::run(&self.dir, &["diff", "--cached", "--quiet"]).is_ok() {
+            return Ok(());
+        }
+        git::run_commit(&self.dir, &["commit", "-q", "-m", msg]).map(|_| ())
+    }
+
+    /// Push HEAD to `origin/<branch>`, retrying on a ref race by REBUILDING the
+    /// change on top of the freshly fetched remote state.
+    ///
+    /// Why re-apply instead of rebase (issue #92): fixed-path keys — the
+    /// `refs/<ref>` and knowledge `current` pointers, `corpus.json`, the
+    /// workspace metadata — are rewritten by every push, so two racing pushes
+    /// genuinely conflict in content and a rebase stops mid-way. Cache keys
+    /// are whole-file last-writer-wins, and the SPEC-SYNC-KNOWLEDGE §5 push
+    /// guard is read-then-publish, not a transaction — so the documented race
+    /// semantic is exactly: reset onto the new `origin/<branch>`, `reapply`
+    /// the change (re-write, re-stage, re-commit), push again. `reapply` must
+    /// leave HEAD carrying the change (tolerating nothing-to-commit when the
+    /// new origin state already has it). Exhausted retries return a real
+    /// `Err` — never `Ok` without our change published.
+    fn push_with_retry(&self, reapply: &dyn Fn() -> Result<(), String>) -> Result<(), String> {
         let refspec = format!("HEAD:refs/heads/{}", self.branch);
         let mut last_err = String::new();
-        for attempt in 0..PUSH_RETRIES {
+        for _ in 0..PUSH_RETRIES {
             match git::run_commit(&self.dir, &["push", "--quiet", "origin", &refspec]) {
                 Ok(_) => return Ok(()),
                 Err(e) => {
                     last_err = e;
-                    // Someone advanced the ref first: fetch and rebase our commit on
-                    // top, then retry. Different shas never conflict in content, so
-                    // the rebase is clean.
-                    let _ = git::run(&self.dir, &["fetch", "--quiet", "origin"]);
-                    let onto = format!("origin/{}", self.branch);
-                    let _ = git::run_commit(&self.dir, &["rebase", "--quiet", &onto]);
-                    if attempt + 1 == PUSH_RETRIES {
-                        break;
+                    self.fetch()?;
+                    // Only re-apply when there is a remote state to rebuild on;
+                    // a push refused with the remote branch still unborn is not
+                    // a ref race (network/auth/hook) — just retry.
+                    if self.origin_branch_exists() {
+                        self.checkout_branch_at_origin()?;
+                        reapply()?;
                     }
                 }
             }
         }
-        Err(format!("push failed after {PUSH_RETRIES} attempts: {last_err}"))
+        Err(format!(
+            "push to origin/{} failed after {PUSH_RETRIES} attempts (lost a push race {PUSH_RETRIES} \
+             times or the remote kept refusing): {last_err}",
+            self.branch
+        ))
     }
 
     /// The `origin/<branch>:<key>` ref-path used to read a file out of the fetched
@@ -304,18 +397,20 @@ impl GitRemote {
         if keys.is_empty() {
             return Ok(());
         }
+        // Start from the latest remote state so the prune descends from it.
         self.fetch()?;
-        let onto = format!("origin/{}", self.branch);
-        let _ = git::run_commit(&self.dir, &["checkout", "-q", "-B", &self.branch, &onto]);
-        let mut args: Vec<&str> = vec!["rm", "-q", "--ignore-unmatch", "--"];
-        args.extend(keys.iter().map(String::as_str));
-        git::run_commit(&self.dir, &args)?;
-        // Every key already absent ⇒ nothing staged ⇒ nothing to prune (success).
-        if git::run(&self.dir, &["diff", "--cached", "--quiet"]).is_ok() {
-            return Ok(());
-        }
-        git::run_commit(&self.dir, &["commit", "-q", "-m", message])?;
-        self.push_with_retry()
+        self.checkout_branch_at_origin()?;
+        // Re-appliable on a push race: `--ignore-unmatch` makes re-running the
+        // removal against the new origin state a no-op for keys another writer
+        // already pruned (nothing staged ⇒ nothing to prune ⇒ success).
+        let apply = || -> Result<(), String> {
+            let mut args: Vec<&str> = vec!["rm", "-q", "--ignore-unmatch", "--"];
+            args.extend(keys.iter().map(String::as_str));
+            git::run_commit(&self.dir, &args)?;
+            self.commit_staged(message)
+        };
+        apply()?;
+        self.push_with_retry(&apply)
     }
 
     /// Read a small *non-artifact* text blob (e.g. a `refs/<ref>` latest pointer)
@@ -325,6 +420,43 @@ impl GitRemote {
         self.fetch()?;
         git::run(&self.dir, &["cat-file", "blob", &self.ref_path(key)])
             .map(|s| s.trim().to_string())
+    }
+
+    /// Post-push verification (issue #92): read every just-written key back
+    /// from `origin/<branch>` and confirm the publish actually happened,
+    /// converting any residual silent failure into a loud error. Artifact keys
+    /// (`.cce`/`.cck`) may be git-LFS *pointers* on the remote, so they are
+    /// checked for existence; every other key — exactly the fixed-path pointer
+    /// files this bug lost — is compared byte-for-byte.
+    fn verify_published(&self, entries: &[(String, Vec<u8>)]) -> Result<(), String> {
+        self.fetch()?;
+        for (key, bytes) in entries {
+            if key.ends_with(".cce") || key.ends_with(".cck") {
+                if git::run(&self.dir, &["cat-file", "-e", &self.ref_path(key)]).is_err() {
+                    return Err(format!(
+                        "push verification failed: {key} is missing from origin/{} after the \
+                         push — nothing was published",
+                        self.branch
+                    ));
+                }
+                continue;
+            }
+            let got = git::run_bytes(&self.dir, &["cat-file", "blob", &self.ref_path(key)])
+                .map_err(|e| {
+                    format!(
+                        "push verification failed: cannot read {key} back from origin/{}: {e}",
+                        self.branch
+                    )
+                })?;
+            if got != *bytes {
+                return Err(format!(
+                    "push verification failed: {key} on origin/{} does not carry the \
+                     just-pushed bytes — the publish was lost",
+                    self.branch
+                ));
+            }
+        }
+        Ok(())
     }
 }
 
@@ -362,31 +494,35 @@ impl SyncRemote for GitRemote {
         }
         // Start from the latest remote state so our commit descends from it.
         self.fetch()?;
-        let onto = format!("origin/{}", self.branch);
-        // If the branch already exists remotely, base our work on it.
-        let _ = git::run_commit(&self.dir, &["checkout", "-q", "-B", &self.branch, &onto]);
-
-        for (key, bytes) in entries {
-            let path = self.dir.join(key);
-            if let Some(parent) = path.parent() {
-                std::fs::create_dir_all(parent)
-                    .map_err(|e| format!("cannot create {key} dir: {e}"))?;
-            }
-            std::fs::write(&path, bytes).map_err(|e| format!("cannot write {key}: {e}"))?;
-            git::run_commit(&self.dir, &["add", "--", key])?;
-        }
+        self.checkout_branch_at_origin()?;
         let msg = if entries.len() == 1 {
             format!("cce sync: {}", entries[0].0)
         } else {
             format!("cce sync: {} artifacts", entries.len())
         };
-        // Nothing-to-commit (an identical re-push) is success, not failure.
-        match git::run_commit(&self.dir, &["commit", "-q", "-m", &msg]) {
-            Ok(_) => {}
-            Err(e) if e.contains("nothing to commit") => {}
-            Err(_) => { /* fall through: still attempt push in case of prior commit */ }
-        }
-        self.push_with_retry()
+        // Write + stage + commit the entries, as a closure so a lost push race
+        // can re-run it on top of the freshly fetched origin state (issue #92:
+        // fixed-path pointer keys make racing commits genuinely conflict, so
+        // the retry rebuilds the whole-file last-writer-wins result instead of
+        // rebasing into a conflict).
+        let apply = || -> Result<(), String> {
+            for (key, bytes) in entries {
+                let path = self.dir.join(key);
+                if let Some(parent) = path.parent() {
+                    std::fs::create_dir_all(parent)
+                        .map_err(|e| format!("cannot create {key} dir: {e}"))?;
+                }
+                std::fs::write(&path, bytes).map_err(|e| format!("cannot write {key}: {e}"))?;
+                git::run_commit(&self.dir, &["add", "--", key])?;
+            }
+            // Nothing staged (an identical re-push) is success, not failure.
+            self.commit_staged(&msg)
+        };
+        apply()?;
+        self.push_with_retry(&apply)?;
+        // Belt and braces (#92): a push that "succeeded" without publishing our
+        // content must error loudly, never report success.
+        self.verify_published(entries)
     }
 
     /// Keys ending in `suffix` under `prefix` (moved verbatim from the former
@@ -684,6 +820,185 @@ mod tests {
         // A file:// URL to a path that is not a repo fails to clone.
         let err = GitRemote::open("file:///definitely/not/a/repo/here.git", false).unwrap_err();
         assert!(err.contains("could not clone"), "got {err}");
+        std::env::remove_var("CCE_HOME");
+    }
+
+    // ---- issue #92: the conflicted push race -------------------------------
+    //
+    // The race is simulated deterministically with a pre-receive hook on the
+    // bare remote: the FIRST push triggers a conflicting out-of-band push from
+    // a separate racer clone and is rejected — exactly a lost ref race, landed
+    // mid-flight between our fetch and our push. Later pushes pass.
+
+    /// A separate clone of `url` with `key` = `content` committed but NOT
+    /// pushed — the conflicting commit the race hook publishes mid-flight.
+    #[cfg(unix)]
+    fn racer_clone(url: &str, key: &str, content: &str) -> (tempfile::TempDir, PathBuf) {
+        let tmp = tempfile::tempdir().unwrap();
+        let dir = tmp.path().join("racer");
+        let dir_str = dir.to_string_lossy().to_string();
+        git::run_commit(Path::new("."), &["clone", "--quiet", url, &dir_str]).unwrap();
+        let path = dir.join(key);
+        std::fs::create_dir_all(path.parent().unwrap()).unwrap();
+        std::fs::write(&path, content).unwrap();
+        git::run_commit(&dir, &["add", "--", key]).unwrap();
+        git::run_commit(&dir, &["commit", "-q", "-m", "racer"]).unwrap();
+        (tmp, dir)
+    }
+
+    /// Install a pre-receive hook on the bare remote: the first push publishes
+    /// `racer`'s HEAD (a mid-flight ref race) and is rejected; later pushes
+    /// pass. With `racer` = None every push is rejected (retries exhausted).
+    #[cfg(unix)]
+    fn arm_race_hook(bare: &Path, racer: Option<&Path>) {
+        use std::os::unix::fs::PermissionsExt;
+        let path = std::env::var("PATH").unwrap_or_default();
+        let script = match racer {
+            Some(r) => format!(
+                "#!/bin/sh\nif [ -f \"$GIT_DIR/race-done\" ]; then exit 0; fi\n\
+                 touch \"$GIT_DIR/race-done\"\n\
+                 env -i PATH=\"{path}\" git -C \"{}\" push --quiet origin \
+                 HEAD:refs/heads/main >&2\n\
+                 echo 'simulated ref race' >&2\nexit 1\n",
+                r.display()
+            ),
+            None => "#!/bin/sh\necho 'rejected by test hook' >&2\nexit 1\n".to_string(),
+        };
+        let hook = bare.join("hooks").join("pre-receive");
+        std::fs::write(&hook, script).unwrap();
+        std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+    }
+
+    /// Is the working clone free of any in-progress rebase?
+    fn no_rebase_in_progress(remote: &GitRemote) -> bool {
+        let git_dir = remote.dir().join(".git");
+        !git_dir.join("rebase-merge").exists() && !git_dir.join("rebase-apply").exists()
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn conflicting_fixed_path_race_republishes_last_writer_wins() {
+        // Issue #92: two pushes rewriting the SAME fixed-path key (a knowledge
+        // `current` pointer) genuinely conflict. The old rebase-based retry
+        // swallowed the conflict, reported success while publishing nothing,
+        // and left the clone mid-rebase. Pinned now: the lost race re-applies
+        // our write on the new origin state (last-writer-wins) and the remote
+        // really carries our bytes afterward.
+        let _home = with_home();
+        let (bare, url) = bare_remote();
+        let remote = GitRemote::open(&url, false).unwrap();
+        let current = "knowledge/v1/corpus/current";
+        let meta = "knowledge/v1/corpus/corpus.json";
+        remote
+            .put_many(&[
+                (current.to_string(), b"aaaa1111\n".to_vec()),
+                (meta.to_string(), b"{\"current\":\"aaaa1111\"}\n".to_vec()),
+            ])
+            .unwrap();
+
+        let (_racer_tmp, racer) = racer_clone(&url, current, "raced9999\n");
+        arm_race_hook(bare.path(), Some(&racer));
+        remote
+            .put_many(&[
+                (current.to_string(), b"bbbb2222\n".to_vec()),
+                (meta.to_string(), b"{\"current\":\"bbbb2222\"}\n".to_vec()),
+            ])
+            .unwrap();
+
+        // The remote carries OUR bytes — success was not a lie.
+        let published = git::run(bare.path(), &["show", &format!("main:{current}")]).unwrap();
+        assert_eq!(published, "bbbb2222");
+        // The clone is clean (no rebase in progress) and still usable.
+        assert!(no_rebase_in_progress(&remote), "clone left mid-rebase");
+        remote.put(current, b"cccc3333\n").unwrap();
+        let published = git::run(bare.path(), &["show", &format!("main:{current}")]).unwrap();
+        assert_eq!(published, "cccc3333");
+        std::env::remove_var("CCE_HOME");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn raced_push_with_different_artifact_keys_lands_both() {
+        // The NON-conflicting race (two distinct content-addressed keys) must
+        // still resolve automatically: the racer's artifact survives and ours
+        // lands beside it.
+        let _home = with_home();
+        let (bare, url) = bare_remote();
+        let remote = GitRemote::open(&url, false).unwrap();
+        remote.put("hash/2.3/x/sha_a.cce", b"A\n").unwrap();
+
+        let (_racer_tmp, racer) = racer_clone(&url, "hash/2.3/x/sha_r.cce", "R\n");
+        arm_race_hook(bare.path(), Some(&racer));
+        remote.put("hash/2.3/x/sha_b.cce", b"B\n").unwrap();
+
+        let mut shas = remote.list("hash/2.3/x").unwrap();
+        shas.sort();
+        assert_eq!(shas, vec!["sha_a".to_string(), "sha_b".to_string(), "sha_r".to_string()]);
+        assert!(no_rebase_in_progress(&remote), "clone left mid-rebase");
+        std::env::remove_var("CCE_HOME");
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn exhausted_push_retries_return_err_and_leave_a_clean_clone() {
+        // A publish that cannot land must be a REAL error — never Ok with
+        // nothing published — and must not poison the clone for later pushes.
+        let _home = with_home();
+        let (bare, url) = bare_remote();
+        let remote = GitRemote::open(&url, false).unwrap();
+        remote.put("knowledge/v1/corpus/current", b"aaaa1111\n").unwrap();
+
+        arm_race_hook(bare.path(), None);
+        let err = remote.put("knowledge/v1/corpus/current", b"bbbb2222\n").unwrap_err();
+        assert!(err.contains("push"), "got {err}");
+        assert!(no_rebase_in_progress(&remote), "clone left mid-rebase");
+        // The remote kept the pre-race state, and the clone recovers as soon
+        // as the remote accepts pushes again.
+        let kept = git::run(bare.path(), &["show", "main:knowledge/v1/corpus/current"]).unwrap();
+        assert_eq!(kept, "aaaa1111");
+        std::fs::remove_file(bare.path().join("hooks").join("pre-receive")).unwrap();
+        remote.put("knowledge/v1/corpus/current", b"cccc3333\n").unwrap();
+        let now = git::run(bare.path(), &["show", "main:knowledge/v1/corpus/current"]).unwrap();
+        assert_eq!(now, "cccc3333");
+        std::env::remove_var("CCE_HOME");
+    }
+
+    #[test]
+    fn poisoned_clone_self_heals_on_open() {
+        // A clone left mid-rebase by the pre-fix retry path (issue #92) must
+        // recover transparently on the next open — no manual deletion.
+        let _home = with_home();
+        let (bare, url) = bare_remote();
+        let remote = GitRemote::open(&url, false).unwrap();
+        let key = "knowledge/v1/corpus/current";
+        remote.put(key, b"aaaa1111\n").unwrap();
+
+        // Poison the clone exactly as the old code did: a local commit to the
+        // fixed path, a conflicting commit on the remote, then a rebase that
+        // stops on the conflict and is abandoned.
+        let dir = remote.dir().to_path_buf();
+        std::fs::write(dir.join(key), b"local5555\n").unwrap();
+        git::run_commit(&dir, &["add", "--", key]).unwrap();
+        git::run_commit(&dir, &["commit", "-q", "-m", "doomed local commit"]).unwrap();
+        let other_home = tempfile::tempdir().unwrap();
+        std::env::set_var("CCE_HOME", other_home.path());
+        let other = GitRemote::open(&url, false).unwrap();
+        other.put(key, b"remote7777\n").unwrap();
+        std::env::set_var("CCE_HOME", _home.path());
+        git::run(&dir, &["fetch", "--quiet", "origin"]).unwrap();
+        assert!(git::run_commit(&dir, &["rebase", "--quiet", "origin/main"]).is_err());
+        assert!(
+            dir.join(".git").join("rebase-merge").exists()
+                || dir.join(".git").join("rebase-apply").exists(),
+            "test setup failed to leave a rebase in progress"
+        );
+
+        // Re-open heals the clone, and the next push publishes for real.
+        let healed = GitRemote::open(&url, false).unwrap();
+        assert!(no_rebase_in_progress(&healed), "open did not heal the mid-rebase clone");
+        healed.put(key, b"bbbb2222\n").unwrap();
+        let published = git::run(bare.path(), &["show", &format!("main:{key}")]).unwrap();
+        assert_eq!(published, "bbbb2222");
         std::env::remove_var("CCE_HOME");
     }
 }

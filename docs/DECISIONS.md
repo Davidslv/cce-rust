@@ -377,10 +377,13 @@ verbatim, so it is human-legible and trivially identical across engines (both
 register the same six packs).
 
 **A per-branch ref pointer implements `latest`; content is addressed by sha.**
-Distinct shas are distinct files, so they never conflict in content. To resolve
-"latest main," `push` also writes `…/<repo_id>/refs/<branch>` = sha in the same
-commit, and `pull --latest` reads it. Only ref advancement can race; the git backend
-handles it with fetch-rebase-retry (proven by a two-clone race test).
+Distinct shas are distinct files, so the artifacts never conflict in content. To
+resolve "latest main," `push` also writes `…/<repo_id>/refs/<branch>` = sha in the
+same commit, and `pull --latest` reads it. The pointer is a fixed path rewritten
+by every push, so racing pushes genuinely conflict there (#92): every key is
+whole-file last-writer-wins, and the git backend retries a lost push race by
+re-applying the write on the freshly fetched remote state (proven by
+deterministic race tests over both the code and knowledge keyspaces).
 
 **`git` is invoked via `std::process`, not a git library.** The remote is "just a
 git repo," and shelling out keeps CCE dependency-light and uses the user's real git

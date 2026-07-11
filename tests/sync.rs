@@ -1709,3 +1709,137 @@ fn knowledge_current_pointer_family_is_untouched_by_ref_fallback() {
     assert_eq!(k["snapshots"], 1);
     assert!(k.get("ref").is_none(), "knowledge rows must not gain a ref field: {k}");
 }
+
+// --- issue #92: the conflicted push race over the code keyspace ---
+//
+// The `refs/<branch>` pointer is a FIXED path rewritten by every push, so two
+// racing pushes genuinely conflict in content (the artifact keys, being
+// content-addressed, never do). The race is simulated deterministically with a
+// pre-receive hook on the bare remote: the first push triggers a conflicting
+// out-of-band push from a separate racer clone and is rejected — a lost ref
+// race landed mid-flight between the client's fetch and its push. Pinned
+// behavior: the push either publishes for real (re-apply, last-writer-wins) or
+// exits nonzero — never exit 0 with nothing published — and the sync clone is
+// never left with a rebase in progress.
+
+/// A separate clone of the cache with conflicting `(path, content)` rewrites
+/// committed but NOT pushed — the commit the race hook publishes mid-flight.
+#[cfg(unix)]
+fn conflicting_racer(url: &str, files: &[(&str, &str)]) -> (tempfile::TempDir, PathBuf) {
+    let tmp = tempfile::tempdir().unwrap();
+    let dir = tmp.path().join("cache");
+    let out = Command::new("git").args(["clone", "-q", url]).arg(&dir).output().unwrap();
+    assert!(out.status.success(), "racer clone failed: {}", String::from_utf8_lossy(&out.stderr));
+    for (path, content) in files {
+        let p = dir.join(path);
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        std::fs::write(p, content).unwrap();
+    }
+    git(&dir, &["add", "-A"]);
+    git(&dir, &["commit", "-q", "-m", "racer"]);
+    (tmp, dir)
+}
+
+/// Install a pre-receive hook on the bare remote: the first push publishes
+/// `racer`'s HEAD (the mid-flight ref race) and is rejected; later pushes pass.
+#[cfg(unix)]
+fn arm_race_hook(bare: &Path, racer: &Path) {
+    use std::os::unix::fs::PermissionsExt;
+    let path = std::env::var("PATH").unwrap_or_default();
+    let script = format!(
+        "#!/bin/sh\nif [ -f \"$GIT_DIR/race-done\" ]; then exit 0; fi\n\
+         touch \"$GIT_DIR/race-done\"\n\
+         env -i PATH=\"{path}\" git -C \"{}\" push --quiet origin \
+         HEAD:refs/heads/main >&2\n\
+         echo 'simulated ref race' >&2\nexit 1\n",
+        racer.display()
+    );
+    let hook = bare.join("hooks").join("pre-receive");
+    std::fs::write(&hook, script).unwrap();
+    std::fs::set_permissions(&hook, std::fs::Permissions::from_mode(0o755)).unwrap();
+}
+
+/// Read `spec` (e.g. `main:hash/2.3/<repo_id>/refs/main`) out of the bare repo.
+#[cfg(unix)]
+fn bare_show(bare: &Path, spec: &str) -> String {
+    let out = Command::new("git").arg("-C").arg(bare).args(["show", spec]).output().unwrap();
+    assert!(
+        out.status.success(),
+        "git show {spec} failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).to_string()
+}
+
+/// Every sync working clone under `home` must be free of in-progress rebases.
+#[cfg(unix)]
+fn assert_no_rebase_in_progress(home: &Path) {
+    for entry in std::fs::read_dir(home.join("sync")).unwrap() {
+        let clone = entry.unwrap().path();
+        let git_dir = clone.join(".git");
+        assert!(
+            !git_dir.join("rebase-merge").exists() && !git_dir.join("rebase-apply").exists(),
+            "sync clone {} was left with a rebase in progress",
+            clone.display()
+        );
+    }
+}
+
+#[cfg(unix)]
+#[test]
+fn sync_push_race_on_the_ref_pointer_republishes_and_pull_latest_resolves() {
+    let home = tempfile::tempdir().unwrap();
+    let (bare, url) = bare_remote();
+    let src = source_repo();
+    init_and_push(home.path(), &url, src.path(), REPO_ID);
+
+    // A second commit → a new sha, so the next push rewrites the SAME
+    // `refs/main` pointer file with different content.
+    std::fs::write(src.path().join("auth.py"), "def login(user):\n    return None\n").unwrap();
+    git(src.path(), &["commit", "-q", "-am", "second"]);
+    let out =
+        Command::new("git").arg("-C").arg(src.path()).args(["rev-parse", "HEAD"]).output().unwrap();
+    let sha2 = String::from_utf8_lossy(&out.stdout).trim().to_string();
+
+    // Mid-push, a conflicting rewrite of the pointer lands first and our push
+    // is rejected once — the exact #92 failure mode on the code keyspace.
+    let pointer = format!("hash/2.3/{REPO_ID}/refs/main");
+    let junk = "d0d0caca".repeat(5) + "\n";
+    let (_racer_tmp, racer) = conflicting_racer(&url, &[(&pointer, junk.as_str())]);
+    arm_race_hook(bare.path(), &racer);
+
+    let out = cce(home.path(), &["sync", "push", "--dir", src.path().to_str().unwrap()]);
+    assert!(out.status.success(), "raced push failed: {}", String::from_utf8_lossy(&out.stderr));
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains(&format!("Pushed {REPO_ID}@{sha2}")), "{stdout}");
+
+    // Success was not a lie: the remote pointer carries OUR sha (last-writer-
+    // wins on the race), and the sync clone is not left mid-rebase.
+    assert_eq!(bare_show(bare.path(), &format!("main:{pointer}")).trim(), sha2);
+    assert_no_rebase_in_progress(home.path());
+
+    // A consumer resolves `--latest` through the raced-but-published pointer.
+    let dst = clone_of(src.path());
+    let work = dst.path().join("work");
+    cce(
+        home.path(),
+        &[
+            "sync",
+            "init",
+            "--remote",
+            &url,
+            "--no-lfs",
+            "--repo-id",
+            REPO_ID,
+            "--dir",
+            work.to_str().unwrap(),
+        ],
+    );
+    let out = cce(home.path(), &["sync", "pull", "--latest", "--dir", work.to_str().unwrap()]);
+    assert!(
+        out.status.success(),
+        "pull --latest after the raced push failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    assert!(work.join(".cce/index.json").exists());
+}
