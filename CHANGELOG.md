@@ -49,10 +49,12 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   and `cce doctor` scans persisted facets for un-redacted secrets (#144).** A
   secret placed in a knowledge record id could not be scrubbed at rest (chunk ids
   and the synthetic document path derive from it) yet was served verbatim through
-  the `expand_chunk` and `related_context` headers — a leak the #111/#112 facet
-  redaction did not cover. Those served surfaces now render a **redacted display
-  form** of the id (`crate::redactor::redact` over the id, display-only; the raw id
-  still addresses). Redaction is the identity on a clean id, so served output for
+  the `expand_chunk` and `related_context` headers, and via the `summarize_context`
+  session digest (the id was recorded raw into the session ledger's `files`
+  section) — a leak the #111/#112 facet redaction did not cover. Those served
+  surfaces now render a **redacted display form** of the id (`crate::redactor::redact`
+  over the id, display-only; the raw id still addresses; on the knowledge search
+  path the id is redacted before it enters the session ledger). Redaction is the identity on a clean id, so served output for
   the common case is byte-identical and no served-output golden moves; only an id
   that contains a secret changes. Separately, a store indexed **before** #111 (or
   one that was tampered with) keeps raw facets on disk — and a local re-index does
