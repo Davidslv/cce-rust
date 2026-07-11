@@ -112,8 +112,11 @@ impl KnowledgeSyncState {
         }
         // #123: propagate a serialization failure rather than writing an empty
         // string (`unwrap_or_default`) that would later parse as a corrupt marker.
+        // #150: route through the atomic temp-file + rename helper (#101), so a
+        // crash mid-write can't truncate the marker. Bytes are byte-identical to
+        // the prior `fs::write` (no trailing newline).
         let json = serde_json::to_string(self).map_err(std::io::Error::other)?;
-        std::fs::write(path, json)
+        crate::atomic::atomic_write(&path, json.as_bytes())
     }
 }
 
@@ -1526,6 +1529,39 @@ mod tests {
         assert!(err.contains("could not verify the remote's current snapshot"), "got: {err}");
         assert!(err.contains(&missing), "the failure names the missing key, got: {err}");
         assert!(err.contains("--force"), "got: {err}");
+    }
+
+    #[test]
+    fn knowledge_marker_save_is_atomic_and_overwrites_a_read_only_marker() {
+        // #150: the knowledge marker goes through the atomic temp+rename helper —
+        // a bare `fs::write` cannot reopen a read-only marker to truncate it, but
+        // an atomic rename replaces it, leaving no temp residue.
+        let root = tempfile::tempdir().unwrap();
+        let s1 = KnowledgeSyncState {
+            corpus_id: "c1".into(),
+            snapshot: "s1".into(),
+            checksum: "x".into(),
+            installed_sha256: None,
+        };
+        s1.save(root.path()).unwrap();
+        let path = KnowledgeSyncState::path(root.path());
+        let mut perms = std::fs::metadata(&path).unwrap().permissions();
+        perms.set_readonly(true);
+        std::fs::set_permissions(&path, perms).unwrap();
+
+        let s2 = KnowledgeSyncState {
+            corpus_id: "c1".into(),
+            snapshot: "s2".into(),
+            checksum: "y".into(),
+            installed_sha256: None,
+        };
+        s2.save(root.path()).unwrap();
+        assert_eq!(KnowledgeSyncState::load(root.path()).unwrap(), s2);
+        let leftover = std::fs::read_dir(KnowledgeStore::dir(root.path()))
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .any(|e| e.file_name().to_string_lossy().contains(".tmp"));
+        assert!(!leftover, "atomic temp file leaked");
     }
 
     #[test]
