@@ -63,6 +63,47 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   record id, flags any that still carry a secret-shaped value (naming the facet,
   never printing the raw value), and calls out a secret-bearing id separately as
   needing a source-adapter fix rather than a re-index. Advisory, exit 0.
+- **Layer-2 redaction no longer leaks a secret tail on same-delimiter quoted
+  values or on a specific-pattern prefix (#142).** Two pre-existing paths let a
+  real secret survive into the shareable `.cce/index.json` store: (1) a
+  same-style quote inside a quoted value (`password = 'abcdefghij'tail-secret'`,
+  or a JSON-escaped `\"`) ended the value at the first inner quote, redacting the
+  ≥8-char prefix while the tail persisted; (2) after a specific pattern redacted
+  a *prefix* of a longer value (`"AKIA…EXAMPLEsuffix-secret"`), the idempotency
+  guard skipped the whole value because it merely *began* with `[REDACTED:`. Fix:
+  the generic-assignment value scan is now quote-aware (extends to the true
+  closing quote — one followed by whitespace or the line end — consuming escaped
+  and inner same-style quotes, bounded to the current line so it never merges a
+  following assignment; adds a backtick branch), and the idempotency guard now
+- **Layer-2 redaction no longer leaks a secret tail on quoted values with an
+  inner same-style quote, doubled-quote escaping, or a specific-pattern prefix,
+  and no longer over-captures across a structural boundary (#142).** Several
+  pre-existing paths let a real secret survive into the shareable
+  `.cce/index.json` store, or deleted clean sibling content from it. The
+  generic-assignment value is now delimited by a small explicit quote/escape-aware
+  scanner (replacing a regex value branch that could not express the grammar
+  without a fragile "continue-unless-whitespace" heuristic). Per quote style the
+  scanner handles BOTH escape conventions — backslash (`\"`) and doubled (`''` /
+  `""` / backtick-pair). A closing quote is decided by what immediately follows
+  it: whitespace or the line end is a true close; a value char (an ASCII word char
+  or a Unicode letter) is an inner quote so the scan continues over it; ASCII
+  punctuation is a true close UNLESS a later matching-style quote appears on the
+  line with no intervening whitespace, in which case the punctuation is inside the
+  value and the scan continues through to that quote. Net effect: a glued secret
+  tail (`'abc'tail`, `'abc'.tail'`, `'abc'étail'`) is fully redacted, while
+  trailing code or a sibling with a structural break (`".freeze`, `", host: "y"`)
+  is preserved. Values never cross a line. The idempotency guard now skips only a
+  value that is EXACTLY a `[REDACTED:LABEL]` token, re-scrubbing any remainder
+  after a specific-pattern prefix, and a scanned span that has swallowed a further
+  recognised `key=`/`key:` assignment (a no-delimiter merge) is never skipped as a
+  placeholder — it is redacted wholesale so no nested secret survives.
+  **Accepted over-redaction contract** (fail toward over-redaction): where the
+  value extent is genuinely ambiguous — two same-line assignments with NO
+  delimiter between them (`a='x'b='y'`), a word-char- or doubled-quote-glued
+  boundary, or punctuation with a later same-style quote and no whitespace — the
+  scanner over-redacts the whole span into one `[REDACTED:SECRET]` rather than
+  risk a leak; punctuation followed by whitespace or the line end (no later quote)
+  is instead a structural close that preserves the trailing token. (redactor.rs)
 - **`cce sync pull` no longer overwrites the local index at a different sha when
   the code marker is corrupt, and never activates a pulled store before its
   marker is durable (#163) — the code-side twins of the knowledge-side #123/#122.**

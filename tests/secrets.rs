@@ -157,6 +157,172 @@ fn protected_index_redacts_values_containing_quotes() {
 }
 
 #[test]
+fn protected_index_closes_142_residual_tail_leaks() {
+    // #142: two residual tail-leak shapes reached the persisted store on
+    // pre-#142 code. Drive the real binary over a file containing each shape
+    // and assert the store holds NO secret fragment.
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = tmp.path().join("leaks142");
+    std::fs::create_dir(&fixture).unwrap();
+    std::fs::write(
+        fixture.join("settings.conf"),
+        format!(
+            concat!(
+                // 1a: same single-delimiter quote inside a single-quoted value.
+                "password = 'abcdefghij'tail-super-secret'\n",
+                // 1b: JSON-escaped inner double quote.
+                "password = \"abcdefghij\\\"tail-super-secret\"\n",
+                // backtick + multiple inner quotes.
+                "password = `abcdefghij`tail-super-secret`\n",
+                "password = 'abcdefgh'mid'tail-super-secret'\n",
+                // 2: a specific (AWS) prefix consumes part of a longer value.
+                "password = \"{aws}suffix-secret\"\n",
+                "password = {aws}suffix-secret\n",
+            ),
+            aws = AWS_KEY,
+        ),
+    )
+    .unwrap();
+    let store = tmp.path().join("index.json");
+
+    let out = Command::new(bin())
+        .args(["index"])
+        .arg(&fixture)
+        .arg("--store")
+        .arg(&store)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "index failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    let (_, content) = read_store(&store);
+    for leaked in ["tail-super-secret", "suffix-secret", "mid'tail", AWS_KEY] {
+        assert!(
+            !content.contains(leaked),
+            "secret fragment {leaked:?} leaked into store: {content}"
+        );
+    }
+    assert!(content.contains("[REDACTED:SECRET]"), "expected redaction marker: {content}");
+}
+
+#[test]
+fn protected_index_closes_142_round3_no_delimiter_and_punctuation_leaks() {
+    // #142 round 3: the no-delimiter placeholder merge (P1) and the
+    // punctuation/Unicode-glued secret tail (P2) — verified end-to-end against
+    // the persisted store, with sibling/trailing-code preservation intact.
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = tmp.path().join("round3");
+    std::fs::create_dir(&fixture).unwrap();
+    std::fs::write(
+        fixture.join("settings.conf"),
+        concat!(
+            // P1: no-delimiter placeholder merge hides the neighbour's secret.
+            "password=\"changeme\"token=\"ZmaskH-mergesecret42\"\n",
+            "password=\"your\"api_key=\"Yourr-realapikey88\"\n",
+            // P2: punctuation-/Unicode-glued secret tail.
+            "password = 'abcdefghij'.ZdotM-tailsecret42'\n",
+            "password = 'abcdefghij'\u{e9}ZuniE-leaksecret777'\n",
+            "password = `abcdefghij`.ZdotM-tailsecret42`\n",
+            // Controls that must stay preserved.
+            "password = \"abcdefghij\".freeze\n",
+            "{password: \"abcdefghij\", host: \"publicdb\"}\n",
+            "password = 'a1b2c3d4e5' token = 'f6g7h8i9j0'\n",
+        ),
+    )
+    .unwrap();
+    let store = tmp.path().join("index.json");
+
+    let out = Command::new(bin())
+        .args(["index"])
+        .arg(&fixture)
+        .arg("--store")
+        .arg(&store)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "index failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    let (_, content) = read_store(&store);
+    // (a) NEVER LEAK.
+    for leaked in [
+        "ZmaskH-mergesecret42",
+        "mergesecret",
+        "Yourr-realapikey88",
+        "realapikey",
+        "ZdotM-tailsecret42",
+        "tailsecret",
+        "leaksecret777",
+        "ZuniE",
+    ] {
+        assert!(
+            !content.contains(leaked),
+            "secret fragment {leaked:?} leaked into store: {content}"
+        );
+    }
+    // (b) siblings / trailing code preserved.
+    assert!(content.contains(".freeze"), "trailing code deleted: {content}");
+    assert!(content.contains("host: \"publicdb\""), "clean sibling deleted: {content}");
+    // The whitespace-separated pair stays two independent redactions.
+    assert!(
+        content.contains("password = '[REDACTED:SECRET]' token = '[REDACTED:SECRET]'"),
+        "whitespace-separated pair not both redacted: {content}"
+    );
+    assert!(content.contains("[REDACTED:SECRET]"), "expected redaction marker: {content}");
+}
+
+#[test]
+fn protected_index_closes_142_round2_leaks_and_preserves_siblings() {
+    // #142 round 2: doubled-quote escaping, comma-adjacent merge, and clean
+    // sibling / trailing-code preservation — all verified against the persisted
+    // store with the real binary.
+    let tmp = tempfile::tempdir().unwrap();
+    let fixture = tmp.path().join("round2");
+    std::fs::create_dir(&fixture).unwrap();
+    std::fs::write(
+        fixture.join("settings.conf"),
+        concat!(
+            // Finding 1: doubled-quote escaping (single/double/backtick).
+            "password = 'abcdefghij''tail-super-secret'\n",
+            "password = 'abc''realsecret-here'\n",
+            "password = \"abcdefghij\"\"tail-super-secret\"\n",
+            "password = `abcdefghij``tail-super-secret`\n",
+            // Finding 2: comma-adjacent placeholder must not shield the neighbour.
+            "password = \"changeme\", token = \"realsecrettail123\"\n",
+            "password = \"realsecrettail123\", token = \"anotherrealsecret999\"\n",
+            // Finding 3: clean sibling + trailing code must survive.
+            "{password: \"abcdefghij\", host: \"publicdb\"}\n",
+            "password = \"abcdefghij\".freeze\n",
+        ),
+    )
+    .unwrap();
+    let store = tmp.path().join("index.json");
+
+    let out = Command::new(bin())
+        .args(["index"])
+        .arg(&fixture)
+        .arg("--store")
+        .arg(&store)
+        .output()
+        .unwrap();
+    assert!(out.status.success(), "index failed: {}", String::from_utf8_lossy(&out.stderr));
+
+    let (_, content) = read_store(&store);
+    // (a) NEVER LEAK — no secret fragment survives.
+    for leaked in
+        ["tail-super-secret", "realsecret-here", "realsecrettail123", "anotherrealsecret999"]
+    {
+        assert!(
+            !content.contains(leaked),
+            "secret fragment {leaked:?} leaked into store: {content}"
+        );
+    }
+    // (b) MINIMIZE over-redaction — clean sibling content and trailing code stay.
+    assert!(content.contains("host: \"publicdb\""), "clean sibling deleted: {content}");
+    assert!(content.contains(".freeze"), "trailing code deleted: {content}");
+    // The comma-adjacent documentation placeholder is preserved (single-value scope).
+    assert!(content.contains("changeme"), "placeholder deleted: {content}");
+    assert!(content.contains("[REDACTED:SECRET]"), "expected redaction marker: {content}");
+}
+
+#[test]
 fn allow_secrets_bypasses_both_layers() {
     let tmp = tempfile::tempdir().unwrap();
     let fixture = tmp.path().join("secrets");
