@@ -118,6 +118,10 @@ scores are compared, sorted, or emitted.
   `cce sync verify --checksum-only` against the `installed_sha256` recorded in
   `.cce/synced.json`) is likewise fully additive — `SYNC_FORMAT_VERSION` stays
   `2.3` and every existing golden is untouched.
+- [`ADR-CORPUS-SERVE.md`](ADR-CORPUS-SERVE.md) — the accepted decision (OD1/OD2)
+  to add a native, opt-in, loopback `cce corpus serve` route over in-process
+  knowledge retrieval, co-located on the signal-engine host; recorded before the
+  implementation (signal-engine Epic #8 · U1.3).
 - [`docs/mcp.md`](docs/mcp.md) · [`docs/savings.md`](docs/savings.md) ·
   [`docs/sync.md`](docs/sync.md) · [`docs/knowledge.md`](docs/knowledge.md) — the
   MCP (nine tools), Savings Layers, Sync, and Knowledge Sources user docs;
