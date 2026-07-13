@@ -147,10 +147,53 @@ fn service_param(target: &str) -> Option<String> {
     None
 }
 
+/// Char cap for a served doc `body` (U2.2 · G19). The consumer fences every untrusted
+/// string with [`Fence::MAX_CHARS`] = 500 by a blunt `text[0, 500]` slice that lands
+/// mid-word / mid-sentence (signal-engine `triage/fence.rb`). Fitting the body to the same
+/// budget *server-side* — but at a sentence or word boundary — means a real ADR arrives as
+/// a readable, incident-ready snippet the consumer passes through untouched, not a
+/// truncated stub. Measured in `char`s (Unicode scalars), matching the consumer's
+/// character-indexed slice, so a multi-byte scalar is never split.
+const BODY_CHAR_CAP: usize = 500;
+
+/// Fit `content` to at most [`BODY_CHAR_CAP`] characters at a sentence or word boundary.
+///
+/// Returns the content verbatim when it already fits. When it must cut, it prefers to end
+/// on the last complete sentence within the cap (a clean snippet needs no marker); failing
+/// that — one long unbroken clause — it cuts at the last word boundary and appends a single
+/// `…` (U+2026) to mark the elision. The cut is always on a `char` boundary, so a
+/// multi-byte scalar is never torn. This is the only place the served body is shaped; the
+/// ranking is [`crate::knowledge::retrieval`]'s and is left untouched.
+fn body_snippet(content: &str) -> String {
+    let chars: Vec<char> = content.chars().collect();
+    if chars.len() <= BODY_CHAR_CAP {
+        return content.to_string();
+    }
+    // Prefer the last complete sentence that fits: end on `.`/`!`/`?` followed by
+    // whitespace (so "3.14" or "e.g" mid-number/word is not mistaken for an end). A run of
+    // whole sentences reads cleanly and needs no elision marker.
+    let within = &chars[..BODY_CHAR_CAP];
+    let sentence_end = within.iter().enumerate().rev().find_map(|(i, &c)| {
+        let terminator = matches!(c, '.' | '!' | '?');
+        let boundary = within.get(i + 1).is_none_or(|n| n.is_whitespace());
+        (terminator && boundary).then_some(i + 1)
+    });
+    if let Some(end) = sentence_end {
+        return within[..end].iter().collect::<String>().trim_end().to_string();
+    }
+    // No sentence terminator in range: cut at the last word boundary and mark the cut.
+    // Reserve one char for the `…` so the marked result still fits the cap.
+    let budget = BODY_CHAR_CAP - 1;
+    let window = &chars[..budget];
+    let cut = window.iter().rposition(|c| c.is_whitespace()).unwrap_or(budget);
+    let kept: String = window[..cut].iter().collect::<String>().trim_end().to_string();
+    format!("{kept}…")
+}
+
 /// The `{"docs":[{"id","title","body"}, …]}` body signal-engine's `corpus_client`
 /// parses: `id` is the section's stable `chunk_id`, `title` the heading, `body` the
-/// section content (already redacted at index time; the consumer truncates to its own
-/// 500-char cap — fitting the body shape server-side is a later ticket, #15).
+/// section content (already redacted at index time), fitted server-side to the consumer's
+/// [`BODY_CHAR_CAP`] at a readable boundary by [`body_snippet`] (U2.2 · G19).
 fn docs_body(hits: &[crate::knowledge::KnowledgeHit]) -> String {
     let docs: Vec<serde_json::Value> = hits
         .iter()
@@ -158,7 +201,7 @@ fn docs_body(hits: &[crate::knowledge::KnowledgeHit]) -> String {
             serde_json::json!({
                 "id": h.chunk_id,
                 "title": h.title,
-                "body": h.content,
+                "body": body_snippet(&h.content),
             })
         })
         .collect();
@@ -555,6 +598,127 @@ mod tests {
         assert!(!ct_eq(b"abc", b"abd"));
         assert!(!ct_eq(b"abc", b"abcd"));
         assert!(!ct_eq(b"", b"x"));
+    }
+
+    #[test]
+    fn short_body_passes_through_unchanged() {
+        // A body already within the cap is served verbatim — no cap, no elision marker.
+        let short = "## Restart\n\nThe checkout service restarts cleanly; drain connections first.";
+        assert!(short.chars().count() <= BODY_CHAR_CAP);
+        assert_eq!(body_snippet(short), short);
+    }
+
+    #[test]
+    fn long_body_is_capped_at_500_chars_on_a_sentence_boundary() {
+        // A multi-sentence body over the cap: the snippet stays ≤500 chars AND ends on a
+        // whole sentence (a real ADR round-trips as a useful snippet, not a mid-sentence
+        // cut). U2.2 — G19.
+        let sentence = "The gateway drains in-flight requests before it exits. ";
+        let body = sentence.repeat(20); // ~1100 chars, every sentence ends in `. `
+        assert!(body.chars().count() > BODY_CHAR_CAP);
+        let snip = body_snippet(&body);
+        assert!(snip.chars().count() <= BODY_CHAR_CAP, "capped: {} chars", snip.chars().count());
+        assert!(snip.chars().count() < body.chars().count(), "actually truncated");
+        // Ends on a complete sentence, not mid-word: last char is a sentence terminator.
+        let last = snip.chars().next_back().unwrap();
+        assert!(matches!(last, '.' | '!' | '?'), "ends on a whole sentence, got {last:?}: {snip}");
+        // And it is a genuine prefix of the source — we never rewrite the text, only cut it.
+        assert!(body.starts_with(&snip), "snippet is a prefix of the source");
+    }
+
+    #[test]
+    fn long_unbroken_sentence_cuts_at_a_word_boundary_with_ellipsis() {
+        // No sentence terminator within the cap (one very long clause): fall back to the
+        // last WORD boundary and mark the elision with U+2026 — never split a word.
+        let body = "alpha beta gamma delta epsilon ".repeat(30); // ~930 chars, no `.`/`!`/`?`
+        assert!(body.chars().count() > BODY_CHAR_CAP);
+        let snip = body_snippet(&body);
+        assert!(snip.chars().count() <= BODY_CHAR_CAP, "capped: {}", snip.chars().count());
+        assert!(snip.ends_with('…'), "mid-sentence cut is marked with an ellipsis: {snip}");
+        // Strip the marker: the remainder is a prefix of the source that ends exactly at a
+        // word boundary — the source char immediately after it is whitespace.
+        let kept = snip.strip_suffix('…').unwrap();
+        assert!(body.starts_with(kept), "kept text is a prefix of the source");
+        let next = body.chars().nth(kept.chars().count()).unwrap();
+        assert!(next.is_whitespace(), "cut lands on a word boundary, next char is {next:?}");
+    }
+
+    #[test]
+    fn body_snippet_never_splits_a_multibyte_char() {
+        // A cap that would fall inside a multi-byte scalar must not panic or emit a
+        // replacement char — the cut is on a char boundary by construction.
+        let body = "é".repeat(BODY_CHAR_CAP + 50); // every char is 2 bytes
+        let snip = body_snippet(&body);
+        assert!(snip.chars().count() <= BODY_CHAR_CAP);
+        assert!(!snip.contains('\u{FFFD}'), "no replacement char from a torn scalar");
+    }
+
+    #[test]
+    fn served_docs_cap_every_body_and_keep_ranking() {
+        // End-to-end through the route: a knowledge record whose section exceeds the cap
+        // is served as a ≤500-char boundary-cut snippet, most-relevant-first ordering
+        // preserved. This is the U2.2 acceptance: ≤500-char bodies + ranked, ADR-shaped.
+        let long_adr = "The gateway rejects a request when its upstream pool is saturated. \
+             Operators restart it with a rolling drain so no in-flight call is dropped. \
+             The runbook pins the drain timeout to thirty seconds. \
+             Escalate to the platform on-call if the pool stays saturated after a restart. \
+             A saturated pool almost always traces back to a slow downstream dependency. \
+             Check the dependency's latency dashboard before assuming the gateway is at fault. \
+             Never bounce the gateway twice in a row without reading the drain log in between. \
+             The last two incidents were both a misconfigured connection ceiling, not load."
+            .to_string();
+        assert!(long_adr.chars().count() > BODY_CHAR_CAP, "fixture must exceed the cap");
+        let feed = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "id": "kn:gateway",
+                "title": "Gateway saturation runbook",
+                "body": format!("## Saturation\n\n{long_adr}"),
+                "source": "handbook",
+                "updated_at": "2026-03-01T10:00:00Z",
+                "labels": ["gateway"],
+            }),
+            serde_json::json!({
+                "id": "kn:unrelated",
+                "title": "Data retention window",
+                "body": "## Rule\n\nPurge inactive account records after ninety days.",
+                "source": "handbook",
+                "updated_at": "2026-01-01T00:00:00Z",
+                "labels": ["privacy"],
+            }),
+        );
+        let records = parse_ndjson(&feed).unwrap();
+        let k = LoadedKnowledge::new(ingest_default(&records, feed.as_bytes()));
+        let r = route(
+            &req("GET", "/docs?service=gateway", Some(&format!("Bearer {TOK}"))),
+            TOK,
+            &k,
+            10,
+            MIN,
+        );
+        assert_eq!(r.status, 200);
+        let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+        let docs = v["docs"].as_array().unwrap();
+        assert!(!docs.is_empty(), "gateway must surface a doc: {}", r.body);
+        // Most-relevant-first: the gateway runbook outranks the unrelated retention note.
+        assert_eq!(docs[0]["title"], "Gateway saturation runbook");
+        // Every served body respects the cap and ends cleanly (whole sentence or ellipsis).
+        for d in docs {
+            let body = d["body"].as_str().unwrap();
+            assert!(body.chars().count() <= BODY_CHAR_CAP, "body ≤{BODY_CHAR_CAP}: {body}");
+            let last = body.chars().next_back().unwrap();
+            assert!(
+                matches!(last, '.' | '!' | '?' | '…'),
+                "served body ends on a boundary, not mid-word: {body:?}"
+            );
+        }
+        // The capped gateway body is still a useful snippet: it carries the opening of the
+        // ADR verbatim (the incident-ready lede), not a blank or a mid-sentence stub.
+        let top_body = docs[0]["body"].as_str().unwrap();
+        assert!(
+            top_body.contains("The gateway rejects a request when its upstream pool is saturated."),
+            "snippet keeps the ADR's opening sentence intact: {top_body}"
+        );
     }
 
     #[test]
