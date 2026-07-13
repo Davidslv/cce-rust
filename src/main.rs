@@ -14,7 +14,10 @@
 //! - Own argument parsing, store-path resolution, and output formatting.
 //! - It does NOT implement chunking, embedding, or retrieval — it calls `lib`.
 
-use cce::config::{EmbedderKind, DEFAULT_DASHBOARD_PORT, DEFAULT_INPUT_PRICE_PER_MILLION, METRICS_FILE};
+use cce::config::{
+    EmbedderKind, CORPUS_TOKEN_ENV, DEFAULT_CORPUS_PORT, DEFAULT_DASHBOARD_PORT,
+    DEFAULT_INPUT_PRICE_PER_MILLION, DEFAULT_TOP_K, METRICS_FILE,
+};
 use cce::embedder::{format6, Embedder, HashEmbedder, OllamaEmbedder};
 use cce::federation::{
     federated_search, load_member_stores, member_metrics, parse_scope, workspace_stats, FedResult,
@@ -125,6 +128,11 @@ enum Command {
         /// per-package breakdown (SPEC-V2.2 §7).
         #[arg(long)]
         workspace: bool,
+    },
+    /// Serve the read-only corpus bridge over loopback HTTP (ADR-CORPUS-SERVE).
+    Corpus {
+        #[command(subcommand)]
+        cmd: CorpusCmd,
     },
     /// Print statistics about a persisted index (or the workspace).
     Stats {
@@ -344,6 +352,31 @@ enum Command {
         /// rollback path. Downgrades warn but proceed.
         #[arg(long, value_name = "vX.Y.Z", conflicts_with = "check")]
         version: Option<String>,
+    },
+}
+
+/// Subcommands of `cce corpus` (ADR-CORPUS-SERVE; signal-engine Epic #8 · U1.3).
+#[derive(Subcommand)]
+enum CorpusCmd {
+    /// Serve `GET /docs?service=` over the local `.cce/knowledge/` store as an
+    /// authenticated, read-only, loopback HTTP bridge for signal-engine triage.
+    /// Requires a bearer token (per-instance secret, R24): set `CCE_CORPUS_TOKEN`
+    /// or pass `--token-file`. Authenticated by construction — it refuses to start
+    /// without one. Loopback-only; TLS/non-loopback bind is a later ticket (#12/#14).
+    Serve {
+        /// Project root whose `.cce/knowledge/` store is served (defaults to `.`).
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// Loopback port to bind. 0 picks an ephemeral port (printed on start).
+        #[arg(long, default_value_t = DEFAULT_CORPUS_PORT)]
+        port: u16,
+        /// File holding the bearer token clients must present (overrides
+        /// `CCE_CORPUS_TOKEN`). Keeps the secret off the process argv.
+        #[arg(long)]
+        token_file: Option<PathBuf>,
+        /// Max docs returned per query (the consumer caps at its own first-3).
+        #[arg(long, default_value_t = DEFAULT_TOP_K)]
+        top_k: usize,
     },
 }
 
@@ -590,6 +623,11 @@ fn main() -> ExitCode {
                 cmd_dashboard(dir, store, metrics, port, price, no_open)
             }
         }
+        Command::Corpus { cmd } => match cmd {
+            CorpusCmd::Serve { dir, port, token_file, top_k } => {
+                cmd_corpus_serve(dir, port, token_file, top_k)
+            }
+        },
         Command::Stats { ws_dir, store, dir, workspace } => {
             if workspace {
                 cmd_stats_workspace(ws_dir.or(dir))
@@ -986,6 +1024,41 @@ fn cmd_dashboard(
     let port = port.unwrap_or(DEFAULT_DASHBOARD_PORT);
     let price = price.unwrap_or(DEFAULT_INPUT_PRICE_PER_MILLION);
     cce::dashboard::run(metrics_path, price, port).map_err(|e| format!("dashboard failed: {e}"))
+}
+
+/// `cce corpus serve` (ADR-CORPUS-SERVE): the read-only, loopback, bearer-authenticated
+/// `GET /docs?service=` bridge over the local `.cce/knowledge/` store. The token is a
+/// per-instance secret (R24): resolved from `--token-file` (preferred — keeps it off the
+/// process argv) or `CCE_CORPUS_TOKEN`, and REQUIRED — the route is authenticated by
+/// construction (OD1), so a missing/empty token fails the command loud rather than
+/// serving an open corpus.
+fn cmd_corpus_serve(
+    dir: Option<PathBuf>,
+    port: u16,
+    token_file: Option<PathBuf>,
+    top_k: usize,
+) -> Result<(), String> {
+    let root = dir.unwrap_or_else(|| PathBuf::from("."));
+    let token = resolve_corpus_token(token_file)?;
+    cce::corpus::run(root, port, token, top_k).map_err(|e| format!("corpus serve failed: {e}"))
+}
+
+/// Resolve the bearer token for `cce corpus serve`, failing closed. `--token-file` wins
+/// over the env var; the value is trimmed and must be non-empty.
+fn resolve_corpus_token(token_file: Option<PathBuf>) -> Result<String, String> {
+    let raw = match token_file {
+        Some(path) => std::fs::read_to_string(&path)
+            .map_err(|e| format!("could not read --token-file {}: {e}", path.display()))?,
+        None => std::env::var(CORPUS_TOKEN_ENV).unwrap_or_default(),
+    };
+    let token = raw.trim().to_string();
+    if token.is_empty() {
+        return Err(format!(
+            "corpus serve requires a bearer token (authenticated by construction): \
+             set {CORPUS_TOKEN_ENV} or pass --token-file <path>"
+        ));
+    }
+    Ok(token)
 }
 
 fn cmd_stats(store: Option<PathBuf>, dir: Option<PathBuf>) -> Result<(), String> {

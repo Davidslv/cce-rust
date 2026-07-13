@@ -7,6 +7,33 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+### Added
+- **`cce corpus serve` — the native corpus-serve bridge (ADR-CORPUS-SERVE;
+  signal-engine Epic #8 · U1.3 / issue #11).** Closes G1, the one seam that
+  carries the whole programme's value: signal-engine enriches triage over
+  `GET /docs?service=` but cce spoke only MCP-over-stdio and exposed no `/docs`
+  route anywhere, so the wired system triaged with zero business context
+  forever (`corpus_degraded: true`, silently). The new subcommand answers
+  `GET /docs?service=<name>` from the same in-process
+  `search_knowledge` the MCP server uses — no shell-out, no second index — and
+  returns `{"docs":[{"id","title","body"}, …]}`, the exact shape
+  signal-engine's `corpus_client` parses (`id` = the section `chunk_id`, the
+  consumer's `corpus_doc_ids`). It reuses the `src/dashboard.rs` loopback
+  HTTP/1.1 shape (`127.0.0.1` only, read-only GET) and is **authenticated by
+  construction**: every request must carry `Authorization: Bearer <token>`
+  (constant-time compared) or it is answered `401` (with a
+  `WWW-Authenticate: Bearer` challenge), and the command refuses to start
+  without a token (`CCE_CORPUS_TOKEN` or `--token-file`, a per-instance secret,
+  R24). An absent store is the pre-first-pull "no evidence" state and serves
+  `{"docs":[]}`; a corrupt store fails loud. cce's **second** opt-in network
+  exception (after the Ollama embedder), bounded by the ADR footnote — `cce
+  update` the only egress, `cce corpus serve` the only ingress, both off by
+  default. Loopback-only for now: TLS and a non-loopback bind are the co-located
+  one-box's later tickets (#12/#14); on the one box (OD2) the hop carries no
+  network. New `src/corpus.rs` (10 unit tests) + `tests/corpus_serve.rs` (the
+  live-socket acceptance: authenticated `service=` → 200 with non-empty docs,
+  unauthenticated → 401, and start-without-token → hard fail).
+
 ## [2.9.0] - 2026-07-13
 
 ### Added
