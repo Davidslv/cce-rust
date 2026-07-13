@@ -37,13 +37,16 @@
 > implementation was built from the identical specs. MIT licensed, © 2026 David
 > Silva. No network calls by default: the semantic embedder over localhost is
 > opt-in, `cce dashboard` is a loopback-only, read-only, self-contained UI, and
-> `cce mcp` is a read-only, stdio-only MCP server.
+> `cce mcp` is a read-only, stdio-only MCP server. The one other opt-in network
+> surface is `cce corpus serve`: a loopback-only, read-only, bearer-authenticated
+> `GET /docs?service=` bridge over the knowledge store, off by default.
 
 ## Documentation
 
 - [README](README.md): What it is, install/setup for macOS and Ubuntu, worked usage examples, tests/coverage.
 - [SPEC.md](SPEC.md): The normative base-engine specification (v1.0).
 - [DASHBOARD-SPEC.md](DASHBOARD-SPEC.md): The dashboard & observability addendum (v1.1) — metrics log, aggregator, dashboard.
+- [ADR-CORPUS-SERVE.md](ADR-CORPUS-SERVE.md): The accepted decision (OD1/OD2) behind `cce corpus serve` — a native, opt-in, loopback, bearer-authenticated `GET /docs?service=` bridge over in-process knowledge retrieval, co-located on the signal-engine host (signal-engine Epic #8 · U1.1/U1.3).
 - [SPEC-V2.md](SPEC-V2.md): The language-packs evolution spec (v2.0) — pack interface, registry, validators, `kind`, conformance shape.
 - [SPEC-V2.1.md](SPEC-V2.1.md): The secret-protection evolution spec (v2.1) — sensitive-file skip + secret redaction.
 - [SPEC-V2.2.md](SPEC-V2.2.md): The workspace-mode evolution spec (v2.2) — detection, manifest, federation, cross-member edges.

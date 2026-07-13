@@ -78,6 +78,13 @@ pub const LOW_CONFIDENCE_THRESHOLD: f64 = 0.30;
 pub const TREND_WINDOW_DAYS: i64 = 7;
 /// Default loopback port for `cce dashboard`.
 pub const DEFAULT_DASHBOARD_PORT: u16 = 8787;
+/// Default loopback port for `cce corpus serve` (ADR-CORPUS-SERVE). Distinct from
+/// the dashboard's 8787 so both surfaces co-locate on the one box (OD2).
+pub const DEFAULT_CORPUS_PORT: u16 = 8799;
+/// Env var carrying the bearer token a client must present to the corpus bridge.
+/// A per-instance secret (R24) — never committed; resolved at serve time and
+/// required (the route is authenticated by construction, ADR-CORPUS-SERVE OD1).
+pub const CORPUS_TOKEN_ENV: &str = "CCE_CORPUS_TOKEN";
 /// Default USD price per 1M input tokens, used for the $-saved estimate.
 pub const DEFAULT_INPUT_PRICE_PER_MILLION: f64 = 3.00;
 /// How many recent searches the aggregate/API returns.

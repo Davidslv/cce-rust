@@ -44,6 +44,7 @@ pub mod metrics;
 pub mod aggregator;
 pub mod usage;
 pub mod dashboard;
+pub mod corpus;
 pub mod workspace;
 pub mod federation;
 pub mod sync;

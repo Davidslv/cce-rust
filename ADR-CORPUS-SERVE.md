@@ -126,8 +126,13 @@ host split out. Until then, one box is correct.
 - **Unblocks the implementation ticket** (U1.3 / signal-engine #11): the bridge is
   now specified as **native + one-box + loopback**, so the first bridge ticket is
   unambiguous — implement `cce corpus serve` as an authenticated, read-only,
-  loopback GET route over `search_knowledge`, and replace signal-engine's corpus
-  mocks with an integration test against it.
+  loopback GET route over `search_knowledge`. Because #11 is routed to the **cce
+  repo only**, its acceptance is the producer-side proof (a live-socket test:
+  authenticated `service=` → non-empty docs, unauthenticated → 401). Teaching
+  signal-engine's `corpus_client` to *send* the bearer token — replacing its
+  corpus mocks with an integration test against the live bridge — is the
+  consumer-side follow-on (U1.4 / #12), since the client sends no auth header
+  today and lives in a different repo.
 - **cce gains a second opt-in network exception**, bounded by the offline-first
   footnote above; the offline-by-default invariant for every other command holds.
 - **cce CI gains an auth/TLS conformance check** once the route exists (#12/#14).
