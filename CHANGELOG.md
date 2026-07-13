@@ -7,6 +7,8 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
+## [2.9.0] - 2026-07-13
+
 ### Added
 - **`cce relevance --compare` — paired significance testing (#84).** The
   comparison mode now reports, per metric, the paired t-statistic over the
@@ -63,18 +65,6 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   record id, flags any that still carry a secret-shaped value (naming the facet,
   never printing the raw value), and calls out a secret-bearing id separately as
   needing a source-adapter fix rather than a re-index. Advisory, exit 0.
-- **Layer-2 redaction no longer leaks a secret tail on same-delimiter quoted
-  values or on a specific-pattern prefix (#142).** Two pre-existing paths let a
-  real secret survive into the shareable `.cce/index.json` store: (1) a
-  same-style quote inside a quoted value (`password = 'abcdefghij'tail-secret'`,
-  or a JSON-escaped `\"`) ended the value at the first inner quote, redacting the
-  ≥8-char prefix while the tail persisted; (2) after a specific pattern redacted
-  a *prefix* of a longer value (`"AKIA…EXAMPLEsuffix-secret"`), the idempotency
-  guard skipped the whole value because it merely *began* with `[REDACTED:`. Fix:
-  the generic-assignment value scan is now quote-aware (extends to the true
-  closing quote — one followed by whitespace or the line end — consuming escaped
-  and inner same-style quotes, bounded to the current line so it never merges a
-  following assignment; adds a backtick branch), and the idempotency guard now
 - **Layer-2 redaction no longer leaks a secret tail on quoted values with an
   inner same-style quote, doubled-quote escaping, or a specific-pattern prefix,
   and no longer over-captures across a structural boundary (#142).** Several
@@ -1574,7 +1564,8 @@ Context Engine, built solely from [`SPEC.md`](SPEC.md) (SPEC v1.0).
 - Project documentation: `SPEC.md`, `docs/architecture.md`, `docs/getting-started.md`,
   `docs/how-to.md`, `docs/DECISIONS.md`, `docs/TDD.md`, `docs/BENCHMARKS.md`.
 
-[Unreleased]: https://github.com/davidslv/cce-rust/compare/v2.1.0...HEAD
+[Unreleased]: https://github.com/davidslv/cce-rust/compare/v2.9.0...HEAD
+[2.9.0]: https://github.com/davidslv/cce-rust/compare/v2.8.0...v2.9.0
 [2.1.0]: https://github.com/davidslv/cce-rust/compare/v2.0.0...v2.1.0
 [2.0.0]: https://github.com/davidslv/cce-rust/compare/v1.1.0...v2.0.0
 [1.1.0]: https://github.com/davidslv/cce-rust/compare/v1.0.0...v1.1.0
