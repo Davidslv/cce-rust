@@ -76,6 +76,19 @@ fn http_get(port: u16, path: &str, bearer: Option<&str>) -> (String, String) {
     (status, body.to_string())
 }
 
+/// Issue one GET and return the FULL raw HTTP/1.1 response (head + body), so a test can
+/// assert on the response head — used to prove a hostile `q` injects no header.
+fn raw_get(port: u16, path: &str, bearer: &str) -> String {
+    let mut stream = TcpStream::connect(("127.0.0.1", port)).unwrap();
+    let req = format!(
+        "GET {path} HTTP/1.1\r\nHost: localhost\r\nAuthorization: Bearer {bearer}\r\nConnection: close\r\n\r\n"
+    );
+    stream.write_all(req.as_bytes()).unwrap();
+    let mut raw = String::new();
+    stream.read_to_string(&mut raw).unwrap();
+    raw
+}
+
 /// Kill-on-drop guard: the serve child never outlives the test.
 struct ChildGuard(std::process::Child);
 impl Drop for ChildGuard {
@@ -155,6 +168,58 @@ fn live_bridge_serves_authenticated_docs_and_401s_the_unauthenticated() {
     // Wrong token → 401 too.
     let (status, _) = http_get(port, "/docs?service=checkout", Some("not-the-token"));
     assert!(status.contains("401"), "wrong token must be 401, got: {status}");
+}
+
+#[test]
+fn live_bridge_fences_a_hostile_q_and_still_answers() {
+    // U2.3 done-when, over a real socket: an incident-derived `q=` is untrusted input. A
+    // hostile q — CRLF header-injection, a shell substitution, NULs, and a length flood —
+    // must not steer the live server into an error or an injected header; it degrades to a
+    // well-formed 200 answer. Only a real round-trip proves the wire response is unpolluted.
+    let tmp = tempfile::tempdir().unwrap();
+    index_knowledge(tmp.path(), &feed());
+
+    let token = "test-corpus-token-abc123";
+    let token_path = tmp.path().join("corpus.token");
+    std::fs::write(&token_path, format!("{token}\n")).unwrap();
+
+    let child = std::process::Command::new(bin())
+        .args(["corpus", "serve", "--dir"])
+        .arg(tmp.path())
+        .args(["--port", "0", "--token-file"])
+        .arg(&token_path)
+        .stdout(std::process::Stdio::piped())
+        .stderr(std::process::Stdio::null())
+        .spawn()
+        .unwrap();
+    let mut guard = ChildGuard(child);
+    let port = wait_for_bound_port(&mut guard.0);
+
+    // A CRLF-injection attempt smuggled through q: `%0d%0a` decodes to CRLF server-side.
+    // The fence neutralises it, so no `X-Injected` header can appear in the response head.
+    let (status, body) =
+        http_get(port, "/docs?service=checkout&q=timeout%0d%0aX-Injected:+evil", Some(token));
+    assert!(status.contains("200"), "hostile q must still answer 200: {status} {body}");
+    let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+    assert!(v["docs"].is_array(), "docs must be an array: {body}");
+
+    // Re-issue and read the RAW response so we can assert the header block is unpolluted.
+    let raw = raw_get(port, "/docs?service=checkout&q=a%0d%0aX-Injected:+evil", token);
+    let head = raw.split("\r\n\r\n").next().unwrap_or("");
+    assert!(
+        !head.to_ascii_lowercase().contains("x-injected"),
+        "no injected header may appear in the response head: {head:?}"
+    );
+
+    // A shell substitution, NULs, and a 2k-char flood (over the fence's 500-char cap, but
+    // within the 8 KiB request-head bound) each still return a clean 200 — the server never
+    // errors on a hostile q (degrade-never-block); the fence caps the over-long term.
+    for q in ["%24%28rm+-rf+%2F%29", "%00%00%00", &"z".repeat(2_000)] {
+        let (status, body) = http_get(port, &format!("/docs?service=checkout&q={q}"), Some(token));
+        assert!(status.contains("200"), "hostile q={q} must answer 200: {status} {body}");
+        let v: serde_json::Value = serde_json::from_str(&body).unwrap();
+        assert!(v["docs"].is_array(), "docs must be an array for q={q}: {body}");
+    }
 }
 
 #[test]
