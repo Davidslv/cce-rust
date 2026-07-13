@@ -1,0 +1,8 @@
+{"schema":"cce.knowledge.ask/v1","corpus":"corpus.knowledge.jsonl"}
+{"id":"ask-login-lockout","query":"how many failed login attempts before an account is locked","expect":["gh:acme/shop#101"],"k":5}
+{"id":"ask-webhook-retry","query":"what is the webhook retry backoff and jitter policy","expect":["gh:acme/shop#102"],"k":5}
+{"id":"ask-pool-exhaustion","query":"database connection pool exhausted during checkout incident","expect":["gh:acme/shop#103"],"k":5}
+{"id":"ask-rank-fusion","query":"which ranking fusion did we adopt for hybrid search","expect":["gh:acme/shop#104"],"k":5}
+{"id":"ask-session-store","query":"where are user sessions stored after the redis migration","expect":["gh:acme/shop#105"],"k":5}
+{"id":"ask-duplicate-charge","query":"how do we prevent a duplicate payment charge on a retried request","expect":["gh:acme/shop#107"],"k":5}
+{"id":"ask-xml-deprecation","query":"is the legacy xml export endpoint deprecated","expect":["gh:acme/shop#108"],"k":5}

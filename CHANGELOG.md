@@ -8,6 +8,30 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`cce knowledge ask` — the Knowledge-Ask golden suite (signal-engine Epic #8 ·
+  U5.4 / issue #28).** A standing regression check for the knowledge host: a
+  committed suite of real operator questions, each pinned to the curated record a
+  good answer must surface, run through the **exact** `search_knowledge` path MCP
+  `context_search` serves for `source: knowledge` — no reimplementation, it
+  measures the real thing. A query is **proven** when every expected record
+  surfaces in its top-k (recall == 1.0), and the command exits non-zero the moment
+  one stops proving, so it gates a corpus rebuild the way `conformance` gates chunk
+  output. The `cce.knowledge.ask/v1` suite contract (NDJSON: an optional header
+  naming a `cce.knowledge/v1` corpus feed, then one `{query, expect:[record_id],
+  k}` case per line) mirrors `cce.relevance/v1`; anchors are **record ids**, so the
+  score is robust to heading-chunking. `--json` emits the byte-pinnable
+  `cce.knowledge.ask.report/v1` (precision@k / recall / MRR / F1, the same grammar
+  discipline as `cce relevance --json`), pinned in CI against
+  `test/fixture/knowledge/ask.golden.json`. `--dir <root>` runs the same suite
+  against an INSTALLED store (`<root>/.cce/knowledge/`) — the path U5.4's parked
+  evidence tail closes on once the production corpus exists. Ships a fixture
+  curated corpus (`eval/knowledge/corpus.knowledge.jsonl`, nine records incl. a
+  `not_planned` decoy that retrieval correctly drops) + a seven-query golden suite
+  (`eval/knowledge/ask.jsonl`), all seven proven. New `src/knowledge/ask.rs` (7
+  unit tests) + `tests/knowledge_ask_cli.rs` (3 acceptance tests: proves-all,
+  byte-identical golden, and an unanswerable suite fails non-zero) +
+  [`docs/knowledge-ask.md`](docs/knowledge-ask.md). Additive: nine MCP tools,
+  `conformance.json`, and the Sync artifact are all untouched.
 - **`cce corpus serve` — the native corpus-serve bridge (ADR-CORPUS-SERVE;
   signal-engine Epic #8 · U1.3 / issue #11).** Closes G1, the one seam that
   carries the whole programme's value: signal-engine enriches triage over
