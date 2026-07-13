@@ -33,6 +33,19 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
   network. New `src/corpus.rs` (10 unit tests) + `tests/corpus_serve.rs` (the
   live-socket acceptance: authenticated `service=` → 200 with non-empty docs,
   unauthenticated → 401, and start-without-token → hard fail).
+- **`cce corpus serve` fits each doc `body` to the consumer's capacity
+  (signal-engine Epic #8 · U2.2 / issue #15; G19).** The served `body` is now
+  capped server-side at 500 characters — the consumer's `Fence::MAX_CHARS` — but
+  cut at a **sentence or word boundary**, not the consumer's blunt `text[0, 500]`
+  slice that lands mid-word. A body already within the cap is served verbatim; a
+  longer one ends on the last complete sentence that fits (no marker), or, for one
+  long unbroken clause, at the last word boundary with a single `…` (U+2026). The
+  cut is on a `char` boundary, so a multi-byte scalar is never split. Net effect: a
+  real ADR round-trips as a readable, incident-ready snippet the consumer passes
+  through untouched, instead of a mid-sentence stub. Ordering is unchanged
+  (`src/knowledge/retrieval` owns ranking; the bridge never re-orders). Five new
+  `src/corpus.rs` tests (short pass-through, sentence-boundary cap, word-boundary +
+  ellipsis, multi-byte safety, and an ADR-shaped end-to-end route assertion).
 
 ## [2.9.0] - 2026-07-13
 
