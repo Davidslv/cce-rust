@@ -147,6 +147,47 @@ fn service_param(target: &str) -> Option<String> {
     None
 }
 
+/// Char cap for an incident-terms `q=` query string (U2.3 · R16, C18). Incident-derived
+/// text reaches the bridge from the consumer's shadow-triage path and is untrusted input
+/// (a hostile exception message or mail body could steer it). It is length-capped to the
+/// consumer's own fence budget — `Fence::MAX_CHARS` = 500 (signal-engine `triage/fence.rb`),
+/// the same 500 as [`BODY_CHAR_CAP`] — and neutralised before it is ever used. It is only
+/// ever a retrieval term over the in-memory BM25/vector index, never interpolated into a
+/// shell, a query language, or the response, so the fence *degrades* an over-long or hostile
+/// q (caps + control-strips it) rather than erroring (C11/R16 degrade-never-block).
+const Q_CHAR_CAP: usize = 500;
+
+/// Pull the optional incident-terms `q=` out of a request target and fence it (U2.3). The
+/// value is percent-decoded (like `service`), then passed through [`fence_query_terms`].
+/// Returns `None` when `q` is absent or fences down to nothing (empty / all-whitespace /
+/// all-control), so an absent or hostile-but-empty q degrades cleanly to a service-only
+/// search rather than erroring.
+fn q_param(target: &str) -> Option<String> {
+    let query = target.split_once('?').map(|(_, q)| q).unwrap_or("");
+    for pair in query.split('&') {
+        if let Some((k, v)) = pair.split_once('=') {
+            if k == "q" {
+                return fence_query_terms(&percent_decode(v));
+            }
+        }
+    }
+    None
+}
+
+/// Neutralise an incident-derived query string for safe use as a retrieval term (U2.3 ·
+/// R16, C18). Every control character (CR, LF, NUL, …) is replaced with a space — so a
+/// hostile q can never embed a header terminator, a NUL, or any other control byte even if
+/// a future change reflected it — and the result is length-capped to [`Q_CHAR_CAP`] chars on
+/// a `char` boundary (a multi-byte scalar is never split) and trimmed. Returns `None` when
+/// nothing printable survives. The fenced string only ever becomes an argument to
+/// [`crate::knowledge::retrieval`]'s in-memory rank; it is interpolated nowhere.
+fn fence_query_terms(raw: &str) -> Option<String> {
+    let fenced: String =
+        raw.chars().map(|c| if c.is_control() { ' ' } else { c }).take(Q_CHAR_CAP).collect();
+    let trimmed = fenced.trim();
+    (!trimmed.is_empty()).then(|| trimmed.to_string())
+}
+
 /// Char cap for a served doc `body` (U2.2 · G19). The consumer fences every untrusted
 /// string with [`Fence::MAX_CHARS`] = 500 by a blunt `text[0, 500]` slice that lands
 /// mid-word / mid-sentence (signal-engine `triage/fence.rb`). Fitting the body to the same
@@ -230,10 +271,18 @@ fn route(
     let Some(service) = service_param(&req.target) else {
         return json_response(400, r#"{"error":"missing service"}"#);
     };
-    // The query is the service name itself: knowledge records for a service carry its
-    // facet (U1.2), so retrieval over the service term surfaces that service's docs. The
-    // optional incident-terms `q=` is a later contract bump (U2.1/#14).
-    let hits = knowledge.search(&service, top_k, min_score);
+    // The retrieval query is the service name — knowledge records carry a service's facet
+    // (U1.2), so ranking over the service term surfaces that service's docs — optionally
+    // *widened* by the consumer's incident-terms `q=` (U2.1), the extension that lets the
+    // contract express the moat's "resembles the March incident…" relevance (D3). `q` is
+    // untrusted incident-derived input, so it is fenced FIRST — length-capped and
+    // control-stripped ([`q_param`] · U2.3 · R16, C18) — and used only as a search term,
+    // never interpolated anywhere. Absent/blank q degrades to a plain service-only search.
+    let query = match q_param(&req.target) {
+        Some(q) => format!("{service} {q}"),
+        None => service,
+    };
+    let hits = knowledge.search(&query, top_k, min_score);
     json_response(200, &docs_body(&hits))
 }
 
@@ -537,6 +586,112 @@ mod tests {
         assert_eq!(r.status, 200);
         let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
         assert_eq!(v["docs"].as_array().unwrap().len(), 0);
+    }
+
+    #[test]
+    fn q_param_extracts_decodes_caps_and_neutralises() {
+        // Absent q → None; retrieval falls back to a service-only search (unchanged path).
+        assert_eq!(q_param("/docs?service=checkout"), None);
+        // A blank or fences-to-nothing q is None, never an error (degrade-never-block).
+        assert_eq!(q_param("/docs?service=checkout&q="), None);
+        assert_eq!(q_param("/docs?service=checkout&q=%00%00"), None);
+        assert_eq!(q_param("/docs?service=checkout&q=+%09+").as_deref(), None);
+        // A normal incident phrase decodes (form-encoded: `+`→space, `%2F`→`/`).
+        assert_eq!(
+            q_param("/docs?service=checkout&q=timeout+at+api%2Fgateway").as_deref(),
+            Some("timeout at api/gateway")
+        );
+        // Control characters — here a decoded CRLF and a NUL — are neutralised to spaces:
+        // a hostile q can never embed a header terminator or a NUL. None survive.
+        let fenced = q_param("/docs?service=checkout&q=a%0d%0aInjected:+1%00b").unwrap();
+        assert!(
+            !fenced.contains(['\r', '\n', '\0']),
+            "control chars must be neutralised: {fenced:?}"
+        );
+        // An over-long q is length-capped to the fence budget, never unbounded.
+        let long = format!("/docs?service=checkout&q={}", "a".repeat(5_000));
+        assert_eq!(q_param(&long).unwrap().chars().count(), Q_CHAR_CAP);
+    }
+
+    #[test]
+    fn hostile_q_degrades_to_200_with_well_formed_json_never_errors() {
+        // A battery of hostile q values — a SQL-ish payload, a shell substitution, a CRLF
+        // header-injection attempt, a path traversal, NULs, and a length flood. Each must
+        // return 200 with a parseable {"docs":[…]} body: the fence *degrades* a hostile q
+        // (C11/R16), it never errors and never lets q steer the server (C18).
+        let k = loaded();
+        let flood = "z".repeat(10_000);
+        let hostile: [&str; 6] = [
+            "%27%3B+DROP+TABLE+docs%3B+--", // '; DROP TABLE docs; --
+            "%24%28rm+-rf+%2F%29",          // $(rm -rf /)
+            "a%0d%0aX-Injected:+evil",      // CRLF header-injection attempt
+            "..%2F..%2F..%2Fetc%2Fpasswd",  // path traversal
+            "%00%00%00",                    // NULs
+            &flood,                         // length flood
+        ];
+        for q in hostile {
+            let target = format!("/docs?service=checkout&q={q}");
+            let r = route(&req("GET", &target, Some(&format!("Bearer {TOK}"))), TOK, &k, 10, MIN);
+            assert_eq!(r.status, 200, "hostile q must degrade to 200, not error: q={q}");
+            let v: serde_json::Value = serde_json::from_str(&r.body)
+                .unwrap_or_else(|e| panic!("body must be valid JSON for q={q}: {e}: {}", r.body));
+            assert!(v["docs"].is_array(), "docs must be an array for q={q}: {}", r.body);
+        }
+    }
+
+    #[test]
+    fn q_widens_retrieval_beyond_the_service_term() {
+        // A store with a checkout doc and an unrelated database-migration doc that shares NO
+        // token with `service=checkout`. Service-only retrieval cannot surface the migration
+        // doc (the precision filter needs a shared query token); blending the fenced incident
+        // `q` in must. This proves the fenced q actually reaches the retrieval query (U2.1
+        // blend), not just parsed then dropped.
+        let feed = format!(
+            "{}\n{}\n",
+            serde_json::json!({
+                "id": "kn:checkout",
+                "title": "Checkout service runbook",
+                "body": "## Restart\n\nThe checkout service restarts cleanly; drain connections first.",
+                "source": "handbook",
+                "updated_at": "2026-02-01T10:00:00Z",
+                "labels": ["checkout"],
+            }),
+            serde_json::json!({
+                "id": "kn:migration",
+                "title": "Database migration rollback",
+                "body": "## Rollback\n\nA failed database migration is retried; replay the migration log, then re-run the migration.",
+                "source": "handbook",
+                "updated_at": "2026-01-15T00:00:00Z",
+                "labels": ["database"],
+            }),
+        );
+        let records = parse_ndjson(&feed).unwrap();
+        let k = LoadedKnowledge::new(ingest_default(&records, feed.as_bytes()));
+
+        let titles = |target: &str| -> Vec<String> {
+            let r = route(&req("GET", target, Some(&format!("Bearer {TOK}"))), TOK, &k, 10, MIN);
+            assert_eq!(r.status, 200);
+            let v: serde_json::Value = serde_json::from_str(&r.body).unwrap();
+            v["docs"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .map(|d| d["title"].as_str().unwrap().to_string())
+                .collect()
+        };
+
+        // Service alone: the migration doc shares no token with "checkout" → never surfaces.
+        let service_only = titles("/docs?service=checkout");
+        assert!(
+            !service_only.iter().any(|t| t.contains("migration")),
+            "service-only must not surface the migration doc: {service_only:?}"
+        );
+        // Blend the incident q: the migration doc now shares tokens and surfaces.
+        let with_q = titles("/docs?service=checkout&q=database+migration+rollback");
+        assert!(
+            with_q.iter().any(|t| t.contains("migration")),
+            "the blended q must surface the migration doc: {with_q:?}"
+        );
     }
 
     #[test]
