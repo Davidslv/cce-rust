@@ -158,6 +158,17 @@ same document's other sections.
 - Final order: score desc, then **recency** (`updated_at` newest-first), then
   `chunk_id` — a missing `updated_at` sorts oldest.
 
+## Proving the corpus (U5.4) — `cce knowledge ask`
+
+A knowledge host is only worth standing up if the questions operators actually ask
+are answered *from the corpus*, and stay answered after every rebuild. **[`cce
+knowledge ask`](knowledge-ask.md)** is that standing regression check: a committed
+`cce.knowledge.ask/v1` suite of real questions — each pinned to the `record_id` a
+good answer must surface — run through the exact `search_knowledge` path above, with
+a byte-pinnable report and a non-zero exit the moment a query stops proving. Run it
+against the shipped fixture corpus (`eval/knowledge/ask.jsonl`) or, with `--dir`,
+against an installed production store. See [docs/knowledge-ask.md](knowledge-ask.md).
+
 ## Configuration (`.cce/config`)
 
 ```yaml

@@ -13,6 +13,7 @@
 //! - Own the `knowledge` module tree and its public surface.
 //! - It contains no algorithm itself; each concern lives in its submodule.
 
+pub mod ask;
 pub mod contract;
 pub mod retrieval;
 pub mod store;

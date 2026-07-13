@@ -1,0 +1,90 @@
+{
+  "cases": [
+    {
+      "expected": 1,
+      "f1": "0.333333",
+      "first_hit_rank": 1,
+      "id": "ask-login-lockout",
+      "k": 5,
+      "mrr": "1.000000",
+      "precision_at_k": "0.200000",
+      "proven": true,
+      "recall": "1.000000"
+    },
+    {
+      "expected": 1,
+      "f1": "0.333333",
+      "first_hit_rank": 1,
+      "id": "ask-webhook-retry",
+      "k": 5,
+      "mrr": "1.000000",
+      "precision_at_k": "0.200000",
+      "proven": true,
+      "recall": "1.000000"
+    },
+    {
+      "expected": 1,
+      "f1": "0.333333",
+      "first_hit_rank": 1,
+      "id": "ask-pool-exhaustion",
+      "k": 5,
+      "mrr": "1.000000",
+      "precision_at_k": "0.200000",
+      "proven": true,
+      "recall": "1.000000"
+    },
+    {
+      "expected": 1,
+      "f1": "0.333333",
+      "first_hit_rank": 1,
+      "id": "ask-rank-fusion",
+      "k": 5,
+      "mrr": "1.000000",
+      "precision_at_k": "0.200000",
+      "proven": true,
+      "recall": "1.000000"
+    },
+    {
+      "expected": 1,
+      "f1": "0.333333",
+      "first_hit_rank": 2,
+      "id": "ask-session-store",
+      "k": 5,
+      "mrr": "0.500000",
+      "precision_at_k": "0.200000",
+      "proven": true,
+      "recall": "1.000000"
+    },
+    {
+      "expected": 1,
+      "f1": "0.333333",
+      "first_hit_rank": 1,
+      "id": "ask-duplicate-charge",
+      "k": 5,
+      "mrr": "1.000000",
+      "precision_at_k": "0.200000",
+      "proven": true,
+      "recall": "1.000000"
+    },
+    {
+      "expected": 1,
+      "f1": "0.333333",
+      "first_hit_rank": 1,
+      "id": "ask-xml-deprecation",
+      "k": 5,
+      "mrr": "1.000000",
+      "precision_at_k": "0.200000",
+      "proven": true,
+      "recall": "1.000000"
+    }
+  ],
+  "corpus": "corpus.knowledge.jsonl",
+  "f1": "0.333333",
+  "min_score": "0.300000",
+  "mrr": "0.928571",
+  "precision_at_k": "0.200000",
+  "proven": 7,
+  "queries": 7,
+  "recall": "1.000000",
+  "schema": "cce.knowledge.ask.report/v1"
+}

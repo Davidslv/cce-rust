@@ -511,6 +511,26 @@ enum KnowledgeCmd {
         #[arg(long)]
         dir: Option<PathBuf>,
     },
+    /// Run a `cce.knowledge.ask/v1` golden suite against the curated corpus and
+    /// report which questions are answered from it (Epic U5.4). The standing
+    /// regression check for a knowledge host: it exercises the exact retrieval MCP
+    /// `context_search` serves and fails (non-zero) if any query stops surfacing
+    /// its expected record. Deterministic — the `--json` report is byte-pinnable.
+    Ask {
+        /// The `cce.knowledge.ask/v1` suite (NDJSON; header names the corpus feed).
+        suite: PathBuf,
+        /// Run against an INSTALLED store at `<dir>/.cce/knowledge/` (the production
+        /// instance) instead of the suite header's fixture feed.
+        #[arg(long)]
+        dir: Option<PathBuf>,
+        /// The recall precision floor (default: the `knowledge.min_score` a fresh
+        /// instance uses, 0.30 — what MCP `context_search` applies).
+        #[arg(long)]
+        min_score: Option<f64>,
+        /// Emit the byte-pinnable `cce.knowledge.ask.report/v1` JSON.
+        #[arg(long)]
+        json: bool,
+    },
     /// Export the current local knowledge store as a canonical `.cck` and put it
     /// on the cache remote: artifact + `current` pointer + `corpus.json` in one
     /// commit, then retention (SPEC-SYNC-KNOWLEDGE §5). The raw feed never
@@ -667,6 +687,9 @@ fn main() -> ExitCode {
         },
         Command::Knowledge { cmd } => match cmd {
             KnowledgeCmd::Index { file, dir } => cmd_knowledge_index(&file, dir),
+            KnowledgeCmd::Ask { suite, dir, min_score, json } => {
+                cmd_knowledge_ask(&suite, dir, min_score, json)
+            }
             KnowledgeCmd::Push { corpus, remote, dir, force, dry_run } => {
                 let root = dir.unwrap_or_else(|| PathBuf::from("."));
                 cce::sync::knowledge_commands::cmd_knowledge_push(
@@ -1239,6 +1262,67 @@ fn cmd_knowledge_index(file: &Path, dir: Option<PathBuf>) -> Result<(), String> 
     println!("  snapshot  : {}", summary.snapshot);
     println!("  store     : {}", summary.store_path.display());
     Ok(())
+}
+
+/// `cce knowledge ask` (Epic U5.4): run a `cce.knowledge.ask/v1` golden suite against
+/// the curated corpus and report which questions are answered from it. Measurement
+/// only — it runs the exact [`cce::knowledge::search_knowledge`] path MCP serves and
+/// never re-ranks. Exits non-zero when any query fails to surface its expected
+/// record, so it is a standing regression gate re-runnable after every corpus rebuild.
+fn cmd_knowledge_ask(
+    suite: &Path,
+    dir: Option<PathBuf>,
+    min_score: Option<f64>,
+    json: bool,
+) -> Result<(), String> {
+    use cce::knowledge::ask;
+    let text = std::fs::read_to_string(suite)
+        .map_err(|e| format!("could not read suite {}: {e}", suite.display()))?;
+    let parsed = ask::parse_suite(&text)?;
+
+    // Corpus resolution: an installed store (`--dir`, the "production instance") wins;
+    // otherwise ingest the suite header's `cce.knowledge/v1` feed, resolved relative to
+    // the suite file (the committed-fixture path proven in CI).
+    let (store, corpus_label) = if let Some(root) = dir.as_ref() {
+        let store = cce::knowledge::store::KnowledgeStore::load_current(root)
+            .map_err(|e| format!("could not load knowledge store under {}: {e}", root.display()))?;
+        (store, root.join(".cce/knowledge").display().to_string())
+    } else {
+        let corpus = parsed.corpus.as_deref().ok_or_else(|| {
+            "suite has no `corpus` header; pass --dir <root> to run against an installed store"
+                .to_string()
+        })?;
+        let feed_path = suite.parent().unwrap_or_else(|| Path::new(".")).join(corpus);
+        let feed = std::fs::read_to_string(&feed_path)
+            .map_err(|e| format!("could not read corpus feed {}: {e}", feed_path.display()))?;
+        let records = cce::knowledge::contract::parse_ndjson(&feed)?;
+        let store = cce::knowledge::store::ingest_default(&records, feed.as_bytes());
+        (store, corpus.to_string())
+    };
+
+    // `--min-score` wins; else, against an installed store use that instance's
+    // `knowledge.min_score` (what its MCP applies), and against a fixture feed the
+    // fresh-instance default. So the parked production re-run measures the real floor.
+    let min = min_score.unwrap_or_else(|| match dir.as_ref() {
+        Some(root) => cce::config::KnowledgeConfig::load(root).min_score,
+        None => cce::config::DEFAULT_KNOWLEDGE_MIN_SCORE,
+    });
+    let report = ask::evaluate(&store, &parsed, min, &corpus_label);
+
+    if json {
+        print!("{}", ask::render_json(&report));
+    } else {
+        print!("{}", ask::render_human(&report));
+    }
+
+    if report.all_proven() {
+        Ok(())
+    } else {
+        Err(format!(
+            "knowledge-ask regression: {}/{} queries proven from the corpus",
+            report.proven, report.queries
+        ))
+    }
 }
 
 /// `cce eval` (SPEC-V2.5 §7): aggregate recorded A/B runs into the correctness-
