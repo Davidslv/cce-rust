@@ -33,7 +33,7 @@ walkdir = "=2.5.0"
 # `.gitignore` files at/below the walk root and to ignore every machine-local
 # source (`.git/info/exclude`, global excludes, bare `.ignore`, parent ignores), so
 # two machines at the same sha still build byte-identical artifacts.
-ignore = "=0.4.23"
+ignore = "=0.4.28"
 clap = { version = "=4.6.1", features = ["derive"] }
 ureq = { version = "=3.3.0", features = ["json"] }
 serde = { version = "=1.0.228", features = ["derive"] }
