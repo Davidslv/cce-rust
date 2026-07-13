@@ -21,7 +21,10 @@ The method is deliberately:
 |------|---------|
 | `questions.jsonl` | The pinned question set + ground truth (`must_include` substrings). |
 | `run.sh` | Template that drives your headless agent twice per question (off/on) and emits run JSONL. **Not run in CI** — needs a live agent. |
+| `run-claude.sh` | The template *instantiated* with a headless Claude Code agent — the concrete, reproducible driver behind the committed baseline. **Not run in CI.** |
 | `runs.example.jsonl` | Canned run outputs showing the exact shape; used to demo the aggregation. |
+| `runs.jsonl` | The **first measured baseline**'s frozen run record (12 = 6 × {off,on}). |
+| `BASELINE.md` | The first measured cost-delta baseline (gap G5 / Epic #8 · U3.1): result, method, provenance, and an honest reading. |
 
 ## Formats
 
