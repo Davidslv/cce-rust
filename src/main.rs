@@ -510,6 +510,11 @@ enum KnowledgeCmd {
         /// (default: current directory).
         #[arg(long)]
         dir: Option<PathBuf>,
+        /// Optional `cce.feed-manifest/v1` sidecar to verify the feed against
+        /// before indexing (record count + sha256). A truncated or misdirected
+        /// feed fails loudly instead of indexing silently (U6.2).
+        #[arg(long)]
+        manifest: Option<PathBuf>,
     },
     /// Run a `cce.knowledge.ask/v1` golden suite against the curated corpus and
     /// report which questions are answered from it (Epic U5.4). The standing
@@ -686,7 +691,9 @@ fn main() -> ExitCode {
             Err(msg) => Err(msg),
         },
         Command::Knowledge { cmd } => match cmd {
-            KnowledgeCmd::Index { file, dir } => cmd_knowledge_index(&file, dir),
+            KnowledgeCmd::Index { file, dir, manifest } => {
+                cmd_knowledge_index(&file, dir, manifest)
+            }
             KnowledgeCmd::Ask { suite, dir, min_score, json } => {
                 cmd_knowledge_ask(&suite, dir, min_score, json)
             }
@@ -1240,12 +1247,20 @@ fn cmd_usage(
     Ok(())
 }
 
-/// `cce knowledge index <file.jsonl> [--dir <root>]` (SPEC-V2.6 §4): ingest a
-/// `cce.knowledge/v1` feed into the snapshot-keyed knowledge store under
+/// `cce knowledge index <file.jsonl> [--dir <root>] [--manifest <path>]` (SPEC-V2.6
+/// §4): ingest a `cce.knowledge/v1` feed into the snapshot-keyed knowledge store under
 /// `<root>/.cce/knowledge/`, heading-chunked (M1) and redacted before write. Offline,
 /// deterministic; a newer snapshot supersedes the old. Honours
 /// `markdown.max_section_tokens` and `knowledge.enabled` from `<root>/.cce/config`.
-fn cmd_knowledge_index(file: &Path, dir: Option<PathBuf>) -> Result<(), String> {
+///
+/// With `--manifest`, the feed is first verified against a neutral
+/// `cce.feed-manifest/v1` sidecar (record count + sha256); a truncated or misdirected
+/// feed fails loudly and nothing is written (U6.2).
+fn cmd_knowledge_index(
+    file: &Path,
+    dir: Option<PathBuf>,
+    manifest: Option<PathBuf>,
+) -> Result<(), String> {
     if !file.is_file() {
         return Err(format!("not a file: {}", file.display()));
     }
@@ -1254,9 +1269,12 @@ fn cmd_knowledge_index(file: &Path, dir: Option<PathBuf>) -> Result<(), String> 
         return Err("knowledge is disabled (knowledge.enabled: false in .cce/config)".to_string());
     }
     let budget = cce::config::MarkdownConfig::load(&root).max_section_tokens;
-    let summary = cce::knowledge::ingest_file(file, &root, budget)?;
+    let summary = cce::knowledge::ingest_file_verified(file, manifest.as_deref(), &root, budget)?;
     println!("Indexed knowledge from {}", file.display());
     println!("  schema    : {}", cce::knowledge::KNOWLEDGE_SCHEMA_ID);
+    if let Some(m) = &manifest {
+        println!("  manifest  : verified ({}) — {} records", m.display(), summary.records);
+    }
     println!("  records   : {}", summary.records);
     println!("  chunks    : {}", summary.chunks);
     println!("  snapshot  : {}", summary.snapshot);

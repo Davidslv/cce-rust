@@ -8,6 +8,22 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`cce knowledge index --manifest` — feed-level integrity check (signal-engine
+  Epic #8 · U6.2 / issue #30).** Closes gap G16: `cce knowledge index` no longer
+  trusts its input blindly. An optional `--manifest <path>` verifies the feed against
+  a **neutral** `cce.feed-manifest/v1` sidecar — two required fields, `records` (the
+  count the feed must contain) and `sha256` (lowercase-hex over the feed's raw bytes,
+  what `sha256sum` prints) — **before** anything is written. A truncated/incomplete
+  feed (`declares N, feed has M`) or a corrupt/misdirected one (checksum mismatch)
+  now **fails loudly** with a non-zero exit and writes no store, instead of indexing
+  silently. The check is **opt-in and additive** — omit `--manifest` and behaviour is
+  byte-for-byte unchanged. It is deliberately **producer-neutral**: cce reads only
+  `records` and `sha256` and ignores every other key, so a producer's own richer
+  manifest (e.g. thresh's `thresh.cce_stage/v1` MANIFEST) *maps onto* the format by
+  carrying those two fields — cce imports no producer-named schema across the seam
+  (C8). Introducing `cce.feed-manifest/v1` is the compatibility event; a future
+  `/v2` would be a deliberate bump (C21). See
+  [docs/knowledge.md](docs/knowledge.md#verifying-a-feed----manifest-u62).
 - **`cce knowledge ask` — the Knowledge-Ask golden suite (signal-engine Epic #8 ·
   U5.4 / issue #28).** A standing regression check for the knowledge host: a
   committed suite of real operator questions, each pinned to the curated record a

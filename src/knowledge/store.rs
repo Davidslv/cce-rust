@@ -302,9 +302,31 @@ pub fn ingest_file(
     root: &Path,
     max_section_tokens: usize,
 ) -> Result<IngestSummary, String> {
+    ingest_file_verified(input_path, None, root, max_section_tokens)
+}
+
+/// Like [`ingest_file`], but optionally verifies the feed against a neutral
+/// `cce.feed-manifest/v1` sidecar (U6.2) BEFORE anything is written. When
+/// `manifest_path` is `Some`, a record-count or checksum mismatch is a loud `Err` and
+/// no store is persisted — a truncated or misdirected feed can never index silently
+/// (gap G16). When `None`, behaviour is byte-identical to a plain ingest (the check is
+/// opt-in and additive). The feed bytes are read exactly once, so the bytes verified
+/// are the bytes ingested.
+pub fn ingest_file_verified(
+    input_path: &Path,
+    manifest_path: Option<&Path>,
+    root: &Path,
+    max_section_tokens: usize,
+) -> Result<IngestSummary, String> {
     let text = std::fs::read_to_string(input_path)
         .map_err(|e| format!("could not read {}: {e}", input_path.display()))?;
     let records = crate::knowledge::contract::parse_ndjson(&text)?;
+    if let Some(mpath) = manifest_path {
+        let mtext = std::fs::read_to_string(mpath)
+            .map_err(|e| format!("could not read feed manifest {}: {e}", mpath.display()))?;
+        let manifest = crate::knowledge::manifest::FeedManifest::parse(&mtext)?;
+        manifest.verify(text.as_bytes(), records.len())?;
+    }
     let store = ingest(&records, text.as_bytes(), max_section_tokens);
     let store_path =
         store.save(root).map_err(|e| format!("could not write knowledge store: {e}"))?;
