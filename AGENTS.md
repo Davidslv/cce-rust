@@ -122,6 +122,11 @@ scores are compared, sorted, or emitted.
   to add a native, opt-in, loopback `cce corpus serve` route over in-process
   knowledge retrieval, co-located on the signal-engine host; recorded before the
   implementation (signal-engine Epic #8 · U1.3).
+- [`ADR-CORPUS-TRUST.md`](ADR-CORPUS-TRUST.md) — the accepted decision (OD6) on
+  corpus trust posture: trust-the-pusher, the git host's ACL as the gate, one
+  publisher per corpus, signatures/rebuild-verify deferred until a second publisher
+  joins. A write-down of the posture `docs/knowledge.md` §Trust and `docs/sync.md`
+  §8 already implement; no behaviour change (signal-engine Epic #8 · U6.3).
 - [`docs/mcp.md`](docs/mcp.md) · [`docs/savings.md`](docs/savings.md) ·
   [`docs/sync.md`](docs/sync.md) · [`docs/knowledge.md`](docs/knowledge.md) — the
   MCP (nine tools), Savings Layers, Sync, and Knowledge Sources user docs;

@@ -47,6 +47,7 @@
 - [SPEC.md](SPEC.md): The normative base-engine specification (v1.0).
 - [DASHBOARD-SPEC.md](DASHBOARD-SPEC.md): The dashboard & observability addendum (v1.1) — metrics log, aggregator, dashboard.
 - [ADR-CORPUS-SERVE.md](ADR-CORPUS-SERVE.md): The accepted decision (OD1/OD2) behind `cce corpus serve` — a native, opt-in, loopback, bearer-authenticated `GET /docs?service=` bridge over in-process knowledge retrieval, co-located on the signal-engine host (signal-engine Epic #8 · U1.1/U1.3).
+- [ADR-CORPUS-TRUST.md](ADR-CORPUS-TRUST.md): The accepted decision (OD6) on corpus trust posture — trust-the-pusher, private-repo git ACL as the gate, one publisher per corpus; signatures/rebuild-verify deferred until a second publisher joins (signal-engine Epic #8 · U6.3). A write-down of the posture the tooling already implements; no behaviour change.
 - [SPEC-V2.md](SPEC-V2.md): The language-packs evolution spec (v2.0) — pack interface, registry, validators, `kind`, conformance shape.
 - [SPEC-V2.1.md](SPEC-V2.1.md): The secret-protection evolution spec (v2.1) — sensitive-file skip + secret redaction.
 - [SPEC-V2.2.md](SPEC-V2.2.md): The workspace-mode evolution spec (v2.2) — detection, manifest, federation, cross-member edges.
