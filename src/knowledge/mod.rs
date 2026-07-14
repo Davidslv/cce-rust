@@ -15,14 +15,17 @@
 
 pub mod ask;
 pub mod contract;
+pub mod manifest;
 pub mod retrieval;
 pub mod store;
 
 pub use contract::{parse_ndjson, render_document, KnowledgeRecord, KNOWLEDGE_SCHEMA_ID};
+pub use manifest::{feed_sha256, FeedManifest, FEED_MANIFEST_SCHEMA_ID};
 pub use retrieval::{
     is_merged_pr_link, provenance_line, same_document_sections, search_knowledge, KnowledgeHit,
     LoadedKnowledge,
 };
 pub use store::{
-    ingest, ingest_default, ingest_file, snapshot_id, IngestSummary, KnowledgeChunk, KnowledgeStore,
+    ingest, ingest_default, ingest_file, ingest_file_verified, snapshot_id, IngestSummary,
+    KnowledgeChunk, KnowledgeStore,
 };

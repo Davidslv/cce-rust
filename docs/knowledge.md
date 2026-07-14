@@ -118,6 +118,47 @@ The result is written to a **separate, snapshot-keyed knowledge store** under
 Knowledge is *mutable*, which is exactly why it is snapshot-keyed rather than
 `repo@sha`-keyed and never enters the byte-identical code cache.
 
+### Verifying a feed — `--manifest` (U6.2)
+
+By default `cce knowledge index` trusts its input: a feed that is truncated in
+transit, or the *wrong* feed pointed at the wrong instance, indexes silently. The
+optional `--manifest` flag closes that gap — a producer emits a small sidecar stating
+what the feed should be, and cce refuses to index anything else:
+
+```
+cce knowledge index curated.jsonl --manifest MANIFEST.json
+```
+
+The sidecar is a **neutral** cce contract, `cce.feed-manifest/v1` — two required
+fields, everything else ignored:
+
+```json
+{"schema": "cce.feed-manifest/v1", "records": 128,
+ "sha256": "9f86d0818…<64 lowercase hex over the raw feed bytes>"}
+```
+
+| field | meaning |
+|-------|---------|
+| `records` | how many `cce.knowledge/v1` records the feed must contain |
+| `sha256` | the SHA-256 of the feed's raw bytes — exactly what `sha256sum curated.jsonl` prints |
+
+Before writing anything, cce checks the feed's actual record count and byte digest
+against the manifest. A mismatch is a **loud, non-zero failure** and **no store is
+written**:
+
+- a **truncated / incomplete** feed (records dropped) → `manifest declares N record(s),
+  feed has M — the feed is truncated or incomplete`;
+- a **corrupt or misdirected** feed (bytes changed, or a wholly different feed) →
+  `feed does not match its manifest checksum … manifest sha256 …, feed sha256 …`.
+
+The check is **opt-in and additive**: omit `--manifest` and behaviour is byte-for-byte
+what it was before. It is also **producer-neutral** — cce reads only `records` and
+`sha256` and ignores every other key, so a producer's own richer manifest (for
+example thresh's `thresh.cce_stage/v1` MANIFEST, which carries the staged file list and
+provenance) *maps onto* this format simply by carrying those two fields. cce imports no
+producer-named schema across the seam; the neutral contract is cce's, and a bump to
+`cce.feed-manifest/v2` would be a deliberate compatibility event.
+
 ## Searching knowledge (M4) — the `source:` blend
 
 Since v2.6.1, knowledge chunks are searchable through the **exact same hybrid
