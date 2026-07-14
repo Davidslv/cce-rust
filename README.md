@@ -936,13 +936,13 @@ node type in a `kind` field alongside the coarse `chunk_type`
 ## Tests & coverage
 
 ```bash
-cargo test                                                  # 660 tests
+cargo test                                                  # 1002 tests
 cargo clippy --all-targets --all-features -- -D warnings    # lint gate
 cargo fmt --check                                           # format gate
 ```
 
-The suite is **605 passing tests** (+1 `#[ignore]` live-Ollama integration test)
-and measures **~94% line coverage** via `cargo llvm-cov`. The default suite is
+The suite is **1002 passing tests** (+1 `#[ignore]` live-Ollama integration test)
+and measures **~95% line coverage** via `cargo llvm-cov`. The default suite is
 fully deterministic and makes no network calls — including the metrics subsystem,
 whose clock and id source are injected and whose dashboard tests bind an
 ephemeral loopback port. A CI test gate runs the three-layer validators over every

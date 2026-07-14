@@ -59,7 +59,7 @@ This codebase was built test-first (SPEC §12) and expects to stay that way — 
 - Tests must be **deterministic and hermetic**: no network, no reliance on wall
   clock or ambient filesystem. The single Ollama integration test is marked
   `#[ignore]` for exactly this reason.
-- Keep or improve coverage. The suite is **660 tests at ~94% line coverage**
+- Keep or improve coverage. The suite is **1002 tests at ~95% line coverage**
   (`cargo llvm-cov`); a change that drops coverage should add tests, not lower
   the bar.
 

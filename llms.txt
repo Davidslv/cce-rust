@@ -68,7 +68,7 @@
 - [Architecture](docs/architecture.md): Design goals, module map, pipeline, the language-pack architecture, and where the design strains.
 - [Dashboard](docs/dashboard.md): The metrics pipeline (log → aggregator → API → page), event schema, and aggregation formulas.
 - [Decisions](docs/DECISIONS.md): How each ambiguity in the spec was resolved, with rationale.
-- [TDD log](docs/TDD.md): The red → green build order and coverage (660 tests, ~94% line coverage).
+- [TDD log](docs/TDD.md): The red → green build order and coverage (1002 tests, ~95% line coverage).
 - [Benchmarks](docs/BENCHMARKS.md): Measured index/latency/recall numbers per language (Ruby/Rust/TypeScript/C) on real corpora.
 
 ## Source (key files)
