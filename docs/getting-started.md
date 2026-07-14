@@ -38,7 +38,7 @@ sudo apt-get update && sudo apt-get install -y build-essential
 git clone https://github.com/davidslv/cce-rust
 cd cce-rust
 cargo build --release     # binary at target/release/cce
-cargo test                # confirms a green build (660 tests)
+cargo test                # confirms a green build (1002 tests)
 ```
 
 Prefer not to build at all? Every release ships **prebuilt binaries** for macOS

@@ -44,3 +44,6 @@ jobs:
 
       - name: Test
         run: cargo test --all-targets --all-features
+
+      - name: Doc test-count honesty (claimed vs actual)
+        run: bash scripts/check-doc-test-count.sh
