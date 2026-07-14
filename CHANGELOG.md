@@ -8,6 +8,15 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 ## [Unreleased]
 
 ### Added
+- **`ADR-CORPUS-TRUST.md` — corpus trust posture recorded (OD6; signal-engine
+  Epic #8 · U6.3 / issue #31).** Closes gap G18 and Open Q5: who may push a
+  corpus, to which remote, under which ACL. The decision is **trust-the-pusher +
+  private-repo ACL, one publisher per corpus** — the git host's ACL is the access
+  control, and detached signatures / rebuild-verify stay a deferred, additive
+  upgrade whose revisit trigger is a **second publisher (person or machine)**
+  joining. This is a **write-down of the posture the tooling already implements**
+  (`docs/knowledge.md` §Trust, `docs/sync.md` §8, the `docs/ci/cce-knowledge-sync.yml`
+  one-publisher adapter) — no code, behaviour, or spec changes.
 - **`cce knowledge index --manifest` — feed-level integrity check (signal-engine
   Epic #8 · U6.2 / issue #30).** Closes gap G16: `cce knowledge index` no longer
   trusts its input blindly. An optional `--manifest <path>` verifies the feed against
