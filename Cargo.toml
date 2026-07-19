@@ -34,7 +34,7 @@ walkdir = "=2.5.0"
 # source (`.git/info/exclude`, global excludes, bare `.ignore`, parent ignores), so
 # two machines at the same sha still build byte-identical artifacts.
 ignore = "=0.4.23"
-clap = { version = "=4.6.1", features = ["derive"] }
+clap = { version = "=4.6.2", features = ["derive"] }
 ureq = { version = "=3.3.0", features = ["json"] }
 serde = { version = "=1.0.228", features = ["derive"] }
 # `float_roundtrip`: parse floats with full precision so a persisted f64 (an
