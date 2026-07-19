@@ -16,7 +16,7 @@ path = "src/lib.rs"
 [dependencies]
 # tree-sitter core, pinned. All grammar crates below share the same
 # `tree-sitter-language` (0.1.x) ABI as this core, so they are interchangeable.
-tree-sitter = "=0.26.10"
+tree-sitter = "=0.26.11"
 # One grammar crate per language pack (SPEC-V2 §2), each pinned.
 tree-sitter-python = "=0.25.0"
 tree-sitter-javascript = "=0.25.0"
