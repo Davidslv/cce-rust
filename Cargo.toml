@@ -46,7 +46,7 @@ serde = { version = "=1.0.228", features = ["derive"] }
 # makes reading match it.
 serde_json = { version = "=1.0.150", features = ["float_roundtrip"] }
 # High-confidence secret redaction patterns (SPEC-V2.1 §1, Layer 2), pinned.
-regex = "=1.12.4"
+regex = "=1.13.1"
 # YAML parsing for the workspace manifest (SPEC-V2.2 §2), pinned. Reading only —
 # the manifest is emitted by a hand-rolled canonical writer for byte-determinism.
 serde_yaml = "=0.9.34"
