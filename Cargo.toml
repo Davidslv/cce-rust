@@ -44,7 +44,7 @@ serde = { version = "=1.0.228", features = ["derive"] }
 # parsing the `.cck` would drift a ULP from a local ingest and break the
 # pulled-store byte-identity bar. Writing was always shortest-roundtrip; this
 # makes reading match it.
-serde_json = { version = "=1.0.150", features = ["float_roundtrip"] }
+serde_json = { version = "=1.0.151", features = ["float_roundtrip"] }
 # High-confidence secret redaction patterns (SPEC-V2.1 §1, Layer 2), pinned.
 regex = "=1.12.4"
 # YAML parsing for the workspace manifest (SPEC-V2.2 §2), pinned. Reading only —
