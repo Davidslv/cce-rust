@@ -155,12 +155,52 @@ jobs:
           sed -i '/./,$!d' notes.md
           echo "--- release notes ---"; cat notes.md
 
-      - name: Create release
+      # Idempotent on purpose. `gh release create` fails outright with "a release
+      # with the same tag name already exists", which is exactly what happened to
+      # v2.9.0: all four binaries built, then this step died and uploaded nothing —
+      # leaving a release with ZERO assets. That silently breaks
+      # `releases/latest/download/…` (404), and with it `cce update` and every
+      # consumer that installs from the latest release.
+      #
+      # A release can pre-exist for ordinary reasons (drafted by hand, or this job
+      # re-run after a transient failure), so publishing must converge rather than
+      # abort: upload into the existing release and refresh its metadata.
+      - name: Create or update release
         env:
           GH_TOKEN: ${{ github.token }}
         run: |
-          gh release create "$GITHUB_REF_NAME" \
-            --title "cce $GITHUB_REF_NAME" \
-            --notes-file notes.md \
-            --verify-tag \
-            dist/*
+          set -euo pipefail
+          if gh release view "$GITHUB_REF_NAME" >/dev/null 2>&1; then
+            echo "release $GITHUB_REF_NAME exists — uploading assets into it"
+            # --clobber so a re-run replaces same-named assets instead of failing.
+            gh release upload "$GITHUB_REF_NAME" --clobber -- dist/*
+            gh release edit "$GITHUB_REF_NAME" \
+              --title "cce $GITHUB_REF_NAME" \
+              --notes-file notes.md
+          else
+            gh release create "$GITHUB_REF_NAME" \
+              --title "cce $GITHUB_REF_NAME" \
+              --notes-file notes.md \
+              --verify-tag \
+              dist/*
+          fi
+
+      # A release with no assets is indistinguishable from a successful one until a
+      # user hits the 404, so assert the artifacts are actually attached.
+      - name: Assert the release has its assets
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          expected=$(ls dist | wc -l | tr -d ' ')
+          actual=$(gh release view "$GITHUB_REF_NAME" --json assets --jq '.assets | length')
+          echo "assets expected=$expected actual=$actual"
+          [ "$actual" -ge "$expected" ] || {
+            echo "::error::release $GITHUB_REF_NAME has $actual assets, expected >= $expected"
+            exit 1
+          }
+          gh release view "$GITHUB_REF_NAME" --json assets \
+            --jq '.assets[].name | select(. == "SHA256SUMS")' | grep -q SHA256SUMS || {
+            echo "::error::SHA256SUMS missing — cce update and the install docs depend on it"
+            exit 1
+          }
