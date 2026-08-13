@@ -65,6 +65,43 @@ gh release delete vX.Y.Z --yes
 git push origin :refs/tags/vX.Y.Z
 ```
 
+### The asset-less release (what happened to v2.9.0)
+
+A distinct failure mode, because deleting and re-tagging is the *wrong* fix once
+the tag is public: a release that exists with **zero assets**.
+
+`gh release create` aborts with `a release with the same tag name already exists`.
+When the release had been created ahead of the workflow, the publish job died
+*after* all four binaries built — so the release stayed, with nothing attached.
+Nothing surfaces that: the tag looks fine, and the breakage only appears
+downstream as a **404** on `releases/latest/download/SHA256SUMS`, which takes out
+`cce update` and any CI that installs from the latest release.
+
+The publish step is now idempotent (upload into an existing release, then refresh
+its title and notes) and a following step **asserts the assets are attached**, so
+this cannot ship silently again.
+
+To repair a release that is already published without assets, re-upload from the
+build artifacts rather than re-tagging — they are retained for 90 days:
+
+```bash
+RUN=$(gh run list --workflow release.yml --limit 20 \
+        --json databaseId,headBranch --jq '[.[]|select(.headBranch=="vX.Y.Z")][0].databaseId')
+gh run download "$RUN" --dir dist-fix
+cd dist-fix && find . -mindepth 2 -type f -exec mv {} . \;   # gh nests per artifact
+shasum -a 256 --check -- *.sha256                            # verify BEFORE uploading
+cat -- *.sha256 > SHA256SUMS && rm -- *.sha256               # same layout as the workflow
+gh release upload vX.Y.Z -- *.tar.gz SHA256SUMS
+```
+
+Then confirm the contract holds:
+
+```bash
+curl -sIL -o /dev/null -w '%{http_code}\n' \
+  https://github.com/davidslv/cce-rust/releases/latest/download/SHA256SUMS   # expect 200
+cce update --check                                                            # expect a version, not an error
+```
+
 ## Deliberately out of scope
 
 - **crates.io** — not published there for now; installing from a release tarball or
