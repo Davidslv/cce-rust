@@ -36,7 +36,7 @@ walkdir = "=2.5.0"
 ignore = "=0.4.23"
 clap = { version = "=4.6.1", features = ["derive"] }
 ureq = { version = "=3.3.0", features = ["json"] }
-serde = { version = "=1.0.228", features = ["derive"] }
+serde = { version = "=1.0.229", features = ["derive"] }
 # `float_roundtrip`: parse floats with full precision so a persisted f64 (an
 # embedding) parses back to the EXACT double that was written. Load-bearing for
 # knowledge-corpus sync (SPEC-SYNC-KNOWLEDGE §2): `knowledge push` exports the
