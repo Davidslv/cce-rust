@@ -24,7 +24,7 @@ tree-sitter-ruby = "=0.23.1"
 tree-sitter-rust = "=0.24.2"
 tree-sitter-typescript = "=0.23.2"
 tree-sitter-c = "=0.24.2"
-sha2 = "=0.11.0"
+sha2 = "=0.11.1"
 walkdir = "=2.5.0"
 # Gitignore-aware directory walking (ripgrep's crate; the de-facto standard),
 # pinned. Used by the indexer's walker so a committed `.gitignore` in the tree at a
