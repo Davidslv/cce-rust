@@ -69,4 +69,4 @@ tempfile = "=3.27.0"
 # generates adversarial-but-legal source (CRLF, unicode identifiers, empty and
 # comment-only files, deep nesting, markdown heading edge cases) and asserts the
 # invariants the byte-pinned goldens cannot cover.
-proptest = "=1.11.0"
+proptest = "=1.12.0"
