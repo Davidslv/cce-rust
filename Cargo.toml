@@ -58,7 +58,7 @@ base64 = "=0.23.1"
 # the same `tree-sitter-language` (0.1.x) ABI as the tree-sitter core above, so it is
 # interchangeable. Used ONLY by the knowledge ingest — the code index never registers
 # it, so `conformance.json` and the Sync golden stay byte-identical (SPEC-V2.6 §1.2).
-tree-sitter-md = "=0.5.3"
+tree-sitter-md = "=0.5.4"
 
 [profile.release]
 opt-level = 3
